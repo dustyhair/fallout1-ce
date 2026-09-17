@@ -13,6 +13,11 @@
 
 namespace fallout {
 
+// Fallout's recorded talking-head dialogue is about 13 dB louder than the
+// generated dialogue cache. Apply that difference here so both sources have
+// comparable perceived loudness while continuing to follow the speech slider.
+static constexpr double TALKING_HEAD_VOLUME_SCALE = 0.22;
+
 static char* lips_fix_string(const char* fileName, size_t length);
 static int lips_stop_speech();
 static int lips_read_phoneme_type(unsigned char* phoneme_type, DB_FILE* stream);
@@ -168,7 +173,7 @@ int lips_play_speech()
     }
 
     int speechVolume = gsound_speech_volume_get();
-    soundVolume(lip_info.sound, (int)(speechVolume * 0.69));
+    soundVolume(lip_info.sound, static_cast<int>(speechVolume * TALKING_HEAD_VOLUME_SCALE));
 
     speechStartTime = get_time();
 
