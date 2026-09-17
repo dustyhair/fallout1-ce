@@ -109,6 +109,7 @@ def main() -> int:
         help="Zero-based shard to render; repeat to assign several shards to one process",
     )
     parser.add_argument("--script", action="append", help="Only render these script names")
+    parser.add_argument("--player-name-lines-only", action="store_true")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -121,6 +122,8 @@ def main() -> int:
     if args.script:
         selected = {name.upper() for name in args.script}
         records = [record for record in records if record.script in selected]
+    if args.player_name_lines_only:
+        records = [record for record in records if "player_name" in record.roles]
     jobs_by_path = {}
     for record in records:
         for job in jobs_for(record, args.cache, cast, args.cast.parent):

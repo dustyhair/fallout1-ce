@@ -32,6 +32,7 @@ class RoleReference:
     message_list_id: int
     message_id: int
     roles: frozenset[str]
+    text: str | None = None
 
 
 def load_fields(path: Path) -> list[tuple[int, str, str]]:
@@ -126,6 +127,163 @@ def _split_arguments(arguments: str) -> list[str]:
     return result
 
 
+def _split_concatenation(expression: str) -> list[str]:
+    result = []
+    start = 0
+    depth = 0
+    quote = None
+    escaped = False
+    for cursor, character in enumerate(expression):
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in {'"', "'"}:
+            quote = character
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+        elif character == "+" and depth == 0:
+            result.append(expression[start:cursor].strip())
+            start = cursor + 1
+    result.append(expression[start:].strip())
+    return result
+
+
+def _player_name_text(
+    expression: str,
+    script_list_id: int,
+    message_texts: dict[tuple[int, int], str],
+) -> str | None:
+    name_pattern = re.compile(
+        r"proto_data\s*\(\s*obj_pid\s*\(\s*dude_obj\s*\)\s*,\s*1\s*\)",
+        re.IGNORECASE,
+    )
+    if name_pattern.search(expression) is None:
+        return None
+
+    pieces = []
+    for term in _split_concatenation(expression):
+        if name_pattern.fullmatch(term):
+            pieces.append("Vault Dweller")
+            continue
+        if len(term) >= 2 and term[0] == term[-1] and term[0] in {'"', "'"}:
+            pieces.append(term[1:-1].replace(r"\"", '"').replace(r"\\", "\\"))
+            continue
+        message_calls = list(_call_arguments(term, "message_str"))
+        if len(message_calls) == 1:
+            fields = _split_arguments(message_calls[0])
+            if (
+                len(fields) >= 2
+                and re.fullmatch(r"\d+", fields[0])
+                and re.fullmatch(r"\d+", fields[1])
+            ):
+                message_list_id = int(fields[0]) or script_list_id
+                text = message_texts.get((message_list_id, int(fields[1])))
+                if text is not None:
+                    pieces.append(text)
+                    continue
+        return None
+    return "".join(pieces)
+
+
+def _player_name_roles(
+    source: str,
+    script_list_id: int,
+    message_texts: dict[tuple[int, int], str],
+) -> list[RoleReference]:
+    references = []
+    calls = {
+        "gsay_reply": ("npc", 1),
+        "gsay_message": ("npc", 1),
+        "gdialog_reply": ("npc", 2),
+        "sayReply": ("npc", 1),
+        "giq_option": ("player", 2),
+        "gsay_option": ("player", 1),
+        "gdialog_option": ("player", 1),
+        "sayOption": ("player", 0),
+    }
+    for function, (role, expression_index) in calls.items():
+        for arguments in _call_arguments(source, function):
+            fields = _split_arguments(arguments)
+            if expression_index >= len(fields):
+                continue
+            text = _player_name_text(fields[expression_index], script_list_id, message_texts)
+            if text:
+                references.append(
+                    RoleReference(
+                        script_list_id,
+                        script_list_id,
+                        -1,
+                        frozenset({role, "player_name"}),
+                        text,
+                    )
+                )
+
+    for arguments in _call_arguments(source, "float_msg"):
+        fields = _split_arguments(arguments)
+        if len(fields) < 2:
+            continue
+        text = _player_name_text(fields[1], script_list_id, message_texts)
+        if text:
+            role = "player" if fields[0].strip().lower() == "dude_obj" else "npc"
+            references.append(
+                RoleReference(
+                    script_list_id,
+                    script_list_id,
+                    -1,
+                    frozenset({role, "floating", "player_name"}),
+                    text,
+                )
+            )
+
+    assignment_pattern = re.compile(
+        r"\b[A-Za-z_]\w*\s*:=\s*([^;]*proto_data\s*\(\s*obj_pid\s*\(\s*dude_obj\s*\)\s*,\s*1\s*\)[^;]*);",
+        re.IGNORECASE,
+    )
+    for expression in assignment_pattern.findall(source):
+        text = _player_name_text(expression, script_list_id, message_texts)
+        if text:
+            references.append(
+                RoleReference(
+                    script_list_id,
+                    script_list_id,
+                    -1,
+                    frozenset({"npc", "player_name"}),
+                    text,
+                )
+            )
+
+    chained_assignment_pattern = re.compile(
+        r"\b(?P<variable>[A-Za-z_]\w*)\s*:=\s*(?P<prefix>[^;]+);\s*"
+        r"(?P=variable)\s*:=\s*(?P=variable)\s*\+\s*"
+        r"(?P<name>proto_data\s*\(\s*obj_pid\s*\(\s*dude_obj\s*\)\s*,\s*1\s*\))\s*;\s*"
+        r"(?P=variable)\s*:=\s*(?P=variable)\s*\+\s*(?P<suffix>[^;]+);",
+        re.IGNORECASE,
+    )
+    for match in chained_assignment_pattern.finditer(source):
+        expression = " + ".join(
+            (match.group("prefix"), match.group("name"), match.group("suffix"))
+        )
+        text = _player_name_text(expression, script_list_id, message_texts)
+        if text:
+            references.append(
+                RoleReference(
+                    script_list_id,
+                    script_list_id,
+                    -1,
+                    frozenset({"npc", "player_name"}),
+                    text,
+                )
+            )
+    return references
+
+
 def _static_message_ids(expression: str) -> set[int] | None:
     expression = expression.strip()
     if re.fullmatch(r"\d+", expression):
@@ -207,6 +365,7 @@ def load_roles(
     ssl_dir: Path,
     scripts: dict[int, ScriptEntry],
     available_messages: dict[int, set[int]],
+    message_texts: dict[tuple[int, int], str],
 ) -> list[RoleReference]:
     roles: dict[tuple[int, int], set[str]] = {}
     patterns = {
@@ -258,6 +417,7 @@ def load_roles(
                         )
                     )
                 continue
+            floating.extend(_player_name_roles(source, script.list_id, message_texts))
             floating.extend(
                 _floating_roles(
                     source,
@@ -300,14 +460,19 @@ def load_dialogue(
             messages[(list_id, message_id)] = message
             available_messages.setdefault(list_id, set()).add(message_id)
 
-    roles = load_roles(ssl_dir, scripts, available_messages)
+    message_texts = {key: message[1] for key, message in messages.items()}
+    roles = load_roles(ssl_dir, scripts, available_messages, message_texts)
 
     records_by_key = {}
     for reference in roles:
         script = scripts.get(reference.speaker_list_id)
         if script is None:
             continue
-        message = messages.get((reference.message_list_id, reference.message_id))
+        message = (
+            ("", reference.text)
+            if reference.text is not None
+            else messages.get((reference.message_list_id, reference.message_id))
+        )
         if message is None or not message[1].strip():
             continue
         key = (reference.speaker_list_id, reference.message_list_id, reference.message_id, message[1])

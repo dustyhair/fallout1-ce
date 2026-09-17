@@ -12,7 +12,9 @@
 #include <vector>
 
 #include "game/config.h"
+#include "game/critter.h"
 #include "game/gconfig.h"
+#include "game/object.h"
 #include "plib/gnw/debug.h"
 #include "tts_audio.h"
 
@@ -84,7 +86,7 @@ static bool speakCached(const std::string& text, const std::string& relativePath
     return playCachedPath(getTextHash(text) + ".opus");
 }
 
-static void speakUtf8(const std::string& text, const std::string& relativePath, bool interrupt)
+static void beginSpeech(bool interrupt)
 {
     if (interrupt) {
         ttsAudioStop();
@@ -94,16 +96,23 @@ static void speakUtf8(const std::string& text, const std::string& relativePath, 
         }
 #endif
     }
+}
 
-    if (speakCached(text, relativePath)) {
-        return;
-    }
-
+static void speakFallback(const std::string& text)
+{
 #if defined(FALLOUT_HAVE_SPEECHD)
     if (tts_connection != nullptr) {
         spd_say(tts_connection, SPD_MESSAGE, text.c_str());
     }
 #endif
+}
+
+static void speakUtf8(const std::string& text, const std::string& relativePath, bool interrupt)
+{
+    beginSpeech(interrupt);
+    if (!speakCached(text, relativePath)) {
+        speakFallback(text);
+    }
 }
 
 static int clampSpeechSetting(int value)
@@ -164,6 +173,62 @@ static std::string convertToUtf8(const char* text)
     iconv_close(converter);
     *outputCursor = '\0';
     return output.data();
+}
+
+static bool isNameCharacter(unsigned char ch)
+{
+    return (ch >= 'A' && ch <= 'Z')
+        || (ch >= 'a' && ch <= 'z')
+        || (ch >= '0' && ch <= '9')
+        || ch == '_'
+        || ch >= 0x80;
+}
+
+static std::string replacePlayerName(const std::string& text)
+{
+    if (obj_dude == nullptr) {
+        return text;
+    }
+
+    std::string playerName = convertToUtf8(critter_name(obj_dude));
+    if (playerName.empty() || playerName == "None" || playerName == "Vault Dweller") {
+        return text;
+    }
+
+    std::string result = text;
+    std::size_t offset = 0;
+    while ((offset = result.find(playerName, offset)) != std::string::npos) {
+        bool startsAtBoundary = offset == 0
+            || !isNameCharacter(static_cast<unsigned char>(result[offset - 1]));
+        std::size_t ending = offset + playerName.size();
+        bool endsAtBoundary = ending == result.size()
+            || !isNameCharacter(static_cast<unsigned char>(result[ending]));
+        if (startsAtBoundary && endsAtBoundary) {
+            result.replace(offset, playerName.size(), "Vault Dweller");
+            offset += strlen("Vault Dweller");
+        } else {
+            offset = ending;
+        }
+    }
+    return result;
+}
+
+static std::string dialogCachePath(const std::string& text, int speakerListId, bool playerVoice, int gender)
+{
+    char genderCode = 'n';
+    if (gender == 0) {
+        genderCode = 'm';
+    } else if (gender == 1) {
+        genderCode = 'f';
+    }
+
+    std::ostringstream relativePath;
+    relativePath << "dialog/" << (playerVoice ? "player" : "npc") << '/';
+    if (!playerVoice) {
+        relativePath << speakerListId << '/';
+    }
+    relativePath << getTextHash(text) << '-' << genderCode << ".opus";
+    return relativePath.str();
 }
 
 bool ttsInit()
@@ -290,23 +355,25 @@ void ttsSpeakDialog(const char* text, int speakerListId, bool playerVoice, int g
         return;
     }
 
-    char genderCode = 'n';
-    if (gender == 0) {
-        genderCode = 'm';
-    } else if (gender == 1) {
-        genderCode = 'f';
-    }
+    std::string relativePath = dialogCachePath(utf8, speakerListId, playerVoice, gender);
+    std::string canonicalText = replacePlayerName(utf8);
+    std::string canonicalPath = dialogCachePath(canonicalText, speakerListId, playerVoice, gender);
 
-    std::ostringstream relativePath;
-    relativePath << "dialog/" << (playerVoice ? "player" : "npc") << '/';
-    if (!playerVoice) {
-        relativePath << speakerListId << '/';
+    beginSpeech(interrupt);
+    if (speakCached(utf8, relativePath)) {
+        tts_last_text = utf8;
+        tts_last_cache_relative_path = relativePath;
+        return;
     }
-    relativePath << getTextHash(utf8) << '-' << genderCode << ".opus";
+    if (canonicalText != utf8 && speakCached(canonicalText, canonicalPath)) {
+        tts_last_text = canonicalText;
+        tts_last_cache_relative_path = canonicalPath;
+        return;
+    }
 
     tts_last_text = utf8;
-    tts_last_cache_relative_path = relativePath.str();
-    speakUtf8(utf8, tts_last_cache_relative_path, interrupt);
+    tts_last_cache_relative_path = relativePath;
+    speakFallback(utf8);
 }
 
 void ttsStop()

@@ -2,7 +2,7 @@
 
 This unofficial Fallout Community Edition modification plays pre-rendered dialogue from an Opus cache. It keeps Fallout's original recorded lines and uses Speech Dispatcher when a generated clip is missing. Conversation replies, player choices, and floating dialogue above characters are supported.
 
-The cache identifies each clip by speaker script, final text, role, and gender. NPC replies and player choices therefore do not share a voice by accident. Text-based keys also cover script-built replies when their final wording is known. At runtime the engine reads an NPC's gender from its critter data and the player's gender from the current character.
+The cache identifies each clip by speaker script, final text, role, and gender. NPC replies and player choices therefore do not share a voice by accident. Text-based keys also cover script-built replies when their final wording is known. At runtime the engine reads an NPC's gender from its critter data and the player's gender from the current character. Dialogue that inserts a custom player name is spoken with the stable name "Vault Dweller" while the chosen name remains visible on screen.
 
 ## Controls
 

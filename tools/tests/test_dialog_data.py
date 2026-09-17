@@ -1,6 +1,13 @@
 import unittest
 
-from dialog_data import _call_arguments, _floating_roles, _split_arguments, _static_message_ids
+from dialog_data import (
+    _call_arguments,
+    _floating_roles,
+    _player_name_roles,
+    _player_name_text,
+    _split_arguments,
+    _static_message_ids,
+)
 
 
 class DialogDataTest(unittest.TestCase):
@@ -58,6 +65,52 @@ class DialogDataTest(unittest.TestCase):
             {603: {101, 102, 103}},
         )
         self.assertEqual({entry.message_id for entry in references}, {101, 102, 103})
+
+    def test_player_name_expression_uses_vault_dweller(self):
+        text = _player_name_text(
+            'message_str(163, 101) + proto_data(obj_pid(dude_obj), 1) + message_str(163, 102)',
+            163,
+            {(163, 101): "Hello, ", (163, 102): ". Welcome home."},
+        )
+        self.assertEqual(text, "Hello, Vault Dweller. Welcome home.")
+
+    def test_player_name_lines_keep_their_speaking_role(self):
+        source = """
+        gsay_reply(163, message_str(163, 101) + proto_data(obj_pid(dude_obj), 1));
+        giq_option(4, 163, message_str(163, 102) + proto_data(obj_pid(dude_obj), 1), Next, 50);
+        """
+        references = _player_name_roles(
+            source,
+            163,
+            {(163, 101): "Hello, ", (163, 102): "My name is "},
+        )
+        self.assertEqual(
+            {(reference.text, tuple(sorted(reference.roles))) for reference in references},
+            {
+                ("Hello, Vault Dweller", ("npc", "player_name")),
+                ("My name is Vault Dweller", ("player", "player_name")),
+            },
+        )
+
+    def test_player_name_split_across_assignments(self):
+        source = """
+        line := message_str(461, 107);
+        line := line + proto_data(obj_pid(dude_obj), 1);
+        line := line + message_str(461, 108);
+        gsay_reply(461, line);
+        """
+        references = _player_name_roles(
+            source,
+            461,
+            {(461, 107): "Hello, ", (461, 108): "."},
+        )
+        self.assertIn(
+            ("Hello, Vault Dweller.", ("npc", "player_name")),
+            {
+                (reference.text, tuple(sorted(reference.roles)))
+                for reference in references
+            },
+        )
 
 
 if __name__ == "__main__":
