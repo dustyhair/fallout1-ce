@@ -1563,6 +1563,9 @@ static int gDialogProcessChoice(int a1)
     gDialogProcessCleanup();
 
     GameDialogOptionEntry* dialogOptionEntry = a1 != -1 ? &(dialogBlock.options[a1]) : &dummy;
+    if (a1 >= 0 && a1 < gdNumOptions) {
+        gdialog_free_speech();
+    }
     if (a1 >= 0 && a1 < gdNumOptions && ttsShouldSpeakOptions()) {
         int speakerListId = dialogOptionEntry->messageListId;
         if (speakerListId <= 0 && dialog_target != nullptr) {
