@@ -1,0 +1,33 @@
+import tempfile
+import unittest
+from pathlib import Path
+
+from dialog_data import load_dialogue
+
+
+class DialogLoadingTest(unittest.TestCase):
+    def test_duplicate_script_names_keep_each_list_id(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            messages = root / "messages"
+            scripts = root / "scripts"
+            messages.mkdir()
+            scripts.mkdir()
+            (messages / "SHARED.MSG").write_text("{100}{}{Hello.}\n", encoding="cp1252")
+            (root / "SCRIPTS.LST").write_text(
+                "SHARED.INT ; First\nSHARED.INT ; Second\n",
+                encoding="cp1252",
+            )
+            (scripts / "SHARED.ssl").write_text(
+                "float_msg(self_obj, message_str(1, 100), 0);\n"
+                "float_msg(self_obj, message_str(2, 100), 0);\n",
+                encoding="cp1252",
+            )
+
+            records = load_dialogue(messages, None, root / "SCRIPTS.LST", scripts)
+
+        self.assertEqual({record.message_list_id for record in records}, {1, 2})
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,37 @@
+[Unit]
+Description=Fallout 1 Chatterbox GPU voice-cache renderer A
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/fallout-tts/source
+Environment=PYTHONPATH=/root/fallout-tts/source/tools
+Environment=HF_HOME=/root/fallout-tts/huggingface
+ExecStart=/root/fallout-tts/venv/bin/python -u /root/fallout-tts/source/tools/precompute_tts.py \
+  --source /root/fallout-tts/data/dialog \
+  --patch-source /root/fallout-tts/data/patch-dialog \
+  --scripts-list /root/fallout-tts/data/scripts/SCRIPTS.LST \
+  --ssl-dir /root/fallout-tts/build/ssl \
+  --cache /root/fallout-tts/game/TTS_CACHE \
+  --cast /root/fallout-tts/build/cast/cast.json \
+  --model-dir /root/fallout-tts/models \
+  --backend torch \
+  --device cuda \
+  --threads 8 \
+  --shard-count 16 \
+  --shard-index 0 \
+  --shard-index 1 \
+  --shard-index 2 \
+  --shard-index 3 \
+  --shard-index 4 \
+  --shard-index 5 \
+  --shard-index 6 \
+  --shard-index 7
+Restart=on-failure
+RestartSec=30s
+StandardOutput=append:/root/fallout-tts/render-a.log
+StandardError=append:/root/fallout-tts/render-a.log
+
+[Install]
+WantedBy=multi-user.target

@@ -43,6 +43,7 @@
 #include "plib/gnw/rect.h"
 #include "plib/gnw/svga.h"
 #include "plib/gnw/vcr.h"
+#include "tts.h"
 
 namespace fallout {
 
@@ -2691,6 +2692,20 @@ static void op_float_msg(Program* program)
     Rect rect;
     if (text_object_create(obj, string, font, color, a5, &rect) != -1) {
         tile_refresh_rect(&rect, obj->elevation);
+
+        bool playerVoice = obj == obj_dude;
+        int speakerListId = -1;
+        int gender = -1;
+        if (PID_TYPE(obj->pid) == OBJ_TYPE_CRITTER) {
+            gender = stat_level(obj, STAT_GENDER);
+        }
+        if (!playerVoice) {
+            Script* speakerScript;
+            if (scr_ptr(obj->sid, &speakerScript) != -1) {
+                speakerListId = speakerScript->scr_script_idx + 1;
+            }
+        }
+        ttsSpeakDialog(string, speakerListId, playerVoice, gender);
     }
 }
 

@@ -13,6 +13,7 @@ namespace fallout {
 #define GAME_CONFIG_SOUND_KEY "sound"
 #define GAME_CONFIG_MAPPER_KEY "mapper"
 #define GAME_CONFIG_DEBUG_KEY "debug"
+#define GAME_CONFIG_TTS_KEY "tts"
 
 #define GAME_CONFIG_EXECUTABLE_KEY "executable"
 #define GAME_CONFIG_MASTER_DAT_KEY "master_dat"
@@ -81,6 +82,17 @@ namespace fallout {
 #define GAME_CONFIG_RUN_MAPPER_AS_GAME_KEY "run_mapper_as_game"
 #define GAME_CONFIG_DEFAULT_F8_AS_GAME_KEY "default_f8_as_game"
 #define GAME_CONFIG_PLAYER_SPEEDUP_KEY "player_speedup"
+
+#define GAME_CONFIG_TTS_ENABLED_KEY "enabled"
+#define GAME_CONFIG_TTS_SPEAK_OPTIONS_KEY "speak_options"
+#define GAME_CONFIG_TTS_RATE_KEY "rate"
+#define GAME_CONFIG_TTS_PITCH_KEY "pitch"
+#define GAME_CONFIG_TTS_VOLUME_KEY "volume"
+#define GAME_CONFIG_TTS_LANGUAGE_KEY "language"
+#define GAME_CONFIG_TTS_VOICE_KEY "voice"
+#define GAME_CONFIG_TTS_OUTPUT_MODULE_KEY "output_module"
+#define GAME_CONFIG_TTS_ENCODING_KEY "encoding"
+#define GAME_CONFIG_TTS_CACHE_PATH_KEY "cache_path"
 
 #define ENGLISH "english"
 #define FRENCH "french"

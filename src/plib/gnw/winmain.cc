@@ -52,6 +52,16 @@ int main(int argc, char* argv[])
     SDL_free(basePath);
 #endif
 
+#if __linux__
+    char* basePath = SDL_GetBasePath();
+    if (basePath != NULL) {
+        if (chdir(basePath) != 0) {
+            SDL_Log("Could not change working directory to %s", basePath);
+        }
+        SDL_free(basePath);
+    }
+#endif
+
 #if __ANDROID__
     SDL_SetHint(SDL_HINT_MOUSE_TOUCH_EVENTS, "0");
     SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");

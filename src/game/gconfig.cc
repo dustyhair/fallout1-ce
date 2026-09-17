@@ -104,6 +104,16 @@ bool gconfig_init(bool isMapper, int argc, char** argv)
     config_set_value(&game_config, GAME_CONFIG_DEBUG_KEY, GAME_CONFIG_SHOW_SCRIPT_MESSAGES_KEY, 0);
     config_set_value(&game_config, GAME_CONFIG_DEBUG_KEY, GAME_CONFIG_SHOW_LOAD_INFO_KEY, 0);
     config_set_value(&game_config, GAME_CONFIG_DEBUG_KEY, GAME_CONFIG_OUTPUT_MAP_DATA_INFO_KEY, 0);
+    config_set_value(&game_config, GAME_CONFIG_TTS_KEY, GAME_CONFIG_TTS_ENABLED_KEY, 1);
+    config_set_value(&game_config, GAME_CONFIG_TTS_KEY, GAME_CONFIG_TTS_SPEAK_OPTIONS_KEY, 1);
+    config_set_value(&game_config, GAME_CONFIG_TTS_KEY, GAME_CONFIG_TTS_RATE_KEY, 0);
+    config_set_value(&game_config, GAME_CONFIG_TTS_KEY, GAME_CONFIG_TTS_PITCH_KEY, 0);
+    config_set_value(&game_config, GAME_CONFIG_TTS_KEY, GAME_CONFIG_TTS_VOLUME_KEY, 0);
+    config_set_string(&game_config, GAME_CONFIG_TTS_KEY, GAME_CONFIG_TTS_LANGUAGE_KEY, "en");
+    config_set_string(&game_config, GAME_CONFIG_TTS_KEY, GAME_CONFIG_TTS_VOICE_KEY, "");
+    config_set_string(&game_config, GAME_CONFIG_TTS_KEY, GAME_CONFIG_TTS_OUTPUT_MODULE_KEY, "");
+    config_set_string(&game_config, GAME_CONFIG_TTS_KEY, GAME_CONFIG_TTS_ENCODING_KEY, "WINDOWS-1252");
+    config_set_string(&game_config, GAME_CONFIG_TTS_KEY, GAME_CONFIG_TTS_CACHE_PATH_KEY, "TTS_CACHE");
 
     if (isMapper) {
         config_set_string(&game_config, GAME_CONFIG_SYSTEM_KEY, GAME_CONFIG_EXECUTABLE_KEY, "mapper");

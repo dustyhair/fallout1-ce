@@ -45,6 +45,7 @@
 #include "game/trait.h"
 #include "game/version.h"
 #include "game/worldmap.h"
+#include "tts.h"
 #include "int/movie.h"
 #include "int/window.h"
 #include "platform_compat.h"
@@ -487,6 +488,15 @@ int game_handle_input(int eventCode, bool isInCombatMode)
     }
 
     switch (eventCode) {
+    case KEY_CTRL_F8:
+        ttsToggle();
+        break;
+    case KEY_F9:
+        ttsStop();
+        break;
+    case KEY_CTRL_R:
+        ttsRepeat();
+        break;
     case -20:
         if (intface_is_enabled()) {
             intface_use_item();

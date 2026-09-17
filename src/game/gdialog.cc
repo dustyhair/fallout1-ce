@@ -40,6 +40,7 @@
 #include "plib/gnw/rect.h"
 #include "plib/gnw/svga.h"
 #include "plib/gnw/text.h"
+#include "tts.h"
 
 namespace fallout {
 
@@ -568,6 +569,7 @@ static int fidgetFrameCounter;
 // 0x43DE08
 int gdialog_init()
 {
+    ttsInit();
     return 0;
 }
 
@@ -582,6 +584,7 @@ int gdialog_reset()
 int gdialog_exit()
 {
     gdialog_free_speech();
+    ttsExit();
     return 0;
 }
 
@@ -737,6 +740,8 @@ void dialogue_system_enter()
 // 0x43E10C
 void gdialog_setup_speech(const char* audioFileName)
 {
+    ttsStop();
+
     char name[16];
     if (art_get_base_name(OBJ_TYPE_HEAD, dialogue_head & 0xFFF, name) == -1) {
         return;
@@ -756,6 +761,8 @@ void gdialog_setup_speech(const char* audioFileName)
 // 0x43E164
 void gdialog_free_speech()
 {
+    ttsStop();
+
     if (gdialog_speech_playing) {
         debug_printf("Ending lipsynch system");
         gdialog_speech_playing = false;
@@ -1367,8 +1374,29 @@ static int gDialogProcess()
         }
 
         if (keyCode != -1) {
-            if (keyCode >= 1200 && keyCode <= 1250) {
-                gDialogProcessHighlight(keyCode - 1200);
+            if (keyCode == KEY_CTRL_F8) {
+                ttsToggle();
+            } else if (keyCode == KEY_F9) {
+                ttsStop();
+            } else if (keyCode == KEY_CTRL_R) {
+                ttsRepeat();
+            } else if (keyCode >= 1200 && keyCode <= 1250) {
+                int option = keyCode - 1200;
+                gDialogProcessHighlight(option);
+                if (option >= 0 && option < gdNumOptions && ttsShouldSpeakOptions()) {
+                    GameDialogOptionEntry* optionEntry = &(dialogBlock.options[option]);
+                    int speakerListId = optionEntry->messageListId;
+                    if (speakerListId <= 0 && dialog_target != nullptr) {
+                        Script* speakerScript;
+                        if (scr_ptr(dialog_target->sid, &speakerScript) != -1) {
+                            speakerListId = speakerScript->scr_script_idx + 1;
+                        }
+                    }
+                    ttsSpeakDialog(optionEntry->text,
+                        speakerListId,
+                        true,
+                        stat_level(obj_dude, STAT_GENDER));
+                }
             } else if (keyCode >= 1300 && keyCode <= 1330) {
                 gDialogProcessUnHighlight(keyCode - 1300);
             } else if (keyCode >= 48 && keyCode <= 57) {
@@ -1757,6 +1785,24 @@ static void gDialogProcessUpdate()
     }
 
     gDialogProcessReply();
+
+    if (!gdialog_speech_playing) {
+        int gender = -1;
+        int speakerListId = dialogBlock.replyMessageListId;
+        if (dialog_target != nullptr && PID_TYPE(dialog_target->pid) == OBJ_TYPE_CRITTER) {
+            gender = stat_level(dialog_target, STAT_GENDER);
+        }
+        if (speakerListId <= 0 && dialog_target != nullptr) {
+            Script* speakerScript;
+            if (scr_ptr(dialog_target->sid, &speakerScript) != -1) {
+                speakerListId = speakerScript->scr_script_idx + 1;
+            }
+        }
+        ttsSpeakDialog(dialogBlock.replyText,
+            speakerListId,
+            false,
+            gender);
+    }
 
     int color = colorTable[992] | 0x2000000;
 

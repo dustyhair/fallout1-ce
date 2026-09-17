@@ -268,9 +268,50 @@ target_sources(${EXECUTABLE_NAME} PUBLIC
     "src/platform_compat.h"
     "src/pointer_registry.cc"
     "src/pointer_registry.h"
+    "src/tts.cc"
+    "src/tts.h"
+    "src/tts_audio.cc"
+    "src/tts_audio.h"
     "src/plib/gnw/touch.cc"
     "src/plib/gnw/touch.h"
 )
+
+if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+    find_path(SPEECHD_INCLUDE_DIR
+        NAMES libspeechd.h
+        PATH_SUFFIXES speech-dispatcher
+    )
+    find_library(SPEECHD_LIBRARY
+        NAMES speechd
+    )
+
+    if(SPEECHD_INCLUDE_DIR AND SPEECHD_LIBRARY)
+        target_compile_definitions(${EXECUTABLE_NAME} PRIVATE FALLOUT_HAVE_SPEECHD=1)
+        target_include_directories(${EXECUTABLE_NAME} PRIVATE ${SPEECHD_INCLUDE_DIR})
+        target_link_libraries(${EXECUTABLE_NAME} ${SPEECHD_LIBRARY})
+        message(STATUS "Linux text-to-speech enabled with Speech Dispatcher")
+    else()
+        message(WARNING "Speech Dispatcher development files not found; text-to-speech will be disabled")
+    endif()
+
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(FFMPEG QUIET IMPORTED_TARGET
+            libavformat
+            libavcodec
+            libavutil
+            libswresample
+        )
+    endif()
+
+    if(FFMPEG_FOUND)
+        target_compile_definitions(${EXECUTABLE_NAME} PRIVATE FALLOUT_HAVE_FFMPEG=1)
+        target_link_libraries(${EXECUTABLE_NAME} PkgConfig::FFMPEG)
+        message(STATUS "Cached text-to-speech enabled with FFmpeg")
+    else()
+        message(WARNING "FFmpeg development files not found; cached Opus speech will be disabled")
+    endif()
+endif()
 
 if(IOS)
     target_sources(${EXECUTABLE_NAME} PUBLIC

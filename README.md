@@ -1,5 +1,7 @@
 # Fallout Community Edition
 
+> **Modified build notice:** This working copy is modified from Fallout Community Edition. It adds native Linux speech using a pre-rendered Opus cache, with Speech Dispatcher as a fallback. The changes are unofficial and are not produced or supported by the upstream project.
+
 Fallout Community Edition is a fully working re-implementation of Fallout, with the same original gameplay, engine bugfixes, and some quality of life improvements, that works (mostly) hassle-free on multiple platforms.
 
 There is also [Fallout 2 Community Edition](https://github.com/alexbatalov/fallout2-ce).
@@ -33,6 +35,10 @@ $ sudo apt install libsdl2-2.0-0
 ```
 
 - Run `./fallout-ce`.
+
+### Linux text-to-speech modification
+
+This modified build reads unvoiced NPC dialogue, player dialogue choices, and floating dialogue aloud. Cached voices can differ by speaker, role, and gender. It uses native Linux audio and does not require Wine. See [TTS.md](TTS.md) for controls, cache generation, configuration, and build requirements.
 
 ### macOS
 
