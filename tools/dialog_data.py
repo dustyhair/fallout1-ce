@@ -243,6 +243,21 @@ def load_roles(
 
         script = scripts_by_name.get(path.stem.upper())
         if script is not None:
+            if not source.strip():
+                # A few original scripts cannot be decompiled. Their message
+                # files still contain both sides of the conversation, so render
+                # each line for both roles. Runtime lookup selects the correct
+                # speaker path, and recorded NPC lines remain preferred.
+                for message_id in available_messages.get(script.list_id, set()):
+                    floating.append(
+                        RoleReference(
+                            script.list_id,
+                            script.list_id,
+                            message_id,
+                            frozenset({"npc", "player", "unclassified"}),
+                        )
+                    )
+                continue
             floating.extend(
                 _floating_roles(
                     source,
