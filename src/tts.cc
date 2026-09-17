@@ -1,6 +1,7 @@
 #include "tts.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstdint>
@@ -34,6 +35,13 @@ static std::string tts_last_cache_relative_path;
 
 #if defined(FALLOUT_HAVE_SPEECHD)
 static SPDConnection* tts_connection = nullptr;
+static std::atomic<std::size_t> tts_fallback_message_id { 0 };
+
+static void speechDispatcherFinished(size_t messageId, size_t, SPDNotificationType)
+{
+    std::size_t expected = messageId + 1;
+    tts_fallback_message_id.compare_exchange_strong(expected, 0);
+}
 #endif
 
 static std::string getTextHash(const std::string& text)
@@ -92,19 +100,25 @@ static void beginSpeech(bool interrupt)
         ttsAudioStop();
 #if defined(FALLOUT_HAVE_SPEECHD)
         if (tts_connection != nullptr) {
+            tts_fallback_message_id = 0;
             spd_cancel(tts_connection);
         }
 #endif
     }
 }
 
-static void speakFallback(const std::string& text)
+static bool speakFallback(const std::string& text)
 {
 #if defined(FALLOUT_HAVE_SPEECHD)
     if (tts_connection != nullptr) {
-        spd_say(tts_connection, SPD_MESSAGE, text.c_str());
+        int messageId = spd_say(tts_connection, SPD_MESSAGE, text.c_str());
+        if (messageId >= 0) {
+            tts_fallback_message_id = static_cast<std::size_t>(messageId) + 1;
+            return true;
+        }
     }
 #endif
+    return false;
 }
 
 static void speakUtf8(const std::string& text, const std::string& relativePath, bool interrupt)
@@ -247,10 +261,15 @@ bool ttsInit()
     bool speechDispatcherAvailable = false;
 
 #if defined(FALLOUT_HAVE_SPEECHD)
-    tts_connection = spd_open("fallout-ce-tts", "main", nullptr, SPD_MODE_SINGLE);
+    tts_connection = spd_open("fallout-ce-tts", "main", nullptr, SPD_MODE_THREADED);
     if (tts_connection == nullptr) {
         debug_printf("Text-to-speech: could not connect to Speech Dispatcher.\n");
     } else {
+        tts_connection->callback_end = speechDispatcherFinished;
+        tts_connection->callback_cancel = speechDispatcherFinished;
+        spd_set_notification_on(tts_connection, SPD_END);
+        spd_set_notification_on(tts_connection, SPD_CANCEL);
+
         int value = 0;
         if (config_get_value(&game_config, GAME_CONFIG_TTS_KEY, GAME_CONFIG_TTS_RATE_KEY, &value)) {
             spd_set_voice_rate(tts_connection, clampSpeechSetting(value));
@@ -295,6 +314,7 @@ void ttsExit()
     ttsAudioStop();
 #if defined(FALLOUT_HAVE_SPEECHD)
     if (tts_connection != nullptr) {
+        tts_fallback_message_id = 0;
         spd_cancel(tts_connection);
         spd_close(tts_connection);
         tts_connection = nullptr;
@@ -313,6 +333,18 @@ bool ttsIsAvailable()
 bool ttsIsEnabled()
 {
     return tts_available && tts_enabled;
+}
+
+bool ttsIsSpeaking()
+{
+    if (ttsAudioIsPlaying()) {
+        return true;
+    }
+#if defined(FALLOUT_HAVE_SPEECHD)
+    return tts_fallback_message_id != 0;
+#else
+    return false;
+#endif
 }
 
 bool ttsShouldSpeakOptions()
@@ -381,6 +413,7 @@ void ttsStop()
     ttsAudioStop();
 #if defined(FALLOUT_HAVE_SPEECHD)
     if (tts_connection != nullptr) {
+        tts_fallback_message_id = 0;
         spd_cancel(tts_connection);
     }
 #endif

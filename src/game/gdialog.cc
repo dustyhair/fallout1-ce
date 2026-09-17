@@ -1,8 +1,11 @@
 #include "game/gdialog.h"
 
 #include <assert.h>
+#include <deque>
 #include <stdio.h>
 #include <string.h>
+#include <string>
+#include <utility>
 
 #include "game/actions.h"
 #include "game/combat.h"
@@ -87,6 +90,20 @@ typedef enum GameDialogReaction {
     GAME_DIALOG_REACTION_BAD = 51,
 } GameDialogReaction;
 
+enum class GameDialogSpeechType {
+    RECORDED,
+    TTS,
+    TTS_FALLBACK,
+};
+
+struct GameDialogSpeechEntry {
+    GameDialogSpeechType type;
+    std::string text;
+    int speakerListId;
+    bool playerVoice;
+    int gender;
+};
+
 typedef struct GameDialogReviewEntry {
     int replyMessageListId;
     int replyMessageId;
@@ -149,6 +166,10 @@ static void gDialogProcessHighlight(int index);
 static void gDialogProcessUnHighlight(int index);
 static void gDialogProcessReply();
 static void gDialogProcessUpdate();
+static void gdialogQueueTts(const char* text, int speakerListId, bool playerVoice, int gender, bool fallbackOnly = false);
+static bool gdialogStartRecordedSpeech(const char* audioFileName);
+static void gdialogFinishRecordedSpeech();
+static void gdialogUpdateSpeechQueue();
 static int gDialogProcessExit();
 static void demo_copy_title(int win);
 static void demo_copy_options(int win);
@@ -214,6 +235,12 @@ static Art* lipsFp = NULL;
 
 // 0x504FF8
 static bool gdialog_speech_playing = false;
+
+static bool gdialog_tts_speech_playing = false;
+
+static bool gdialog_reply_has_recorded_speech = false;
+
+static std::deque<GameDialogSpeechEntry> gdialog_speech_queue;
 
 // 0x504FFC
 static unsigned char* headWindowBuffer = NULL;
@@ -740,15 +767,33 @@ void dialogue_system_enter()
 // 0x43E10C
 void gdialog_setup_speech(const char* audioFileName)
 {
-    ttsStop();
-
-    char name[16];
-    if (art_get_base_name(OBJ_TYPE_HEAD, dialogue_head & 0xFFF, name) == -1) {
+    if (audioFileName == nullptr || *audioFileName == '\0') {
         return;
     }
 
+    GameDialogSpeechEntry entry;
+    entry.type = GameDialogSpeechType::RECORDED;
+    entry.text = audioFileName;
+    entry.speakerListId = -1;
+    entry.playerVoice = false;
+    entry.gender = -1;
+    gdialog_speech_queue.push_back(std::move(entry));
+    gdialog_reply_has_recorded_speech = true;
+}
+
+static bool gdialogStartRecordedSpeech(const char* audioFileName)
+{
+    if (audioFileName == nullptr || *audioFileName == '\0') {
+        return false;
+    }
+
+    char name[16];
+    if (art_get_base_name(OBJ_TYPE_HEAD, dialogue_head & 0xFFF, name) == -1) {
+        return false;
+    }
+
     if (lips_load_file(audioFileName, name) == -1) {
-        return;
+        return false;
     }
 
     gdialog_speech_playing = true;
@@ -756,19 +801,80 @@ void gdialog_setup_speech(const char* audioFileName)
     lips_play_speech();
 
     debug_printf("Starting lipsynch speech");
+    return true;
+}
+
+static void gdialogQueueTts(const char* text, int speakerListId, bool playerVoice, int gender, bool fallbackOnly)
+{
+    if (text == nullptr || *text == '\0') {
+        return;
+    }
+
+    GameDialogSpeechEntry entry;
+    entry.type = fallbackOnly ? GameDialogSpeechType::TTS_FALLBACK : GameDialogSpeechType::TTS;
+    entry.text = text;
+    entry.speakerListId = speakerListId;
+    entry.playerVoice = playerVoice;
+    entry.gender = gender;
+    gdialog_speech_queue.push_back(std::move(entry));
+}
+
+static void gdialogFinishRecordedSpeech()
+{
+    if (gdialog_speech_playing) {
+        debug_printf("Ending lipsynch system");
+        gdialog_speech_playing = false;
+        lips_free_speech();
+    }
+}
+
+static void gdialogUpdateSpeechQueue()
+{
+    if (gdialog_speech_playing) {
+        return;
+    }
+
+    if (gdialog_tts_speech_playing) {
+        if (ttsIsSpeaking()) {
+            return;
+        }
+        gdialog_tts_speech_playing = false;
+    }
+
+    while (!gdialog_speech_queue.empty()) {
+        GameDialogSpeechEntry entry = std::move(gdialog_speech_queue.front());
+        gdialog_speech_queue.pop_front();
+
+        if (entry.type == GameDialogSpeechType::RECORDED) {
+            if (gdialogStartRecordedSpeech(entry.text.c_str())) {
+                if (!gdialog_speech_queue.empty()
+                    && gdialog_speech_queue.front().type == GameDialogSpeechType::TTS_FALLBACK) {
+                    gdialog_speech_queue.pop_front();
+                }
+                return;
+            }
+        } else {
+            ttsSpeakDialog(entry.text.c_str(),
+                entry.speakerListId,
+                entry.playerVoice,
+                entry.gender,
+                false);
+            if (ttsIsSpeaking()) {
+                gdialog_tts_speech_playing = true;
+                return;
+            }
+        }
+    }
 }
 
 // 0x43E164
 void gdialog_free_speech()
 {
     ttsStop();
-
-    if (gdialog_speech_playing) {
-        debug_printf("Ending lipsynch system");
-        gdialog_speech_playing = false;
-
-        lips_free_speech();
-    }
+    gdialog_tts_speech_playing = false;
+    gdialog_reply_has_recorded_speech = false;
+    gdialog_speech_queue.clear();
+    gdialogFinishRecordedSpeech();
 }
 
 // 0x43E18C
@@ -1289,6 +1395,7 @@ static int gDialogProcess()
     pageOffsets[0] = 0;
     for (;;) {
         sharedFpsLimiter.mark();
+        gdialogUpdateSpeechQueue();
 
         int keyCode = get_input();
 
@@ -1377,26 +1484,12 @@ static int gDialogProcess()
             if (keyCode == KEY_CTRL_F8) {
                 ttsToggle();
             } else if (keyCode == KEY_F9) {
-                ttsStop();
+                gdialog_free_speech();
             } else if (keyCode == KEY_CTRL_R) {
                 ttsRepeat();
             } else if (keyCode >= 1200 && keyCode <= 1250) {
                 int option = keyCode - 1200;
                 gDialogProcessHighlight(option);
-                if (option >= 0 && option < gdNumOptions && ttsShouldSpeakOptions()) {
-                    GameDialogOptionEntry* optionEntry = &(dialogBlock.options[option]);
-                    int speakerListId = optionEntry->messageListId;
-                    if (speakerListId <= 0 && dialog_target != nullptr) {
-                        Script* speakerScript;
-                        if (scr_ptr(dialog_target->sid, &speakerScript) != -1) {
-                            speakerListId = speakerScript->scr_script_idx + 1;
-                        }
-                    }
-                    ttsSpeakDialog(optionEntry->text,
-                        speakerListId,
-                        true,
-                        stat_level(obj_dude, STAT_GENDER));
-                }
             } else if (keyCode >= 1300 && keyCode <= 1330) {
                 gDialogProcessUnHighlight(keyCode - 1300);
             } else if (keyCode >= 48 && keyCode <= 57) {
@@ -1470,6 +1563,20 @@ static int gDialogProcessChoice(int a1)
     gDialogProcessCleanup();
 
     GameDialogOptionEntry* dialogOptionEntry = a1 != -1 ? &(dialogBlock.options[a1]) : &dummy;
+    if (a1 >= 0 && a1 < gdNumOptions && ttsShouldSpeakOptions()) {
+        int speakerListId = dialogOptionEntry->messageListId;
+        if (speakerListId <= 0 && dialog_target != nullptr) {
+            Script* speakerScript;
+            if (scr_ptr(dialog_target->sid, &speakerScript) != -1) {
+                speakerListId = speakerScript->scr_script_idx + 1;
+            }
+        }
+        gdialogQueueTts(dialogOptionEntry->text,
+            speakerListId,
+            true,
+            stat_level(obj_dude, STAT_GENDER));
+    }
+
     if (dialogOptionEntry->messageListId == -4) {
         gdAddReviewOptionChosenStr(dialogOptionEntry->text);
     } else {
@@ -1477,8 +1584,6 @@ static int gDialogProcessChoice(int a1)
     }
 
     can_start_new_fidget = false;
-
-    gdialog_free_speech();
 
     int v1 = GAME_DIALOG_REACTION_NEUTRAL;
     switch (dialogOptionEntry->reaction) {
@@ -1778,6 +1883,7 @@ static void gDialogProcessUpdate()
     demo_copy_title(gReplyWin);
     demo_copy_options(gOptionWin);
 
+    gdialog_reply_has_recorded_speech = false;
     if (dialogBlock.replyMessageListId > 0) {
         char* s = scr_get_msg_str_speech(dialogBlock.replyMessageListId, dialogBlock.replyMessageId, 1);
         strncpy(dialogBlock.replyText, s, sizeof(dialogBlock.replyText) - 1);
@@ -1786,23 +1892,22 @@ static void gDialogProcessUpdate()
 
     gDialogProcessReply();
 
-    if (!gdialog_speech_playing) {
-        int gender = -1;
-        int speakerListId = dialogBlock.replyMessageListId;
-        if (dialog_target != nullptr && PID_TYPE(dialog_target->pid) == OBJ_TYPE_CRITTER) {
-            gender = stat_level(dialog_target, STAT_GENDER);
-        }
-        if (speakerListId <= 0 && dialog_target != nullptr) {
-            Script* speakerScript;
-            if (scr_ptr(dialog_target->sid, &speakerScript) != -1) {
-                speakerListId = speakerScript->scr_script_idx + 1;
-            }
-        }
-        ttsSpeakDialog(dialogBlock.replyText,
-            speakerListId,
-            false,
-            gender);
+    int gender = -1;
+    int speakerListId = dialogBlock.replyMessageListId;
+    if (dialog_target != nullptr && PID_TYPE(dialog_target->pid) == OBJ_TYPE_CRITTER) {
+        gender = stat_level(dialog_target, STAT_GENDER);
     }
+    if (speakerListId <= 0 && dialog_target != nullptr) {
+        Script* speakerScript;
+        if (scr_ptr(dialog_target->sid, &speakerScript) != -1) {
+            speakerListId = speakerScript->scr_script_idx + 1;
+        }
+    }
+    gdialogQueueTts(dialogBlock.replyText,
+        speakerListId,
+        false,
+        gender,
+        gdialog_reply_has_recorded_speech);
 
     int color = colorTable[992] | 0x2000000;
 
@@ -1914,6 +2019,7 @@ static void gDialogProcessUpdate()
 
     win_draw(gReplyWin);
     win_draw(gOptionWin);
+    gdialogUpdateSpeechQueue();
 }
 
 // 0x43F8D4
@@ -2108,7 +2214,8 @@ static void head_bk()
         }
 
         if (!soundPlaying(lip_info.sound)) {
-            gdialog_free_speech();
+            gdialogFinishRecordedSpeech();
+            gdialogUpdateSpeechQueue();
             talk_to_display_frame(lipsFp, 0);
             can_start_new_fidget = true;
             dialogue_seconds_since_last_input = 3;

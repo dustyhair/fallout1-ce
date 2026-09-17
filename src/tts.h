@@ -7,6 +7,7 @@ bool ttsInit();
 void ttsExit();
 bool ttsIsAvailable();
 bool ttsIsEnabled();
+bool ttsIsSpeaking();
 bool ttsShouldSpeakOptions();
 void ttsSpeak(const char* text, bool interrupt = true);
 void ttsSpeakDialog(const char* text, int speakerListId, bool playerVoice, int gender, bool interrupt = true);

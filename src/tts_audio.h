@@ -6,6 +6,7 @@
 namespace fallout {
 
 bool ttsAudioIsAvailable();
+bool ttsAudioIsPlaying();
 bool ttsAudioPlay(const std::string& path);
 void ttsAudioStop();
 

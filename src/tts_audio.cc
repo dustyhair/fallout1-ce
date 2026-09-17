@@ -159,6 +159,17 @@ bool ttsAudioIsAvailable()
 #endif
 }
 
+bool ttsAudioIsPlaying()
+{
+    if (ttsSoundBuffer == -1) {
+        return false;
+    }
+
+    unsigned int status = 0;
+    return audioEngineSoundBufferGetStatus(ttsSoundBuffer, &status)
+        && (status & AUDIO_ENGINE_SOUND_BUFFER_STATUS_PLAYING) != 0;
+}
+
 bool ttsAudioPlay(const std::string& path)
 {
 #if defined(FALLOUT_HAVE_FFMPEG)

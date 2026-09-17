@@ -6,9 +6,9 @@ The cache identifies each clip by speaker script, final text, role, and gender. 
 
 ## Controls
 
-- Move the pointer onto a dialogue option to read it aloud.
+- Select a dialogue option to speak it. NPC speech waits for the selected line to finish, while the next options remain available on screen.
 - `Ctrl+R`: repeat the last spoken line.
-- `F9`: stop speech.
+- `F9`: stop the current speech and clear queued dialogue.
 - `Ctrl+F8`: toggle text-to-speech. The setting is saved in `fallout.cfg` when the game exits normally.
 
 ## Configuration
