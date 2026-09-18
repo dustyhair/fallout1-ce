@@ -20,6 +20,7 @@
 #include "multiplayer/player_character_state.h"
 #include "multiplayer/protocol.h"
 #include "multiplayer/save_sidecar.h"
+#include "multiplayer/session_recovery.h"
 #include "multiplayer/snapshot.h"
 #include "multiplayer/tcp_transport.h"
 #include "multiplayer/types.h"
@@ -1573,6 +1574,109 @@ void testSnapshotRoundTripAndRecovery()
     expect(validateSnapshot(invalidOwner) == SnapshotError::InvalidPlayerId, "two-player snapshot rejects an unknown actor owner");
 }
 
+GameEvent sampleMovementEvent(std::uint64_t sequence)
+{
+    GameEvent event;
+    event.sequence.value = sequence;
+    event.causedBy.value = sequence;
+    event.payload = ActorMovementStartedEvent { EntityId { 2 }, 20100 + static_cast<int>(sequence), 0, false };
+    return event;
+}
+
+void testNetworkSessionRecoveryPrimitives()
+{
+    EventJournal journal(3, kDefaultEventJournalMaximumBytes);
+    expect(journal.append(sampleMovementEvent(1)) == EventJournalError::None, "event journal accepts its first authoritative event");
+    expect(journal.append(sampleMovementEvent(2)) == EventJournalError::None, "event journal accepts a contiguous event");
+    expect(journal.append(sampleMovementEvent(4)) == EventJournalError::SequenceGap, "event journal rejects a sequence gap");
+    expect(journal.latestSequence() == EventSequence { 2 }, "rejected journal append does not advance the sequence");
+
+    EventReplay fromBeginning = journal.replayAfter(EventSequence {});
+    expect(fromBeginning.status == EventReplayStatus::Available
+            && fromBeginning.events.size() == 2
+            && fromBeginning.events.front().sequence == EventSequence { 1 },
+        "event journal replays retained events in order");
+    expect(journal.replayAfter(EventSequence { 2 }).status == EventReplayStatus::UpToDate,
+        "event journal recognizes an up-to-date peer");
+    expect(journal.replayAfter(EventSequence { 3 }).status == EventReplayStatus::InvalidFutureSequence,
+        "event journal rejects a peer sequence ahead of the host");
+
+    expect(journal.append(sampleMovementEvent(3)) == EventJournalError::None, "event journal accepts event three");
+    expect(journal.append(sampleMovementEvent(4)) == EventJournalError::None, "event journal accepts event four and evicts its oldest event");
+    expect(journal.size() == 3 && journal.oldestSequence() == EventSequence { 2 },
+        "event journal enforces its event-count bound");
+    expect(journal.replayAfter(EventSequence {}).status == EventReplayStatus::SnapshotRequired,
+        "a peer older than retained history requires a snapshot");
+    EventReplay retainedReplay = journal.replayAfter(EventSequence { 1 });
+    expect(retainedReplay.status == EventReplayStatus::Available
+            && retainedReplay.events.size() == 3
+            && retainedReplay.events.front().sequence == EventSequence { 2 },
+        "a peer at the retention boundary receives journal replay");
+
+    EventJournal byteBoundedJournal(10, 1);
+    expect(byteBoundedJournal.append(sampleMovementEvent(1)) == EventJournalError::EventTooLarge,
+        "event journal rejects an event larger than its byte budget");
+    EventJournal invalidJournal(0, 100);
+    expect(invalidJournal.append(sampleMovementEvent(1)) == EventJournalError::InvalidLimit,
+        "event journal rejects a zero retention limit");
+    journal.reset(EventSequence { 41 });
+    expect(journal.empty()
+            && journal.latestSequence() == EventSequence { 41 }
+            && journal.replayAfter(EventSequence { 40 }).status == EventReplayStatus::SnapshotRequired
+            && journal.append(sampleMovementEvent(42)) == EventJournalError::None,
+        "event journal can resume after a restored snapshot without claiming evicted history");
+
+    SessionId sessionId { 0x1020304050607080ULL };
+    ReconnectToken token;
+    for (std::size_t index = 0; index < token.bytes.size(); index++) {
+        token.bytes[index] = static_cast<std::uint8_t>(index + 1);
+    }
+    ReconnectToken wrongToken = token;
+    wrongToken.bytes.back() ^= 1;
+    ReconnectTokenRegistry tokens(sessionId);
+    expect(tokens.install(kGuestPlayerId, token) == ReconnectTokenError::None,
+        "reconnect registry installs a nonzero token for the guest slot");
+    expect(tokens.validate(sessionId, kGuestPlayerId, token),
+        "reconnect registry validates the matching session, slot, and token");
+    expect(!tokens.validate(SessionId { sessionId.value + 1 }, kGuestPlayerId, token)
+            && !tokens.validate(sessionId, kHostPlayerId, token)
+            && !tokens.validate(sessionId, kGuestPlayerId, wrongToken),
+        "reconnect token cannot be reused for another session, slot, or value");
+    tokens.invalidate(kGuestPlayerId);
+    expect(!tokens.validate(sessionId, kGuestPlayerId, token), "invalidating a reconnect slot revokes its token");
+    ReconnectToken emptyToken;
+    expect(tokens.install(kGuestPlayerId, emptyToken) == ReconnectTokenError::InvalidToken,
+        "reconnect registry rejects an all-zero token");
+    tokens.reset(SessionId { sessionId.value + 1 });
+    expect(tokens.sessionId() == SessionId { sessionId.value + 1 }
+            && !tokens.validate(sessionId, kGuestPlayerId, token),
+        "starting a new session invalidates all old reconnect tokens");
+
+    WorldSnapshot snapshot = sampleSnapshot();
+    SnapshotRecoveryQueue queue;
+    expect(queue.begin(snapshot) == SnapshotQueueError::None, "snapshot recovery begins from a valid host snapshot");
+    expect(queue.append(sampleMovementEvent(42)) == SnapshotQueueError::None
+            && queue.append(sampleMovementEvent(43)) == SnapshotQueueError::None,
+        "events created during snapshot transfer queue contiguously");
+    std::optional<SnapshotRecoveryBatch> batch = queue.finish();
+    expect(batch.has_value()
+            && batch->snapshot.lastIncludedEvent == EventSequence { 41 }
+            && batch->followingEvents.size() == 2
+            && batch->followingEvents.back().sequence == EventSequence { 43 },
+        "snapshot recovery returns the base snapshot followed by ordered newer events");
+    expect(!queue.active(), "finishing recovery clears the in-flight queue");
+
+    expect(queue.begin(snapshot) == SnapshotQueueError::None, "snapshot recovery can restart");
+    expect(queue.append(sampleMovementEvent(43)) == SnapshotQueueError::SequenceGap,
+        "snapshot recovery rejects a gap after the snapshot boundary");
+    SnapshotRecoveryQueue tinyQueue(1);
+    expect(tinyQueue.begin(snapshot) == SnapshotQueueError::None, "bounded snapshot queue starts");
+    expect(tinyQueue.append(sampleMovementEvent(42)) == SnapshotQueueError::QueueOverflow
+            && tinyQueue.restartRequired()
+            && !tinyQueue.finish().has_value(),
+        "snapshot queue overflow requires a fresh snapshot instead of dropping newer events");
+}
+
 } // namespace
 } // namespace multiplayer
 } // namespace fallout
@@ -1597,6 +1701,7 @@ int main()
     fallout::multiplayer::testLocalSessionLifecycle();
     fallout::multiplayer::testAuthoritativeCommandProcessing();
     fallout::multiplayer::testSnapshotRoundTripAndRecovery();
+    fallout::multiplayer::testNetworkSessionRecoveryPrimitives();
 
     if (fallout::multiplayer::failures != 0) {
         std::cerr << fallout::multiplayer::failures << " test assertion(s) failed\n";

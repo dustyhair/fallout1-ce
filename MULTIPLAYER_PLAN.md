@@ -1,6 +1,6 @@
 # Two-player co-op plan
 
-Status: Phases 0 and 1 are complete on the `multiplayer-plan` branch. Phase 2 is in progress. Host and guest can connect from the in-game multiplayer lobby or explicit launch modes, exchange validated character sheets, start together, and exchange versioned gameplay commands, results, and events. Live command routing and recovery are next.
+Status: Phases 0 and 1 are complete on the `multiplayer-plan` branch. Phase 2 is in progress. Host and guest can connect from the in-game multiplayer lobby or explicit launch modes, exchange validated character sheets, start together, and exchange versioned gameplay commands, results, and events. [Bounded event-journal, snapshot-queue, and reconnect-token primitives](docs/multiplayer/network-session-recovery.md) are in place; live host-authoritative command and recovery routing are next.
 
 ## Goal
 
