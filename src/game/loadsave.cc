@@ -6,6 +6,8 @@
 #include <time.h>
 
 #include <algorithm>
+#include <limits>
+#include <vector>
 
 #include "game/automap.h"
 #include "game/bmpdlog.h"
@@ -38,6 +40,8 @@
 #include "game/version.h"
 #include "game/wordwrap.h"
 #include "game/worldmap.h"
+#include "multiplayer/developer_local_session.h"
+#include "multiplayer/save_sidecar.h"
 #include "platform_compat.h"
 #include "plib/color/color.h"
 #include "plib/gnw/button.h"
@@ -153,6 +157,8 @@ static int RestoreSave();
 static int LoadObjDudeCid(DB_FILE* stream);
 static int SaveObjDudeCid(DB_FILE* stream);
 static int EraseSave();
+static bool SaveMultiplayerSidecar();
+static void LoadMultiplayerSidecar();
 
 // 0x46D930
 static const int lsgrphs[LOAD_SAVE_FRM_COUNT] = {
@@ -1570,6 +1576,16 @@ static int SaveSlot()
 
     db_fclose(flptr);
 
+    if (!SaveMultiplayerSidecar()) {
+        debug_printf("\nLOADSAVE: ** Error writing multiplayer save metadata! **\n");
+        RestoreSave();
+        snprintf(gmpath, sizeof(gmpath), "%s\\%s%.2d\\", "SAVEGAME", "SLOT", slot_cursor + 1);
+        MapDirErase(gmpath, "BAK");
+        partyMemberUnPrepSave();
+        gsound_background_unpause();
+        return -1;
+    }
+
     snprintf(gmpath, sizeof(gmpath), "%s\\%s%.2d\\", "SAVEGAME", "SLOT", slot_cursor + 1);
     MapDirErase(gmpath, "BAK");
 
@@ -1646,6 +1662,8 @@ static int LoadSlot(int slot)
 
     debug_printf("LOADSAVE: Total load data read: %ld bytes.\n", db_ftell(flptr));
     db_fclose(flptr);
+
+    LoadMultiplayerSidecar();
 
     snprintf(str, sizeof(str), "%s\\", "MAPS");
     MapDirErase(str, "BAK");
@@ -2815,6 +2833,197 @@ static int EraseSave()
     compat_remove(str0);
 
     return 0;
+}
+
+static bool ReadSaveFile(const char* relativePath, std::size_t maximumSize, std::vector<std::uint8_t>& bytes)
+{
+    bytes.clear();
+    DB_FILE* stream = db_fopen(relativePath, "rb");
+    if (stream == nullptr) {
+        return false;
+    }
+
+    long length = db_filelength(stream);
+    if (length < 0 || static_cast<std::size_t>(length) > maximumSize) {
+        db_fclose(stream);
+        return false;
+    }
+
+    bytes.resize(static_cast<std::size_t>(length));
+    bool read = length == 0 || db_fread(bytes.data(), 1, bytes.size(), stream) == bytes.size();
+    db_fclose(stream);
+    if (!read) {
+        bytes.clear();
+    }
+    return read;
+}
+
+static bool DigestSaveDat(std::uint64_t& digest)
+{
+    snprintf(gmpath, sizeof(gmpath), "%s\\%s%.2d\\%s", "SAVEGAME", "SLOT", slot_cursor + 1, "SAVE.DAT");
+    DB_FILE* stream = db_fopen(gmpath, "rb");
+    if (stream == nullptr) {
+        return false;
+    }
+
+    long remaining = db_filelength(stream);
+    if (remaining < 0) {
+        db_fclose(stream);
+        return false;
+    }
+
+    digest = multiplayer::kMultiplayerSaveDigestOffset;
+    std::uint8_t buffer[16384];
+    while (remaining > 0) {
+        std::size_t chunkSize = std::min<std::size_t>(remaining, sizeof(buffer));
+        if (db_fread(buffer, 1, chunkSize, stream) != chunkSize) {
+            db_fclose(stream);
+            return false;
+        }
+        digest = multiplayer::updateMultiplayerSaveDigest(digest, buffer, chunkSize);
+        remaining -= static_cast<long>(chunkSize);
+    }
+
+    db_fclose(stream);
+    return true;
+}
+
+static void MultiplayerSidecarPath(char* path, const char* fileName, bool relative)
+{
+    if (relative) {
+        snprintf(path, COMPAT_MAX_PATH, "%s\\%s%.2d\\%s", "SAVEGAME", "SLOT", slot_cursor + 1, fileName);
+    } else {
+        snprintf(path, COMPAT_MAX_PATH, "%s\\%s\\%s%.2d\\%s", patches, "SAVEGAME", "SLOT", slot_cursor + 1, fileName);
+    }
+}
+
+static bool FileExists(const char* path)
+{
+    FILE* stream = compat_fopen(path, "rb");
+    if (stream == nullptr) {
+        return false;
+    }
+    fclose(stream);
+    return true;
+}
+
+static bool PublishMultiplayerSidecar(const std::vector<std::uint8_t>& bytes)
+{
+    char destination[COMPAT_MAX_PATH];
+    char temporary[COMPAT_MAX_PATH];
+    char backup[COMPAT_MAX_PATH];
+    MultiplayerSidecarPath(destination, "MULTI.DAT", false);
+    MultiplayerSidecarPath(temporary, "MULTI.TMP", false);
+    MultiplayerSidecarPath(backup, "MULTI.BAK", false);
+
+    compat_remove(temporary);
+    compat_remove(backup);
+    FILE* stream = compat_fopen(temporary, "wb");
+    if (stream == nullptr) {
+        return false;
+    }
+    bool written = bytes.empty() || fwrite(bytes.data(), 1, bytes.size(), stream) == bytes.size();
+    written = fflush(stream) == 0 && written;
+    written = fclose(stream) == 0 && written;
+    if (!written) {
+        compat_remove(temporary);
+        return false;
+    }
+
+    bool hadPrevious = FileExists(destination);
+    if (hadPrevious && compat_rename(destination, backup) != 0) {
+        compat_remove(temporary);
+        return false;
+    }
+    if (compat_rename(temporary, destination) != 0) {
+        if (hadPrevious) {
+            compat_rename(backup, destination);
+        }
+        compat_remove(temporary);
+        return false;
+    }
+    compat_remove(backup);
+    return true;
+}
+
+static void RemoveMultiplayerSidecar()
+{
+    char path[COMPAT_MAX_PATH];
+    MultiplayerSidecarPath(path, "MULTI.DAT", false);
+    compat_remove(path);
+    MultiplayerSidecarPath(path, "MULTI.TMP", false);
+    compat_remove(path);
+    MultiplayerSidecarPath(path, "MULTI.BAK", false);
+    compat_remove(path);
+}
+
+static bool SaveMultiplayerSidecar()
+{
+    if (!multiplayer::developerLocalSessionIsActive()) {
+        RemoveMultiplayerSidecar();
+        return true;
+    }
+
+    std::uint64_t saveDatDigest;
+    if (!DigestSaveDat(saveDatDigest)) {
+        return false;
+    }
+
+    std::uint64_t generation = 1;
+    char relativePath[COMPAT_MAX_PATH];
+    MultiplayerSidecarPath(relativePath, "MULTI.DAT", true);
+    std::vector<std::uint8_t> priorBytes;
+    if (ReadSaveFile(relativePath, multiplayer::kMultiplayerSaveMaximumSize, priorBytes)) {
+        multiplayer::MultiplayerSaveDecodeResult prior = multiplayer::decodeMultiplayerSave(priorBytes);
+        if (prior) {
+            if (prior.sidecar.generation == std::numeric_limits<std::uint64_t>::max()) {
+                return false;
+            }
+            generation = prior.sidecar.generation + 1;
+        }
+    }
+
+    multiplayer::MultiplayerSaveSidecar sidecar;
+    if (multiplayer::developerLocalSessionCaptureSave(generation, saveDatDigest, sidecar)
+        != multiplayer::MultiplayerSaveError::None) {
+        return false;
+    }
+
+    std::vector<std::uint8_t> bytes;
+    if (multiplayer::encodeMultiplayerSave(sidecar, bytes) != multiplayer::MultiplayerSaveError::None) {
+        return false;
+    }
+    return PublishMultiplayerSidecar(bytes);
+}
+
+static void LoadMultiplayerSidecar()
+{
+    if (!multiplayer::developerLocalSessionIsEnabled()) {
+        return;
+    }
+
+    char relativePath[COMPAT_MAX_PATH];
+    MultiplayerSidecarPath(relativePath, "MULTI.DAT", true);
+    std::vector<std::uint8_t> bytes;
+    if (!ReadSaveFile(relativePath, multiplayer::kMultiplayerSaveMaximumSize, bytes)) {
+        debug_printf("LOADSAVE: No multiplayer sidecar is available for this slot.\n");
+        multiplayer::developerLocalSessionRejectLoadedSave();
+        return;
+    }
+
+    multiplayer::MultiplayerSaveDecodeResult decoded = multiplayer::decodeMultiplayerSave(bytes);
+    std::uint64_t saveDatDigest;
+    if (!decoded
+        || !DigestSaveDat(saveDatDigest)
+        || decoded.sidecar.saveDatDigest != saveDatDigest
+        || !multiplayer::developerLocalSessionStageLoadedSave(decoded.sidecar)) {
+        debug_printf("LOADSAVE: Multiplayer sidecar is corrupt or does not match SAVE.DAT; loading without multiplayer.\n");
+        multiplayer::developerLocalSessionRejectLoadedSave();
+        return;
+    }
+
+    debug_printf("LOADSAVE: Multiplayer sidecar generation %llu staged.\n",
+        static_cast<unsigned long long>(decoded.sidecar.generation));
 }
 
 } // namespace fallout

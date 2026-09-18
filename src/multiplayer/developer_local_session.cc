@@ -1,6 +1,7 @@
 #include "multiplayer/developer_local_session.h"
 
 #include <cstring>
+#include <optional>
 
 #include "game/actions.h"
 #include "game/anim.h"
@@ -33,6 +34,7 @@ LocalSession session;
 CommandProcessor commandProcessor;
 std::uint64_t nextHostCommandSequence = 1;
 std::uint64_t nextGuestCommandSequence = 1;
+std::optional<MultiplayerSaveSidecar> pendingLoadedSave;
 
 void eraseGuestActor();
 
@@ -285,6 +287,37 @@ bool beginSession()
     return true;
 }
 
+bool beginRestoredSession()
+{
+    if (!pendingLoadedSave.has_value()) {
+        return false;
+    }
+
+    guestActor = createGuestActor();
+    if (guestActor == nullptr) {
+        return false;
+    }
+    if (session.start(obj_dude, guestActor) != LocalSessionError::None
+        || session.restorePlayerCharacters(*pendingLoadedSave) != LocalSessionError::None
+        || bindLocalPlayer(session, kHostPlayerId) != LocalPlayerError::None
+        || session.transitionTo(SessionPhase::Loading) != LocalSessionError::None
+        || session.transitionTo(SessionPhase::Exploration) != LocalSessionError::None
+        || !refreshPlayerBuild(kHostPlayerId)
+        || !refreshPlayerBuild(kGuestPlayerId)) {
+        session.stop();
+        eraseGuestActor();
+        return false;
+    }
+
+    pendingLoadedSave.reset();
+    commandProcessor.reset();
+    nextHostCommandSequence = 1;
+    nextGuestCommandSequence = 1;
+    intface_redraw();
+    debug_printf("Multiplayer developer session restored from slot sidecar.\n");
+    return true;
+}
+
 bool finishMapTransition()
 {
     Object* replacement = createGuestActor();
@@ -292,13 +325,27 @@ bool finishMapTransition()
         return false;
     }
 
-    if (session.rebindPlayerActor(kGuestPlayerId, replacement) != LocalSessionError::None
-        || session.transitionTo(SessionPhase::Exploration) != LocalSessionError::None) {
+    if (session.rebindPlayerActor(kGuestPlayerId, replacement) != LocalSessionError::None) {
         obj_erase_object(replacement, nullptr);
         return false;
     }
 
     guestActor = replacement;
+    if ((pendingLoadedSave.has_value()
+            && session.restorePlayerCharacters(*pendingLoadedSave) != LocalSessionError::None)
+        || session.transitionTo(SessionPhase::Exploration) != LocalSessionError::None
+        || !refreshPlayerBuild(kGuestPlayerId)
+        || (pendingLoadedSave.has_value() && !refreshPlayerBuild(kHostPlayerId))) {
+        eraseGuestActor();
+        session.stop();
+        return false;
+    }
+
+    pendingLoadedSave.reset();
+    commandProcessor.reset();
+    nextHostCommandSequence = 1;
+    nextGuestCommandSequence = 1;
+    intface_redraw();
     return true;
 }
 
@@ -307,6 +354,7 @@ bool finishMapTransition()
 void developerLocalSessionConfigure(int argc, char** argv)
 {
     enabled = false;
+    pendingLoadedSave.reset();
     for (int index = 1; index < argc; index++) {
         if (std::strcmp(argv[index], "--multiplayer-dev") == 0) {
             enabled = true;
@@ -320,6 +368,11 @@ bool developerLocalSessionIsEnabled()
     return enabled;
 }
 
+bool developerLocalSessionIsActive()
+{
+    return enabled && session.isActive();
+}
+
 bool developerLocalSessionEnsureStarted()
 {
     if (!enabled) {
@@ -327,6 +380,9 @@ bool developerLocalSessionEnsureStarted()
     }
 
     if (!session.isActive()) {
+        if (pendingLoadedSave.has_value()) {
+            return beginRestoredSession();
+        }
         return beginSession();
     }
 
@@ -335,6 +391,35 @@ bool developerLocalSessionEnsureStarted()
     }
 
     return guestActor != nullptr;
+}
+
+MultiplayerSaveError developerLocalSessionCaptureSave(std::uint64_t generation,
+    std::uint64_t saveDatDigest,
+    MultiplayerSaveSidecar& sidecar)
+{
+    if (!enabled || !session.isActive()) {
+        return MultiplayerSaveError::PlayerMissing;
+    }
+    return captureMultiplayerSave(session.players(), generation, saveDatDigest, sidecar);
+}
+
+bool developerLocalSessionStageLoadedSave(const MultiplayerSaveSidecar& sidecar)
+{
+    if (!enabled || validateMultiplayerSave(sidecar) != MultiplayerSaveError::None) {
+        return false;
+    }
+    pendingLoadedSave = sidecar;
+    return true;
+}
+
+void developerLocalSessionRejectLoadedSave()
+{
+    pendingLoadedSave.reset();
+    if (session.isActive()) {
+        eraseGuestActor();
+        session.stop();
+        commandProcessor.reset();
+    }
 }
 
 bool developerLocalSessionSubmitMove(PlayerId playerId, int destinationTile, int elevation, bool running)
@@ -378,6 +463,7 @@ void developerLocalSessionPrepareForWorldReset()
 
 void developerLocalSessionStop()
 {
+    pendingLoadedSave.reset();
     eraseGuestActor();
     session.stop();
     commandProcessor.reset();

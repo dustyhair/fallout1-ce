@@ -2,6 +2,7 @@
 #include <iostream>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "multiplayer/acting_player_context.h"
@@ -13,6 +14,7 @@
 #include "multiplayer/loopback_transport.h"
 #include "multiplayer/player_character_state.h"
 #include "multiplayer/protocol.h"
+#include "multiplayer/save_sidecar.h"
 #include "multiplayer/snapshot.h"
 #include "multiplayer/types.h"
 
@@ -351,6 +353,89 @@ void testCharacterLobbyValidationAndWireFormat()
     invalid = sheet;
     invalid.primaryStats[0] = 0;
     expect(encodeCharacterSheet(invalid, packet) == CharacterLobbyError::PrimaryStatOutOfRange && packet.empty(), "invalid character sheet leaves no partial packet");
+}
+
+void testMultiplayerSaveSidecar()
+{
+    MultiplayerSaveSidecar sidecar;
+    sidecar.generation = 7;
+    const std::string saveData = "legacy SAVE.DAT bytes";
+    sidecar.saveDatDigest = updateMultiplayerSaveDigest(kMultiplayerSaveDigestOffset, saveData.data(), saveData.size());
+    sidecar.players[0].playerId = kHostPlayerId;
+    sidecar.players[0].name = "Vault Dweller";
+    sidecar.players[0].build.baseStats[STAT_STRENGTH] = 8;
+    sidecar.players[0].build.skillPoints[SKILL_SMALL_GUNS] = 23;
+    sidecar.players[0].build.perkRanks[PERK_AWARENESS] = 1;
+    sidecar.players[0].build.taggedSkills = { SKILL_SMALL_GUNS, SKILL_FIRST_AID, SKILL_SPEECH, -1 };
+    sidecar.players[0].build.traits = { TRAIT_GIFTED, -1 };
+    sidecar.players[0].build.unspentSkillPoints = 4;
+    sidecar.players[0].build.level = 6;
+    sidecar.players[0].build.experience = 15000;
+    sidecar.players[1].playerId = kGuestPlayerId;
+    sidecar.players[1].name = "Guest";
+    sidecar.players[1].build.baseStats[STAT_AGILITY] = 9;
+    sidecar.players[1].build.skillPoints[SKILL_SPEECH] = 17;
+    sidecar.players[1].build.taggedSkills = { SKILL_ENERGY_WEAPONS, SKILL_DOCTOR, SKILL_REPAIR, -1 };
+    sidecar.players[1].build.level = 5;
+    sidecar.players[1].build.experience = 10000;
+
+    expect(validateMultiplayerSave(sidecar) == MultiplayerSaveError::None, "two progressed character builds form valid save metadata");
+    std::vector<std::uint8_t> packet;
+    expect(encodeMultiplayerSave(sidecar, packet) == MultiplayerSaveError::None, "multiplayer save metadata encodes");
+    expect(packet.size() <= kMultiplayerSaveMaximumSize, "multiplayer sidecar has a strict size bound");
+    expect(packet[0] == 'F' && packet[1] == 'C' && packet[2] == 'M' && packet[3] == 'D', "multiplayer sidecar has distinct magic");
+
+    MultiplayerSaveDecodeResult decoded = decodeMultiplayerSave(packet);
+    expect(static_cast<bool>(decoded), "multiplayer save metadata decodes");
+    expect(decoded.sidecar.generation == 7 && decoded.sidecar.saveDatDigest == sidecar.saveDatDigest, "sidecar keeps generation and SAVE.DAT digest");
+    expect(decoded.sidecar.players[0] == sidecar.players[0], "sidecar keeps the host name and full build");
+    expect(decoded.sidecar.players[1] == sidecar.players[1], "sidecar keeps the guest name and full build");
+
+    std::uint64_t changedDigest = updateMultiplayerSaveDigest(kMultiplayerSaveDigestOffset, "legacy SAVE.DAT byteS", saveData.size());
+    expect(changedDigest != sidecar.saveDatDigest, "SAVE.DAT digest detects different base-save bytes");
+
+    std::vector<std::uint8_t> badMagic = packet;
+    badMagic[0] = 0;
+    expect(decodeMultiplayerSave(badMagic).error == MultiplayerSaveError::InvalidMagic, "sidecar rejects invalid magic");
+    std::vector<std::uint8_t> badVersion = packet;
+    badVersion[5]++;
+    expect(decodeMultiplayerSave(badVersion).error == MultiplayerSaveError::UnsupportedVersion, "sidecar rejects an unsupported version");
+    std::vector<std::uint8_t> corrupt = packet;
+    corrupt.back() ^= 1;
+    expect(decodeMultiplayerSave(corrupt).error == MultiplayerSaveError::ChecksumMismatch, "sidecar rejects corrupt character data");
+    std::vector<std::uint8_t> truncated = packet;
+    truncated.pop_back();
+    expect(decodeMultiplayerSave(truncated).error == MultiplayerSaveError::TruncatedPayload, "sidecar rejects truncated data");
+    std::vector<std::uint8_t> trailing = packet;
+    trailing.push_back(0);
+    expect(decodeMultiplayerSave(trailing).error == MultiplayerSaveError::TrailingData, "sidecar rejects trailing data");
+
+    MultiplayerSaveSidecar invalid = sidecar;
+    invalid.generation = 0;
+    expect(validateMultiplayerSave(invalid) == MultiplayerSaveError::InvalidGeneration, "sidecar requires a nonzero generation");
+    invalid = sidecar;
+    std::swap(invalid.players[0], invalid.players[1]);
+    expect(validateMultiplayerSave(invalid) == MultiplayerSaveError::NonCanonicalPlayerOrder, "sidecar requires deterministic host-then-guest order");
+    invalid = sidecar;
+    invalid.players[1].playerId = kHostPlayerId;
+    expect(validateMultiplayerSave(invalid) == MultiplayerSaveError::DuplicatePlayer, "sidecar rejects duplicate player slots");
+    invalid = sidecar;
+    invalid.players[1].build.taggedSkills[0] = SKILL_COUNT;
+    expect(validateMultiplayerSave(invalid) == MultiplayerSaveError::InvalidBuild, "sidecar rejects invalid restored build values");
+
+    TestObject hostActor;
+    TestObject guestActor;
+    LocalSession source;
+    expect(source.start(asGameObject(hostActor), asGameObject(guestActor)) == LocalSessionError::None, "sidecar source session starts");
+    expect(source.restorePlayerCharacters(sidecar) == LocalSessionError::None, "validated sidecar restores both registered players");
+    expect(source.characterLobbyReady(), "restored players satisfy the loading gate without creation sheets");
+    expect(source.transitionTo(SessionPhase::Loading) == LocalSessionError::None, "restored session can enter loading");
+    expect(source.players().find(kHostPlayerId)->build == sidecar.players[0].build, "restored host keeps progressed state");
+    expect(source.players().find(kGuestPlayerId)->build == sidecar.players[1].build, "restored guest keeps separate progressed state");
+
+    MultiplayerSaveSidecar captured;
+    expect(captureMultiplayerSave(source.players(), 8, sidecar.saveDatDigest, captured) == MultiplayerSaveError::None, "active player state can be captured for the next generation");
+    expect(captured.generation == 8 && captured.players == sidecar.players, "capture uses canonical player IDs and preserves both builds");
 }
 
 void testActingPlayerContext()
@@ -853,6 +938,7 @@ int main()
     fallout::multiplayer::testEntityRegistryAcrossEngineLifecycles();
     fallout::multiplayer::testPlayerCharacterStateStore();
     fallout::multiplayer::testCharacterLobbyValidationAndWireFormat();
+    fallout::multiplayer::testMultiplayerSaveSidecar();
     fallout::multiplayer::testActingPlayerContext();
     fallout::multiplayer::testLocalPlayerContext();
     fallout::multiplayer::testProtocolRoundTrip();

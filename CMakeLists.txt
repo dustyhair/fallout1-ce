@@ -50,6 +50,8 @@ add_library(fallout-multiplayer-core STATIC
     "src/multiplayer/player_character_state.h"
     "src/multiplayer/protocol.cc"
     "src/multiplayer/protocol.h"
+    "src/multiplayer/save_sidecar.cc"
+    "src/multiplayer/save_sidecar.h"
     "src/multiplayer/snapshot.cc"
     "src/multiplayer/snapshot.h"
     "src/multiplayer/transport.h"

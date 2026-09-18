@@ -16,6 +16,6 @@ Perks, invested skill points, bonus stats, level, experience, and player flags a
 
 The existing New Game flow creates the host character. On the first map, `--multiplayer-dev` starts a session in Lobby and submits that host character. It then binds the guest as the local presentation player and reuses Fallout's character editor for the second character.
 
-After the guest accepts the editor, the host validates and reconstructs the guest build, restores the host as the local player, and advances through Loading to Exploration. Cancelling the editor returns to single-player mode. Existing saves are rejected by this temporary flow because converting progressed characters belongs with multiplayer save persistence.
+After the guest accepts the editor, the host validates and reconstructs the guest build, restores the host as the local player, and advances through Loading to Exploration. Cancelling the editor returns to single-player mode. A matching multiplayer save sidecar restores both progressed builds and satisfies the same loading gate without treating progression as character-creation input.
 
 Headless tests cover every validation rule, wire round trips, malformed lengths, host and guest readiness, the lobby phase gate, canonical build construction, and teardown.

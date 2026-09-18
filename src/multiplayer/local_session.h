@@ -7,6 +7,7 @@
 #include "multiplayer/entity_registry.h"
 #include "multiplayer/loopback_transport.h"
 #include "multiplayer/player_character_state.h"
+#include "multiplayer/save_sidecar.h"
 #include "multiplayer/types.h"
 
 namespace fallout {
@@ -24,6 +25,7 @@ enum class LocalSessionError {
     InvalidPlayer,
     InvalidTransition,
     LobbyNotReady,
+    InvalidSaveState,
     RegistryFailure,
 };
 
@@ -39,6 +41,7 @@ public:
     std::uint32_t phaseRevision() const;
     LocalSessionError transitionTo(SessionPhase phase);
     CharacterLobbyError submitCharacterSheet(const CharacterCreationSheet& sheet);
+    LocalSessionError restorePlayerCharacters(const MultiplayerSaveSidecar& sidecar);
     bool characterLobbyReady() const;
 
     EntityId playerActorId(PlayerId playerId) const;
@@ -67,6 +70,7 @@ private:
     EntityRegistry _entities;
     PlayerCharacterStateStore _players;
     CharacterLobby _characterLobby;
+    bool _restoredPlayersReady = false;
     LoopbackTransportPair _transports;
 };
 

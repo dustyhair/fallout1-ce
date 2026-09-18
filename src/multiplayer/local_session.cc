@@ -26,6 +26,7 @@ LocalSessionError LocalSession::start(Object* hostActor, Object* guestActor)
 
     _players.clear();
     _characterLobby.reset();
+    _restoredPlayersReady = false;
 
     EntityRegistrationResult host = _entities.registerObject(hostActor, kHostPlayerId);
     if (!host) {
@@ -84,6 +85,7 @@ void LocalSession::stop()
     _transports = {};
     _players.clear();
     _characterLobby.reset();
+    _restoredPlayersReady = false;
     _entities.clear();
     _hostActorId = {};
     _guestActorId = {};
@@ -119,7 +121,8 @@ LocalSessionError LocalSession::transitionTo(SessionPhase phase)
 
     if (_phase == SessionPhase::Lobby
         && phase == SessionPhase::Loading
-        && !_characterLobby.allPlayersReady()) {
+        && !_characterLobby.allPlayersReady()
+        && !_restoredPlayersReady) {
         return LocalSessionError::LobbyNotReady;
     }
 
@@ -143,9 +146,44 @@ CharacterLobbyError LocalSession::submitCharacterSheet(const CharacterCreationSh
     return _characterLobby.submit(sheet, _players);
 }
 
+LocalSessionError LocalSession::restorePlayerCharacters(const MultiplayerSaveSidecar& sidecar)
+{
+    if (!_active) {
+        return LocalSessionError::NotActive;
+    }
+    if (_phase != SessionPhase::Lobby && _phase != SessionPhase::Transition) {
+        return LocalSessionError::InvalidTransition;
+    }
+    if (validateMultiplayerSave(sidecar) != MultiplayerSaveError::None) {
+        return LocalSessionError::InvalidSaveState;
+    }
+
+    const SavedPlayerCharacter* host = nullptr;
+    const SavedPlayerCharacter* guest = nullptr;
+    for (const SavedPlayerCharacter& saved : sidecar.players) {
+        if (saved.playerId == kHostPlayerId) {
+            host = &saved;
+        } else if (saved.playerId == kGuestPlayerId) {
+            guest = &saved;
+        }
+    }
+    if (host == nullptr || guest == nullptr) {
+        return LocalSessionError::InvalidSaveState;
+    }
+
+    if (_players.setName(host->playerId, host->name) != PlayerStateError::None
+        || _players.setBuild(host->playerId, host->build) != PlayerStateError::None
+        || _players.setName(guest->playerId, guest->name) != PlayerStateError::None
+        || _players.setBuild(guest->playerId, guest->build) != PlayerStateError::None) {
+        return LocalSessionError::InvalidSaveState;
+    }
+    _restoredPlayersReady = true;
+    return LocalSessionError::None;
+}
+
 bool LocalSession::characterLobbyReady() const
 {
-    return _characterLobby.allPlayersReady();
+    return _characterLobby.allPlayersReady() || _restoredPlayersReady;
 }
 
 EntityId LocalSession::playerActorId(PlayerId playerId) const
