@@ -1,5 +1,6 @@
 #include "multiplayer/lobby_screen.h"
 
+#include <array>
 #include <string>
 
 #include "game/art.h"
@@ -29,6 +30,30 @@ constexpr int kLobbyWidth = 640;
 constexpr int kLobbyHeight = 480;
 constexpr int kCommandPanelLeft = 84;
 constexpr int kCommandPanelRight = 556;
+constexpr int kOptionFirstY = 351;
+constexpr int kOptionHeight = 17;
+constexpr int kOptionMouseEnterEventBase = 1200;
+constexpr int kOptionMouseExitEventBase = 1300;
+constexpr int kJoinEndpointInputLength = 48;
+
+enum class LobbyOption {
+    Host,
+    Join,
+    ChooseCharacter,
+    StartGame,
+    Disconnect,
+    Back,
+    Count,
+};
+
+constexpr std::array<const char*, static_cast<std::size_t>(LobbyOption::Count)> kOptionLabels = {
+    "\x95 1. HOST A SESSION",
+    "\x95 2. JOIN A SESSION",
+    "\x95 3. CHOOSE YOUR CHARACTER",
+    "\x95 4. START THE GAME",
+    "\x95 5. DISCONNECT",
+    "\x95 6. RETURN TO MAIN MENU",
+};
 
 const CharacterCreationSheet* sheetForPlayer(PlayerId playerId)
 {
@@ -85,9 +110,9 @@ std::string terminalStatus()
     return status;
 }
 
-std::string screenSignature(const std::string& notice)
+std::string screenSignature(const std::string& notice, int highlightedOption)
 {
-    return std::string(networkRuntimeStatus()) + "\n" + slotText(kHostPlayerId) + "\n" + slotText(kGuestPlayerId) + "\n" + notice;
+    return std::string(networkRuntimeStatus()) + "\n" + slotText(kHostPlayerId) + "\n" + slotText(kGuestPlayerId) + "\n" + notice + "\n" + std::to_string(highlightedOption);
 }
 
 bool canStartGame()
@@ -102,7 +127,8 @@ void drawLobby(int window,
     unsigned char* background,
     unsigned char* commandPanel,
     int commandPanelHeight,
-    const std::string& notice)
+    const std::string& notice,
+    int highlightedOption)
 {
     unsigned char* buffer = win_get_buf(window);
     buf_to_buf(background, kLobbyWidth, kLobbyHeight, kLobbyWidth, buffer, kLobbyWidth);
@@ -151,46 +177,60 @@ void drawLobby(int window,
         text_to_buf(buffer + kLobbyWidth * 204 + 166, notice.c_str(), 320, kLobbyWidth, brightGreen);
     }
 
-    const char* commandsTitle = "COMMAND CONSOLE";
+    const char* commandsTitle = "SELECT COMMAND";
     int commandsTitleX = (kLobbyWidth - text_width(commandsTitle)) / 2;
-    text_to_buf(buffer + kLobbyWidth * 347 + commandsTitleX,
+    text_to_buf(buffer + kLobbyWidth * 327 + commandsTitleX,
         commandsTitle,
         kLobbyWidth - commandsTitleX,
         kLobbyWidth,
         brightGreen);
-    draw_line(buffer, kLobbyWidth, 100, 366, 540, 366, dimGreen);
-    text_to_buf(buffer + kLobbyWidth * 382 + 131, "HOST", 70, kLobbyWidth, green);
-    text_to_buf(buffer + kLobbyWidth * 382 + 226, "JOIN", 70, kLobbyWidth, green);
-    text_to_buf(buffer + kLobbyWidth * 382 + 321, "CHOOSE CHARACTER", 125, kLobbyWidth, green);
-    text_to_buf(buffer + kLobbyWidth * 382 + 476,
-        "START GAME",
-        75,
-        kLobbyWidth,
-        canStartGame() ? brightGreen : dimGreen);
-    text_to_buf(buffer + kLobbyWidth * 428 + 131, "DISCONNECT", 110, kLobbyWidth, green);
-    text_to_buf(buffer + kLobbyWidth * 428 + 476, "BACK", 70, kLobbyWidth, green);
+    draw_line(buffer, kLobbyWidth, 112, 345, 528, 345, dimGreen);
+    for (std::size_t index = 0; index < kOptionLabels.size(); index++) {
+        int color = green;
+        LobbyOption option = static_cast<LobbyOption>(index);
+        bool enabled = true;
+        if (option == LobbyOption::ChooseCharacter) {
+            enabled = networkRuntimeConnected() && networkRuntimeLocalSheet() == nullptr;
+        } else if (option == LobbyOption::StartGame) {
+            enabled = canStartGame();
+        } else if (option == LobbyOption::Disconnect) {
+            enabled = networkRuntimeMode() != NetworkLaunchMode::Disabled;
+        }
+        if (!enabled) {
+            color = dimGreen;
+        } else if (highlightedOption == static_cast<int>(index)) {
+            color = colorTable[32747];
+        }
+
+        int y = kOptionFirstY + static_cast<int>(index) * kOptionHeight;
+        text_to_buf(buffer + kLobbyWidth * y + 124,
+            kOptionLabels[index],
+            392,
+            kLobbyWidth,
+            color);
+    }
 
     text_font(oldFont);
     win_draw(window);
 }
 
-int registerActionButton(int window, int x, int y, int key, unsigned char* up, unsigned char* down)
+int registerOptionHotspot(int window, int optionIndex)
 {
     int button = win_register_button(window,
-        x,
-        y,
-        14,
-        14,
+        112,
+        kOptionFirstY + optionIndex * kOptionHeight - 2,
+        416,
+        kOptionHeight,
+        kOptionMouseEnterEventBase + optionIndex,
+        kOptionMouseExitEventBase + optionIndex,
         -1,
-        -1,
-        -1,
-        key,
-        up,
-        down,
+        KEY_1 + optionIndex,
         nullptr,
-        BUTTON_FLAG_TRANSPARENT);
+        nullptr,
+        nullptr,
+        0);
     if (button != -1) {
-        win_register_button_sound_func(button, gsound_med_butt_press, gsound_med_butt_release);
+        win_register_button_sound_func(button, gsound_red_butt_press, gsound_red_butt_release);
     }
     return button;
 }
@@ -213,28 +253,16 @@ MultiplayerLobbyScreenResult multiplayerLobbyScreen()
 
     CacheEntry* backgroundKey = nullptr;
     CacheEntry* commandPanelKey = nullptr;
-    CacheEntry* buttonUpKey = nullptr;
-    CacheEntry* buttonDownKey = nullptr;
     unsigned char* background = art_ptr_lock_data(art_id(OBJ_TYPE_INTERFACE, 103, 0, 0, 0), 0, 0, &backgroundKey);
     Art* commandPanelFrm = art_ptr_lock(art_id(OBJ_TYPE_INTERFACE, 99, 0, 0, 0), &commandPanelKey);
     unsigned char* commandPanel = commandPanelFrm != nullptr ? art_frame_data(commandPanelFrm, 0, 0) : nullptr;
     int commandPanelWidth = commandPanelFrm != nullptr ? art_frame_width(commandPanelFrm, 0, 0) : 0;
     int commandPanelHeight = commandPanelFrm != nullptr ? art_frame_length(commandPanelFrm, 0, 0) : 0;
-    unsigned char* buttonUp = art_ptr_lock_data(art_id(OBJ_TYPE_INTERFACE, 96, 0, 0, 0), 0, 0, &buttonUpKey);
-    unsigned char* buttonDown = art_ptr_lock_data(art_id(OBJ_TYPE_INTERFACE, 95, 0, 0, 0), 0, 0, &buttonDownKey);
     if (background == nullptr
         || commandPanel == nullptr
         || commandPanelWidth != kLobbyWidth
         || commandPanelHeight <= 0
-        || commandPanelHeight >= kLobbyHeight
-        || buttonUp == nullptr
-        || buttonDown == nullptr) {
-        if (buttonDown != nullptr) {
-            art_ptr_unlock(buttonDownKey);
-        }
-        if (buttonUp != nullptr) {
-            art_ptr_unlock(buttonUpKey);
-        }
+        || commandPanelHeight >= kLobbyHeight) {
         if (background != nullptr) {
             art_ptr_unlock(backgroundKey);
         }
@@ -245,12 +273,9 @@ MultiplayerLobbyScreenResult multiplayerLobbyScreen()
         return MultiplayerLobbyScreenResult::Back;
     }
 
-    registerActionButton(window, 110, 379, KEY_LOWERCASE_H, buttonUp, buttonDown);
-    registerActionButton(window, 205, 379, KEY_LOWERCASE_J, buttonUp, buttonDown);
-    registerActionButton(window, 300, 379, KEY_LOWERCASE_C, buttonUp, buttonDown);
-    registerActionButton(window, 455, 379, KEY_LOWERCASE_S, buttonUp, buttonDown);
-    registerActionButton(window, 110, 425, KEY_LOWERCASE_D, buttonUp, buttonDown);
-    registerActionButton(window, 455, 425, KEY_ESCAPE, buttonUp, buttonDown);
+    for (int optionIndex = 0; optionIndex < static_cast<int>(LobbyOption::Count); optionIndex++) {
+        registerOptionHotspot(window, optionIndex);
+    }
 
     bool cursorWasHidden = mouse_hidden();
     if (cursorWasHidden) {
@@ -263,19 +288,43 @@ MultiplayerLobbyScreenResult multiplayerLobbyScreen()
     static char hostPort[7] = "42424";
     std::string notice;
     std::string drawnSignature;
+    int highlightedOption = -1;
     MultiplayerLobbyScreenResult result = MultiplayerLobbyScreenResult::Back;
     bool done = false;
     while (!done && game_user_wants_to_quit == 0) {
         sharedFpsLimiter.mark();
 
-        std::string signature = screenSignature(notice);
+        std::string signature = screenSignature(notice, highlightedOption);
         if (signature != drawnSignature) {
             drawnSignature = signature;
-            drawLobby(window, background, commandPanel, commandPanelHeight, notice);
+            drawLobby(window, background, commandPanel, commandPanelHeight, notice, highlightedOption);
         }
 
         int keyCode = get_input();
+        if (keyCode >= kOptionMouseEnterEventBase
+            && keyCode < kOptionMouseEnterEventBase + static_cast<int>(LobbyOption::Count)) {
+            highlightedOption = keyCode - kOptionMouseEnterEventBase;
+            keyCode = -1;
+        } else if (keyCode >= kOptionMouseExitEventBase
+            && keyCode < kOptionMouseExitEventBase + static_cast<int>(LobbyOption::Count)) {
+            if (highlightedOption == keyCode - kOptionMouseExitEventBase) {
+                highlightedOption = -1;
+            }
+            keyCode = -1;
+        } else if (keyCode == KEY_ARROW_DOWN) {
+            highlightedOption = (highlightedOption + 1) % static_cast<int>(LobbyOption::Count);
+            keyCode = -1;
+        } else if (keyCode == KEY_ARROW_UP) {
+            highlightedOption = highlightedOption <= 0
+                ? static_cast<int>(LobbyOption::Count) - 1
+                : highlightedOption - 1;
+            keyCode = -1;
+        } else if (keyCode == KEY_RETURN && highlightedOption != -1) {
+            keyCode = KEY_1 + highlightedOption;
+        }
+
         switch (keyCode) {
+        case KEY_1:
         case KEY_UPPERCASE_H:
         case KEY_LOWERCASE_H:
             notice.clear();
@@ -294,13 +343,14 @@ MultiplayerLobbyScreenResult multiplayerLobbyScreen()
                 }
             }
             break;
+        case KEY_2:
         case KEY_UPPERCASE_J:
         case KEY_LOWERCASE_J:
             notice.clear();
             if (win_get_str(joinEndpoint,
-                    sizeof(joinEndpoint) - 2,
+                    kJoinEndpointInputLength,
                     "Enter host address (address:port):",
-                    windowX + 150,
+                    windowX + 80,
                     windowY + 170)
                     == 0
                 && joinEndpoint[0] != '\0'
@@ -308,6 +358,7 @@ MultiplayerLobbyScreenResult multiplayerLobbyScreen()
                 notice = "CHECK THE HOST ADDRESS AND TRY AGAIN.";
             }
             break;
+        case KEY_3:
         case KEY_UPPERCASE_C:
         case KEY_LOWERCASE_C:
             notice.clear();
@@ -326,6 +377,7 @@ MultiplayerLobbyScreenResult multiplayerLobbyScreen()
                 drawnSignature.clear();
             }
             break;
+        case KEY_4:
         case KEY_UPPERCASE_S:
         case KEY_LOWERCASE_S:
             if (canStartGame()) {
@@ -335,11 +387,13 @@ MultiplayerLobbyScreenResult multiplayerLobbyScreen()
                 notice = "BOTH PLAYERS MUST CHOOSE A CHARACTER.";
             }
             break;
+        case KEY_5:
         case KEY_UPPERCASE_D:
         case KEY_LOWERCASE_D:
             networkRuntimeDisconnect();
             notice.clear();
             break;
+        case KEY_6:
         case KEY_UPPERCASE_B:
         case KEY_LOWERCASE_B:
         case KEY_ESCAPE:
@@ -363,8 +417,6 @@ MultiplayerLobbyScreenResult multiplayerLobbyScreen()
         mouse_hide();
     }
     win_delete(window);
-    art_ptr_unlock(buttonDownKey);
-    art_ptr_unlock(buttonUpKey);
     art_ptr_unlock(commandPanelKey);
     art_ptr_unlock(backgroundKey);
     return result;
