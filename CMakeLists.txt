@@ -82,6 +82,8 @@ target_sources(${EXECUTABLE_NAME} PRIVATE
     "src/multiplayer/lobby_screen.h"
     "src/multiplayer/network_runtime.cc"
     "src/multiplayer/network_runtime.h"
+    "src/multiplayer/network_world.cc"
+    "src/multiplayer/network_world.h"
     "src/multiplayer/presentation_bridge.cc"
     "src/multiplayer/presentation_bridge.h"
 )

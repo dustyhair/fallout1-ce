@@ -1068,6 +1068,14 @@ void testNetworkCharacterLobby()
         "guest retains both validated character sheets");
     expect(host.submitLocalSheet(hostSheet) == CharacterLobbyError::WrongPhase,
         "ready lobby locks the submitted character sheet");
+    expect(!guest.requestStart(), "guest cannot start the network game");
+    expect(host.requestStart(), "ready host broadcasts the game start");
+    for (int attempt = 0; attempt < 100 && !guest.startRequested(); attempt++) {
+        host.poll();
+        guest.poll();
+    }
+    expect(host.startRequested() && guest.startRequested(),
+        "host and guest observe the same game start");
     expect(host.takeTransport() != nullptr && guest.takeTransport() != nullptr,
         "ready lobbies hand the connection to the game session");
 

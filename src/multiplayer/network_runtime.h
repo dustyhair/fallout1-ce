@@ -28,6 +28,10 @@ bool networkRuntimeRunSmokeTest();
 bool networkRuntimeSubmitLocalCharacter(Object* actor);
 bool networkRuntimeWaitForLobby();
 bool networkRuntimeLobbyReady();
+bool networkRuntimeRequestStart();
+bool networkRuntimeStartRequested();
+bool networkRuntimeEnterWorld();
+void networkRuntimeLeaveWorld();
 void networkRuntimeStop();
 
 } // namespace multiplayer

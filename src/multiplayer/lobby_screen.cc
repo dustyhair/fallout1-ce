@@ -117,7 +117,7 @@ std::string screenSignature(const std::string& notice, int highlightedOption)
 
 bool canStartGame()
 {
-    return networkRuntimeMode() != NetworkLaunchMode::Disabled
+    return networkRuntimeMode() == NetworkLaunchMode::Host
         && networkRuntimeLocalSheet() != nullptr
         && networkRuntimePeerSheet() != nullptr
         && networkRuntimeLobbyReady();
@@ -203,8 +203,12 @@ void drawLobby(int window,
         }
 
         int y = kOptionFirstY + static_cast<int>(index) * kOptionHeight;
+        const char* label = kOptionLabels[index];
+        if (option == LobbyOption::StartGame && networkRuntimeMode() == NetworkLaunchMode::Join) {
+            label = "\x95 4. WAITING FOR HOST TO START";
+        }
         text_to_buf(buffer + kLobbyWidth * y + 124,
-            kOptionLabels[index],
+            label,
             392,
             kLobbyWidth,
             color);
@@ -294,6 +298,11 @@ MultiplayerLobbyScreenResult multiplayerLobbyScreen()
     while (!done && game_user_wants_to_quit == 0) {
         sharedFpsLimiter.mark();
 
+        if (networkRuntimeMode() == NetworkLaunchMode::Join && networkRuntimeStartRequested()) {
+            result = MultiplayerLobbyScreenResult::StartGame;
+            break;
+        }
+
         std::string signature = screenSignature(notice, highlightedOption);
         if (signature != drawnSignature) {
             drawnSignature = signature;
@@ -380,9 +389,11 @@ MultiplayerLobbyScreenResult multiplayerLobbyScreen()
         case KEY_4:
         case KEY_UPPERCASE_S:
         case KEY_LOWERCASE_S:
-            if (canStartGame()) {
+            if (canStartGame() && networkRuntimeRequestStart()) {
                 result = MultiplayerLobbyScreenResult::StartGame;
                 done = true;
+            } else if (networkRuntimeMode() == NetworkLaunchMode::Join) {
+                notice = "WAITING FOR THE HOST TO START THE GAME.";
             } else {
                 notice = "BOTH PLAYERS MUST CHOOSE A CHARACTER.";
             }

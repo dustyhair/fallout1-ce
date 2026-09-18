@@ -19,6 +19,7 @@
 #include "multiplayer/gameplay_wire.h"
 #include "multiplayer/network_bootstrap.h"
 #include "multiplayer/network_lobby.h"
+#include "multiplayer/network_world.h"
 #include "multiplayer/protocol.h"
 #include "plib/color/color.h"
 #include "plib/gnw/debug.h"
@@ -180,7 +181,11 @@ void reportLobbyStatus()
     } else if (state == NetworkLobbyState::Ready && local != nullptr && peer != nullptr) {
         const CharacterCreationSheet* host = local->playerId == kHostPlayerId ? local : peer;
         const CharacterCreationSheet* guest = local->playerId == kGuestPlayerId ? local : peer;
-        setStatus("MULTIPLAYER LOBBY READY: " + host->name + " + " + guest->name);
+        if (lobby.startRequested()) {
+            setStatus("MULTIPLAYER GAME STARTED: " + host->name + " + " + guest->name);
+        } else {
+            setStatus("MULTIPLAYER LOBBY READY: " + host->name + " + " + guest->name);
+        }
     } else if (state == NetworkLobbyState::Rejected) {
         setStatus(std::string("MULTIPLAYER CHARACTER REJECTED: ") + characterLobbyErrorMessage(lobby.sheetError()));
     } else if (state == NetworkLobbyState::Failed) {
@@ -669,8 +674,13 @@ bool networkRuntimeWaitForLobby()
         }
 
         if (lobbyStarted && lobby.state() == NetworkLobbyState::Ready) {
-            ready = true;
-            break;
+            if (launchOptions.mode == NetworkLaunchMode::Host && !lobby.startRequested()) {
+                networkRuntimeRequestStart();
+            }
+            if (lobby.startRequested()) {
+                ready = true;
+                break;
+            }
         }
         if ((lobbyStarted && (lobby.state() == NetworkLobbyState::Rejected || lobby.state() == NetworkLobbyState::Failed))
             || bootstrap.state() == NetworkBootstrapState::Rejected
@@ -693,8 +703,53 @@ bool networkRuntimeLobbyReady()
         || (lobbyStarted && lobby.state() == NetworkLobbyState::Ready);
 }
 
+bool networkRuntimeRequestStart()
+{
+    if (launchOptions.mode != NetworkLaunchMode::Host || !lobbyStarted) {
+        return false;
+    }
+    bool started = lobby.requestStart();
+    if (started) {
+        reportLobbyStatus();
+    }
+    return started;
+}
+
+bool networkRuntimeStartRequested()
+{
+    return lobbyStarted && lobby.startRequested();
+}
+
+bool networkRuntimeEnterWorld()
+{
+    if (launchOptions.mode == NetworkLaunchMode::Disabled) {
+        return true;
+    }
+    const CharacterCreationSheet* local = networkRuntimeLocalSheet();
+    const CharacterCreationSheet* peer = networkRuntimePeerSheet();
+    if (!networkRuntimeLobbyReady()
+        || !networkRuntimeStartRequested()
+        || local == nullptr
+        || peer == nullptr) {
+        setStatus("MULTIPLAYER WORLD FAILED: LOBBY DID NOT START");
+        return false;
+    }
+    if (!networkWorldEnter(launchOptions.mode, *local, *peer)) {
+        setStatus("MULTIPLAYER WORLD FAILED: COULD NOT PLACE BOTH PLAYERS");
+        return false;
+    }
+    reportLobbyStatus();
+    return true;
+}
+
+void networkRuntimeLeaveWorld()
+{
+    networkWorldLeave();
+}
+
 void networkRuntimeStop()
 {
+    networkWorldLeave();
     if (backgroundProcessRegistered) {
         remove_bk_process(networkRuntimeBackgroundProcess);
         backgroundProcessRegistered = false;

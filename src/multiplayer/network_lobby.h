@@ -39,6 +39,7 @@ class NetworkLobby {
 public:
     bool start(NetworkLaunchMode mode, SessionId sessionId, std::unique_ptr<Transport> transport);
     CharacterLobbyError submitLocalSheet(const CharacterCreationSheet& sheet);
+    bool requestStart();
     void poll();
     void stop();
 
@@ -47,6 +48,7 @@ public:
     CharacterLobbyError sheetError() const;
     const CharacterCreationSheet* localSheet() const;
     const CharacterCreationSheet* peerSheet() const;
+    bool startRequested() const;
     std::uint64_t nextSendSequence() const;
     std::uint64_t nextReceiveSequence() const;
     std::unique_ptr<Transport> takeTransport();
@@ -56,6 +58,7 @@ private:
         CharacterSheet = 1,
         Ready = 2,
         Rejected = 3,
+        Start = 4,
     };
 
     bool sendMessage(MessageType type, const std::vector<std::uint8_t>& body = {});
@@ -74,6 +77,7 @@ private:
     std::uint64_t _nextReceiveSequence = 2;
     std::optional<CharacterCreationSheet> _localSheet;
     std::optional<CharacterCreationSheet> _peerSheet;
+    bool _startRequested = false;
     std::unique_ptr<Transport> _transport;
 };
 

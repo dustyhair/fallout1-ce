@@ -41,6 +41,7 @@ bool NetworkLobby::start(NetworkLaunchMode mode, SessionId sessionId, std::uniqu
     _nextReceiveSequence = 2;
     _localSheet.reset();
     _peerSheet.reset();
+    _startRequested = false;
 
     if ((mode != NetworkLaunchMode::Host && mode != NetworkLaunchMode::Join)
         || sessionId.value == 0
@@ -92,19 +93,32 @@ CharacterLobbyError NetworkLobby::submitLocalSheet(const CharacterCreationSheet&
     return CharacterLobbyError::None;
 }
 
+bool NetworkLobby::requestStart()
+{
+    if (_mode != NetworkLaunchMode::Host || _state != NetworkLobbyState::Ready) {
+        return false;
+    }
+    if (_startRequested) {
+        return true;
+    }
+    if (!sendMessage(MessageType::Start)) {
+        return false;
+    }
+
+    _startRequested = true;
+    return true;
+}
+
 void NetworkLobby::poll()
 {
     if (_transport == nullptr) {
         return;
     }
-    if (_state == NetworkLobbyState::Ready || _state == NetworkLobbyState::Rejected) {
+    if (_state == NetworkLobbyState::Rejected) {
         _transport->poll();
-        if (_state == NetworkLobbyState::Ready && !_transport->isConnected()) {
-            fail(NetworkLobbyError::Disconnected);
-        }
         return;
     }
-    if (_state != NetworkLobbyState::Waiting) {
+    if (_state != NetworkLobbyState::Waiting && _state != NetworkLobbyState::Ready) {
         return;
     }
 
@@ -117,7 +131,7 @@ void NetworkLobby::poll()
             return;
         }
         handlePacket(*packet);
-        if (_state != NetworkLobbyState::Waiting) {
+        if (_state != NetworkLobbyState::Waiting && _state != NetworkLobbyState::Ready) {
             return;
         }
     }
@@ -129,6 +143,7 @@ void NetworkLobby::stop()
         _transport->close();
         _transport.reset();
     }
+    _startRequested = false;
     _state = NetworkLobbyState::Stopped;
 }
 
@@ -155,6 +170,11 @@ const CharacterCreationSheet* NetworkLobby::localSheet() const
 const CharacterCreationSheet* NetworkLobby::peerSheet() const
 {
     return _peerSheet.has_value() ? &*_peerSheet : nullptr;
+}
+
+bool NetworkLobby::startRequested() const
+{
+    return _startRequested;
 }
 
 std::uint64_t NetworkLobby::nextSendSequence() const
@@ -238,6 +258,17 @@ void NetworkLobby::handlePacket(const Packet& packet)
         }
         _error = NetworkLobbyError::PeerSheetRejected;
         _state = NetworkLobbyState::Rejected;
+        return;
+    case MessageType::Start:
+        if (_mode != NetworkLaunchMode::Join
+            || _state != NetworkLobbyState::Ready
+            || !body.empty()
+            || !_localSheet.has_value()
+            || !_peerSheet.has_value()) {
+            fail(NetworkLobbyError::UnexpectedMessage);
+            return;
+        }
+        _startRequested = true;
         return;
     }
     fail(NetworkLobbyError::UnexpectedMessage);

@@ -248,7 +248,9 @@ static void main_start_selected_game()
     gmovie_play(MOVIE_OVRINTRO, GAME_MOVIE_STOP_MUSIC);
     roll_set_seed(-1);
     main_load_new(mainMap);
-    main_game_loop();
+    if (multiplayer::networkRuntimeEnterWorld()) {
+        main_game_loop();
+    }
     palette_fade_to(white_palette);
 
     // NOTE: Uninline.
@@ -346,6 +348,7 @@ static int main_loadgame_new()
 // 0x472A40
 static void main_unload_new()
 {
+    multiplayer::networkRuntimeLeaveWorld();
     multiplayer::developerLocalSessionStop();
     obj_turn_off(obj_dude, NULL);
     map_exit();
