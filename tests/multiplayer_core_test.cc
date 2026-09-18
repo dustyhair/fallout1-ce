@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "multiplayer/command_processor.h"
 #include "multiplayer/entity_registry.h"
 #include "multiplayer/local_session.h"
 #include "multiplayer/loopback_transport.h"
@@ -282,6 +283,143 @@ void testLocalSessionLifecycle()
     expect(session.transitionTo(SessionPhase::Loading) == LocalSessionError::NotActive, "inactive session cannot change phase");
 }
 
+class RecordingCommandExecutor : public CommandExecutor {
+public:
+    CommandExecutionStatus move(Object* actor, const MoveCommand& command) override
+    {
+        moveCalls++;
+        lastActor = actor;
+        lastMove = command;
+        return nextStatus;
+    }
+
+    CommandExecutionStatus useDoor(Object* actor, Object* target) override
+    {
+        doorCalls++;
+        lastActor = actor;
+        lastTarget = target;
+        return nextStatus;
+    }
+
+    CommandExecutionStatus nextStatus = CommandExecutionStatus::Applied;
+    int moveCalls = 0;
+    int doorCalls = 0;
+    Object* lastActor = nullptr;
+    Object* lastTarget = nullptr;
+    MoveCommand lastMove;
+};
+
+void testAuthoritativeCommandProcessing()
+{
+    TestObject hostActor;
+    TestObject guestActor;
+    TestObject door;
+    TestObject laterWorldObject;
+    LocalSession session;
+    expect(session.start(asGameObject(hostActor), asGameObject(guestActor)) == LocalSessionError::None, "command test session starts");
+    expect(session.transitionTo(SessionPhase::Loading) == LocalSessionError::None, "command test session enters loading");
+    expect(session.transitionTo(SessionPhase::Exploration) == LocalSessionError::None, "command test session enters exploration");
+
+    EntityRegistrationResult registeredDoor = session.registerWorldObject(asGameObject(door));
+    expect(static_cast<bool>(registeredDoor), "door receives a world entity ID");
+    expect(session.registerWorldObject(asGameObject(door)).entityId == registeredDoor.entityId, "registering the same world object returns its entity ID");
+
+    CommandProcessor processor;
+    RecordingCommandExecutor executor;
+
+    GameCommand move;
+    move.sequence.value = 1;
+    move.playerId = kHostPlayerId;
+    move.actorId = session.playerActorId(kHostPlayerId);
+    move.expectedPhase = SessionPhase::Exploration;
+    move.expectedPhaseRevision = session.phaseRevision();
+    move.payload = MoveCommand { 12345, 1, true };
+
+    AuthoritativeCommandResult moved = processor.process(move, session, executor);
+    expect(moved.result.status == CommandStatus::Accepted, "owned movement command is accepted");
+    expect(moved.result.rejection == CommandRejection::None, "accepted movement has no rejection reason");
+    expect(moved.result.firstEventSequence == EventSequence { 1 } && moved.result.eventCount == 1, "accepted movement names its authoritative event");
+    expect(executor.moveCalls == 1 && executor.lastActor == asGameObject(hostActor), "movement executes once for the owned actor");
+    const ActorMovementStartedEvent* moveEvent = moved.event.has_value() ? std::get_if<ActorMovementStartedEvent>(&moved.event->payload) : nullptr;
+    expect(moveEvent != nullptr && moveEvent->destinationTile == 12345 && moveEvent->running, "movement event records the accepted destination and gait");
+
+    AuthoritativeCommandResult duplicate = processor.process(move, session, executor);
+    expect(duplicate.result.status == CommandStatus::Accepted, "duplicate command returns its prior result");
+    expect(executor.moveCalls == 1, "duplicate command does not execute twice");
+    expect(duplicate.event.has_value() && duplicate.event->sequence == EventSequence { 1 }, "duplicate command returns the original event");
+
+    GameCommand stolen = move;
+    stolen.sequence.value = 1;
+    stolen.playerId = kGuestPlayerId;
+    AuthoritativeCommandResult notOwner = processor.process(stolen, session, executor);
+    expect(notOwner.result.rejection == CommandRejection::NotOwner, "player cannot command another player's actor");
+    expect(executor.moveCalls == 1, "ownership rejection does not reach the executor");
+
+    GameCommand useDoor;
+    useDoor.sequence.value = 2;
+    useDoor.playerId = kGuestPlayerId;
+    useDoor.actorId = session.playerActorId(kGuestPlayerId);
+    useDoor.expectedPhase = SessionPhase::Exploration;
+    useDoor.expectedPhaseRevision = session.phaseRevision();
+    useDoor.payload = InteractCommand { registeredDoor.entityId };
+    AuthoritativeCommandResult usedDoor = processor.process(useDoor, session, executor);
+    expect(usedDoor.result.status == CommandStatus::Accepted, "owned door command is accepted");
+    expect(executor.doorCalls == 1 && executor.lastTarget == asGameObject(door), "door command resolves the authoritative target object");
+    const DoorUseStartedEvent* doorEvent = usedDoor.event.has_value() ? std::get_if<DoorUseStartedEvent>(&usedDoor.event->payload) : nullptr;
+    expect(doorEvent != nullptr && doorEvent->targetId == registeredDoor.entityId, "door event records the actor and target IDs");
+    expect(usedDoor.event.has_value() && usedDoor.event->sequence == EventSequence { 2 }, "event sequence advances across players");
+
+    executor.nextStatus = CommandExecutionStatus::InvalidAction;
+    move.sequence.value = 2;
+    AuthoritativeCommandResult invalid = processor.process(move, session, executor);
+    expect(invalid.result.rejection == CommandRejection::InvalidAction, "executor can reject an impossible action");
+    expect(!invalid.event.has_value(), "rejected action emits no authoritative event");
+
+    move.sequence.value = 4;
+    AuthoritativeCommandResult gap = processor.process(move, session, executor);
+    expect(gap.result.rejection == CommandRejection::Stale, "command sequence gap is rejected");
+    expect(executor.moveCalls == 2, "sequence gap does not reach the executor");
+
+    executor.nextStatus = CommandExecutionStatus::Applied;
+    move.sequence.value = 3;
+    move.payload = InteractCommand { EntityId { 999 } };
+    AuthoritativeCommandResult missing = processor.process(move, session, executor);
+    expect(missing.result.rejection == CommandRejection::MissingEntity, "unknown interaction target is rejected");
+
+    AuthoritativeCommandResult olderDuplicate = processor.process(GameCommand {
+        CommandSequence { 1 },
+        kHostPlayerId,
+        session.playerActorId(kHostPlayerId),
+        SessionPhase::Exploration,
+        session.phaseRevision(),
+        MoveCommand { 12345, 1, true },
+    }, session, executor);
+    expect(olderDuplicate.result.status == CommandStatus::Accepted, "older cached command returns its prior result");
+    expect(executor.moveCalls == 2, "older cached command does not execute twice");
+
+    expect(session.transitionTo(SessionPhase::Combat) == LocalSessionError::None, "command test session enters combat");
+    move.sequence.value = 4;
+    move.expectedPhase = SessionPhase::Combat;
+    move.expectedPhaseRevision = session.phaseRevision();
+    move.payload = MoveCommand { 100, 0, false };
+    AuthoritativeCommandResult wrongPhase = processor.process(move, session, executor);
+    expect(wrongPhase.result.rejection == CommandRejection::WrongPhase, "exploration command is rejected during combat");
+
+    std::uint32_t combatRevision = session.phaseRevision();
+    expect(session.transitionTo(SessionPhase::Exploration) == LocalSessionError::None, "command test session returns to exploration");
+    move.sequence.value = 5;
+    move.expectedPhase = SessionPhase::Exploration;
+    move.expectedPhaseRevision = combatRevision;
+    AuthoritativeCommandResult stalePhase = processor.process(move, session, executor);
+    expect(stalePhase.result.rejection == CommandRejection::Stale, "stale phase revision is rejected");
+
+    session.clearWorldEntities();
+    expect(session.entities().size() == 2, "world reset preserves player actors only");
+    expect(session.entities().findObject(registeredDoor.entityId) == nullptr, "world reset removes the old door pointer");
+    EntityRegistrationResult later = session.registerWorldObject(asGameObject(laterWorldObject));
+    expect(later.entityId.value > registeredDoor.entityId.value, "world entity IDs are not reused after a reset");
+}
+
 } // namespace
 } // namespace multiplayer
 } // namespace fallout
@@ -295,6 +433,7 @@ int main()
     fallout::multiplayer::testProtocolRejectsInvalidPackets();
     fallout::multiplayer::testLoopbackTransport();
     fallout::multiplayer::testLocalSessionLifecycle();
+    fallout::multiplayer::testAuthoritativeCommandProcessing();
 
     if (fallout::multiplayer::failures != 0) {
         std::cerr << fallout::multiplayer::failures << " test assertion(s) failed\n";

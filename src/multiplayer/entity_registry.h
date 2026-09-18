@@ -52,6 +52,7 @@ public:
 
     bool contains(EntityId entityId) const;
     std::size_t size() const;
+    void removeUnowned();
     void clear();
 
 private:

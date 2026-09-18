@@ -160,6 +160,20 @@ std::size_t EntityRegistry::size() const
     return _entities.size();
 }
 
+void EntityRegistry::removeUnowned()
+{
+    auto entity = _entities.begin();
+    while (entity != _entities.end()) {
+        if (entity->second.owner.has_value()) {
+            entity++;
+            continue;
+        }
+
+        _objects.erase(entity->second.object);
+        entity = _entities.erase(entity);
+    }
+}
+
 void EntityRegistry::clear()
 {
     _entities.clear();

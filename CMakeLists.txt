@@ -32,6 +32,8 @@ else()
 endif()
 
 add_library(fallout-multiplayer-core STATIC
+    "src/multiplayer/command_processor.cc"
+    "src/multiplayer/command_processor.h"
     "src/multiplayer/entity_registry.cc"
     "src/multiplayer/entity_registry.h"
     "src/multiplayer/local_session.cc"

@@ -119,6 +119,25 @@ LocalSessionError LocalSession::rebindPlayerActor(PlayerId playerId, Object* rep
     return LocalSessionError::None;
 }
 
+EntityRegistrationResult LocalSession::registerWorldObject(Object* object)
+{
+    if (!_active) {
+        return { EntityRegistryError::EntityNotFound, {} };
+    }
+
+    std::optional<EntityId> existing = _entities.findEntity(object);
+    if (existing.has_value()) {
+        return { EntityRegistryError::None, *existing };
+    }
+
+    return _entities.registerObject(object);
+}
+
+void LocalSession::clearWorldEntities()
+{
+    _entities.removeUnowned();
+}
+
 bool LocalSession::owns(PlayerId playerId, EntityId entityId) const
 {
     return _active && _entities.isOwnedBy(entityId, playerId);

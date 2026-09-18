@@ -12,6 +12,9 @@ struct PlayerId {
     std::uint32_t value = 0;
 };
 
+constexpr PlayerId kHostPlayerId { 1 };
+constexpr PlayerId kGuestPlayerId { 2 };
+
 constexpr bool isValid(PlayerId id)
 {
     return id.value != 0;
@@ -115,6 +118,7 @@ enum class SessionPhase : std::uint8_t {
 struct MoveCommand {
     std::int32_t destinationTile = -1;
     std::int32_t elevation = -1;
+    bool running = false;
 };
 
 struct InteractCommand {
@@ -153,6 +157,26 @@ struct CommandResult {
     CommandRejection rejection = CommandRejection::Malformed;
     EventSequence firstEventSequence;
     std::uint32_t eventCount = 0;
+};
+
+struct ActorMovementStartedEvent {
+    EntityId actorId;
+    std::int32_t destinationTile = -1;
+    std::int32_t elevation = -1;
+    bool running = false;
+};
+
+struct DoorUseStartedEvent {
+    EntityId actorId;
+    EntityId targetId;
+};
+
+using GameEventPayload = std::variant<ActorMovementStartedEvent, DoorUseStartedEvent>;
+
+struct GameEvent {
+    EventSequence sequence;
+    CommandSequence causedBy;
+    GameEventPayload payload;
 };
 
 } // namespace multiplayer

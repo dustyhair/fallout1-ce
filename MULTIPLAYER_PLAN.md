@@ -1,6 +1,6 @@
 # Two-player co-op plan
 
-Status: Phase 0 foundation in progress on the `multiplayer-plan` branch. A developer-only local session can create two player-owned actors; command routing is next.
+Status: Phase 0 foundation in progress on the `multiplayer-plan` branch. The developer session routes movement and door use through ownership-checked commands; snapshot recovery is next.
 
 ## Goal
 
@@ -353,7 +353,7 @@ Keep the first reviews small enough to validate the architecture before socket c
 1. [x] Add the headless test target, multiplayer value types, protocol envelope, and loopback transport.
 2. [x] Add the ownership registry and document the `Object::id` audit with tests for create, clone, inventory, map load, and save/load behavior.
 3. [x] Add the local session controller and the second developer actor.
-4. [ ] Route movement and one door interaction through commands and authoritative results.
+4. [x] Route movement and one door interaction through commands and authoritative results.
 5. [ ] Add the minimal snapshot, sectioned state digest, and recovery test.
 
 Do not add a networking dependency, lobby UI, or broad player-state refactor in this series. Its purpose is to prove command ownership, safe-point execution, identity, and recovery.

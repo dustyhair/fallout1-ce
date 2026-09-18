@@ -19,6 +19,7 @@
 #include "game/proto.h"
 #include "game/skilldex.h"
 #include "game/tile.h"
+#include "multiplayer/developer_local_session.h"
 #include "platform_compat.h"
 #include "plib/color/color.h"
 #include "plib/gnw/gnw.h"
@@ -885,19 +886,24 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
             bool running;
             configGetBool(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_RUNNING_KEY, &running);
 
+            bool shouldRun = running;
             if (keys[SDL_SCANCODE_LSHIFT] || keys[SDL_SCANCODE_RSHIFT]) {
-                if (running) {
-                    dude_move(actionPoints);
-                    return;
-                }
-            } else {
-                if (!running) {
-                    dude_move(actionPoints);
-                    return;
-                }
+                shouldRun = !shouldRun;
             }
 
-            dude_run(actionPoints);
+            if (multiplayer::developerLocalSessionIsEnabled()) {
+                multiplayer::PlayerId playerId = keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL]
+                    ? multiplayer::kGuestPlayerId
+                    : multiplayer::kHostPlayerId;
+                multiplayer::developerLocalSessionSubmitMove(playerId, obj_mouse_flat->tile, map_elevation, shouldRun);
+                return;
+            }
+
+            if (shouldRun) {
+                dude_run(actionPoints);
+            } else {
+                dude_move(actionPoints);
+            }
             return;
         }
 
@@ -932,7 +938,14 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
                     break;
                 case OBJ_TYPE_SCENERY:
                     if (proto_action_can_use(target->pid)) {
-                        action_use_an_object(obj_dude, target);
+                        if (multiplayer::developerLocalSessionIsEnabled() && obj_is_a_portal(target)) {
+                            multiplayer::PlayerId playerId = keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL]
+                                ? multiplayer::kGuestPlayerId
+                                : multiplayer::kHostPlayerId;
+                            multiplayer::developerLocalSessionSubmitDoorUse(playerId, target);
+                        } else {
+                            action_use_an_object(obj_dude, target);
+                        }
                     } else {
                         if (obj_examine(obj_dude, target) == -1) {
                             obj_look_at(obj_dude, target);
@@ -1134,7 +1147,14 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
                     case GAME_MOUSE_ACTION_MENU_ITEM_USE:
                         switch (FID_TYPE(target->fid)) {
                         case OBJ_TYPE_SCENERY:
-                            action_use_an_object(obj_dude, target);
+                            if (multiplayer::developerLocalSessionIsEnabled() && obj_is_a_portal(target)) {
+                                multiplayer::PlayerId playerId = keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL]
+                                    ? multiplayer::kGuestPlayerId
+                                    : multiplayer::kHostPlayerId;
+                                multiplayer::developerLocalSessionSubmitDoorUse(playerId, target);
+                            } else {
+                                action_use_an_object(obj_dude, target);
+                            }
                             break;
                         case OBJ_TYPE_CRITTER:
                             action_loot_container(obj_dude, target);

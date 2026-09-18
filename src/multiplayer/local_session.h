@@ -13,9 +13,6 @@ struct Object;
 
 namespace multiplayer {
 
-constexpr PlayerId kHostPlayerId { 1 };
-constexpr PlayerId kGuestPlayerId { 2 };
-
 enum class LocalSessionError {
     None,
     AlreadyActive,
@@ -39,6 +36,8 @@ public:
 
     EntityId playerActorId(PlayerId playerId) const;
     LocalSessionError rebindPlayerActor(PlayerId playerId, Object* replacement);
+    EntityRegistrationResult registerWorldObject(Object* object);
+    void clearWorldEntities();
     bool owns(PlayerId playerId, EntityId entityId) const;
 
     Transport* transportFor(PlayerId playerId);
