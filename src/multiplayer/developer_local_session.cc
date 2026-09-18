@@ -8,6 +8,7 @@
 #include "game/map_defs.h"
 #include "game/object.h"
 #include "game/protinst.h"
+#include "multiplayer/character_build_bridge.h"
 #include "multiplayer/command_processor.h"
 #include "multiplayer/local_session.h"
 #include "plib/gnw/debug.h"
@@ -153,6 +154,15 @@ bool beginSession()
     if (session.start(obj_dude, guestActor) != LocalSessionError::None
         || session.transitionTo(SessionPhase::Loading) != LocalSessionError::None
         || session.transitionTo(SessionPhase::Exploration) != LocalSessionError::None) {
+        session.stop();
+        eraseGuestActor();
+        return false;
+    }
+
+    CharacterBuild hostBuild;
+    if (!captureLegacyCharacterBuild(obj_dude, hostBuild)
+        || session.players().setBuild(kHostPlayerId, hostBuild) != PlayerStateError::None
+        || session.players().setBuild(kGuestPlayerId, hostBuild) != PlayerStateError::None) {
         session.stop();
         eraseGuestActor();
         return false;

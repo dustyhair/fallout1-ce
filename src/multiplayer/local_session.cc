@@ -17,20 +17,44 @@ LocalSessionError LocalSession::start(Object* hostActor, Object* guestActor)
         return LocalSessionError::SameActor;
     }
 
+    _players.clear();
+
     EntityRegistrationResult host = _entities.registerObject(hostActor, kHostPlayerId);
     if (!host) {
+        _players.clear();
         _entities.clear();
         return LocalSessionError::RegistryFailure;
     }
 
     EntityRegistrationResult guest = _entities.registerObject(guestActor, kGuestPlayerId);
     if (!guest) {
+        _players.clear();
         _entities.clear();
         return LocalSessionError::RegistryFailure;
     }
 
     _hostActorId = host.entityId;
     _guestActorId = guest.entityId;
+
+    PlayerCharacterState hostState;
+    hostState.id = kHostPlayerId;
+    hostState.actorId = _hostActorId;
+    hostState.ownership = PlayerOwnership::LocalControl;
+    hostState.connection = ConnectionState::Local;
+    PlayerCharacterState guestState;
+    guestState.id = kGuestPlayerId;
+    guestState.actorId = _guestActorId;
+    guestState.ownership = PlayerOwnership::LocalControl;
+    guestState.connection = ConnectionState::Local;
+    if (_players.registerPlayer(hostState, _entities) != PlayerStateError::None
+        || _players.registerPlayer(guestState, _entities) != PlayerStateError::None) {
+        _players.clear();
+        _entities.clear();
+        _hostActorId = {};
+        _guestActorId = {};
+        return LocalSessionError::RegistryFailure;
+    }
+
     _transports = createLoopbackTransportPair();
     _phase = SessionPhase::Lobby;
     _phaseRevision = 1;
@@ -48,6 +72,7 @@ void LocalSession::stop()
     }
 
     _transports = {};
+    _players.clear();
     _entities.clear();
     _hostActorId = {};
     _guestActorId = {};
@@ -179,6 +204,16 @@ EntityRegistry& LocalSession::entities()
 const EntityRegistry& LocalSession::entities() const
 {
     return _entities;
+}
+
+PlayerCharacterStateStore& LocalSession::players()
+{
+    return _players;
+}
+
+const PlayerCharacterStateStore& LocalSession::players() const
+{
+    return _players;
 }
 
 bool LocalSession::isTransitionAllowed(SessionPhase from, SessionPhase to)

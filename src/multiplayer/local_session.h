@@ -5,6 +5,7 @@
 
 #include "multiplayer/entity_registry.h"
 #include "multiplayer/loopback_transport.h"
+#include "multiplayer/player_character_state.h"
 #include "multiplayer/types.h"
 
 namespace fallout {
@@ -45,6 +46,8 @@ public:
 
     EntityRegistry& entities();
     const EntityRegistry& entities() const;
+    PlayerCharacterStateStore& players();
+    const PlayerCharacterStateStore& players() const;
 
 private:
     static bool isTransitionAllowed(SessionPhase from, SessionPhase to);
@@ -55,6 +58,7 @@ private:
     EntityId _hostActorId;
     EntityId _guestActorId;
     EntityRegistry _entities;
+    PlayerCharacterStateStore _players;
     LoopbackTransportPair _transports;
 };
 

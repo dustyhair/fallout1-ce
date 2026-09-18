@@ -8,6 +8,7 @@
 #include "multiplayer/entity_registry.h"
 #include "multiplayer/local_session.h"
 #include "multiplayer/loopback_transport.h"
+#include "multiplayer/player_character_state.h"
 #include "multiplayer/protocol.h"
 #include "multiplayer/snapshot.h"
 #include "multiplayer/types.h"
@@ -167,6 +168,86 @@ void testEntityRegistryAcrossEngineLifecycles()
     expect(registry.registerObject(asGameObject(exhaustedObject)).error == EntityRegistryError::EntityIdsExhausted, "entity ID allocation does not wrap");
 }
 
+void testPlayerCharacterStateStore()
+{
+    EntityRegistry registry;
+    PlayerCharacterStateStore players;
+    TestObject hostActor;
+    TestObject guestActor;
+    TestObject replacementGuest;
+    TestObject worldObject;
+
+    EntityRegistrationResult host = registry.registerObject(asGameObject(hostActor), kHostPlayerId);
+    EntityRegistrationResult guest = registry.registerObject(asGameObject(guestActor), kGuestPlayerId);
+    EntityRegistrationResult world = registry.registerObject(asGameObject(worldObject));
+    expect(static_cast<bool>(host) && static_cast<bool>(guest) && static_cast<bool>(world), "player state test entities register");
+
+    PlayerCharacterState invalidPlayer;
+    invalidPlayer.actorId = host.entityId;
+    expect(players.registerPlayer(invalidPlayer, registry) == PlayerStateError::InvalidPlayerId, "player state rejects player ID zero");
+
+    PlayerCharacterState invalidActor;
+    invalidActor.id = kHostPlayerId;
+    expect(players.registerPlayer(invalidActor, registry) == PlayerStateError::InvalidEntityId, "player state rejects actor ID zero");
+
+    PlayerCharacterState missingActor;
+    missingActor.id = kHostPlayerId;
+    missingActor.actorId = EntityId { 999 };
+    expect(players.registerPlayer(missingActor, registry) == PlayerStateError::ActorMissing, "player state requires a registered actor");
+
+    PlayerCharacterState unownedActor;
+    unownedActor.id = kHostPlayerId;
+    unownedActor.actorId = world.entityId;
+    expect(players.registerPlayer(unownedActor, registry) == PlayerStateError::ActorNotOwned, "player state requires matching actor ownership");
+
+    PlayerCharacterState hostState;
+    hostState.id = kHostPlayerId;
+    hostState.actorId = host.entityId;
+    hostState.ownership = PlayerOwnership::LocalControl;
+    hostState.connection = ConnectionState::Local;
+    hostState.build.baseStats[0] = 8;
+    hostState.build.perkRanks[0] = 1;
+    hostState.build.level = 4;
+    expect(players.registerPlayer(hostState, registry) == PlayerStateError::None, "host player state registers");
+    expect(players.registerPlayer(hostState, registry) == PlayerStateError::PlayerAlreadyRegistered, "player state rejects duplicate player IDs");
+
+    PlayerCharacterState duplicateActor;
+    duplicateActor.id = kGuestPlayerId;
+    duplicateActor.actorId = host.entityId;
+    expect(players.registerPlayer(duplicateActor, registry) == PlayerStateError::ActorAlreadyRegistered, "player state rejects duplicate actor bindings");
+
+    PlayerCharacterState guestState;
+    guestState.id = kGuestPlayerId;
+    guestState.actorId = guest.entityId;
+    guestState.ownership = PlayerOwnership::RemoteControl;
+    guestState.connection = ConnectionState::Connected;
+    guestState.build.baseStats[0] = 4;
+    guestState.build.perkRanks[0] = 0;
+    guestState.build.level = 2;
+    expect(players.registerPlayer(guestState, registry) == PlayerStateError::None, "guest player state registers");
+    expect(players.size() == 2 && players.bindingsMatch(registry), "player states match registry ownership");
+    expect(players.find(kHostPlayerId)->build != players.find(kGuestPlayerId)->build, "host and guest retain distinct character builds");
+    expect(players.findByActor(guest.entityId) == players.find(kGuestPlayerId), "player state resolves from actor identity");
+
+    CharacterBuild updatedGuestBuild = players.find(kGuestPlayerId)->build;
+    updatedGuestBuild.unspentSkillPoints = 12;
+    expect(players.setBuild(kGuestPlayerId, updatedGuestBuild) == PlayerStateError::None, "guest build can be replaced");
+    expect(players.setConnection(kGuestPlayerId, ConnectionState::Disconnected) == PlayerStateError::None, "guest connection state can change");
+    expect(players.find(kGuestPlayerId)->build.unspentSkillPoints == 12, "guest build update is retained");
+    expect(players.find(kGuestPlayerId)->connection == ConnectionState::Disconnected, "guest connection update is retained");
+    expect(players.setBuild(PlayerId { 99 }, updatedGuestBuild) == PlayerStateError::PlayerNotFound, "unknown player build cannot be changed");
+
+    expect(registry.rebindObject(guest.entityId, asGameObject(replacementGuest)) == EntityRegistryError::None, "guest object can be replaced beneath player state");
+    expect(players.bindingsMatch(registry), "player binding survives object pointer replacement");
+    expect(players.find(kGuestPlayerId)->build == updatedGuestBuild, "character build survives object pointer replacement");
+
+    expect(players.unregisterPlayer(kGuestPlayerId) == PlayerStateError::None, "guest player state can be removed");
+    expect(players.findByActor(guest.entityId) == nullptr, "removed actor binding no longer resolves");
+    expect(players.unregisterPlayer(kGuestPlayerId) == PlayerStateError::PlayerNotFound, "player state cannot be removed twice");
+    players.clear();
+    expect(players.size() == 0, "clearing removes all player states");
+}
+
 void testProtocolRoundTrip()
 {
     ProtocolEnvelope envelope = sampleEnvelope();
@@ -269,7 +350,16 @@ void testLocalSessionLifecycle()
     expect(isValid(hostId) && isValid(guestId) && hostId != guestId, "players receive distinct actor entity IDs");
     expect(session.owns(kHostPlayerId, hostId), "host owns the host actor");
     expect(session.owns(kGuestPlayerId, guestId), "guest owns the guest actor");
+    expect(session.players().size() == 2, "local session creates both player states");
+    expect(session.players().find(kHostPlayerId)->actorId == hostId, "host player state binds to the host actor");
+    expect(session.players().find(kGuestPlayerId)->actorId == guestId, "guest player state binds to the guest actor");
+    expect(session.players().bindingsMatch(session.entities()), "local session player states match registry ownership");
     expect(!isValid(session.playerActorId(PlayerId { 99 })), "unknown player has no actor entity ID");
+
+    CharacterBuild guestBuild;
+    guestBuild.baseStats[0] = 6;
+    guestBuild.level = 3;
+    expect(session.players().setBuild(kGuestPlayerId, guestBuild) == PlayerStateError::None, "local session accepts a guest character build");
 
     expect(session.transitionTo(SessionPhase::Combat) == LocalSessionError::InvalidTransition, "lobby cannot jump directly to combat");
     expect(session.phaseRevision() == 1, "rejected transition does not change phase revision");
@@ -291,11 +381,14 @@ void testLocalSessionLifecycle()
     expect(session.playerActorId(kGuestPlayerId) == guestId, "guest entity ID survives object replacement");
     expect(session.entities().findObject(guestId) == asGameObject(replacementGuest), "guest entity resolves to the replacement object");
     expect(session.owns(kGuestPlayerId, guestId), "guest ownership survives object replacement");
+    expect(session.players().bindingsMatch(session.entities()), "guest player state remains bound after object replacement");
+    expect(session.players().find(kGuestPlayerId)->build == guestBuild, "guest character build survives object replacement");
     expect(session.rebindPlayerActor(PlayerId { 99 }, asGameObject(guestActor)) == LocalSessionError::InvalidPlayer, "unknown player actor cannot be rebound");
 
     session.stop();
     expect(!session.isActive(), "stopped local session is inactive");
     expect(session.entities().size() == 0, "stopping clears the local entity registry");
+    expect(session.players().size() == 0, "stopping clears player character state");
     expect(session.transportFor(kHostPlayerId) == nullptr, "stopping removes local transports");
     expect(session.transitionTo(SessionPhase::Loading) == LocalSessionError::NotActive, "inactive session cannot change phase");
 }
@@ -538,6 +631,7 @@ int main()
     fallout::multiplayer::testCoreTypes();
     fallout::multiplayer::testEntityRegistry();
     fallout::multiplayer::testEntityRegistryAcrossEngineLifecycles();
+    fallout::multiplayer::testPlayerCharacterStateStore();
     fallout::multiplayer::testProtocolRoundTrip();
     fallout::multiplayer::testProtocolRejectsInvalidPackets();
     fallout::multiplayer::testLoopbackTransport();

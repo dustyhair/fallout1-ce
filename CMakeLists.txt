@@ -40,6 +40,8 @@ add_library(fallout-multiplayer-core STATIC
     "src/multiplayer/local_session.h"
     "src/multiplayer/loopback_transport.cc"
     "src/multiplayer/loopback_transport.h"
+    "src/multiplayer/player_character_state.cc"
+    "src/multiplayer/player_character_state.h"
     "src/multiplayer/protocol.cc"
     "src/multiplayer/protocol.h"
     "src/multiplayer/snapshot.cc"
@@ -51,6 +53,8 @@ target_include_directories(fallout-multiplayer-core PUBLIC src)
 set_target_properties(fallout-multiplayer-core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(${EXECUTABLE_NAME} fallout-multiplayer-core)
 target_sources(${EXECUTABLE_NAME} PRIVATE
+    "src/multiplayer/character_build_bridge.cc"
+    "src/multiplayer/character_build_bridge.h"
     "src/multiplayer/developer_local_session.cc"
     "src/multiplayer/developer_local_session.h"
 )
