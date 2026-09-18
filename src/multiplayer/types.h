@@ -125,7 +125,15 @@ struct InteractCommand {
     EntityId targetId;
 };
 
-using GameCommandPayload = std::variant<MoveCommand, InteractCommand>;
+struct PickupCommand {
+    EntityId targetId;
+};
+
+struct LootCommand {
+    EntityId targetId;
+};
+
+using GameCommandPayload = std::variant<MoveCommand, InteractCommand, PickupCommand, LootCommand>;
 
 struct GameCommand {
     CommandSequence sequence;
@@ -171,7 +179,17 @@ struct DoorUseStartedEvent {
     EntityId targetId;
 };
 
-using GameEventPayload = std::variant<ActorMovementStartedEvent, DoorUseStartedEvent>;
+struct ItemPickupStartedEvent {
+    EntityId actorId;
+    EntityId targetId;
+};
+
+struct LootStartedEvent {
+    EntityId actorId;
+    EntityId targetId;
+};
+
+using GameEventPayload = std::variant<ActorMovementStartedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, LootStartedEvent>;
 
 struct GameEvent {
     EventSequence sequence;

@@ -163,6 +163,33 @@ public:
 
         return CommandExecutionStatus::Applied;
     }
+
+    CommandExecutionStatus pickup(Object* actor, Object* target) override
+    {
+        if (isInCombat()
+            || actor == target
+            || actor->elevation != target->elevation
+            || FID_TYPE(target->fid) != OBJ_TYPE_ITEM
+            || target->owner != nullptr
+            || action_get_an_object(actor, target) == -1) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+
+        return CommandExecutionStatus::Applied;
+    }
+
+    CommandExecutionStatus loot(Object* actor, Object* target) override
+    {
+        if (isInCombat()
+            || actor == target
+            || actor->elevation != target->elevation
+            || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER
+            || action_loot_container(actor, target) == -1) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+
+        return CommandExecutionStatus::Applied;
+    }
 };
 
 EngineCommandExecutor commandExecutor;
@@ -617,6 +644,34 @@ bool developerLocalSessionSubmitDoorUse(PlayerId playerId, Object* target)
     }
 
     return submitCommand(playerId, InteractCommand { registered.entityId });
+}
+
+bool developerLocalSessionSubmitPickup(PlayerId playerId, Object* target)
+{
+    if (!enabled || !session.isActive() || target == nullptr || FID_TYPE(target->fid) != OBJ_TYPE_ITEM) {
+        return false;
+    }
+
+    EntityRegistrationResult registered = session.registerWorldObject(target);
+    if (!registered) {
+        return false;
+    }
+
+    return submitCommand(playerId, PickupCommand { registered.entityId });
+}
+
+bool developerLocalSessionSubmitLoot(PlayerId playerId, Object* target)
+{
+    if (!enabled || !session.isActive() || target == nullptr || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER) {
+        return false;
+    }
+
+    EntityRegistrationResult registered = session.registerWorldObject(target);
+    if (!registered) {
+        return false;
+    }
+
+    return submitCommand(playerId, LootCommand { registered.entityId });
 }
 
 void developerLocalSessionPrepareForWorldReset()

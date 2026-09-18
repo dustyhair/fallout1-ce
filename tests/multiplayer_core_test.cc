@@ -519,6 +519,12 @@ void testLocalPlayerContext()
     }
     expect(localPlayerId() == kHostPlayerId && localPlayerActor() == asGameObject(hostActor), "leaving a scoped binding restores the host");
     {
+        ScopedLocalPlayerBinding guestBinding(asGameObject(guestActor));
+        expect(static_cast<bool>(guestBinding), "actor-scoped binding resolves a registered player");
+        expect(localPlayerId() == kGuestPlayerId && localPlayerActor() == asGameObject(guestActor), "actor-scoped binding selects the guest that began a deferred action");
+    }
+    expect(localPlayerId() == kHostPlayerId, "actor-scoped binding restores the host");
+    {
         ScopedLocalPlayerBinding invalidBinding(session, PlayerId { 99 });
         expect(!invalidBinding && invalidBinding.error() == LocalPlayerError::PlayerMissing, "scoped binding reports an unknown player");
     }
@@ -723,6 +729,24 @@ public:
         return nextStatus;
     }
 
+    CommandExecutionStatus pickup(Object* actor, Object* target) override
+    {
+        pickupCalls++;
+        lastActor = actor;
+        lastTarget = target;
+        recordContext();
+        return nextStatus;
+    }
+
+    CommandExecutionStatus loot(Object* actor, Object* target) override
+    {
+        lootCalls++;
+        lastActor = actor;
+        lastTarget = target;
+        recordContext();
+        return nextStatus;
+    }
+
     void recordContext()
     {
         PlayerCharacterState* player = actingPlayerState();
@@ -734,6 +758,8 @@ public:
     CommandExecutionStatus nextStatus = CommandExecutionStatus::Applied;
     int moveCalls = 0;
     int doorCalls = 0;
+    int pickupCalls = 0;
+    int lootCalls = 0;
     Object* lastActor = nullptr;
     Object* lastTarget = nullptr;
     Object* lastContextActor = nullptr;
@@ -747,6 +773,8 @@ void testAuthoritativeCommandProcessing()
     TestObject hostActor;
     TestObject guestActor;
     TestObject door;
+    TestObject item;
+    TestObject lootableCritter;
     TestObject laterWorldObject;
     LocalSession session;
     expect(session.start(asGameObject(hostActor), asGameObject(guestActor)) == LocalSessionError::None, "command test session starts");
@@ -757,6 +785,9 @@ void testAuthoritativeCommandProcessing()
     EntityRegistrationResult registeredDoor = session.registerWorldObject(asGameObject(door));
     expect(static_cast<bool>(registeredDoor), "door receives a world entity ID");
     expect(session.registerWorldObject(asGameObject(door)).entityId == registeredDoor.entityId, "registering the same world object returns its entity ID");
+    EntityRegistrationResult registeredItem = session.registerWorldObject(asGameObject(item));
+    EntityRegistrationResult registeredLootableCritter = session.registerWorldObject(asGameObject(lootableCritter));
+    expect(static_cast<bool>(registeredItem) && static_cast<bool>(registeredLootableCritter), "item interaction targets receive world entity IDs");
 
     CommandProcessor processor;
     RecordingCommandExecutor executor;
@@ -811,20 +842,48 @@ void testAuthoritativeCommandProcessing()
     expect(doorEvent != nullptr && doorEvent->targetId == registeredDoor.entityId, "door event records the actor and target IDs");
     expect(usedDoor.event.has_value() && usedDoor.event->sequence == EventSequence { 2 }, "event sequence advances across players");
 
+    GameCommand pickup;
+    pickup.sequence.value = 2;
+    pickup.playerId = kHostPlayerId;
+    pickup.actorId = session.playerActorId(kHostPlayerId);
+    pickup.expectedPhase = SessionPhase::Exploration;
+    pickup.expectedPhaseRevision = session.phaseRevision();
+    pickup.payload = PickupCommand { registeredItem.entityId };
+    AuthoritativeCommandResult pickedUp = processor.process(pickup, session, executor);
+    expect(pickedUp.result.status == CommandStatus::Accepted, "owned pickup command is accepted");
+    expect(executor.pickupCalls == 1 && executor.lastActor == asGameObject(hostActor) && executor.lastTarget == asGameObject(item), "pickup resolves the owned actor and authoritative item");
+    const ItemPickupStartedEvent* pickupEvent = pickedUp.event.has_value() ? std::get_if<ItemPickupStartedEvent>(&pickedUp.event->payload) : nullptr;
+    expect(pickupEvent != nullptr && pickupEvent->actorId == session.playerActorId(kHostPlayerId) && pickupEvent->targetId == registeredItem.entityId, "pickup event records the actor and item IDs");
+
+    GameCommand loot;
+    loot.sequence.value = 3;
+    loot.playerId = kGuestPlayerId;
+    loot.actorId = session.playerActorId(kGuestPlayerId);
+    loot.expectedPhase = SessionPhase::Exploration;
+    loot.expectedPhaseRevision = session.phaseRevision();
+    loot.payload = LootCommand { registeredLootableCritter.entityId };
+    AuthoritativeCommandResult looted = processor.process(loot, session, executor);
+    expect(looted.result.status == CommandStatus::Accepted, "owned loot command is accepted");
+    expect(executor.lootCalls == 1 && executor.lastActor == asGameObject(guestActor) && executor.lastTarget == asGameObject(lootableCritter), "loot resolves the guest actor and authoritative critter");
+    expect(executor.lastActingPlayerId == kGuestPlayerId && executor.lastBuild == &session.players().find(kGuestPlayerId)->build, "loot executes with guest character rules");
+    const LootStartedEvent* lootEvent = looted.event.has_value() ? std::get_if<LootStartedEvent>(&looted.event->payload) : nullptr;
+    expect(lootEvent != nullptr && lootEvent->actorId == session.playerActorId(kGuestPlayerId) && lootEvent->targetId == registeredLootableCritter.entityId, "loot event records the actor and target IDs");
+    expect(looted.event.has_value() && looted.event->sequence == EventSequence { 4 }, "item interactions share the authoritative event sequence");
+
     executor.nextStatus = CommandExecutionStatus::InvalidAction;
-    move.sequence.value = 2;
+    move.sequence.value = 3;
     AuthoritativeCommandResult invalid = processor.process(move, session, executor);
     expect(invalid.result.rejection == CommandRejection::InvalidAction, "executor can reject an impossible action");
     expect(!invalid.event.has_value(), "rejected action emits no authoritative event");
     expect(actingPlayerState() == nullptr, "invalid action does not leak its acting-player context");
 
-    move.sequence.value = 4;
+    move.sequence.value = 5;
     AuthoritativeCommandResult gap = processor.process(move, session, executor);
     expect(gap.result.rejection == CommandRejection::Stale, "command sequence gap is rejected");
     expect(executor.moveCalls == 2, "sequence gap does not reach the executor");
 
     executor.nextStatus = CommandExecutionStatus::Applied;
-    move.sequence.value = 3;
+    move.sequence.value = 4;
     move.payload = InteractCommand { EntityId { 999 } };
     AuthoritativeCommandResult missing = processor.process(move, session, executor);
     expect(missing.result.rejection == CommandRejection::MissingEntity, "unknown interaction target is rejected");
@@ -841,7 +900,7 @@ void testAuthoritativeCommandProcessing()
     expect(executor.moveCalls == 2, "older cached command does not execute twice");
 
     expect(session.transitionTo(SessionPhase::Combat) == LocalSessionError::None, "command test session enters combat");
-    move.sequence.value = 4;
+    move.sequence.value = 5;
     move.expectedPhase = SessionPhase::Combat;
     move.expectedPhaseRevision = session.phaseRevision();
     move.payload = MoveCommand { 100, 0, false };
@@ -850,7 +909,7 @@ void testAuthoritativeCommandProcessing()
 
     std::uint32_t combatRevision = session.phaseRevision();
     expect(session.transitionTo(SessionPhase::Exploration) == LocalSessionError::None, "command test session returns to exploration");
-    move.sequence.value = 5;
+    move.sequence.value = 6;
     move.expectedPhase = SessionPhase::Exploration;
     move.expectedPhaseRevision = combatRevision;
     AuthoritativeCommandResult stalePhase = processor.process(move, session, executor);

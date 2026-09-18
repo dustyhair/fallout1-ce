@@ -29,6 +29,7 @@ bool isLocalPlayerActor(const Object* actor);
 class ScopedLocalPlayerBinding {
 public:
     ScopedLocalPlayerBinding(LocalSession& session, PlayerId playerId);
+    explicit ScopedLocalPlayerBinding(Object* actor);
     ~ScopedLocalPlayerBinding();
 
     ScopedLocalPlayerBinding(const ScopedLocalPlayerBinding&) = delete;

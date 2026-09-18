@@ -1,6 +1,7 @@
 #include "game/protinst.h"
 
 #include <assert.h>
+#include <optional>
 #include <stdio.h>
 #include <string.h>
 
@@ -25,6 +26,7 @@
 #include "game/stat.h"
 #include "game/tile.h"
 #include "game/worldmap.h"
+#include "multiplayer/local_player_context.h"
 #include "plib/color/color.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/rect.h"
@@ -471,6 +473,12 @@ int obj_examine_func(Object* critter, Object* target, void (*fn)(char* string))
 // 0x48AA3C
 int obj_pickup(Object* critter, Object* item)
 {
+    multiplayer::ScopedLocalPlayerBinding localPlayerBinding(critter);
+    std::optional<multiplayer::ScopedLocalPlayerContext> localPlayerContext;
+    if (localPlayerBinding) {
+        localPlayerContext.emplace();
+    }
+
     int sid = -1;
     bool overriden = false;
 

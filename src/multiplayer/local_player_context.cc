@@ -84,6 +84,30 @@ ScopedLocalPlayerBinding::ScopedLocalPlayerBinding(LocalSession& session, Player
 {
 }
 
+ScopedLocalPlayerBinding::ScopedLocalPlayerBinding(Object* actor)
+    : _previousSession(boundSession)
+    , _previousPlayerId(boundPlayerId)
+    , _error(LocalPlayerError::SessionInactive)
+{
+    if (boundSession == nullptr || !boundSession->isActive()) {
+        return;
+    }
+
+    std::optional<EntityId> entityId = boundSession->entities().findEntity(actor);
+    if (!entityId.has_value()) {
+        _error = LocalPlayerError::ActorMissing;
+        return;
+    }
+
+    PlayerCharacterState* player = boundSession->players().findByActor(*entityId);
+    if (player == nullptr) {
+        _error = LocalPlayerError::PlayerMissing;
+        return;
+    }
+
+    _error = bindLocalPlayer(*boundSession, player->id);
+}
+
 ScopedLocalPlayerBinding::~ScopedLocalPlayerBinding()
 {
     if (_error != LocalPlayerError::None) {

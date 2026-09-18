@@ -64,9 +64,23 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
 
     const MoveCommand* move = std::get_if<MoveCommand>(&command.payload);
     const InteractCommand* interact = std::get_if<InteractCommand>(&command.payload);
+    const PickupCommand* pickup = std::get_if<PickupCommand>(&command.payload);
+    const LootCommand* loot = std::get_if<LootCommand>(&command.payload);
     Object* target = nullptr;
+    EntityId targetId;
+    bool hasTarget = false;
     if (interact != nullptr) {
-        target = session.entities().findObject(interact->targetId);
+        targetId = interact->targetId;
+        hasTarget = true;
+    } else if (pickup != nullptr) {
+        targetId = pickup->targetId;
+        hasTarget = true;
+    } else if (loot != nullptr) {
+        targetId = loot->targetId;
+        hasTarget = true;
+    }
+    if (hasTarget) {
+        target = session.entities().findObject(targetId);
         if (target == nullptr) {
             return rejectAndRemember(CommandRejection::MissingEntity);
         }
@@ -81,6 +95,12 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
         } else if (interact != nullptr) {
             executionStatus = executor.useDoor(actor, target);
             event.payload = DoorUseStartedEvent { command.actorId, interact->targetId };
+        } else if (pickup != nullptr) {
+            executionStatus = executor.pickup(actor, target);
+            event.payload = ItemPickupStartedEvent { command.actorId, pickup->targetId };
+        } else if (loot != nullptr) {
+            executionStatus = executor.loot(actor, target);
+            event.payload = LootStartedEvent { command.actorId, loot->targetId };
         }
     }
 

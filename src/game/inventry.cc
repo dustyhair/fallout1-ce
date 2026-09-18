@@ -3634,7 +3634,7 @@ void inven_action_cursor(int keyCode, int inventoryWindowType)
 }
 
 // 0x466B10
-int loot_container(Object* a1, Object* a2)
+static int loot_container_for_current_player(Object* a1, Object* a2)
 {
     multiplayer::ScopedLocalPlayerContext localPlayerContext;
 
@@ -4091,6 +4091,21 @@ int loot_container(Object* a1, Object* a2)
     }
 
     return 0;
+}
+
+// 0x466B10
+int loot_container(Object* a1, Object* a2)
+{
+    int rc;
+    {
+        multiplayer::ScopedLocalPlayerBinding localPlayerBinding(a1);
+        if (localPlayerBinding) {
+            inven_reset_dude();
+        }
+        rc = loot_container_for_current_player(a1, a2);
+    }
+    inven_reset_dude();
+    return rc;
 }
 
 // 0x467658

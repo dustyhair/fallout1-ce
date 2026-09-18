@@ -367,7 +367,7 @@ Do not add a networking dependency, lobby UI, or broad player-state refactor in 
 2. [x] Add a scoped acting-player context and route stat, skill, perk, trait, and progression access through it.
 3. [x] Point the HUD, character sheet, inventory, and equipment views at the local actor.
 4. [x] Add temporary two-character creation and host-side validation.
-5. [ ] Persist both builds in a versioned multiplayer sidecar and verify save/load separation.
+5. [x] Persist both builds and guest inventory in a versioned multiplayer sidecar and verify save/load separation.
 
 ## Testing strategy
 

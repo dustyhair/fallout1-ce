@@ -912,7 +912,14 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
             if (target != NULL) {
                 switch (FID_TYPE(target->fid)) {
                 case OBJ_TYPE_ITEM:
-                    action_get_an_object(obj_dude, target);
+                    if (multiplayer::developerLocalSessionIsEnabled()) {
+                        multiplayer::PlayerId playerId = keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL]
+                            ? multiplayer::kGuestPlayerId
+                            : multiplayer::kHostPlayerId;
+                        multiplayer::developerLocalSessionSubmitPickup(playerId, target);
+                    } else {
+                        action_get_an_object(obj_dude, target);
+                    }
                     break;
                 case OBJ_TYPE_CRITTER:
                     if (target == obj_dude) {
@@ -932,7 +939,14 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
                                 action_talk_to(obj_dude, target);
                             }
                         } else {
-                            action_loot_container(obj_dude, target);
+                            if (multiplayer::developerLocalSessionIsEnabled()) {
+                                multiplayer::PlayerId playerId = keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL]
+                                    ? multiplayer::kGuestPlayerId
+                                    : multiplayer::kHostPlayerId;
+                                multiplayer::developerLocalSessionSubmitLoot(playerId, target);
+                            } else {
+                                action_loot_container(obj_dude, target);
+                            }
                         }
                     }
                     break;
@@ -1157,10 +1171,24 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
                             }
                             break;
                         case OBJ_TYPE_CRITTER:
-                            action_loot_container(obj_dude, target);
+                            if (multiplayer::developerLocalSessionIsEnabled()) {
+                                multiplayer::PlayerId playerId = keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL]
+                                    ? multiplayer::kGuestPlayerId
+                                    : multiplayer::kHostPlayerId;
+                                multiplayer::developerLocalSessionSubmitLoot(playerId, target);
+                            } else {
+                                action_loot_container(obj_dude, target);
+                            }
                             break;
                         default:
-                            action_get_an_object(obj_dude, target);
+                            if (multiplayer::developerLocalSessionIsEnabled()) {
+                                multiplayer::PlayerId playerId = keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL]
+                                    ? multiplayer::kGuestPlayerId
+                                    : multiplayer::kHostPlayerId;
+                                multiplayer::developerLocalSessionSubmitPickup(playerId, target);
+                            } else {
+                                action_get_an_object(obj_dude, target);
+                            }
                             break;
                         }
                         break;

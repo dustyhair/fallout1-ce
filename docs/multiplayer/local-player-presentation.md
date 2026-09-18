@@ -21,6 +21,8 @@ The binding is cleared when its session stops or is destroyed. Headless tests co
 
 `ScopedLocalPlayerBinding` temporarily selects another registered player for synchronous modal UI. The developer session uses it for `Ctrl+I`: inventory ownership and character-rule lookups resolve to the guest while the window is open, then the prior host binding is restored.
 
+Pickup and loot animations finish asynchronously. Their callbacks bind by the initiating actor, so a guest action still opens and mutates the guest inventory after the original mouse command has returned.
+
 The guest actor remains temporary, but its inventory is detached before a map reset and attached to the replacement actor. Version 2 save sidecars persist the same recursive object data across process restarts.
 
 ## Current limits

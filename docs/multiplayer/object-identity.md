@@ -42,13 +42,12 @@ The registry runs on the simulation thread at the safe points defined in the mul
 
 ## Integration status
 
-The local session controller now owns the registry. Its developer mode registers both player actors, removes the temporary guest before a map unload, and rebinds the same guest `EntityId` after the next map loads.
+The local session controller now owns the registry. Its developer mode registers both player actors and interaction targets, removes the temporary guest before a map unload, and rebinds the same guest `EntityId` after the next map loads. The multiplayer sidecar restores the guest's recursive inventory separately from the legacy map save.
 
 Later changes still need explicit hooks for:
 
 - Snapshot application.
-- Persistent guest state and inventory restore.
 - Stack merge and split results.
 - Script-created replicated objects.
 
-The headless tests cover unique creation, clone identity, inventory moves, legacy ID rewrites, pointer replacement during load, save metadata restore, ownership, collisions, and session reset. The developer local session supplies the first engine integration scenario; command routing is the next slice.
+The headless tests cover unique creation, clone identity, inventory moves, legacy ID rewrites, pointer replacement during load, save metadata restore, ownership, collisions, session reset, and authoritative interaction-target resolution. The developer session routes movement, doors, pickup, and looting through those identities.
