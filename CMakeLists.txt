@@ -34,6 +34,8 @@ endif()
 add_library(fallout-multiplayer-core STATIC
     "src/multiplayer/entity_registry.cc"
     "src/multiplayer/entity_registry.h"
+    "src/multiplayer/local_session.cc"
+    "src/multiplayer/local_session.h"
     "src/multiplayer/loopback_transport.cc"
     "src/multiplayer/loopback_transport.h"
     "src/multiplayer/protocol.cc"
@@ -44,6 +46,10 @@ add_library(fallout-multiplayer-core STATIC
 target_include_directories(fallout-multiplayer-core PUBLIC src)
 set_target_properties(fallout-multiplayer-core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(${EXECUTABLE_NAME} fallout-multiplayer-core)
+target_sources(${EXECUTABLE_NAME} PRIVATE
+    "src/multiplayer/developer_local_session.cc"
+    "src/multiplayer/developer_local_session.h"
+)
 
 if (BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
     add_executable(fallout-multiplayer-core-test

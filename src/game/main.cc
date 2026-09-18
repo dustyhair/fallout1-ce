@@ -36,6 +36,7 @@
 #include "game/selfrun.h"
 #include "game/wordwrap.h"
 #include "game/worldmap.h"
+#include "multiplayer/developer_local_session.h"
 #include "plib/color/color.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/gnw.h"
@@ -88,6 +89,8 @@ static bool main_death_voiceover_done;
 // 0x4725E8
 int gnw_main(int argc, char** argv)
 {
+    multiplayer::developerLocalSessionConfigure(argc, argv);
+
     if (!autorun_mutex_create()) {
         return 1;
     }
@@ -303,6 +306,7 @@ static int main_loadgame_new()
 // 0x472A40
 static void main_unload_new()
 {
+    multiplayer::developerLocalSessionStop();
     obj_turn_off(obj_dude, NULL);
     map_exit();
 }
@@ -321,6 +325,8 @@ static void main_game_loop()
 
     while (game_user_wants_to_quit == 0) {
         sharedFpsLimiter.mark();
+
+        multiplayer::developerLocalSessionEnsureStarted();
 
         int keyCode = get_input();
         game_handle_input(keyCode, false);

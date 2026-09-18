@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "multiplayer/entity_registry.h"
+#include "multiplayer/local_session.h"
 #include "multiplayer/loopback_transport.h"
 #include "multiplayer/protocol.h"
 #include "multiplayer/types.h"
@@ -229,6 +230,58 @@ void testLoopbackTransport()
     expect(pair.first->send(Packet { 7 }) == TransportSendResult::Disconnected, "send fails after peer closes");
 }
 
+void testLocalSessionLifecycle()
+{
+    LocalSession session;
+    TestObject hostActor;
+    TestObject guestActor;
+    TestObject replacementGuest;
+
+    expect(!session.isActive(), "local session starts inactive");
+    expect(session.phaseRevision() == 0, "inactive session has no phase revision");
+    expect(session.start(nullptr, asGameObject(guestActor)) == LocalSessionError::NullActor, "local session rejects a null host actor");
+    expect(session.start(asGameObject(hostActor), asGameObject(hostActor)) == LocalSessionError::SameActor, "local session requires distinct actors");
+    expect(session.start(asGameObject(hostActor), asGameObject(guestActor)) == LocalSessionError::None, "local session starts with two actors");
+    expect(session.isActive(), "started local session is active");
+    expect(session.phase() == SessionPhase::Lobby && session.phaseRevision() == 1, "local session starts in the first lobby revision");
+    expect(session.start(asGameObject(hostActor), asGameObject(guestActor)) == LocalSessionError::AlreadyActive, "active local session cannot start twice");
+
+    EntityId hostId = session.playerActorId(kHostPlayerId);
+    EntityId guestId = session.playerActorId(kGuestPlayerId);
+    expect(isValid(hostId) && isValid(guestId) && hostId != guestId, "players receive distinct actor entity IDs");
+    expect(session.owns(kHostPlayerId, hostId), "host owns the host actor");
+    expect(session.owns(kGuestPlayerId, guestId), "guest owns the guest actor");
+    expect(!isValid(session.playerActorId(PlayerId { 99 })), "unknown player has no actor entity ID");
+
+    expect(session.transitionTo(SessionPhase::Combat) == LocalSessionError::InvalidTransition, "lobby cannot jump directly to combat");
+    expect(session.phaseRevision() == 1, "rejected transition does not change phase revision");
+    expect(session.transitionTo(SessionPhase::Loading) == LocalSessionError::None, "lobby can enter loading");
+    expect(session.transitionTo(SessionPhase::Exploration) == LocalSessionError::None, "loading can enter exploration");
+    expect(session.phaseRevision() == 3, "accepted transitions advance the phase revision");
+    expect(session.transitionTo(SessionPhase::Exploration) == LocalSessionError::None, "repeating the current phase is harmless");
+    expect(session.phaseRevision() == 3, "repeating the current phase does not advance its revision");
+
+    Transport* hostTransport = session.transportFor(kHostPlayerId);
+    Transport* guestTransport = session.transportFor(kGuestPlayerId);
+    expect(hostTransport != nullptr && guestTransport != nullptr, "both players have loopback transport endpoints");
+    expect(hostTransport->send(Packet { 4, 2 }) == TransportSendResult::Sent, "host can send through the local session transport");
+    std::optional<Packet> packet = guestTransport->receive();
+    expect(packet.has_value() && *packet == Packet({ 4, 2 }), "guest receives the host packet");
+
+    expect(session.transitionTo(SessionPhase::Transition) == LocalSessionError::None, "exploration can enter a map transition");
+    expect(session.rebindPlayerActor(kGuestPlayerId, asGameObject(replacementGuest)) == LocalSessionError::None, "map transition can replace the guest object");
+    expect(session.playerActorId(kGuestPlayerId) == guestId, "guest entity ID survives object replacement");
+    expect(session.entities().findObject(guestId) == asGameObject(replacementGuest), "guest entity resolves to the replacement object");
+    expect(session.owns(kGuestPlayerId, guestId), "guest ownership survives object replacement");
+    expect(session.rebindPlayerActor(PlayerId { 99 }, asGameObject(guestActor)) == LocalSessionError::InvalidPlayer, "unknown player actor cannot be rebound");
+
+    session.stop();
+    expect(!session.isActive(), "stopped local session is inactive");
+    expect(session.entities().size() == 0, "stopping clears the local entity registry");
+    expect(session.transportFor(kHostPlayerId) == nullptr, "stopping removes local transports");
+    expect(session.transitionTo(SessionPhase::Loading) == LocalSessionError::NotActive, "inactive session cannot change phase");
+}
+
 } // namespace
 } // namespace multiplayer
 } // namespace fallout
@@ -241,6 +294,7 @@ int main()
     fallout::multiplayer::testProtocolRoundTrip();
     fallout::multiplayer::testProtocolRejectsInvalidPackets();
     fallout::multiplayer::testLoopbackTransport();
+    fallout::multiplayer::testLocalSessionLifecycle();
 
     if (fallout::multiplayer::failures != 0) {
         std::cerr << fallout::multiplayer::failures << " test assertion(s) failed\n";

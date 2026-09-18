@@ -22,6 +22,7 @@
 #include "game/textobj.h"
 #include "game/tile.h"
 #include "game/worldmap.h"
+#include "multiplayer/developer_local_session.h"
 #include "plib/color/color.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/grbuf.h"
@@ -2054,6 +2055,7 @@ void obj_remove_all()
     ObjectListNode* prev;
     ObjectListNode* next;
 
+    multiplayer::developerLocalSessionPrepareForWorldReset();
     scr_remove_all();
 
     for (int tile = 0; tile < HEX_GRID_SIZE; tile++) {

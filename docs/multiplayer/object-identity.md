@@ -40,14 +40,15 @@ These behaviors are valid single-player implementation details. Changing them wo
 
 The registry runs on the simulation thread at the safe points defined in the multiplayer plan. It is not a transport callback data structure.
 
-## Integration work still required
+## Integration status
 
-The registry is deliberately separate from engine object allocation in this change. The local session controller will own it first. Later changes need explicit hooks for:
+The local session controller now owns the registry. Its developer mode registers both player actors, removes the temporary guest before a map unload, and rebinds the same guest `EntityId` after the next map loads.
 
-- Player actor creation and destruction.
-- Map unload and snapshot application.
-- Persistent guest actor and inventory restore.
+Later changes still need explicit hooks for:
+
+- Snapshot application.
+- Persistent guest state and inventory restore.
 - Stack merge and split results.
 - Script-created replicated objects.
 
-The headless tests cover unique creation, clone identity, inventory moves, legacy ID rewrites, pointer replacement during load, save metadata restore, ownership, collisions, and session reset. Engine integration scenarios will exercise the hooks once the local session controller exists.
+The headless tests cover unique creation, clone identity, inventory moves, legacy ID rewrites, pointer replacement during load, save metadata restore, ownership, collisions, and session reset. The developer local session supplies the first engine integration scenario; command routing is the next slice.
