@@ -27,6 +27,8 @@ namespace {
 
 constexpr int kLobbyWidth = 640;
 constexpr int kLobbyHeight = 480;
+constexpr int kCommandPanelLeft = 84;
+constexpr int kCommandPanelRight = 556;
 
 const CharacterCreationSheet* sheetForPlayer(PlayerId playerId)
 {
@@ -96,10 +98,21 @@ bool canStartGame()
         && networkRuntimeLobbyReady();
 }
 
-void drawLobby(int window, unsigned char* background, const std::string& notice)
+void drawLobby(int window,
+    unsigned char* background,
+    unsigned char* commandPanel,
+    int commandPanelHeight,
+    const std::string& notice)
 {
     unsigned char* buffer = win_get_buf(window);
     buf_to_buf(background, kLobbyWidth, kLobbyHeight, kLobbyWidth, buffer, kLobbyWidth);
+    int commandPanelY = kLobbyHeight - commandPanelHeight;
+    buf_to_buf(commandPanel + kCommandPanelLeft,
+        kCommandPanelRight - kCommandPanelLeft,
+        commandPanelHeight,
+        kLobbyWidth,
+        buffer + kLobbyWidth * commandPanelY + kCommandPanelLeft,
+        kLobbyWidth);
 
     const int green = colorTable[992];
     const int brightGreen = colorTable[992];
@@ -116,7 +129,7 @@ void drawLobby(int window, unsigned char* background, const std::string& notice)
         brightGreen);
 
     draw_line(buffer, kLobbyWidth, 154, 57, 486, 57, dimGreen);
-    draw_line(buffer, kLobbyWidth, 320, 68, 320, 174, dimGreen);
+    draw_line(buffer, kLobbyWidth, 320, 68, 320, 142, dimGreen);
 
     text_font(101);
     std::string host = slotText(kHostPlayerId);
@@ -130,13 +143,12 @@ void drawLobby(int window, unsigned char* background, const std::string& notice)
     text_to_buf(buffer + kLobbyWidth * 100 + 334, guest.c_str(), 145, kLobbyWidth, brightGreen);
     text_to_buf(buffer + kLobbyWidth * 126 + 334, guestStatus.c_str(), 145, kLobbyWidth, green);
 
-    draw_box(buffer, kLobbyWidth, 94, 232, 546, 316, dimGreen);
-    text_to_buf(buffer + kLobbyWidth * 244 + 108, "NETWORK LINK", 420, kLobbyWidth, brightGreen);
-    draw_line(buffer, kLobbyWidth, 108, 263, 532, 263, dimGreen);
+    draw_line(buffer, kLobbyWidth, 154, 151, 486, 151, dimGreen);
+    text_to_buf(buffer + kLobbyWidth * 162 + 166, "NETWORK LINK", 145, kLobbyWidth, brightGreen);
     std::string status = terminalStatus();
-    text_to_buf(buffer + kLobbyWidth * 275 + 108, status.c_str(), 420, kLobbyWidth, green);
+    text_to_buf(buffer + kLobbyWidth * 184 + 166, status.c_str(), 320, kLobbyWidth, green);
     if (!notice.empty()) {
-        text_to_buf(buffer + kLobbyWidth * 297 + 108, notice.c_str(), 420, kLobbyWidth, brightGreen);
+        text_to_buf(buffer + kLobbyWidth * 204 + 166, notice.c_str(), 320, kLobbyWidth, brightGreen);
     }
 
     const char* commandsTitle = "COMMAND CONSOLE";
@@ -146,17 +158,17 @@ void drawLobby(int window, unsigned char* background, const std::string& notice)
         kLobbyWidth - commandsTitleX,
         kLobbyWidth,
         brightGreen);
-    draw_line(buffer, kLobbyWidth, 55, 366, 585, 366, dimGreen);
-    text_to_buf(buffer + kLobbyWidth * 382 + 76, "HOST", 80, kLobbyWidth, green);
-    text_to_buf(buffer + kLobbyWidth * 382 + 186, "JOIN", 80, kLobbyWidth, green);
-    text_to_buf(buffer + kLobbyWidth * 382 + 296, "CHOOSE CHARACTER", 150, kLobbyWidth, green);
-    text_to_buf(buffer + kLobbyWidth * 382 + 473,
+    draw_line(buffer, kLobbyWidth, 100, 366, 540, 366, dimGreen);
+    text_to_buf(buffer + kLobbyWidth * 382 + 131, "HOST", 70, kLobbyWidth, green);
+    text_to_buf(buffer + kLobbyWidth * 382 + 226, "JOIN", 70, kLobbyWidth, green);
+    text_to_buf(buffer + kLobbyWidth * 382 + 321, "CHOOSE CHARACTER", 125, kLobbyWidth, green);
+    text_to_buf(buffer + kLobbyWidth * 382 + 476,
         "START GAME",
-        110,
+        75,
         kLobbyWidth,
         canStartGame() ? brightGreen : dimGreen);
-    text_to_buf(buffer + kLobbyWidth * 428 + 76, "DISCONNECT", 110, kLobbyWidth, green);
-    text_to_buf(buffer + kLobbyWidth * 428 + 523, "BACK", 80, kLobbyWidth, green);
+    text_to_buf(buffer + kLobbyWidth * 428 + 131, "DISCONNECT", 110, kLobbyWidth, green);
+    text_to_buf(buffer + kLobbyWidth * 428 + 476, "BACK", 70, kLobbyWidth, green);
 
     text_font(oldFont);
     win_draw(window);
@@ -200,12 +212,23 @@ MultiplayerLobbyScreenResult multiplayerLobbyScreen()
     }
 
     CacheEntry* backgroundKey = nullptr;
+    CacheEntry* commandPanelKey = nullptr;
     CacheEntry* buttonUpKey = nullptr;
     CacheEntry* buttonDownKey = nullptr;
     unsigned char* background = art_ptr_lock_data(art_id(OBJ_TYPE_INTERFACE, 103, 0, 0, 0), 0, 0, &backgroundKey);
+    Art* commandPanelFrm = art_ptr_lock(art_id(OBJ_TYPE_INTERFACE, 99, 0, 0, 0), &commandPanelKey);
+    unsigned char* commandPanel = commandPanelFrm != nullptr ? art_frame_data(commandPanelFrm, 0, 0) : nullptr;
+    int commandPanelWidth = commandPanelFrm != nullptr ? art_frame_width(commandPanelFrm, 0, 0) : 0;
+    int commandPanelHeight = commandPanelFrm != nullptr ? art_frame_length(commandPanelFrm, 0, 0) : 0;
     unsigned char* buttonUp = art_ptr_lock_data(art_id(OBJ_TYPE_INTERFACE, 96, 0, 0, 0), 0, 0, &buttonUpKey);
     unsigned char* buttonDown = art_ptr_lock_data(art_id(OBJ_TYPE_INTERFACE, 95, 0, 0, 0), 0, 0, &buttonDownKey);
-    if (background == nullptr || buttonUp == nullptr || buttonDown == nullptr) {
+    if (background == nullptr
+        || commandPanel == nullptr
+        || commandPanelWidth != kLobbyWidth
+        || commandPanelHeight <= 0
+        || commandPanelHeight >= kLobbyHeight
+        || buttonUp == nullptr
+        || buttonDown == nullptr) {
         if (buttonDown != nullptr) {
             art_ptr_unlock(buttonDownKey);
         }
@@ -215,16 +238,19 @@ MultiplayerLobbyScreenResult multiplayerLobbyScreen()
         if (background != nullptr) {
             art_ptr_unlock(backgroundKey);
         }
+        if (commandPanelFrm != nullptr) {
+            art_ptr_unlock(commandPanelKey);
+        }
         win_delete(window);
         return MultiplayerLobbyScreenResult::Back;
     }
 
-    registerActionButton(window, 55, 379, KEY_LOWERCASE_H, buttonUp, buttonDown);
-    registerActionButton(window, 165, 379, KEY_LOWERCASE_J, buttonUp, buttonDown);
-    registerActionButton(window, 275, 379, KEY_LOWERCASE_C, buttonUp, buttonDown);
-    registerActionButton(window, 452, 379, KEY_LOWERCASE_S, buttonUp, buttonDown);
-    registerActionButton(window, 55, 425, KEY_LOWERCASE_D, buttonUp, buttonDown);
-    registerActionButton(window, 502, 425, KEY_ESCAPE, buttonUp, buttonDown);
+    registerActionButton(window, 110, 379, KEY_LOWERCASE_H, buttonUp, buttonDown);
+    registerActionButton(window, 205, 379, KEY_LOWERCASE_J, buttonUp, buttonDown);
+    registerActionButton(window, 300, 379, KEY_LOWERCASE_C, buttonUp, buttonDown);
+    registerActionButton(window, 455, 379, KEY_LOWERCASE_S, buttonUp, buttonDown);
+    registerActionButton(window, 110, 425, KEY_LOWERCASE_D, buttonUp, buttonDown);
+    registerActionButton(window, 455, 425, KEY_ESCAPE, buttonUp, buttonDown);
 
     bool cursorWasHidden = mouse_hidden();
     if (cursorWasHidden) {
@@ -245,7 +271,7 @@ MultiplayerLobbyScreenResult multiplayerLobbyScreen()
         std::string signature = screenSignature(notice);
         if (signature != drawnSignature) {
             drawnSignature = signature;
-            drawLobby(window, background, notice);
+            drawLobby(window, background, commandPanel, commandPanelHeight, notice);
         }
 
         int keyCode = get_input();
@@ -339,6 +365,7 @@ MultiplayerLobbyScreenResult multiplayerLobbyScreen()
     win_delete(window);
     art_ptr_unlock(buttonDownKey);
     art_ptr_unlock(buttonUpKey);
+    art_ptr_unlock(commandPanelKey);
     art_ptr_unlock(backgroundKey);
     return result;
 }
