@@ -1,6 +1,7 @@
 #ifndef FALLOUT_MULTIPLAYER_TRANSPORT_H_
 #define FALLOUT_MULTIPLAYER_TRANSPORT_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <vector>
@@ -10,9 +11,12 @@ namespace multiplayer {
 
 using Packet = std::vector<std::uint8_t>;
 
+constexpr std::size_t kMaxTransportPacketSize = 1024 * 1024 + 64;
+
 enum class TransportSendResult {
     Sent,
     Disconnected,
+    PacketTooLarge,
 };
 
 class Transport {

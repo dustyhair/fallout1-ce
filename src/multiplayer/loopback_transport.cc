@@ -36,6 +36,9 @@ public:
         if (!_state->open[_endpoint] || !_state->open[peer]) {
             return TransportSendResult::Disconnected;
         }
+        if (packet.size() > kMaxTransportPacketSize) {
+            return TransportSendResult::PacketTooLarge;
+        }
 
         _state->queues[peer].push_back(std::move(packet));
         return TransportSendResult::Sent;

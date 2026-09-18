@@ -36,6 +36,8 @@ add_library(fallout-multiplayer-core STATIC
     "src/multiplayer/acting_player_context.h"
     "src/multiplayer/character_lobby.cc"
     "src/multiplayer/character_lobby.h"
+    "src/multiplayer/connection_handshake.cc"
+    "src/multiplayer/connection_handshake.h"
     "src/multiplayer/command_processor.cc"
     "src/multiplayer/command_processor.h"
     "src/multiplayer/entity_registry.cc"
@@ -54,11 +56,16 @@ add_library(fallout-multiplayer-core STATIC
     "src/multiplayer/save_sidecar.h"
     "src/multiplayer/snapshot.cc"
     "src/multiplayer/snapshot.h"
+    "src/multiplayer/tcp_transport.cc"
+    "src/multiplayer/tcp_transport.h"
     "src/multiplayer/transport.h"
     "src/multiplayer/types.h"
 )
 target_include_directories(fallout-multiplayer-core PUBLIC src)
 set_target_properties(fallout-multiplayer-core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(WIN32)
+    target_link_libraries(fallout-multiplayer-core PUBLIC ws2_32)
+endif()
 target_link_libraries(${EXECUTABLE_NAME} fallout-multiplayer-core)
 target_sources(${EXECUTABLE_NAME} PRIVATE
     "src/multiplayer/character_build_bridge.cc"

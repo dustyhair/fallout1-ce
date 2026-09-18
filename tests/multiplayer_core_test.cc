@@ -8,6 +8,7 @@
 #include "multiplayer/acting_player_context.h"
 #include "multiplayer/character_lobby.h"
 #include "multiplayer/command_processor.h"
+#include "multiplayer/connection_handshake.h"
 #include "multiplayer/entity_registry.h"
 #include "multiplayer/local_session.h"
 #include "multiplayer/local_player_context.h"
@@ -16,6 +17,7 @@
 #include "multiplayer/protocol.h"
 #include "multiplayer/save_sidecar.h"
 #include "multiplayer/snapshot.h"
+#include "multiplayer/tcp_transport.h"
 #include "multiplayer/types.h"
 
 namespace fallout {
@@ -627,9 +629,127 @@ void testLoopbackTransport()
     std::optional<Packet> receivedReply = pair.first->receive();
     expect(receivedReply.has_value() && *receivedReply == reply, "first endpoint receives the reply");
 
+    Packet oversized(kMaxTransportPacketSize + 1);
+    expect(pair.first->send(std::move(oversized)) == TransportSendResult::PacketTooLarge, "loopback rejects an oversized packet before queueing it");
     pair.second->close();
     expect(!pair.first->isConnected(), "closing one endpoint disconnects its peer");
     expect(pair.first->send(Packet { 7 }) == TransportSendResult::Disconnected, "send fails after peer closes");
+}
+
+std::unique_ptr<Transport> acceptTcpPeer(TcpListener& listener)
+{
+    for (int attempt = 0; attempt < 10000; attempt++) {
+        std::unique_ptr<Transport> transport = listener.accept();
+        if (transport != nullptr) {
+            return transport;
+        }
+    }
+    return nullptr;
+}
+
+std::optional<Packet> receiveTcpPacket(Transport& transport)
+{
+    for (int attempt = 0; attempt < 10000; attempt++) {
+        std::optional<Packet> packet = transport.receive();
+        if (packet.has_value()) {
+            return packet;
+        }
+    }
+    return std::nullopt;
+}
+
+void testTcpTransportAndHandshake()
+{
+    TcpListenResult listening = listenTcp(0);
+    expect(static_cast<bool>(listening), "TCP host listens on an available port");
+    if (!listening) {
+        return;
+    }
+    expect(listening.listener->port() != 0 && listening.listener->isOpen(), "TCP host reports its assigned port");
+
+    TcpConnectResult joining = connectTcp("127.0.0.1", listening.listener->port());
+    expect(static_cast<bool>(joining), "TCP guest connects by direct IP");
+    if (!joining) {
+        return;
+    }
+
+    std::unique_ptr<Transport> host = acceptTcpPeer(*listening.listener);
+    expect(host != nullptr && host->isConnected() && joining.transport->isConnected(), "TCP host accepts the guest connection");
+    if (host == nullptr) {
+        return;
+    }
+
+    constexpr std::uint64_t contentDigest = 0x1020304050607080ULL;
+    SessionId sessionId { 0x8877665544332211ULL };
+    ProtocolEnvelope helloEnvelope;
+    helloEnvelope.sequence = 1;
+    expect(encodeHandshakeMessage(HandshakeHello { contentDigest }, helloEnvelope) == HandshakeError::None, "guest handshake hello encodes");
+
+    Packet helloPacket;
+    expect(encodeEnvelope(helloEnvelope, helloPacket) == ProtocolError::None, "guest handshake envelope encodes");
+    expect(joining.transport->send(std::move(helloPacket)) == TransportSendResult::Sent, "guest sends its handshake");
+
+    std::optional<Packet> receivedHello = receiveTcpPacket(*host);
+    expect(receivedHello.has_value(), "host receives one framed handshake packet");
+    if (!receivedHello.has_value()) {
+        return;
+    }
+    ProtocolDecodeResult decodedHelloEnvelope = decodeEnvelope(*receivedHello);
+    HandshakeDecodeResult decodedHello = decodedHelloEnvelope ? decodeHandshakeMessage(decodedHelloEnvelope.envelope) : HandshakeDecodeResult {};
+    const HandshakeHello* hello = decodedHello ? std::get_if<HandshakeHello>(&decodedHello.message) : nullptr;
+    expect(hello != nullptr && hello->contentDigest == contentDigest, "host decodes the guest content digest");
+    if (hello == nullptr) {
+        return;
+    }
+
+    HandshakeMessage response = makeHostHandshakeResponse(*hello, contentDigest, sessionId);
+    ProtocolEnvelope welcomeEnvelope;
+    welcomeEnvelope.sequence = 1;
+    expect(encodeHandshakeMessage(response, welcomeEnvelope) == HandshakeError::None, "host handshake welcome encodes");
+    Packet welcomePacket;
+    expect(encodeEnvelope(welcomeEnvelope, welcomePacket) == ProtocolError::None, "host handshake envelope encodes");
+    expect(host->send(std::move(welcomePacket)) == TransportSendResult::Sent, "host sends its handshake response");
+
+    std::optional<Packet> receivedWelcome = receiveTcpPacket(*joining.transport);
+    expect(receivedWelcome.has_value(), "guest receives one framed welcome packet");
+    if (receivedWelcome.has_value()) {
+        ProtocolDecodeResult decodedWelcomeEnvelope = decodeEnvelope(*receivedWelcome);
+        HandshakeDecodeResult decodedWelcome = decodedWelcomeEnvelope ? decodeHandshakeMessage(decodedWelcomeEnvelope.envelope) : HandshakeDecodeResult {};
+        const HandshakeWelcome* welcome = decodedWelcome ? std::get_if<HandshakeWelcome>(&decodedWelcome.message) : nullptr;
+        expect(welcome != nullptr && welcome->sessionId == sessionId && welcome->assignedPlayerId == kGuestPlayerId, "guest accepts its session and player assignment");
+    }
+
+    expect(host->send(Packet { 1, 2, 3 }) == TransportSendResult::Sent, "TCP transport queues the first gameplay packet");
+    expect(host->send(Packet { 4, 5 }) == TransportSendResult::Sent, "TCP transport queues a second gameplay packet");
+    std::optional<Packet> first = receiveTcpPacket(*joining.transport);
+    std::optional<Packet> second = receiveTcpPacket(*joining.transport);
+    expect(first == Packet({ 1, 2, 3 }) && second == Packet({ 4, 5 }), "TCP framing preserves packet boundaries and order");
+
+    Packet oversized(kMaxTransportPacketSize + 1);
+    expect(host->send(std::move(oversized)) == TransportSendResult::PacketTooLarge, "TCP transport rejects oversized packets without disconnecting");
+    expect(host->isConnected(), "oversized packet rejection leaves the TCP connection open");
+
+    HandshakeMessage mismatch = makeHostHandshakeResponse(HandshakeHello { contentDigest + 1 }, contentDigest, sessionId);
+    const HandshakeRejected* mismatchRejection = std::get_if<HandshakeRejected>(&mismatch);
+    expect(mismatchRejection != nullptr && mismatchRejection->reason == HandshakeRejection::ContentMismatch, "host rejects a different content digest");
+    HandshakeMessage full = makeHostHandshakeResponse(HandshakeHello { contentDigest }, contentDigest, sessionId, false);
+    const HandshakeRejected* fullRejection = std::get_if<HandshakeRejected>(&full);
+    expect(fullRejection != nullptr && fullRejection->reason == HandshakeRejection::SessionFull, "host rejects a third player");
+
+    ProtocolEnvelope malformed = helloEnvelope;
+    malformed.payload.push_back(0);
+    expect(decodeHandshakeMessage(malformed).error == HandshakeError::InvalidLength, "handshake rejects trailing payload bytes");
+    malformed = helloEnvelope;
+    malformed.payload[3] = 1;
+    expect(decodeHandshakeMessage(malformed).error == HandshakeError::InvalidReservedField, "handshake rejects nonzero reserved fields");
+
+    joining.transport->close();
+    expect(joining.transport->send(Packet { 9 }) == TransportSendResult::Disconnected, "closed TCP endpoint rejects sends");
+    listening.listener->close();
+    expect(!listening.listener->isOpen(), "TCP listener closes explicitly");
+
+    expect(connectTcp("", 0).error == TcpError::InvalidArgument, "TCP join rejects an empty address and port");
+    expect(connectTcp("127.0.0.1", 1, 0).error == TcpError::InvalidArgument, "TCP join rejects a zero timeout");
 }
 
 void testLocalSessionLifecycle()
@@ -1031,6 +1151,7 @@ int main()
     fallout::multiplayer::testProtocolRoundTrip();
     fallout::multiplayer::testProtocolRejectsInvalidPackets();
     fallout::multiplayer::testLoopbackTransport();
+    fallout::multiplayer::testTcpTransportAndHandshake();
     fallout::multiplayer::testLocalSessionLifecycle();
     fallout::multiplayer::testAuthoritativeCommandProcessing();
     fallout::multiplayer::testSnapshotRoundTripAndRecovery();
