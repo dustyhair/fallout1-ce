@@ -6,13 +6,24 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <optional>
 #include <string>
 
+#include "game/critter.h"
+#include "game/game.h"
 #include "game/gconfig.h"
+#include "game/mainmenu.h"
+#include "multiplayer/character_build_bridge.h"
 #include "multiplayer/network_bootstrap.h"
+#include "multiplayer/network_lobby.h"
 #include "multiplayer/protocol.h"
+#include "plib/color/color.h"
 #include "plib/gnw/debug.h"
+#include "plib/gnw/gnw.h"
 #include "plib/gnw/input.h"
+#include "plib/gnw/kb.h"
+#include "plib/gnw/svga.h"
+#include "plib/gnw/text.h"
 
 namespace fallout {
 namespace multiplayer {
@@ -20,8 +31,12 @@ namespace {
 
 NetworkLaunchOptions launchOptions;
 NetworkBootstrap bootstrap;
+NetworkLobby lobby;
 NetworkBootstrapState reportedState = NetworkBootstrapState::Disabled;
+std::optional<CharacterCreationSheet> pendingLocalSheet;
+std::string runtimeStatus;
 bool backgroundProcessRegistered = false;
+bool lobbyStarted = false;
 
 constexpr std::uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
 constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
@@ -128,6 +143,66 @@ SessionId createSessionId()
     return SessionId { value != 0 ? value : 1 };
 }
 
+void setStatus(const std::string& status)
+{
+    if (runtimeStatus == status) {
+        return;
+    }
+    runtimeStatus = status;
+    main_menu_set_multiplayer_status(runtimeStatus.c_str());
+    std::fprintf(stderr, "%s\n", runtimeStatus.c_str());
+    debug_printf("%s\n", runtimeStatus.c_str());
+}
+
+std::string playerLabel(PlayerId playerId)
+{
+    return playerId == kHostPlayerId ? "HOST" : "GUEST";
+}
+
+void reportLobbyStatus()
+{
+    NetworkLobbyState state = lobby.state();
+    const CharacterCreationSheet* local = lobby.localSheet();
+    const CharacterCreationSheet* peer = lobby.peerSheet();
+
+    if (state == NetworkLobbyState::Waiting) {
+        if (local != nullptr && peer == nullptr) {
+            setStatus("MULTIPLAYER: CHARACTER SENT, WAITING FOR THE OTHER PLAYER");
+        } else if (local == nullptr && peer != nullptr) {
+            setStatus("MULTIPLAYER: OTHER PLAYER READY, CHOOSE NEW GAME");
+        } else {
+            setStatus("MULTIPLAYER CONNECTED: BOTH PLAYERS CHOOSE NEW GAME");
+        }
+    } else if (state == NetworkLobbyState::Ready && local != nullptr && peer != nullptr) {
+        const CharacterCreationSheet* host = local->playerId == kHostPlayerId ? local : peer;
+        const CharacterCreationSheet* guest = local->playerId == kGuestPlayerId ? local : peer;
+        setStatus("MULTIPLAYER LOBBY READY: " + host->name + " + " + guest->name);
+    } else if (state == NetworkLobbyState::Rejected) {
+        setStatus(std::string("MULTIPLAYER CHARACTER REJECTED: ") + characterLobbyErrorMessage(lobby.sheetError()));
+    } else if (state == NetworkLobbyState::Failed) {
+        setStatus(std::string("MULTIPLAYER LOBBY FAILED: ") + networkLobbyErrorMessage(lobby.error()));
+    }
+}
+
+bool startLobby()
+{
+    std::unique_ptr<Transport> transport = bootstrap.takeTransport();
+    lobbyStarted = true;
+    if (!lobby.start(launchOptions.mode, bootstrap.sessionId(), std::move(transport))) {
+        setStatus(std::string("MULTIPLAYER LOBBY FAILED: ") + networkLobbyErrorMessage(lobby.error()));
+        return false;
+    }
+    if (pendingLocalSheet.has_value()) {
+        CharacterLobbyError error = lobby.submitLocalSheet(*pendingLocalSheet);
+        if (error != CharacterLobbyError::None) {
+            setStatus(std::string("MULTIPLAYER CHARACTER REJECTED: ") + characterLobbyErrorMessage(error));
+            return false;
+        }
+    }
+    reportLobbyStatus();
+    return true;
+}
+
 void reportState()
 {
     NetworkBootstrapState state = bootstrap.state();
@@ -138,20 +213,13 @@ void reportState()
 
     switch (state) {
     case NetworkBootstrapState::Connected:
-        std::fprintf(stderr, "Multiplayer connection established: session %llu, local player %u.\n",
-            static_cast<unsigned long long>(bootstrap.sessionId().value),
-            bootstrap.localPlayerId().value);
-        debug_printf("Multiplayer connection established: session %llu, local player %u.\n",
-            static_cast<unsigned long long>(bootstrap.sessionId().value),
-            bootstrap.localPlayerId().value);
+        setStatus("MULTIPLAYER CONNECTED: BOTH PLAYERS CHOOSE NEW GAME");
         break;
     case NetworkBootstrapState::Rejected:
-        std::fprintf(stderr, "Multiplayer connection rejected: %s.\n", handshakeRejectionMessage(bootstrap.rejection()));
-        debug_printf("Multiplayer connection rejected: %s.\n", handshakeRejectionMessage(bootstrap.rejection()));
+        setStatus(std::string("MULTIPLAYER CONNECTION REJECTED: ") + handshakeRejectionMessage(bootstrap.rejection()));
         break;
     case NetworkBootstrapState::Failed:
-        std::fprintf(stderr, "Multiplayer connection failed: %s.\n", networkBootstrapErrorMessage(bootstrap.error()));
-        debug_printf("Multiplayer connection failed: %s.\n", networkBootstrapErrorMessage(bootstrap.error()));
+        setStatus(std::string("MULTIPLAYER CONNECTION FAILED: ") + networkBootstrapErrorMessage(bootstrap.error()));
         break;
     default:
         break;
@@ -160,8 +228,17 @@ void reportState()
 
 void networkRuntimeBackgroundProcess()
 {
-    bootstrap.poll();
-    reportState();
+    if (!lobbyStarted) {
+        bootstrap.poll();
+        reportState();
+        if (bootstrap.state() == NetworkBootstrapState::Connected) {
+            startLobby();
+        }
+        return;
+    }
+
+    lobby.poll();
+    reportLobbyStatus();
 }
 
 } // namespace
@@ -174,6 +251,9 @@ bool networkRuntimeConfigure(int argc, char** argv)
         return false;
     }
     launchOptions = result.options;
+    pendingLocalSheet.reset();
+    runtimeStatus.clear();
+    lobbyStarted = false;
     return true;
 }
 
@@ -199,20 +279,121 @@ bool networkRuntimeStart()
 
     reportedState = bootstrap.state();
     if (launchOptions.mode == NetworkLaunchMode::Host) {
-        std::fprintf(stderr, "Multiplayer host listening on TCP port %u.\n", bootstrap.port());
-        debug_printf("Multiplayer host listening on TCP port %u.\n", bootstrap.port());
+        setStatus("MULTIPLAYER HOST: WAITING ON PORT " + std::to_string(bootstrap.port()));
     } else {
-        std::fprintf(stderr, "Multiplayer guest connected to %s:%u; awaiting host handshake.\n",
-            launchOptions.address.c_str(),
-            launchOptions.port);
-        debug_printf("Multiplayer guest connected to %s:%u; awaiting host handshake.\n",
-            launchOptions.address.c_str(),
-            launchOptions.port);
+        setStatus("MULTIPLAYER GUEST: CONNECTING TO " + launchOptions.address + ":" + std::to_string(launchOptions.port));
     }
 
     add_bk_process(networkRuntimeBackgroundProcess);
     backgroundProcessRegistered = true;
     return true;
+}
+
+bool networkRuntimeSubmitLocalCharacter(Object* actor)
+{
+    if (launchOptions.mode == NetworkLaunchMode::Disabled) {
+        return true;
+    }
+
+    CharacterBuild build;
+    if (!captureLegacyCharacterBuild(actor, build)) {
+        setStatus("MULTIPLAYER CHARACTER REJECTED: COULD NOT READ CHARACTER BUILD");
+        return false;
+    }
+
+    PlayerId playerId = launchOptions.mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
+    const char* actorName = critter_name(actor);
+    CharacterCreationSheet sheet = characterSheetFromBuild(
+        playerId,
+        actorName != nullptr && *actorName != '\0' ? actorName : playerLabel(playerId),
+        build);
+    CharacterLobbyError error = validateCharacterSheet(sheet);
+    if (error != CharacterLobbyError::None) {
+        setStatus(std::string("MULTIPLAYER CHARACTER REJECTED: ") + characterLobbyErrorMessage(error));
+        return false;
+    }
+
+    if (lobbyStarted && lobby.state() == NetworkLobbyState::Ready) {
+        const CharacterCreationSheet* submitted = lobby.localSheet();
+        return submitted != nullptr && *submitted == sheet;
+    }
+
+    pendingLocalSheet = sheet;
+    if (!lobbyStarted) {
+        setStatus("MULTIPLAYER: CHARACTER READY, WAITING FOR CONNECTION");
+        return true;
+    }
+
+    error = lobby.submitLocalSheet(sheet);
+    if (error != CharacterLobbyError::None) {
+        setStatus(std::string("MULTIPLAYER CHARACTER REJECTED: ") + characterLobbyErrorMessage(error));
+        return false;
+    }
+    reportLobbyStatus();
+    return true;
+}
+
+bool networkRuntimeWaitForLobby()
+{
+    if (launchOptions.mode == NetworkLaunchMode::Disabled) {
+        return true;
+    }
+    if (!pendingLocalSheet.has_value()) {
+        return false;
+    }
+
+    constexpr int windowWidth = 520;
+    constexpr int windowHeight = 120;
+    int window = win_add((screenGetWidth() - windowWidth) / 2,
+        (screenGetHeight() - windowHeight) / 2,
+        windowWidth,
+        windowHeight,
+        colorTable[0],
+        WINDOW_MODAL | WINDOW_MOVE_ON_TOP);
+    if (window == -1) {
+        return false;
+    }
+
+    std::string drawnStatus;
+    bool ready = false;
+    for (;;) {
+        if (drawnStatus != runtimeStatus) {
+            drawnStatus = runtimeStatus;
+            win_fill(window, 0, 0, windowWidth, windowHeight, colorTable[0]);
+            win_border(window);
+            int oldFont = text_curr();
+            text_font(103);
+            win_print(window, "MULTIPLAYER LOBBY", 0, 20, 18, colorTable[21091]);
+            text_font(101);
+            win_print(window, drawnStatus.c_str(), windowWidth - 40, 20, 52, colorTable[21204]);
+            win_print(window, "Press Esc to return to the main menu.", 0, 20, 88, colorTable[21204]);
+            text_font(oldFont);
+            win_draw(window);
+        }
+
+        if (lobbyStarted && lobby.state() == NetworkLobbyState::Ready) {
+            ready = true;
+            break;
+        }
+        if ((lobbyStarted && (lobby.state() == NetworkLobbyState::Rejected || lobby.state() == NetworkLobbyState::Failed))
+            || bootstrap.state() == NetworkBootstrapState::Rejected
+            || bootstrap.state() == NetworkBootstrapState::Failed
+            || game_user_wants_to_quit != 0) {
+            break;
+        }
+        if (get_input() == KEY_ESCAPE) {
+            break;
+        }
+    }
+
+    win_delete(window);
+    return ready;
+}
+
+bool networkRuntimeLobbyReady()
+{
+    return launchOptions.mode == NetworkLaunchMode::Disabled
+        || (lobbyStarted && lobby.state() == NetworkLobbyState::Ready);
 }
 
 void networkRuntimeStop()
@@ -221,7 +402,9 @@ void networkRuntimeStop()
         remove_bk_process(networkRuntimeBackgroundProcess);
         backgroundProcessRegistered = false;
     }
+    lobby.stop();
     bootstrap.stop();
+    lobbyStarted = false;
 }
 
 } // namespace multiplayer

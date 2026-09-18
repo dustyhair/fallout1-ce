@@ -46,4 +46,4 @@ For this launch slice, the compatibility digest covers the protocol and handshak
 
 ## Current boundary
 
-The developer mode still uses its in-process loopback endpoints. Network host and guest modes establish a connection, validate compatibility, assign the host and guest player IDs, and retain the connected transport for the session layer. They do not yet exchange character sheets or create network-controlled world actors. LAN discovery, encryption, reconnect tokens, and gameplay message encoding are not part of this slice.
+The developer mode still uses its in-process loopback endpoints. Network host and guest modes establish a connection, validate compatibility, assign the host and guest player IDs, and pass the connected transport to the [network character lobby](network-character-lobby.md). LAN discovery, encryption, and reconnect tokens are not part of this slice.

@@ -15,6 +15,7 @@
 #include "multiplayer/local_player_context.h"
 #include "multiplayer/loopback_transport.h"
 #include "multiplayer/network_bootstrap.h"
+#include "multiplayer/network_lobby.h"
 #include "multiplayer/player_character_state.h"
 #include "multiplayer/protocol.h"
 #include "multiplayer/save_sidecar.h"
@@ -859,6 +860,88 @@ void testNetworkLaunchAndBootstrap()
         "content mismatch preserves the rejection reason on both peers");
 }
 
+void pollNetworkLobbies(NetworkLobby& host, NetworkLobby& guest)
+{
+    for (int attempt = 0; attempt < 10000; attempt++) {
+        host.poll();
+        guest.poll();
+        if (host.state() != NetworkLobbyState::Waiting && guest.state() != NetworkLobbyState::Waiting) {
+            return;
+        }
+    }
+}
+
+void testNetworkCharacterLobby()
+{
+    SessionId sessionId { 0x1029384756ABCDEFULL };
+    LoopbackTransportPair pair = createLoopbackTransportPair();
+    NetworkLobby host;
+    NetworkLobby guest;
+    expect(host.start(NetworkLaunchMode::Host, sessionId, std::move(pair.first)), "network host starts its character lobby");
+    expect(guest.start(NetworkLaunchMode::Join, sessionId, std::move(pair.second)), "network guest starts its character lobby");
+
+    CharacterCreationSheet hostSheet = sampleCharacterSheet(kHostPlayerId, "Albert");
+    CharacterCreationSheet guestSheet = sampleCharacterSheet(kGuestPlayerId, "Max");
+    expect(host.submitLocalSheet(hostSheet) == CharacterLobbyError::None, "network host sends its character sheet");
+    expect(guest.submitLocalSheet(guestSheet) == CharacterLobbyError::None, "network guest sends its character sheet");
+    pollNetworkLobbies(host, guest);
+
+    expect(host.state() == NetworkLobbyState::Ready && guest.state() == NetworkLobbyState::Ready,
+        "host approval readies both network lobbies");
+    expect(host.localSheet() != nullptr && *host.localSheet() == hostSheet
+            && host.peerSheet() != nullptr && *host.peerSheet() == guestSheet,
+        "host retains both validated character sheets");
+    expect(guest.localSheet() != nullptr && *guest.localSheet() == guestSheet
+            && guest.peerSheet() != nullptr && *guest.peerSheet() == hostSheet,
+        "guest retains both validated character sheets");
+    expect(host.submitLocalSheet(hostSheet) == CharacterLobbyError::WrongPhase,
+        "ready lobby locks the submitted character sheet");
+    expect(host.takeTransport() != nullptr && guest.takeTransport() != nullptr,
+        "ready lobbies hand the connection to the game session");
+
+    LoopbackTransportPair wrongPlayerPair = createLoopbackTransportPair();
+    NetworkLobby wrongPlayerGuest;
+    expect(wrongPlayerGuest.start(NetworkLaunchMode::Join, sessionId, std::move(wrongPlayerPair.first)),
+        "guest lobby starts for local validation");
+    expect(wrongPlayerGuest.submitLocalSheet(hostSheet) == CharacterLobbyError::InvalidPlayerId,
+        "guest cannot submit a host-owned character sheet");
+
+    LoopbackTransportPair rejectedPair = createLoopbackTransportPair();
+    NetworkLobby rejectingHost;
+    expect(rejectingHost.start(NetworkLaunchMode::Host, sessionId, std::move(rejectedPair.first)),
+        "rejecting host lobby starts");
+    std::vector<std::uint8_t> encodedWrongSheet;
+    expect(encodeCharacterSheet(hostSheet, encodedWrongSheet) == CharacterLobbyError::None,
+        "wrong-owner character sheet encodes for hostile packet test");
+    ProtocolEnvelope wrongOwnerEnvelope;
+    wrongOwnerEnvelope.kind = MessageKind::Lobby;
+    wrongOwnerEnvelope.sessionId = sessionId;
+    wrongOwnerEnvelope.sequence = 2;
+    wrongOwnerEnvelope.payload = { 0, static_cast<std::uint8_t>(kNetworkLobbyVersion), 1, 0 };
+    wrongOwnerEnvelope.payload.insert(wrongOwnerEnvelope.payload.end(), encodedWrongSheet.begin(), encodedWrongSheet.end());
+    Packet wrongOwnerPacket;
+    expect(encodeEnvelope(wrongOwnerEnvelope, wrongOwnerPacket) == ProtocolError::None
+            && rejectedPair.second->send(std::move(wrongOwnerPacket)) == TransportSendResult::Sent,
+        "hostile peer sends a host-owned sheet in the guest slot");
+    rejectingHost.poll();
+    expect(rejectingHost.state() == NetworkLobbyState::Rejected
+            && rejectingHost.sheetError() == CharacterLobbyError::InvalidPlayerId,
+        "host rejects a peer sheet owned by the wrong player");
+
+    LoopbackTransportPair disconnectedPair = createLoopbackTransportPair();
+    NetworkLobby disconnectedHost;
+    NetworkLobby disconnectedGuest;
+    expect(disconnectedHost.start(NetworkLaunchMode::Host, sessionId, std::move(disconnectedPair.first)),
+        "disconnect test host lobby starts");
+    expect(disconnectedGuest.start(NetworkLaunchMode::Join, sessionId, std::move(disconnectedPair.second)),
+        "disconnect test guest lobby starts");
+    disconnectedGuest.stop();
+    disconnectedHost.poll();
+    expect(disconnectedHost.state() == NetworkLobbyState::Failed
+            && disconnectedHost.error() == NetworkLobbyError::Disconnected,
+        "waiting lobby reports a disconnected peer");
+}
+
 void testLocalSessionLifecycle()
 {
     LocalSession session;
@@ -1260,6 +1343,7 @@ int main()
     fallout::multiplayer::testLoopbackTransport();
     fallout::multiplayer::testTcpTransportAndHandshake();
     fallout::multiplayer::testNetworkLaunchAndBootstrap();
+    fallout::multiplayer::testNetworkCharacterLobby();
     fallout::multiplayer::testLocalSessionLifecycle();
     fallout::multiplayer::testAuthoritativeCommandProcessing();
     fallout::multiplayer::testSnapshotRoundTripAndRecovery();

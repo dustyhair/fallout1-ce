@@ -50,6 +50,8 @@ add_library(fallout-multiplayer-core STATIC
     "src/multiplayer/loopback_transport.h"
     "src/multiplayer/network_bootstrap.cc"
     "src/multiplayer/network_bootstrap.h"
+    "src/multiplayer/network_lobby.cc"
+    "src/multiplayer/network_lobby.h"
     "src/multiplayer/player_character_state.cc"
     "src/multiplayer/player_character_state.h"
     "src/multiplayer/protocol.cc"

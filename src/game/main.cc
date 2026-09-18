@@ -136,6 +136,11 @@ int gnw_main(int argc, char** argv)
                 main_menu_hide(true);
                 main_menu_destroy();
                 if (select_character() == 2) {
+                    if (!multiplayer::networkRuntimeSubmitLocalCharacter(obj_dude)
+                        || !multiplayer::networkRuntimeWaitForLobby()) {
+                        main_menu_create();
+                        break;
+                    }
                     gmovie_play(MOVIE_OVRINTRO, GAME_MOVIE_STOP_MUSIC);
                     roll_set_seed(-1);
                     main_load_new(mainMap);

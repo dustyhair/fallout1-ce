@@ -34,6 +34,7 @@ typedef enum MainMenuButton {
 
 static int main_menu_fatal_error();
 static void main_menu_play_sound(const char* fileName);
+static void main_menu_draw_multiplayer_status();
 
 // 0x505A84
 static int main_window = -1;
@@ -91,6 +92,8 @@ static CacheEntry* button_down_key;
 
 // 0x612DE0
 static CacheEntry* background_key;
+
+static char multiplayer_status[128];
 
 // 0x472F80
 int main_menu_create()
@@ -210,8 +213,59 @@ int main_menu_create()
 
     main_menu_created = true;
     main_menu_is_hidden = true;
+    main_menu_draw_multiplayer_status();
 
     return 0;
+}
+
+void main_menu_set_multiplayer_status(const char* status)
+{
+    if (status == NULL) {
+        multiplayer_status[0] = '\0';
+    } else {
+        strncpy(multiplayer_status, status, sizeof(multiplayer_status) - 1);
+        multiplayer_status[sizeof(multiplayer_status) - 1] = '\0';
+    }
+    main_menu_draw_multiplayer_status();
+}
+
+static void main_menu_draw_multiplayer_status()
+{
+    if (!main_menu_created || main_window == -1 || main_window_buf == NULL || multiplayer_status[0] == '\0') {
+        return;
+    }
+
+    constexpr int statusY = 435;
+    constexpr int statusHeight = 18;
+    CacheEntry* statusBackgroundKey;
+    int backgroundFid = art_id(OBJ_TYPE_INTERFACE, 140, 0, 0, 0);
+    unsigned char* statusBackground = art_ptr_lock_data(backgroundFid, 0, 0, &statusBackgroundKey);
+    if (statusBackground != NULL) {
+        buf_to_buf(statusBackground + MAIN_MENU_WINDOW_WIDTH * statusY,
+            MAIN_MENU_WINDOW_WIDTH,
+            statusHeight,
+            MAIN_MENU_WINDOW_WIDTH,
+            main_window_buf + MAIN_MENU_WINDOW_WIDTH * statusY,
+            MAIN_MENU_WINDOW_WIDTH);
+        art_ptr_unlock(statusBackgroundKey);
+    }
+
+    int oldFont = text_curr();
+    text_font(100);
+    int width = text_width(multiplayer_status);
+    int x = (MAIN_MENU_WINDOW_WIDTH - width) / 2;
+    if (x < 5) {
+        x = 5;
+    }
+    text_to_buf(main_window_buf + MAIN_MENU_WINDOW_WIDTH * statusY + x,
+        multiplayer_status,
+        MAIN_MENU_WINDOW_WIDTH - x - 5,
+        MAIN_MENU_WINDOW_WIDTH,
+        colorTable[21091]);
+    text_font(oldFont);
+
+    Rect rect = { 0, statusY, MAIN_MENU_WINDOW_WIDTH - 1, statusY + statusHeight - 1 };
+    win_draw_rect(main_window, &rect);
 }
 
 // 0x473298
