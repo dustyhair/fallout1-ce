@@ -1,6 +1,6 @@
 # Two-player co-op plan
 
-Status: Phases 0 and 1 are complete on the `multiplayer-plan` branch. Phase 2 is in progress. Host and guest now connect from explicit launch modes, display their state on the main menu, exchange validated character sheets, wait for host lobby approval, and exchange versioned gameplay commands, results, and events. The first real lobby UI is next.
+Status: Phases 0 and 1 are complete on the `multiplayer-plan` branch. Phase 2 is in progress. Host and guest can connect from the in-game multiplayer lobby or explicit launch modes, exchange validated character sheets, start together, and exchange versioned gameplay commands, results, and events. Live command routing and recovery are next.
 
 ## Goal
 
@@ -374,8 +374,9 @@ Do not add a networking dependency, lobby UI, or broad player-state refactor in 
 1. [x] Add a [bounded, nonblocking TCP packet transport](docs/multiplayer/direct-ip-transport.md) and a versioned content-check handshake.
 2. [x] Add explicit host and direct-IP join launch modes around the TCP connection bootstrap.
 3. [x] Send validated lobby character sheets through the network transport.
-4. [x] Encode commands, results, and events for the existing authoritative processor.
-5. [ ] Add event journaling, snapshot recovery, and reconnect tokens to the network session.
+4. [x] Add a sixth main-menu entry and a [native two-player lobby](docs/multiplayer/lobby-screen.md) for hosting, joining, and character readiness.
+5. [x] Encode commands, results, and events for the existing authoritative processor.
+6. [ ] Add event journaling, snapshot recovery, and reconnect tokens to the network session.
 
 ## Testing strategy
 

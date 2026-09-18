@@ -593,7 +593,7 @@ int win_get_str(char* dest, int length, const char* title, int x, int y)
 
     win_draw(win);
 
-    win_input_str(win,
+    int rc = win_input_str(win,
         dest,
         length,
         16,
@@ -603,7 +603,7 @@ int win_get_str(char* dest, int length, const char* title, int x, int y)
 
     win_delete(win);
 
-    return 0;
+    return rc;
 }
 
 // 0x4C7E78

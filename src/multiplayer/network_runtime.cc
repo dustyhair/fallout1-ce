@@ -245,6 +245,34 @@ void networkRuntimeBackgroundProcess()
     reportLobbyStatus();
 }
 
+bool startConfiguredRuntime()
+{
+    std::uint64_t digest = compatibilityDigest();
+    if (digest == 0) {
+        setStatus("MULTIPLAYER CONNECTION FAILED: COULD NOT FINGERPRINT GAME DATA");
+        return false;
+    }
+
+    SessionId sessionId = launchOptions.mode == NetworkLaunchMode::Host ? createSessionId() : SessionId {};
+    if (!bootstrap.start(launchOptions, digest, sessionId)) {
+        setStatus(std::string("MULTIPLAYER CONNECTION FAILED: ") + networkBootstrapErrorMessage(bootstrap.error()));
+        return false;
+    }
+
+    reportedState = bootstrap.state();
+    if (launchOptions.mode == NetworkLaunchMode::Host) {
+        setStatus("MULTIPLAYER HOST: WAITING ON PORT " + std::to_string(bootstrap.port()));
+    } else {
+        setStatus("MULTIPLAYER GUEST: CONNECTING TO " + launchOptions.address + ":" + std::to_string(launchOptions.port));
+    }
+
+    if (!backgroundProcessRegistered) {
+        add_bk_process(networkRuntimeBackgroundProcess);
+        backgroundProcessRegistered = true;
+    }
+    return true;
+}
+
 } // namespace
 
 bool networkRuntimeConfigure(int argc, char** argv)
@@ -488,30 +516,74 @@ bool networkRuntimeStart()
         return true;
     }
 
-    std::uint64_t digest = compatibilityDigest();
-    if (digest == 0) {
-        std::fprintf(stderr, "Multiplayer launch failed: could not fingerprint master.dat and critter.dat.\n");
-        debug_printf("Multiplayer launch failed: could not fingerprint master.dat and critter.dat.\n");
+    return startConfiguredRuntime();
+}
+
+bool networkRuntimeHost(std::uint16_t port)
+{
+    networkRuntimeDisconnect();
+    launchOptions.mode = NetworkLaunchMode::Host;
+    launchOptions.port = port;
+    launchOptions.address.clear();
+    return startConfiguredRuntime();
+}
+
+bool networkRuntimeJoin(const char* endpoint)
+{
+    std::string address;
+    std::uint16_t port;
+    if (endpoint == nullptr || !parseNetworkJoinEndpoint(endpoint, address, port)) {
+        setStatus("MULTIPLAYER CONNECTION FAILED: INVALID HOST ADDRESS");
         return false;
     }
 
-    SessionId sessionId = launchOptions.mode == NetworkLaunchMode::Host ? createSessionId() : SessionId {};
-    if (!bootstrap.start(launchOptions, digest, sessionId)) {
-        std::fprintf(stderr, "Multiplayer launch failed: %s.\n", networkBootstrapErrorMessage(bootstrap.error()));
-        debug_printf("Multiplayer launch failed: %s.\n", networkBootstrapErrorMessage(bootstrap.error()));
-        return false;
-    }
+    networkRuntimeDisconnect();
+    launchOptions.mode = NetworkLaunchMode::Join;
+    launchOptions.address = address;
+    launchOptions.port = port;
+    return startConfiguredRuntime();
+}
 
-    reportedState = bootstrap.state();
-    if (launchOptions.mode == NetworkLaunchMode::Host) {
-        setStatus("MULTIPLAYER HOST: WAITING ON PORT " + std::to_string(bootstrap.port()));
-    } else {
-        setStatus("MULTIPLAYER GUEST: CONNECTING TO " + launchOptions.address + ":" + std::to_string(launchOptions.port));
-    }
+void networkRuntimeDisconnect()
+{
+    networkRuntimeStop();
+    launchOptions = NetworkLaunchOptions {};
+    pendingLocalSheet.reset();
+    reportedState = NetworkBootstrapState::Disabled;
+    setStatus("MULTIPLAYER: NOT CONNECTED");
+}
 
-    add_bk_process(networkRuntimeBackgroundProcess);
-    backgroundProcessRegistered = true;
-    return true;
+NetworkLaunchMode networkRuntimeMode()
+{
+    return launchOptions.mode;
+}
+
+bool networkRuntimeConnected()
+{
+    return lobbyStarted
+        && (lobby.state() == NetworkLobbyState::Waiting || lobby.state() == NetworkLobbyState::Ready);
+}
+
+bool networkRuntimeFailed()
+{
+    return bootstrap.state() == NetworkBootstrapState::Rejected
+        || bootstrap.state() == NetworkBootstrapState::Failed
+        || (lobbyStarted && (lobby.state() == NetworkLobbyState::Rejected || lobby.state() == NetworkLobbyState::Failed));
+}
+
+const char* networkRuntimeStatus()
+{
+    return runtimeStatus.empty() ? "MULTIPLAYER: NOT CONNECTED" : runtimeStatus.c_str();
+}
+
+const CharacterCreationSheet* networkRuntimeLocalSheet()
+{
+    return lobbyStarted ? lobby.localSheet() : nullptr;
+}
+
+const CharacterCreationSheet* networkRuntimePeerSheet()
+{
+    return lobbyStarted ? lobby.peerSheet() : nullptr;
 }
 
 bool networkRuntimeSubmitLocalCharacter(Object* actor)

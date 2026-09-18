@@ -78,6 +78,8 @@ target_sources(${EXECUTABLE_NAME} PRIVATE
     "src/multiplayer/character_build_bridge.h"
     "src/multiplayer/developer_local_session.cc"
     "src/multiplayer/developer_local_session.h"
+    "src/multiplayer/lobby_screen.cc"
+    "src/multiplayer/lobby_screen.h"
     "src/multiplayer/network_runtime.cc"
     "src/multiplayer/network_runtime.h"
     "src/multiplayer/presentation_bridge.cc"

@@ -78,6 +78,11 @@ bool setMode(NetworkLaunchParseResult& result, NetworkLaunchMode mode)
 
 } // namespace
 
+bool parseNetworkJoinEndpoint(const std::string& value, std::string& address, std::uint16_t& port)
+{
+    return parseJoinAddress(value, address, port);
+}
+
 NetworkLaunchParseResult parseNetworkLaunchOptions(int argc, char* const* argv)
 {
     NetworkLaunchParseResult result;

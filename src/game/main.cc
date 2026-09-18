@@ -37,6 +37,7 @@
 #include "game/wordwrap.h"
 #include "game/worldmap.h"
 #include "multiplayer/developer_local_session.h"
+#include "multiplayer/lobby_screen.h"
 #include "multiplayer/network_runtime.h"
 #include "plib/color/color.h"
 #include "plib/gnw/debug.h"
@@ -59,6 +60,7 @@ static int main_load_new(char* fname);
 static int main_loadgame_new();
 static void main_unload_new();
 static void main_game_loop();
+static void main_start_selected_game();
 static bool main_selfrun_init();
 static void main_selfrun_exit();
 static void main_selfrun_record();
@@ -149,26 +151,19 @@ int gnw_main(int argc, char** argv)
                         main_menu_create();
                         break;
                     }
-                    gmovie_play(MOVIE_OVRINTRO, GAME_MOVIE_STOP_MUSIC);
-                    roll_set_seed(-1);
-                    main_load_new(mainMap);
-                    main_game_loop();
-                    palette_fade_to(white_palette);
-
-                    // NOTE: Uninline.
-                    main_unload_new();
-
-                    // NOTE: Uninline.
-                    main_reset_system();
-
-                    if (main_show_death_scene != 0) {
-                        main_death_scene();
-                        main_show_death_scene = 0;
-                    }
+                    main_start_selected_game();
                 }
 
                 main_menu_create();
 
+                break;
+            case MAIN_MENU_MULTIPLAYER:
+                main_menu_hide(true);
+                main_menu_destroy();
+                if (multiplayer::multiplayerLobbyScreen() == multiplayer::MultiplayerLobbyScreenResult::StartGame) {
+                    main_start_selected_game();
+                }
+                main_menu_create();
                 break;
             case MAIN_MENU_LOAD_GAME:
                 if (1) {
@@ -246,6 +241,26 @@ int gnw_main(int argc, char** argv)
     autorun_mutex_destroy();
 
     return 0;
+}
+
+static void main_start_selected_game()
+{
+    gmovie_play(MOVIE_OVRINTRO, GAME_MOVIE_STOP_MUSIC);
+    roll_set_seed(-1);
+    main_load_new(mainMap);
+    main_game_loop();
+    palette_fade_to(white_palette);
+
+    // NOTE: Uninline.
+    main_unload_new();
+
+    // NOTE: Uninline.
+    main_reset_system();
+
+    if (main_show_death_scene != 0) {
+        main_death_scene();
+        main_show_death_scene = 0;
+    }
 }
 
 // 0x4728CC

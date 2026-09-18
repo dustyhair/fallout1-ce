@@ -970,6 +970,17 @@ void testNetworkLaunchAndBootstrap()
     expect(joinIpv6 && joinIpv6.options.address == "::1" && joinIpv6.options.port == 45125,
         "join launch parses a bracketed IPv6 endpoint");
 
+    std::string address;
+    std::uint16_t port = 0;
+    expect(parseNetworkJoinEndpoint("localhost", address, port)
+            && address == "localhost" && port == kDefaultMultiplayerPort,
+        "lobby join parser accepts a host with the default port");
+    expect(parseNetworkJoinEndpoint("127.0.0.1:45126", address, port)
+            && address == "127.0.0.1" && port == 45126,
+        "lobby join parser accepts an IPv4 endpoint");
+    expect(!parseNetworkJoinEndpoint("localhost:0", address, port),
+        "lobby join parser rejects an invalid port");
+
     expect(parseLaunchArguments({ "fallout-ce", "--multiplayer-join" }).error == NetworkLaunchParseError::MissingJoinAddress,
         "join launch rejects a missing address");
     expect(parseLaunchArguments({ "fallout-ce", "--multiplayer-join", "--some-other-option" }).error == NetworkLaunchParseError::MissingJoinAddress,

@@ -47,6 +47,7 @@ struct NetworkLaunchParseResult {
 };
 
 NetworkLaunchParseResult parseNetworkLaunchOptions(int argc, char* const* argv);
+bool parseNetworkJoinEndpoint(const std::string& value, std::string& address, std::uint16_t& port);
 const char* networkLaunchParseErrorMessage(NetworkLaunchParseError error);
 
 enum class NetworkBootstrapState {
