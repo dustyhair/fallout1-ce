@@ -18,6 +18,7 @@ enum class EventType : std::uint8_t {
     DoorUseStarted = 2,
     ItemPickupStarted = 3,
     LootStarted = 4,
+    ActorFacingChanged = 5,
 };
 
 constexpr std::size_t kCommandHeaderSize = 28;
@@ -25,8 +26,9 @@ constexpr std::size_t kMoveCommandSize = kCommandHeaderSize + 12;
 constexpr std::size_t kTargetCommandSize = kCommandHeaderSize + 4;
 constexpr std::size_t kCommandResultSize = 24;
 constexpr std::size_t kEventHeaderSize = 20;
-constexpr std::size_t kMovementEventSize = kEventHeaderSize + 16;
+constexpr std::size_t kMovementEventHeaderSize = kEventHeaderSize + 20;
 constexpr std::size_t kTargetEventSize = kEventHeaderSize + 8;
+constexpr std::size_t kFacingEventSize = kEventHeaderSize + 8;
 
 void appendUInt16(std::vector<std::uint8_t>& bytes, std::uint16_t value)
 {
@@ -214,6 +216,25 @@ GameplayWireError validateEvent(const GameEvent& event)
         }
         if (movement->destinationTile < 0 || movement->elevation < 0 || movement->elevation > 2) {
             return GameplayWireError::InvalidMove;
+        }
+        if (movement->path.size() > kMaximumMovementPathLength
+            || (movement->path.empty() && movement->startingTile != -1)
+            || (!movement->path.empty() && movement->startingTile < 0)) {
+            return GameplayWireError::InvalidMove;
+        }
+        for (std::uint8_t rotation : movement->path) {
+            if (rotation >= kActorRotationCount) {
+                return GameplayWireError::InvalidMove;
+            }
+        }
+        return GameplayWireError::None;
+    }
+    if (const auto* facing = std::get_if<ActorFacingChangedEvent>(&event.payload)) {
+        if (!isValid(facing->actorId)) {
+            return GameplayWireError::InvalidEntityId;
+        }
+        if (facing->rotation < 0 || facing->rotation >= kActorRotationCount) {
+            return GameplayWireError::InvalidRotation;
         }
         return GameplayWireError::None;
     }
@@ -424,8 +445,15 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
         appendUInt32(envelope.payload, movement->actorId.value);
         appendInt32(envelope.payload, movement->destinationTile);
         appendInt32(envelope.payload, movement->elevation);
+        appendInt32(envelope.payload, movement->startingTile);
         envelope.payload.push_back(movement->running ? 1 : 0);
-        envelope.payload.insert(envelope.payload.end(), 3, 0);
+        envelope.payload.push_back(0);
+        appendUInt16(envelope.payload, static_cast<std::uint16_t>(movement->path.size()));
+        envelope.payload.insert(envelope.payload.end(), movement->path.begin(), movement->path.end());
+    } else if (const auto* facing = std::get_if<ActorFacingChangedEvent>(&event.payload)) {
+        appendEventHeader(event, EventType::ActorFacingChanged, envelope.payload);
+        appendUInt32(envelope.payload, facing->actorId.value);
+        appendInt32(envelope.payload, facing->rotation);
     } else if (const auto* door = std::get_if<DoorUseStartedEvent>(&event.payload)) {
         appendEventHeader(event, EventType::DoorUseStarted, envelope.payload);
         appendUInt32(envelope.payload, door->actorId.value);
@@ -468,19 +496,39 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
     result.event.causedBy.value = readUInt64(envelope.payload, 12);
     switch (type) {
     case EventType::ActorMovementStarted:
-        if (envelope.payload.size() != kMovementEventSize) {
+        if (envelope.payload.size() < kMovementEventHeaderSize) {
             result.error = GameplayWireError::InvalidLength;
             return result;
         }
-        if (envelope.payload[32] > 1 || envelope.payload[33] != 0 || envelope.payload[34] != 0 || envelope.payload[35] != 0) {
+        if (envelope.payload[36] > 1 || envelope.payload[37] != 0) {
             result.error = GameplayWireError::InvalidReservedField;
             return result;
         }
-        result.event.payload = ActorMovementStartedEvent {
+        {
+            std::size_t pathLength = readUInt16(envelope.payload, 38);
+            if (pathLength > kMaximumMovementPathLength
+                || envelope.payload.size() != kMovementEventHeaderSize + pathLength) {
+                result.error = GameplayWireError::InvalidLength;
+                return result;
+            }
+            result.event.payload = ActorMovementStartedEvent {
+                EntityId { readUInt32(envelope.payload, 20) },
+                readInt32(envelope.payload, 24),
+                readInt32(envelope.payload, 28),
+                envelope.payload[36] != 0,
+                readInt32(envelope.payload, 32),
+                std::vector<std::uint8_t>(envelope.payload.begin() + kMovementEventHeaderSize, envelope.payload.end()),
+            };
+        }
+        break;
+    case EventType::ActorFacingChanged:
+        if (envelope.payload.size() != kFacingEventSize) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.event.payload = ActorFacingChangedEvent {
             EntityId { readUInt32(envelope.payload, 20) },
             readInt32(envelope.payload, 24),
-            readInt32(envelope.payload, 28),
-            envelope.payload[32] != 0,
         };
         break;
     case EventType::DoorUseStarted:
@@ -543,6 +591,8 @@ const char* gameplayWireErrorMessage(GameplayWireError error)
         return "invalid phase revision";
     case GameplayWireError::InvalidMove:
         return "invalid movement payload";
+    case GameplayWireError::InvalidRotation:
+        return "invalid actor rotation";
     case GameplayWireError::InvalidStatus:
         return "invalid command status";
     case GameplayWireError::InvalidRejection:

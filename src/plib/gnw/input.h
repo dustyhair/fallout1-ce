@@ -49,6 +49,7 @@ void GNW95_input_exit();
 void GNW95_process_message();
 void GNW95_clear_time_stamps();
 void GNW95_lost_focus();
+void set_background_processing_when_inactive(bool enabled);
 
 void beginTextInput();
 void endTextInput();

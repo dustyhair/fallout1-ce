@@ -68,6 +68,7 @@ typedef enum AnimationKind {
     ANIM_KIND_26 = 26,
     ANIM_KIND_27 = 27,
     ANIM_KIND_NOOP = 28,
+    ANIM_KIND_MOVE_ALONG_PATH = 29,
 } AnimationKind;
 
 typedef enum AnimationSequenceFlags {
@@ -203,6 +204,8 @@ typedef struct AnimationDescription {
         void* param3;
     };
     CacheEntry* artCacheKey;
+    int pathLength;
+    unsigned char path[kAnimationMaximumPathLength];
 } AnimationDescription;
 
 typedef struct AnimationSequence {
@@ -261,6 +264,7 @@ static int anim_move_to_object(Object* from, Object* to, int a3, int anim, int a
 static int make_stair_path(Object* object, int from, int fromElevation, int to, int toElevation, StraightPathNode* a6, Object** obstaclePtr);
 static int anim_move_to_tile(Object* obj, int tile_num, int elev, int a4, int anim, int animationSequenceIndex);
 static int anim_move(Object* obj, int tile, int elev, int a3, int anim, int a5, int animationSequenceIndex);
+static int anim_move_along_path(Object* obj, int tile, const unsigned char* rotations, int pathLength, int anim, int animationSequenceIndex);
 static int anim_move_straight_to_tile(Object* obj, int tile, int elevation, int anim, int animationSequenceIndex, int flags);
 static void object_move(int index);
 static void object_straight_move(int index);
@@ -737,6 +741,47 @@ int register_object_run_to_tile(Object* owner, int tile, int elevation, int acti
 
     curr_anim_counter++;
 
+    return 0;
+}
+
+int register_object_move_along_path(
+    Object* owner,
+    int destinationTile,
+    int elevation,
+    const unsigned char* rotations,
+    int pathLength,
+    bool running,
+    int delay)
+{
+    if (check_registry(owner) == -1
+        || rotations == nullptr
+        || pathLength <= 0
+        || pathLength > kAnimationMaximumPathLength
+        || elevation != owner->elevation) {
+        anim_cleanup();
+        return -1;
+    }
+
+    AnimationDescription* animationDescription = &(anim_set[curr_anim_set].animations[curr_anim_counter]);
+    animationDescription->kind = ANIM_KIND_MOVE_ALONG_PATH;
+    animationDescription->owner = owner;
+    animationDescription->tile = destinationTile;
+    animationDescription->elevation = elevation;
+    animationDescription->anim = running ? ANIM_RUNNING : ANIM_WALK;
+    if (!art_exists(art_id(FID_TYPE(owner->fid), owner->fid & 0xFFF, animationDescription->anim, 0, owner->rotation + 1))) {
+        animationDescription->anim = ANIM_WALK;
+    }
+    animationDescription->delay = delay;
+    animationDescription->pathLength = pathLength;
+    memcpy(animationDescription->path, rotations, pathLength);
+
+    int fid = art_id(FID_TYPE(owner->fid), owner->fid & 0xFFF, animationDescription->anim, (owner->fid & 0xF000) >> 12, owner->rotation + 1);
+    if (anim_preload(owner, fid, &(animationDescription->artCacheKey)) == -1) {
+        anim_cleanup();
+        return -1;
+    }
+
+    curr_anim_counter++;
     return 0;
 }
 
@@ -1453,6 +1498,14 @@ static int anim_set_check(int animationSequenceIndex)
             break;
         case ANIM_KIND_MOVE_TO_TILE:
             rc = anim_move_to_tile(animationDescription->owner, animationDescription->tile, animationDescription->elevation, animationDescription->actionPoints, animationDescription->anim, animationSequenceIndex);
+            break;
+        case ANIM_KIND_MOVE_ALONG_PATH:
+            rc = anim_move_along_path(animationDescription->owner,
+                animationDescription->tile,
+                animationDescription->path,
+                animationDescription->pathLength,
+                animationDescription->anim,
+                animationSequenceIndex);
             break;
         case ANIM_KIND_MOVE_TO_TILE_STRAIGHT:
             rc = anim_move_straight_to_tile(animationDescription->owner, animationDescription->tile, animationDescription->elevation, animationDescription->anim, animationSequenceIndex, 0);
@@ -2445,6 +2498,36 @@ static int anim_move(Object* obj, int tile, int elev, int a3, int anim, int a5, 
         sad_entry->field_1C = a3;
     }
 
+    return curr_sad++;
+}
+
+static int anim_move_along_path(
+    Object* obj,
+    int tile,
+    const unsigned char* rotations,
+    int pathLength,
+    int anim,
+    int animationSequenceIndex)
+{
+    if (curr_sad == ANIMATION_SAD_LIST_CAPACITY
+        || rotations == nullptr
+        || pathLength <= 0
+        || pathLength > kAnimationMaximumPathLength) {
+        return -1;
+    }
+
+    AnimationSad* sad_entry = &(sad[curr_sad]);
+    sad_entry->flags = 0;
+    sad_entry->obj = obj;
+    sad_entry->field_20 = -2000;
+    sad_entry->fid = art_id(FID_TYPE(obj->fid), obj->fid & 0xFFF, anim, (obj->fid & 0xF000) >> 12, obj->rotation + 1);
+    sad_entry->animationTimestamp = 0;
+    sad_entry->ticksPerFrame = compute_tpf(obj, sad_entry->fid);
+    sad_entry->field_24 = tile;
+    sad_entry->animationSequenceIndex = animationSequenceIndex;
+    sad_entry->anim = anim;
+    sad_entry->field_1C = pathLength;
+    memcpy(sad_entry->rotations, rotations, pathLength);
     return curr_sad++;
 }
 

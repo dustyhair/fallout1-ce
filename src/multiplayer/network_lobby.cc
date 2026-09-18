@@ -1,6 +1,7 @@
 #include "multiplayer/network_lobby.h"
 
 #include <utility>
+#include <variant>
 
 #include "multiplayer/gameplay_wire.h"
 #include "multiplayer/protocol.h"
@@ -29,6 +30,20 @@ bool isKnownCharacterLobbyError(CharacterLobbyError error)
     return error > CharacterLobbyError::None && error <= CharacterLobbyError::TrailingData;
 }
 
+EntityId eventActorId(const GameEventPayload& payload)
+{
+    return std::visit([](const auto& event) {
+        return event.actorId;
+    }, payload);
+}
+
+bool isSupportedLiveEvent(const GameEventPayload& payload)
+{
+    return std::holds_alternative<ActorMovementStartedEvent>(payload)
+        || std::holds_alternative<ActorFacingChangedEvent>(payload)
+        || std::holds_alternative<DoorUseStartedEvent>(payload);
+}
+
 } // namespace
 
 bool NetworkLobby::start(NetworkLaunchMode mode, SessionId sessionId, std::unique_ptr<Transport> transport)
@@ -43,8 +58,8 @@ bool NetworkLobby::start(NetworkLaunchMode mode, SessionId sessionId, std::uniqu
     _localSheet.reset();
     _peerSheet.reset();
     _startRequested = false;
-    _nextMovementSequence = 1;
-    _peerMoves.clear();
+    _nextEventSequence = 1;
+    _peerEvents.clear();
 
     if ((mode != NetworkLaunchMode::Host && mode != NetworkLaunchMode::Join)
         || sessionId.value == 0
@@ -60,22 +75,46 @@ bool NetworkLobby::start(NetworkLaunchMode mode, SessionId sessionId, std::uniqu
     return true;
 }
 
-bool NetworkLobby::sendLocalMove(int destinationTile, int elevation, bool running)
+bool NetworkLobby::sendLocalMove(
+    int destinationTile,
+    int elevation,
+    bool running,
+    int startingTile,
+    const std::vector<std::uint8_t>& path)
+{
+    PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
+    return sendLocalEvent(ActorMovementStartedEvent {
+        EntityId { playerId.value },
+        destinationTile,
+        elevation,
+        running,
+        startingTile,
+        path,
+    });
+}
+
+bool NetworkLobby::sendLocalDoorUse(EntityId targetId)
+{
+    PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
+    return sendLocalEvent(DoorUseStartedEvent { EntityId { playerId.value }, targetId });
+}
+
+bool NetworkLobby::sendLocalFacing(int rotation)
+{
+    PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
+    return sendLocalEvent(ActorFacingChangedEvent { EntityId { playerId.value }, rotation });
+}
+
+bool NetworkLobby::sendLocalEvent(GameEventPayload payload)
 {
     if (_state != NetworkLobbyState::Ready || !_startRequested || _transport == nullptr) {
         return false;
     }
 
-    PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
     GameEvent event;
-    event.sequence.value = _nextMovementSequence;
-    event.causedBy.value = _nextMovementSequence;
-    event.payload = ActorMovementStartedEvent {
-        EntityId { playerId.value },
-        destinationTile,
-        elevation,
-        running,
-    };
+    event.sequence.value = _nextEventSequence;
+    event.causedBy.value = _nextEventSequence;
+    event.payload = std::move(payload);
 
     ProtocolEnvelope envelope;
     envelope.sessionId = _sessionId;
@@ -91,19 +130,19 @@ bool NetworkLobby::sendLocalMove(int destinationTile, int elevation, bool runnin
         return false;
     }
 
-    _nextMovementSequence++;
+    _nextEventSequence++;
     return true;
 }
 
-std::optional<ActorMovementStartedEvent> NetworkLobby::takePeerMove()
+std::optional<GameEvent> NetworkLobby::takePeerEvent()
 {
-    if (_peerMoves.empty()) {
+    if (_peerEvents.empty()) {
         return std::nullopt;
     }
 
-    ActorMovementStartedEvent movement = _peerMoves.front();
-    _peerMoves.pop_front();
-    return movement;
+    GameEvent event = std::move(_peerEvents.front());
+    _peerEvents.pop_front();
+    return event;
 }
 
 CharacterLobbyError NetworkLobby::submitLocalSheet(const CharacterCreationSheet& sheet)
@@ -193,7 +232,7 @@ void NetworkLobby::stop()
         _transport.reset();
     }
     _startRequested = false;
-    _peerMoves.clear();
+    _peerEvents.clear();
     _state = NetworkLobbyState::Stopped;
 }
 
@@ -281,16 +320,16 @@ void NetworkLobby::handlePacket(const Packet& packet)
 
     if (decoded.envelope.kind == MessageKind::Event) {
         GameEventDecodeResult event = decodeGameEvent(decoded.envelope);
-        const auto* movement = event ? std::get_if<ActorMovementStartedEvent>(&event.event.payload) : nullptr;
         PlayerId peerPlayerId = _mode == NetworkLaunchMode::Host ? kGuestPlayerId : kHostPlayerId;
         if (_state != NetworkLobbyState::Ready
             || !_startRequested
-            || movement == nullptr
-            || movement->actorId != EntityId { peerPlayerId.value }) {
+            || !event
+            || !isSupportedLiveEvent(event.event.payload)
+            || eventActorId(event.event.payload) != EntityId { peerPlayerId.value }) {
             fail(NetworkLobbyError::UnexpectedMessage);
             return;
         }
-        _peerMoves.push_back(*movement);
+        _peerEvents.push_back(std::move(event.event));
         return;
     }
 

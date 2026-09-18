@@ -119,6 +119,10 @@ static int input_put;
 // 0x671F04
 static bool bk_disabled;
 
+// Multiplayer peers must continue polling the network and advancing remote
+// actor animations when their window is on an inactive workspace.
+static bool background_processing_when_inactive;
+
 // 0x671F08
 static unsigned int bk_process_time;
 
@@ -1212,7 +1216,10 @@ void GNW95_lost_focus()
     while (!GNW95_isActive) {
         GNW95_process_message();
 
-        if (idle_func != NULL) {
+        if (background_processing_when_inactive) {
+            GNW_do_bk_process();
+            SDL_Delay(16);
+        } else if (idle_func != NULL) {
             idle_func();
         }
     }
@@ -1220,6 +1227,11 @@ void GNW95_lost_focus()
     if (focus_func != NULL) {
         focus_func(1);
     }
+}
+
+void set_background_processing_when_inactive(bool enabled)
+{
+    background_processing_when_inactive = enabled;
 }
 
 static void idleImpl()

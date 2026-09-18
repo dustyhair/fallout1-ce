@@ -1,12 +1,19 @@
 #include "multiplayer/network_world.h"
 
+#include <algorithm>
+#include <tuple>
+#include <vector>
+
+#include "game/actions.h"
 #include "game/anim.h"
+#include "game/combat.h"
 #include "game/critter.h"
 #include "game/intface.h"
 #include "game/map_defs.h"
 #include "game/object.h"
 #include "game/protinst.h"
 #include "game/stat.h"
+#include "game/tile.h"
 #include "multiplayer/acting_player_context.h"
 #include "multiplayer/local_player_context.h"
 #include "multiplayer/local_session.h"
@@ -18,6 +25,28 @@ namespace {
 
 LocalSession session;
 Object* peerActor = nullptr;
+
+bool registerWorldDoors()
+{
+    std::vector<Object*> doors;
+    for (Object* object = obj_find_first(); object != nullptr; object = obj_find_next()) {
+        if (obj_is_a_portal(object)) {
+            doors.push_back(object);
+        }
+    }
+
+    std::sort(doors.begin(), doors.end(), [](const Object* lhs, const Object* rhs) {
+        return std::tie(lhs->elevation, lhs->tile, lhs->pid, lhs->id, lhs->fid)
+            < std::tie(rhs->elevation, rhs->tile, rhs->pid, rhs->id, rhs->fid);
+    });
+
+    for (Object* door : doors) {
+        if (!session.registerWorldObject(door)) {
+            return false;
+        }
+    }
+    return true;
+}
 
 void erasePeerActor()
 {
@@ -135,7 +164,9 @@ bool networkWorldEnter(NetworkLaunchMode mode,
     localPlayer->connection = ConnectionState::Connected;
     remotePlayer->ownership = PlayerOwnership::RemoteControl;
     remotePlayer->connection = ConnectionState::Connected;
-    if (!refreshPlayer(kHostPlayerId) || !refreshPlayer(kGuestPlayerId)) {
+    if (!registerWorldDoors()
+        || !refreshPlayer(kHostPlayerId)
+        || !refreshPlayer(kGuestPlayerId)) {
         session.stop();
         erasePeerActor();
         return false;
@@ -160,15 +191,107 @@ bool networkWorldApplyPeerMove(const ActorMovementStartedEvent& movement)
         return false;
     }
 
+    if (!movement.path.empty()) {
+        if (movement.path.size() > kMaximumMovementPathLength
+            || movement.path.size() > static_cast<std::size_t>(kAnimationMaximumPathLength)
+            || !hexGridTileIsValid(movement.startingTile)) {
+            return false;
+        }
+
+        int pathTile = movement.startingTile;
+        for (std::uint8_t rotation : movement.path) {
+            if (rotation >= ROTATION_COUNT) {
+                return false;
+            }
+            pathTile = tile_num_in_direction(pathTile, rotation, 1);
+            if (!hexGridTileIsValid(pathTile)) {
+                return false;
+            }
+        }
+        if (pathTile != movement.destinationTile) {
+            return false;
+        }
+    }
+
     register_clear(peerActor);
+    if (!movement.path.empty() && peerActor->tile != movement.startingTile) {
+        Rect dirtyRect;
+        if (obj_move_to_tile(peerActor, movement.startingTile, movement.elevation, &dirtyRect) == -1) {
+            return false;
+        }
+        tile_refresh_rect(&dirtyRect, peerActor->elevation);
+    }
     if (register_begin(ANIMATION_REQUEST_UNRESERVED) == -1) {
         return false;
     }
-    int rc = movement.running
-        ? register_object_run_to_tile(peerActor, movement.destinationTile, movement.elevation, -1, 0)
-        : register_object_move_to_tile(peerActor, movement.destinationTile, movement.elevation, -1, 0);
+    int rc;
+    if (!movement.path.empty()) {
+        rc = register_object_move_along_path(peerActor,
+            movement.destinationTile,
+            movement.elevation,
+            movement.path.data(),
+            static_cast<int>(movement.path.size()),
+            movement.running,
+            0);
+    } else {
+        rc = movement.running
+            ? register_object_run_to_tile(peerActor, movement.destinationTile, movement.elevation, -1, 0)
+            : register_object_move_to_tile(peerActor, movement.destinationTile, movement.elevation, -1, 0);
+    }
     int endRc = register_end();
     return rc != -1 && endRc != -1;
+}
+
+bool networkWorldApplyPeerFacing(const ActorFacingChangedEvent& facing)
+{
+    if (!session.isActive() || peerActor == nullptr) {
+        return false;
+    }
+
+    PlayerCharacterState* remotePlayer = session.players().findByActor(facing.actorId);
+    if (remotePlayer == nullptr
+        || remotePlayer->ownership != PlayerOwnership::RemoteControl
+        || session.entities().findObject(remotePlayer->actorId) != peerActor
+        || facing.rotation < 0
+        || facing.rotation >= ROTATION_COUNT) {
+        return false;
+    }
+
+    Rect dirtyRect;
+    if (obj_set_rotation(peerActor, facing.rotation, &dirtyRect) == -1) {
+        return false;
+    }
+    tile_refresh_rect(&dirtyRect, peerActor->elevation);
+    return true;
+}
+
+bool networkWorldApplyPeerDoorUse(const DoorUseStartedEvent& doorUse)
+{
+    if (!session.isActive() || peerActor == nullptr || isInCombat()) {
+        return false;
+    }
+
+    PlayerCharacterState* remotePlayer = session.players().findByActor(doorUse.actorId);
+    Object* target = session.entities().findObject(doorUse.targetId);
+    if (remotePlayer == nullptr
+        || remotePlayer->ownership != PlayerOwnership::RemoteControl
+        || session.entities().findObject(remotePlayer->actorId) != peerActor
+        || target == nullptr
+        || !obj_is_a_portal(target)
+        || peerActor->elevation != target->elevation) {
+        return false;
+    }
+
+    ScopedActingPlayerContext actingPlayer(*remotePlayer, peerActor);
+    return action_use_an_object(peerActor, target) != -1;
+}
+
+std::optional<EntityId> networkWorldFindEntity(const Object* object)
+{
+    if (!session.isActive() || object == nullptr) {
+        return std::nullopt;
+    }
+    return session.entities().findEntity(object);
 }
 
 void networkWorldLeave()

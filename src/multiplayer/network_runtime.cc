@@ -11,10 +11,14 @@
 #include <string>
 #include <thread>
 
+#include "game/actions.h"
+#include "game/anim.h"
 #include "game/critter.h"
 #include "game/game.h"
 #include "game/gconfig.h"
 #include "game/mainmenu.h"
+#include "game/object.h"
+#include "game/protinst.h"
 #include "multiplayer/character_build_bridge.h"
 #include "multiplayer/gameplay_wire.h"
 #include "multiplayer/network_bootstrap.h"
@@ -42,6 +46,7 @@ std::string runtimeStatus;
 bool backgroundProcessRegistered = false;
 bool lobbyStarted = false;
 bool smokeTestEnabled = false;
+int lastSentLocalRotation = -1;
 
 constexpr std::uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
 constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
@@ -248,9 +253,23 @@ void networkRuntimeBackgroundProcess()
 
     lobby.poll();
     if (networkWorldActive()) {
-        while (std::optional<ActorMovementStartedEvent> movement = lobby.takePeerMove()) {
-            if (!networkWorldApplyPeerMove(*movement)) {
-                debug_printf("Multiplayer peer movement could not be applied.\n");
+        if (obj_dude != nullptr
+            && FID_ANIM_TYPE(obj_dude->fid) == ANIM_STAND
+            && obj_dude->rotation != lastSentLocalRotation
+            && lobby.sendLocalFacing(obj_dude->rotation)) {
+            lastSentLocalRotation = obj_dude->rotation;
+        }
+        while (std::optional<GameEvent> event = lobby.takePeerEvent()) {
+            bool applied = false;
+            if (const auto* movement = std::get_if<ActorMovementStartedEvent>(&event->payload)) {
+                applied = networkWorldApplyPeerMove(*movement);
+            } else if (const auto* facing = std::get_if<ActorFacingChangedEvent>(&event->payload)) {
+                applied = networkWorldApplyPeerFacing(*facing);
+            } else if (const auto* doorUse = std::get_if<DoorUseStartedEvent>(&event->payload)) {
+                applied = networkWorldApplyPeerDoorUse(*doorUse);
+            }
+            if (!applied) {
+                debug_printf("Multiplayer peer event could not be applied.\n");
             }
         }
     }
@@ -282,6 +301,7 @@ bool startConfiguredRuntime()
         add_bk_process(networkRuntimeBackgroundProcess);
         backgroundProcessRegistered = true;
     }
+    set_background_processing_when_inactive(true);
     return true;
 }
 
@@ -745,22 +765,61 @@ bool networkRuntimeEnterWorld()
         setStatus("MULTIPLAYER WORLD FAILED: COULD NOT PLACE BOTH PLAYERS");
         return false;
     }
+    lastSentLocalRotation = -1;
     reportLobbyStatus();
     return true;
 }
 
 bool networkRuntimeSubmitLocalMove(int destinationTile, int elevation, bool running)
 {
-    return networkWorldActive() && lobby.sendLocalMove(destinationTile, elevation, running);
+    if (!networkWorldActive() || obj_dude == nullptr || elevation != obj_dude->elevation) {
+        return false;
+    }
+    if (destinationTile == obj_dude->tile) {
+        return true;
+    }
+
+    std::array<unsigned char, kMaximumMovementPathLength> path;
+    int pathLength = make_path(obj_dude, obj_dude->tile, destinationTile, path.data(), 1);
+    if (pathLength <= 0) {
+        return false;
+    }
+
+    return lobby.sendLocalMove(
+        destinationTile,
+        elevation,
+        running,
+        obj_dude->tile,
+        std::vector<std::uint8_t>(path.begin(), path.begin() + pathLength));
+}
+
+bool networkRuntimeHandleLocalDoorUse(Object* target)
+{
+    if (!networkWorldActive() || target == nullptr || !obj_is_a_portal(target)) {
+        return false;
+    }
+
+    std::optional<EntityId> targetId = networkWorldFindEntity(target);
+    if (!targetId.has_value()) {
+        debug_printf("Multiplayer door is missing a shared entity ID.\n");
+        return true;
+    }
+
+    if (action_use_an_object(obj_dude, target) != -1 && !lobby.sendLocalDoorUse(*targetId)) {
+        debug_printf("Multiplayer door event could not be sent.\n");
+    }
+    return true;
 }
 
 void networkRuntimeLeaveWorld()
 {
+    lastSentLocalRotation = -1;
     networkWorldLeave();
 }
 
 void networkRuntimeStop()
 {
+    set_background_processing_when_inactive(false);
     networkWorldLeave();
     if (backgroundProcessRegistered) {
         remove_bk_process(networkRuntimeBackgroundProcess);

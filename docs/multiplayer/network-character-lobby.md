@@ -19,4 +19,6 @@ fallout-ce --multiplayer-join=127.0.0.1:45455 --multiplayer-smoke-test
 
 ## Current boundary
 
-Lobby readiness gates the local new-game flow and proves that both selected character builds crossed the real TCP connection. The wire format now carries movement, door-use, pickup, and loot commands plus authoritative results and events. The runtime still needs to feed live game input through the authoritative processor and apply received events, so this is not playable co-op yet.
+Lobby readiness gates the local new-game flow and proves that both selected character builds crossed the real TCP connection. During exploration, the runtime sends click-to-move events, actor facing changes, and usable-door events over the live connection. Movement events carry the exact hex route chosen by the sender, and multiplayer clients continue network and animation processing while their window is unfocused. Each client applies those events to its remote actor. Doors receive matching entity IDs from a canonical map scan before play starts.
+
+Pickup and loot events exist in the wire format but are not connected to live input yet. The runtime also does not use the host-authoritative command result path for exploration, so this remains an early co-op implementation.

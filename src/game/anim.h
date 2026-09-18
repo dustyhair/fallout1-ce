@@ -101,6 +101,8 @@ typedef int AnimationCallback3(void*, void*, void*);
 
 typedef Object* PathBuilderCallback(Object* object, int tile, int elevation);
 
+constexpr int kAnimationMaximumPathLength = 800;
+
 typedef struct StraightPathNode {
     int tile;
     int elevation;
@@ -121,6 +123,13 @@ int register_object_move_to_object(Object* owner, Object* destination, int actio
 int register_object_run_to_object(Object* owner, Object* destination, int actionPoints, int delay);
 int register_object_move_to_tile(Object* owner, int tile, int elevation, int actionPoints, int delay);
 int register_object_run_to_tile(Object* owner, int tile, int elevation, int actionPoints, int delay);
+int register_object_move_along_path(Object* owner,
+    int destinationTile,
+    int elevation,
+    const unsigned char* rotations,
+    int pathLength,
+    bool running,
+    int delay);
 int register_object_move_straight_to_tile(Object* object, int tile, int elevation, int anim, int delay);
 int register_object_animate_and_move_straight(Object* owner, int tile, int elev, int anim, int delay);
 int register_object_move_on_stairs(Object* owner, Object* stairs, int delay);

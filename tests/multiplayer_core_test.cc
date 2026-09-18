@@ -706,10 +706,11 @@ void testGameplayWireFormat()
         "rejected command result round trips");
 
     std::vector<GameEvent> events = {
-        GameEvent { EventSequence { 7 }, CommandSequence { 1 }, ActorMovementStartedEvent { EntityId { 20 }, 12345, 1, true } },
+        GameEvent { EventSequence { 7 }, CommandSequence { 1 }, ActorMovementStartedEvent { EntityId { 20 }, 12345, 1, true, 12340, { 1, 2, 3 } } },
         GameEvent { EventSequence { 8 }, CommandSequence { 2 }, DoorUseStartedEvent { EntityId { 20 }, EntityId { 40 } } },
         GameEvent { EventSequence { 9 }, CommandSequence { 3 }, ItemPickupStartedEvent { EntityId { 20 }, EntityId { 41 } } },
         GameEvent { EventSequence { 10 }, CommandSequence { 4 }, LootStartedEvent { EntityId { 20 }, EntityId { 42 } } },
+        GameEvent { EventSequence { 11 }, CommandSequence { 5 }, ActorFacingChangedEvent { EntityId { 20 }, 4 } },
     };
     for (std::size_t index = 0; index < events.size(); index++) {
         ProtocolEnvelope envelope = gameplayEnvelope(30 + index);
@@ -731,10 +732,23 @@ void testGameplayWireFormat()
             && movementEvent->actorId == EntityId { 20 }
             && movementEvent->destinationTile == 12345
             && movementEvent->elevation == 1
-            && movementEvent->running,
+            && movementEvent->running
+            && movementEvent->startingTile == 12340
+            && movementEvent->path == std::vector<std::uint8_t>({ 1, 2, 3 }),
         "movement event payload round trips");
 
-    ProtocolEnvelope missingSession = gameplayEnvelope(41);
+    ProtocolEnvelope facingEventEnvelope = gameplayEnvelope(41);
+    encodeGameEvent(events[4], facingEventEnvelope);
+    GameEventDecodeResult decodedFacingEvent = decodeGameEvent(facingEventEnvelope);
+    const ActorFacingChangedEvent* facingEvent = decodedFacingEvent
+        ? std::get_if<ActorFacingChangedEvent>(&decodedFacingEvent.event.payload)
+        : nullptr;
+    expect(facingEvent != nullptr
+            && facingEvent->actorId == EntityId { 20 }
+            && facingEvent->rotation == 4,
+        "facing event payload round trips");
+
+    ProtocolEnvelope missingSession = gameplayEnvelope(42);
     missingSession.sessionId = {};
     expect(encodeGameCommand(commands[0], missingSession) == GameplayWireError::InvalidSessionId,
         "gameplay encoder rejects a missing session ID");
@@ -767,9 +781,17 @@ void testGameplayWireFormat()
         "rejected result requires a known rejection reason");
 
     ProtocolEnvelope malformedEvent = movementEventEnvelope;
-    malformedEvent.payload[33] = 1;
+    malformedEvent.payload[37] = 1;
     expect(decodeGameEvent(malformedEvent).error == GameplayWireError::InvalidReservedField,
         "event decoder rejects a reserved movement byte");
+    malformedEvent = movementEventEnvelope;
+    malformedEvent.payload.back() = kActorRotationCount;
+    expect(decodeGameEvent(malformedEvent).error == GameplayWireError::InvalidMove,
+        "event decoder rejects an invalid path direction");
+    malformedEvent = movementEventEnvelope;
+    malformedEvent.payload.pop_back();
+    expect(decodeGameEvent(malformedEvent).error == GameplayWireError::InvalidLength,
+        "event decoder rejects a truncated movement path");
 }
 
 void testLoopbackTransport()
@@ -1076,25 +1098,53 @@ void testNetworkCharacterLobby()
     }
     expect(host.startRequested() && guest.startRequested(),
         "host and guest observe the same game start");
-    expect(host.sendLocalMove(12345, 0, true), "host sends its local movement");
+    expect(host.sendLocalMove(12345, 0, true, 12340, { 1, 2, 3 }), "host sends its local movement");
     guest.poll();
-    std::optional<ActorMovementStartedEvent> hostMove = guest.takePeerMove();
-    expect(hostMove.has_value()
+    std::optional<GameEvent> hostMoveEvent = guest.takePeerEvent();
+    const auto* hostMove = hostMoveEvent.has_value()
+        ? std::get_if<ActorMovementStartedEvent>(&hostMoveEvent->payload)
+        : nullptr;
+    expect(hostMove != nullptr
             && hostMove->actorId == EntityId { kHostPlayerId.value }
             && hostMove->destinationTile == 12345
             && hostMove->elevation == 0
-            && hostMove->running,
+            && hostMove->running
+            && hostMove->startingTile == 12340
+            && hostMove->path == std::vector<std::uint8_t>({ 1, 2, 3 }),
         "guest receives the host movement");
-    expect(!guest.takePeerMove().has_value(), "received host movement is consumed once");
+    expect(!guest.takePeerEvent().has_value(), "received host movement is consumed once");
     expect(guest.sendLocalMove(12346, 1, false), "guest sends its local movement");
     host.poll();
-    std::optional<ActorMovementStartedEvent> guestMove = host.takePeerMove();
-    expect(guestMove.has_value()
+    std::optional<GameEvent> guestMoveEvent = host.takePeerEvent();
+    const auto* guestMove = guestMoveEvent.has_value()
+        ? std::get_if<ActorMovementStartedEvent>(&guestMoveEvent->payload)
+        : nullptr;
+    expect(guestMove != nullptr
             && guestMove->actorId == EntityId { kGuestPlayerId.value }
             && guestMove->destinationTile == 12346
             && guestMove->elevation == 1
             && !guestMove->running,
         "host receives the guest movement");
+    expect(host.sendLocalDoorUse(EntityId { 77 }), "host sends its local door use");
+    guest.poll();
+    std::optional<GameEvent> doorEvent = guest.takePeerEvent();
+    const auto* doorUse = doorEvent.has_value()
+        ? std::get_if<DoorUseStartedEvent>(&doorEvent->payload)
+        : nullptr;
+    expect(doorUse != nullptr
+            && doorUse->actorId == EntityId { kHostPlayerId.value }
+            && doorUse->targetId == EntityId { 77 },
+        "guest receives the host door use");
+    expect(guest.sendLocalFacing(4), "guest sends its local facing direction");
+    host.poll();
+    std::optional<GameEvent> facingEvent = host.takePeerEvent();
+    const auto* facing = facingEvent.has_value()
+        ? std::get_if<ActorFacingChangedEvent>(&facingEvent->payload)
+        : nullptr;
+    expect(facing != nullptr
+            && facing->actorId == EntityId { kGuestPlayerId.value }
+            && facing->rotation == 4,
+        "host receives the guest facing direction");
     expect(host.takeTransport() != nullptr && guest.takeTransport() != nullptr,
         "ready lobbies hand the connection to the game session");
 

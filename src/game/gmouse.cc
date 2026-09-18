@@ -960,7 +960,7 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
                                 ? multiplayer::kGuestPlayerId
                                 : multiplayer::kHostPlayerId;
                             multiplayer::developerLocalSessionSubmitDoorUse(playerId, target);
-                        } else {
+                        } else if (!multiplayer::networkRuntimeHandleLocalDoorUse(target)) {
                             action_use_an_object(obj_dude, target);
                         }
                     } else {
@@ -1169,7 +1169,7 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
                                     ? multiplayer::kGuestPlayerId
                                     : multiplayer::kHostPlayerId;
                                 multiplayer::developerLocalSessionSubmitDoorUse(playerId, target);
-                            } else {
+                            } else if (!multiplayer::networkRuntimeHandleLocalDoorUse(target)) {
                                 action_use_an_object(obj_dude, target);
                             }
                             break;

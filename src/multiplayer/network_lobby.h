@@ -5,6 +5,7 @@
 #include <deque>
 #include <memory>
 #include <optional>
+#include <vector>
 
 #include "multiplayer/character_lobby.h"
 #include "multiplayer/network_bootstrap.h"
@@ -41,8 +42,14 @@ public:
     bool start(NetworkLaunchMode mode, SessionId sessionId, std::unique_ptr<Transport> transport);
     CharacterLobbyError submitLocalSheet(const CharacterCreationSheet& sheet);
     bool requestStart();
-    bool sendLocalMove(int destinationTile, int elevation, bool running);
-    std::optional<ActorMovementStartedEvent> takePeerMove();
+    bool sendLocalMove(int destinationTile,
+        int elevation,
+        bool running,
+        int startingTile = -1,
+        const std::vector<std::uint8_t>& path = {});
+    bool sendLocalFacing(int rotation);
+    bool sendLocalDoorUse(EntityId targetId);
+    std::optional<GameEvent> takePeerEvent();
     void poll();
     void stop();
 
@@ -64,6 +71,7 @@ private:
         Start = 4,
     };
 
+    bool sendLocalEvent(GameEventPayload payload);
     bool sendMessage(MessageType type, const std::vector<std::uint8_t>& body = {});
     void handlePacket(const Packet& packet);
     void handleCharacterSheet(const std::vector<std::uint8_t>& body);
@@ -81,8 +89,8 @@ private:
     std::optional<CharacterCreationSheet> _localSheet;
     std::optional<CharacterCreationSheet> _peerSheet;
     bool _startRequested = false;
-    std::uint64_t _nextMovementSequence = 1;
-    std::deque<ActorMovementStartedEvent> _peerMoves;
+    std::uint64_t _nextEventSequence = 1;
+    std::deque<GameEvent> _peerEvents;
     std::unique_ptr<Transport> _transport;
 };
 

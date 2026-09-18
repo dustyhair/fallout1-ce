@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <variant>
+#include <vector>
 
 namespace fallout {
 namespace multiplayer {
@@ -172,7 +173,18 @@ struct ActorMovementStartedEvent {
     std::int32_t destinationTile = -1;
     std::int32_t elevation = -1;
     bool running = false;
+    std::int32_t startingTile = -1;
+    std::vector<std::uint8_t> path;
 };
+
+constexpr std::size_t kMaximumMovementPathLength = 800;
+
+struct ActorFacingChangedEvent {
+    EntityId actorId;
+    std::int32_t rotation = 0;
+};
+
+constexpr std::int32_t kActorRotationCount = 6;
 
 struct DoorUseStartedEvent {
     EntityId actorId;
@@ -189,7 +201,7 @@ struct LootStartedEvent {
     EntityId targetId;
 };
 
-using GameEventPayload = std::variant<ActorMovementStartedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, LootStartedEvent>;
+using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, LootStartedEvent>;
 
 struct GameEvent {
     EventSequence sequence;
