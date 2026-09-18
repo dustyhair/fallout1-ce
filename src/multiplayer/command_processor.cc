@@ -63,6 +63,7 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     event.causedBy = command.sequence;
 
     const MoveCommand* move = std::get_if<MoveCommand>(&command.payload);
+    const FaceCommand* face = std::get_if<FaceCommand>(&command.payload);
     const InteractCommand* interact = std::get_if<InteractCommand>(&command.payload);
     const PickupCommand* pickup = std::get_if<PickupCommand>(&command.payload);
     const LootCommand* loot = std::get_if<LootCommand>(&command.payload);
@@ -92,6 +93,9 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
         if (move != nullptr) {
             executionStatus = executor.move(actor, *move);
             event.payload = ActorMovementStartedEvent { command.actorId, move->destinationTile, move->elevation, move->running };
+        } else if (face != nullptr) {
+            executionStatus = executor.face(actor, *face);
+            event.payload = ActorFacingChangedEvent { command.actorId, face->rotation };
         } else if (interact != nullptr) {
             executionStatus = executor.useDoor(actor, target);
             event.payload = DoorUseStartedEvent { command.actorId, interact->targetId };

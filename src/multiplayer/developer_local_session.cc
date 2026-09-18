@@ -15,6 +15,7 @@
 #include "game/palette.h"
 #include "game/protinst.h"
 #include "game/stat.h"
+#include "game/tile.h"
 #include "multiplayer/acting_player_context.h"
 #include "multiplayer/character_build_bridge.h"
 #include "multiplayer/character_lobby.h"
@@ -149,6 +150,19 @@ public:
             return CommandExecutionStatus::InvalidAction;
         }
 
+        return CommandExecutionStatus::Applied;
+    }
+
+    CommandExecutionStatus face(Object* actor, const FaceCommand& command) override
+    {
+        if (command.rotation < 0 || command.rotation >= ROTATION_COUNT) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        Rect dirtyRect;
+        if (obj_set_rotation(actor, command.rotation, &dirtyRect) == -1) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        tile_refresh_rect(&dirtyRect, actor->elevation);
         return CommandExecutionStatus::Applied;
     }
 

@@ -1,6 +1,7 @@
 #include "multiplayer/network_world.h"
 
 #include <algorithm>
+#include <array>
 #include <tuple>
 #include <vector>
 
@@ -25,9 +26,105 @@ namespace {
 
 LocalSession session;
 Object* peerActor = nullptr;
+CommandProcessor commandProcessor;
+std::vector<std::pair<EntityId, Object*>> worldDoors;
+
+class NetworkCommandExecutor : public CommandExecutor {
+public:
+    CommandExecutionStatus move(Object* actor, const MoveCommand& command) override
+    {
+        if (isInCombat()
+            || !hexGridTileIsValid(command.destinationTile)
+            || !elevationIsValid(command.elevation)
+            || command.elevation != actor->elevation
+            || command.destinationTile == actor->tile) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+
+        std::array<unsigned char, kMaximumMovementPathLength> path;
+        int pathLength = make_path(actor, actor->tile, command.destinationTile, path.data(), 1);
+        if (pathLength <= 0 || pathLength > kAnimationMaximumPathLength) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+
+        register_clear(actor);
+        int requestOptions = actor == obj_dude
+            ? ANIMATION_REQUEST_RESERVED
+            : ANIMATION_REQUEST_UNRESERVED;
+        if (register_begin(requestOptions) == -1) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        int rc = register_object_move_along_path(actor,
+            command.destinationTile,
+            command.elevation,
+            path.data(),
+            pathLength,
+            command.running,
+            0);
+        int endRc = register_end();
+        return rc != -1 && endRc != -1
+            ? CommandExecutionStatus::Applied
+            : CommandExecutionStatus::InvalidAction;
+    }
+
+    CommandExecutionStatus face(Object* actor, const FaceCommand& command) override
+    {
+        if (command.rotation < 0 || command.rotation >= ROTATION_COUNT) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        Rect dirtyRect;
+        if (obj_set_rotation(actor, command.rotation, &dirtyRect) == -1) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        tile_refresh_rect(&dirtyRect, actor->elevation);
+        return CommandExecutionStatus::Applied;
+    }
+
+    CommandExecutionStatus useDoor(Object* actor, Object* target) override
+    {
+        if (isInCombat()
+            || target == nullptr
+            || actor->elevation != target->elevation
+            || !obj_is_a_portal(target)
+            || action_use_an_object(actor, target) == -1) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        return CommandExecutionStatus::Applied;
+    }
+
+    CommandExecutionStatus pickup(Object* actor, Object* target) override
+    {
+        if (isInCombat()
+            || actor == target
+            || target == nullptr
+            || actor->elevation != target->elevation
+            || FID_TYPE(target->fid) != OBJ_TYPE_ITEM
+            || target->owner != nullptr
+            || action_get_an_object(actor, target) == -1) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        return CommandExecutionStatus::Applied;
+    }
+
+    CommandExecutionStatus loot(Object* actor, Object* target) override
+    {
+        if (isInCombat()
+            || actor == target
+            || target == nullptr
+            || actor->elevation != target->elevation
+            || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER
+            || action_loot_container(actor, target) == -1) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        return CommandExecutionStatus::Applied;
+    }
+};
+
+NetworkCommandExecutor commandExecutor;
 
 bool registerWorldDoors()
 {
+    worldDoors.clear();
     std::vector<Object*> doors;
     for (Object* object = obj_find_first(); object != nullptr; object = obj_find_next()) {
         if (obj_is_a_portal(object)) {
@@ -41,9 +138,11 @@ bool registerWorldDoors()
     });
 
     for (Object* door : doors) {
-        if (!session.registerWorldObject(door)) {
+        EntityRegistrationResult registration = session.registerWorldObject(door);
+        if (!registration) {
             return false;
         }
+        worldDoors.emplace_back(registration.entityId, door);
     }
     return true;
 }
@@ -173,21 +272,22 @@ bool networkWorldEnter(NetworkLaunchMode mode,
     }
 
     intface_redraw();
+    commandProcessor.reset();
     return true;
 }
 
 bool networkWorldApplyPeerMove(const ActorMovementStartedEvent& movement)
 {
-    if (!session.isActive() || peerActor == nullptr) {
+    if (!session.isActive()) {
         return false;
     }
 
-    PlayerCharacterState* remotePlayer = session.players().findByActor(movement.actorId);
-    if (remotePlayer == nullptr
-        || remotePlayer->ownership != PlayerOwnership::RemoteControl
-        || session.entities().findObject(remotePlayer->actorId) != peerActor
+    PlayerCharacterState* player = session.players().findByActor(movement.actorId);
+    Object* actor = player != nullptr ? session.entities().findObject(player->actorId) : nullptr;
+    if (player == nullptr
+        || actor == nullptr
         || !hexGridTileIsValid(movement.destinationTile)
-        || movement.elevation != peerActor->elevation) {
+        || movement.elevation != actor->elevation) {
         return false;
     }
 
@@ -213,20 +313,23 @@ bool networkWorldApplyPeerMove(const ActorMovementStartedEvent& movement)
         }
     }
 
-    register_clear(peerActor);
-    if (!movement.path.empty() && peerActor->tile != movement.startingTile) {
+    register_clear(actor);
+    if (!movement.path.empty() && actor->tile != movement.startingTile) {
         Rect dirtyRect;
-        if (obj_move_to_tile(peerActor, movement.startingTile, movement.elevation, &dirtyRect) == -1) {
+        if (obj_move_to_tile(actor, movement.startingTile, movement.elevation, &dirtyRect) == -1) {
             return false;
         }
-        tile_refresh_rect(&dirtyRect, peerActor->elevation);
+        tile_refresh_rect(&dirtyRect, actor->elevation);
     }
-    if (register_begin(ANIMATION_REQUEST_UNRESERVED) == -1) {
+    int requestOptions = actor == obj_dude
+        ? ANIMATION_REQUEST_RESERVED
+        : ANIMATION_REQUEST_UNRESERVED;
+    if (register_begin(requestOptions) == -1) {
         return false;
     }
     int rc;
     if (!movement.path.empty()) {
-        rc = register_object_move_along_path(peerActor,
+        rc = register_object_move_along_path(actor,
             movement.destinationTile,
             movement.elevation,
             movement.path.data(),
@@ -235,8 +338,8 @@ bool networkWorldApplyPeerMove(const ActorMovementStartedEvent& movement)
             0);
     } else {
         rc = movement.running
-            ? register_object_run_to_tile(peerActor, movement.destinationTile, movement.elevation, -1, 0)
-            : register_object_move_to_tile(peerActor, movement.destinationTile, movement.elevation, -1, 0);
+            ? register_object_run_to_tile(actor, movement.destinationTile, movement.elevation, -1, 0)
+            : register_object_move_to_tile(actor, movement.destinationTile, movement.elevation, -1, 0);
     }
     int endRc = register_end();
     return rc != -1 && endRc != -1;
@@ -244,46 +347,180 @@ bool networkWorldApplyPeerMove(const ActorMovementStartedEvent& movement)
 
 bool networkWorldApplyPeerFacing(const ActorFacingChangedEvent& facing)
 {
-    if (!session.isActive() || peerActor == nullptr) {
+    if (!session.isActive()) {
         return false;
     }
 
-    PlayerCharacterState* remotePlayer = session.players().findByActor(facing.actorId);
-    if (remotePlayer == nullptr
-        || remotePlayer->ownership != PlayerOwnership::RemoteControl
-        || session.entities().findObject(remotePlayer->actorId) != peerActor
+    PlayerCharacterState* player = session.players().findByActor(facing.actorId);
+    Object* actor = player != nullptr ? session.entities().findObject(player->actorId) : nullptr;
+    if (player == nullptr
+        || actor == nullptr
         || facing.rotation < 0
         || facing.rotation >= ROTATION_COUNT) {
         return false;
     }
 
     Rect dirtyRect;
-    if (obj_set_rotation(peerActor, facing.rotation, &dirtyRect) == -1) {
+    if (obj_set_rotation(actor, facing.rotation, &dirtyRect) == -1) {
         return false;
     }
-    tile_refresh_rect(&dirtyRect, peerActor->elevation);
+    tile_refresh_rect(&dirtyRect, actor->elevation);
     return true;
 }
 
 bool networkWorldApplyPeerDoorUse(const DoorUseStartedEvent& doorUse)
 {
-    if (!session.isActive() || peerActor == nullptr || isInCombat()) {
+    if (!session.isActive() || isInCombat()) {
         return false;
     }
 
-    PlayerCharacterState* remotePlayer = session.players().findByActor(doorUse.actorId);
+    PlayerCharacterState* player = session.players().findByActor(doorUse.actorId);
+    Object* actor = player != nullptr ? session.entities().findObject(player->actorId) : nullptr;
     Object* target = session.entities().findObject(doorUse.targetId);
-    if (remotePlayer == nullptr
-        || remotePlayer->ownership != PlayerOwnership::RemoteControl
-        || session.entities().findObject(remotePlayer->actorId) != peerActor
+    if (player == nullptr
+        || actor == nullptr
         || target == nullptr
         || !obj_is_a_portal(target)
-        || peerActor->elevation != target->elevation) {
+        || actor->elevation != target->elevation) {
         return false;
     }
 
-    ScopedActingPlayerContext actingPlayer(*remotePlayer, peerActor);
-    return action_use_an_object(peerActor, target) != -1;
+    ScopedActingPlayerContext actingPlayer(*player, actor);
+    return action_use_an_object(actor, target) != -1;
+}
+
+AuthoritativeCommandResult networkWorldProcessCommand(const GameCommand& command)
+{
+    std::vector<std::uint8_t> path;
+    int startingTile = -1;
+    if (const auto* move = std::get_if<MoveCommand>(&command.payload)) {
+        Object* actor = session.entities().findObject(command.actorId);
+        if (actor != nullptr) {
+            std::array<unsigned char, kMaximumMovementPathLength> rotations;
+            int pathLength = make_path(actor, actor->tile, move->destinationTile, rotations.data(), 1);
+            if (pathLength > 0 && pathLength <= kAnimationMaximumPathLength) {
+                startingTile = actor->tile;
+                path.assign(rotations.begin(), rotations.begin() + pathLength);
+            }
+        }
+    }
+
+    AuthoritativeCommandResult result = commandProcessor.process(command, session, commandExecutor);
+    if (result.event.has_value()) {
+        if (auto* movement = std::get_if<ActorMovementStartedEvent>(&result.event->payload)) {
+            movement->startingTile = startingTile;
+            movement->path = std::move(path);
+        }
+    }
+    return result;
+}
+
+SessionPhase networkWorldPhase()
+{
+    return session.phase();
+}
+
+std::uint32_t networkWorldPhaseRevision()
+{
+    return session.phaseRevision();
+}
+
+bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot& snapshot)
+{
+    if (!session.isActive()) {
+        return false;
+    }
+
+    WorldSnapshot captured;
+    captured.lastIncludedEvent = lastIncludedEvent;
+    captured.phase = session.phase();
+    captured.phaseRevision = session.phaseRevision();
+    for (PlayerId playerId : { kHostPlayerId, kGuestPlayerId }) {
+        EntityId actorId = session.playerActorId(playerId);
+        Object* actor = session.entities().findObject(actorId);
+        if (actor == nullptr || anim_busy(actor) == -1) {
+            return false;
+        }
+        captured.actors.push_back(ActorSnapshot {
+            actorId,
+            playerId,
+            actor->tile,
+            actor->elevation,
+            actor->rotation,
+            critter_get_hits(actor),
+        });
+    }
+    for (const auto& entry : worldDoors) {
+        Object* door = entry.second;
+        if (door == nullptr
+            || session.entities().findObject(entry.first) != door
+            || anim_busy(door) == -1) {
+            return false;
+        }
+        captured.doors.push_back(DoorSnapshot {
+            entry.first,
+            obj_is_open(door) != 0,
+            obj_is_locked(door),
+            door->frame,
+        });
+    }
+    if (validateSnapshot(captured) != SnapshotError::None) {
+        return false;
+    }
+    snapshot = std::move(captured);
+    return true;
+}
+
+bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
+{
+    if (!session.isActive()
+        || validateSnapshot(snapshot) != SnapshotError::None
+        || snapshot.phase != session.phase()
+        || snapshot.phaseRevision != session.phaseRevision()
+        || snapshot.actors.size() != 2
+        || snapshot.doors.size() != worldDoors.size()) {
+        return false;
+    }
+
+    for (const ActorSnapshot& actorState : snapshot.actors) {
+        Object* actor = session.entities().findObject(actorState.entityId);
+        std::optional<PlayerId> owner = session.entities().ownerOf(actorState.entityId);
+        if (actor == nullptr || !owner.has_value() || *owner != actorState.ownerId) {
+            return false;
+        }
+    }
+    for (const DoorSnapshot& doorState : snapshot.doors) {
+        Object* door = session.entities().findObject(doorState.entityId);
+        if (door == nullptr
+            || !obj_is_a_portal(door)
+            || doorState.open != (doorState.frame != 0)) {
+            return false;
+        }
+    }
+
+    for (const ActorSnapshot& actorState : snapshot.actors) {
+        Object* actor = session.entities().findObject(actorState.entityId);
+        register_clear(actor);
+        Rect dirtyRect;
+        if (obj_move_to_tile(actor, actorState.tile, actorState.elevation, &dirtyRect) == -1
+            || obj_set_rotation(actor, actorState.rotation, &dirtyRect) == -1) {
+            return false;
+        }
+        int currentHitPoints = critter_get_hits(actor);
+        critter_adjust_hits(actor, actorState.hitPoints - currentHitPoints);
+        tile_refresh_rect(&dirtyRect, actorState.elevation);
+    }
+    for (const DoorSnapshot& doorState : snapshot.doors) {
+        Object* door = session.entities().findObject(doorState.entityId);
+        Rect dirtyRect;
+        if (obj_set_frame(door, doorState.frame, &dirtyRect) == -1
+            || (doorState.locked ? obj_lock(door) : obj_unlock(door)) == -1) {
+            return false;
+        }
+        tile_refresh_rect(&dirtyRect, door->elevation);
+    }
+    intface_redraw();
+    return true;
 }
 
 std::optional<EntityId> networkWorldFindEntity(const Object* object)
@@ -297,6 +534,7 @@ std::optional<EntityId> networkWorldFindEntity(const Object* object)
 void networkWorldLeave()
 {
     session.stop();
+    worldDoors.clear();
     erasePeerActor();
 }
 

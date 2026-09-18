@@ -122,6 +122,10 @@ struct MoveCommand {
     bool running = false;
 };
 
+struct FaceCommand {
+    std::int32_t rotation = 0;
+};
+
 struct InteractCommand {
     EntityId targetId;
 };
@@ -134,7 +138,7 @@ struct LootCommand {
     EntityId targetId;
 };
 
-using GameCommandPayload = std::variant<MoveCommand, InteractCommand, PickupCommand, LootCommand>;
+using GameCommandPayload = std::variant<MoveCommand, FaceCommand, InteractCommand, PickupCommand, LootCommand>;
 
 struct GameCommand {
     CommandSequence sequence;

@@ -628,6 +628,7 @@ void testGameplayWireFormat()
         GameCommand { CommandSequence { 2 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, InteractCommand { EntityId { 40 } } },
         GameCommand { CommandSequence { 3 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, PickupCommand { EntityId { 41 } } },
         GameCommand { CommandSequence { 4 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, LootCommand { EntityId { 42 } } },
+        GameCommand { CommandSequence { 5 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, FaceCommand { 4 } },
     };
 
     for (std::size_t index = 0; index < commands.size(); index++) {
@@ -676,6 +677,12 @@ void testGameplayWireFormat()
     GameCommandDecodeResult decodedLoot = decodeGameCommand(lootEnvelope);
     const LootCommand* loot = decodedLoot ? std::get_if<LootCommand>(&decodedLoot.command.payload) : nullptr;
     expect(loot != nullptr && loot->targetId == EntityId { 42 }, "loot command target round trips");
+
+    ProtocolEnvelope faceEnvelope = gameplayEnvelope(24);
+    encodeGameCommand(commands[4], faceEnvelope);
+    GameCommandDecodeResult decodedFace = decodeGameCommand(faceEnvelope);
+    const FaceCommand* face = decodedFace ? std::get_if<FaceCommand>(&decodedFace.command.payload) : nullptr;
+    expect(face != nullptr && face->rotation == 4, "facing command rotation round trips");
 
     CommandResult accepted;
     accepted.commandSequence.value = 1;
@@ -1116,16 +1123,43 @@ void testNetworkCharacterLobby()
     expect(!guest.takePeerEvent().has_value(), "received host movement is consumed once");
     expect(guest.sendLocalMove(12346, 1, false), "guest sends its local movement");
     host.poll();
-    std::optional<GameEvent> guestMoveEvent = host.takePeerEvent();
+    std::optional<GameCommand> guestMoveCommand = host.takePeerCommand();
+    const auto* guestMoveIntent = guestMoveCommand.has_value()
+        ? std::get_if<MoveCommand>(&guestMoveCommand->payload)
+        : nullptr;
+    expect(guestMoveIntent != nullptr
+            && guestMoveCommand->playerId == kGuestPlayerId
+            && guestMoveCommand->actorId == EntityId { kGuestPlayerId.value }
+            && guestMoveIntent->destinationTile == 12346
+            && guestMoveIntent->elevation == 1
+            && !guestMoveIntent->running,
+        "host receives the guest movement command");
+    AuthoritativeCommandResult guestMoveOutcome;
+    guestMoveOutcome.result.commandSequence = guestMoveCommand->sequence;
+    guestMoveOutcome.result.status = CommandStatus::Accepted;
+    guestMoveOutcome.result.rejection = CommandRejection::None;
+    guestMoveOutcome.event = GameEvent {
+        EventSequence { 1 },
+        guestMoveCommand->sequence,
+        ActorMovementStartedEvent { EntityId { kGuestPlayerId.value }, 12346, 1, false },
+    };
+    expect(host.sendCommandOutcome(std::move(guestMoveOutcome)), "host publishes the accepted guest movement");
+    guest.poll();
+    std::optional<CommandResult> guestMoveResult = guest.takeCommandResult();
+    std::optional<GameEvent> guestMoveEvent = guest.takePeerEvent();
     const auto* guestMove = guestMoveEvent.has_value()
         ? std::get_if<ActorMovementStartedEvent>(&guestMoveEvent->payload)
         : nullptr;
-    expect(guestMove != nullptr
+    expect(guestMoveResult.has_value()
+            && guestMoveResult->status == CommandStatus::Accepted
+            && guestMoveResult->firstEventSequence == EventSequence { 2 }
+            && guestMove != nullptr
+            && guestMoveEvent->sequence == EventSequence { 2 }
             && guestMove->actorId == EntityId { kGuestPlayerId.value }
             && guestMove->destinationTile == 12346
             && guestMove->elevation == 1
             && !guestMove->running,
-        "host receives the guest movement");
+        "guest receives the host-authoritative movement result and event");
     expect(host.sendLocalDoorUse(EntityId { 77 }), "host sends its local door use");
     guest.poll();
     std::optional<GameEvent> doorEvent = guest.takePeerEvent();
@@ -1138,14 +1172,56 @@ void testNetworkCharacterLobby()
         "guest receives the host door use");
     expect(guest.sendLocalFacing(4), "guest sends its local facing direction");
     host.poll();
-    std::optional<GameEvent> facingEvent = host.takePeerEvent();
+    std::optional<GameCommand> facingCommand = host.takePeerCommand();
+    const auto* facingIntent = facingCommand.has_value()
+        ? std::get_if<FaceCommand>(&facingCommand->payload)
+        : nullptr;
+    expect(facingIntent != nullptr && facingIntent->rotation == 4,
+        "host receives the guest facing command");
+    AuthoritativeCommandResult facingOutcome;
+    facingOutcome.result.commandSequence = facingCommand->sequence;
+    facingOutcome.result.status = CommandStatus::Accepted;
+    facingOutcome.result.rejection = CommandRejection::None;
+    facingOutcome.event = GameEvent {
+        EventSequence { 1 },
+        facingCommand->sequence,
+        ActorFacingChangedEvent { EntityId { kGuestPlayerId.value }, 4 },
+    };
+    expect(host.sendCommandOutcome(std::move(facingOutcome)), "host publishes the accepted guest facing");
+    guest.poll();
+    std::optional<CommandResult> facingResult = guest.takeCommandResult();
+    std::optional<GameEvent> facingEvent = guest.takePeerEvent();
     const auto* facing = facingEvent.has_value()
         ? std::get_if<ActorFacingChangedEvent>(&facingEvent->payload)
         : nullptr;
-    expect(facing != nullptr
+    expect(facingResult.has_value()
+            && facingResult->status == CommandStatus::Accepted
+            && facing != nullptr
             && facing->actorId == EntityId { kGuestPlayerId.value }
             && facing->rotation == 4,
-        "host receives the guest facing direction");
+        "guest receives the host-authoritative facing result and event");
+    EventReplay completeReplay = host.replayAfter(EventSequence {});
+    expect(completeReplay.status == EventReplayStatus::Available
+            && completeReplay.events.size() == 4
+            && completeReplay.events.front().sequence == EventSequence { 1 }
+            && completeReplay.events.back().sequence == EventSequence { 4 },
+        "host journals every authoritative live event in session order");
+    expect(guest.requestRecovery(EventSequence { 2 }), "guest requests recovery from its last retained event");
+    host.poll();
+    std::optional<EventSequence> recoveryRequest = host.takeRecoveryRequest();
+    expect(recoveryRequest == EventSequence { 2 }, "host receives the guest recovery boundary");
+    WorldSnapshot recoverySnapshot = sampleSnapshot();
+    recoverySnapshot.lastIncludedEvent = host.latestAuthoritativeEvent();
+    expect(host.sendRecovery(*recoveryRequest, recoverySnapshot), "host sends retained journal events for a short recovery gap");
+    guest.poll();
+    std::optional<GameEvent> replayedDoor = guest.takePeerEvent();
+    std::optional<GameEvent> replayedFacing = guest.takePeerEvent();
+    expect(replayedDoor.has_value()
+            && replayedDoor->sequence == EventSequence { 3 }
+            && replayedFacing.has_value()
+            && replayedFacing->sequence == EventSequence { 4 }
+            && !guest.recoveryInProgress(),
+        "guest applies ordered journal replay and observes recovery completion");
     expect(host.takeTransport() != nullptr && guest.takeTransport() != nullptr,
         "ready lobbies hand the connection to the game session");
 
@@ -1280,6 +1356,15 @@ public:
         return nextStatus;
     }
 
+    CommandExecutionStatus face(Object* actor, const FaceCommand& command) override
+    {
+        faceCalls++;
+        lastActor = actor;
+        lastFace = command;
+        recordContext();
+        return nextStatus;
+    }
+
     CommandExecutionStatus useDoor(Object* actor, Object* target) override
     {
         doorCalls++;
@@ -1317,6 +1402,7 @@ public:
 
     CommandExecutionStatus nextStatus = CommandExecutionStatus::Applied;
     int moveCalls = 0;
+    int faceCalls = 0;
     int doorCalls = 0;
     int pickupCalls = 0;
     int lootCalls = 0;
@@ -1326,6 +1412,7 @@ public:
     CharacterBuild* lastBuild = nullptr;
     PlayerId lastActingPlayerId;
     MoveCommand lastMove;
+    FaceCommand lastFace;
 };
 
 void testAuthoritativeCommandProcessing()

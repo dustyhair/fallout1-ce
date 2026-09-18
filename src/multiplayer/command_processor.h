@@ -21,6 +21,7 @@ public:
     virtual ~CommandExecutor() = default;
 
     virtual CommandExecutionStatus move(Object* actor, const MoveCommand& command) = 0;
+    virtual CommandExecutionStatus face(Object* actor, const FaceCommand& command) = 0;
     virtual CommandExecutionStatus useDoor(Object* actor, Object* target) = 0;
     virtual CommandExecutionStatus pickup(Object* actor, Object* target) = 0;
     virtual CommandExecutionStatus loot(Object* actor, Object* target) = 0;

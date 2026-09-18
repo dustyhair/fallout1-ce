@@ -42,7 +42,7 @@ fallout-ce --multiplayer-join=192.168.1.20:42424
 
 The host starts a nonblocking listener and the guest performs a bounded connection attempt. The handshake is then pumped by the engine's background input processing, including while either game is at the main menu or in a modal input loop. Network shutdown removes that process before the engine input system is destroyed.
 
-For this launch slice, the compatibility digest covers the protocol and handshake versions, language, archive sizes, and the first and last 64 KiB of `master.dat` and `critter.dat`. It is deterministic across supported platforms and catches common installation mismatches without hashing hundreds of megabytes at startup. The planned content manifest must expand this to scripts, maps, prototypes, message files, and gameplay configuration before compatibility checking is considered complete.
+For this launch slice, the compatibility digest covers the protocol, handshake, lobby, and gameplay-wire versions, language, archive sizes, and the first and last 64 KiB of `master.dat` and `critter.dat`. It is deterministic across supported platforms and catches common installation mismatches without hashing hundreds of megabytes at startup. The planned content manifest must expand this to scripts, maps, prototypes, message files, and gameplay configuration before compatibility checking is considered complete.
 
 ## Current boundary
 

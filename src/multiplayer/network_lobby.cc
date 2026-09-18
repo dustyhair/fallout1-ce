@@ -1,5 +1,6 @@
 #include "multiplayer/network_lobby.h"
 
+#include <limits>
 #include <utility>
 #include <variant>
 
@@ -11,6 +12,14 @@ namespace multiplayer {
 namespace {
 
 constexpr std::size_t kLobbyHeaderSize = 4;
+constexpr std::uint16_t kRecoveryWireVersion = 1;
+constexpr std::size_t kRecoveryHeaderSize = 4;
+
+enum class RecoveryMessageType : std::uint8_t {
+    Request = 1,
+    Snapshot = 2,
+    Complete = 3,
+};
 
 void appendUInt16(std::vector<std::uint8_t>& bytes, std::uint16_t value)
 {
@@ -18,11 +27,27 @@ void appendUInt16(std::vector<std::uint8_t>& bytes, std::uint16_t value)
     bytes.push_back(static_cast<std::uint8_t>(value & 0xFF));
 }
 
+void appendUInt64(std::vector<std::uint8_t>& bytes, std::uint64_t value)
+{
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        bytes.push_back(static_cast<std::uint8_t>((value >> shift) & 0xFF));
+    }
+}
+
 std::uint16_t readUInt16(const std::vector<std::uint8_t>& bytes, std::size_t offset)
 {
     return static_cast<std::uint16_t>(
         (static_cast<std::uint16_t>(bytes[offset]) << 8)
         | static_cast<std::uint16_t>(bytes[offset + 1]));
+}
+
+std::uint64_t readUInt64(const std::vector<std::uint8_t>& bytes, std::size_t offset)
+{
+    std::uint64_t value = 0;
+    for (int index = 0; index < 8; index++) {
+        value = (value << 8) | bytes[offset + index];
+    }
+    return value;
 }
 
 bool isKnownCharacterLobbyError(CharacterLobbyError error)
@@ -58,8 +83,17 @@ bool NetworkLobby::start(NetworkLaunchMode mode, SessionId sessionId, std::uniqu
     _localSheet.reset();
     _peerSheet.reset();
     _startRequested = false;
+    _nextLocalCommandSequence = 1;
     _nextEventSequence = 1;
+    _nextExpectedEventSequence = 1;
+    _pendingCommandSequences.clear();
+    _recoveryRequests.clear();
+    _peerCommands.clear();
+    _commandResults.clear();
     _peerEvents.clear();
+    _peerSnapshots.clear();
+    _recovering = false;
+    _eventJournal.clear();
 
     if ((mode != NetworkLaunchMode::Host && mode != NetworkLaunchMode::Join)
         || sessionId.value == 0
@@ -80,58 +114,160 @@ bool NetworkLobby::sendLocalMove(
     int elevation,
     bool running,
     int startingTile,
-    const std::vector<std::uint8_t>& path)
+    const std::vector<std::uint8_t>& path,
+    std::uint32_t phaseRevision)
 {
     PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
-    return sendLocalEvent(ActorMovementStartedEvent {
-        EntityId { playerId.value },
-        destinationTile,
-        elevation,
-        running,
-        startingTile,
-        path,
-    });
+    EntityId actorId { playerId.value };
+    return sendLocalAction(
+        ActorMovementStartedEvent { actorId, destinationTile, elevation, running, startingTile, path },
+        MoveCommand { destinationTile, elevation, running },
+        phaseRevision);
 }
 
-bool NetworkLobby::sendLocalDoorUse(EntityId targetId)
+bool NetworkLobby::sendLocalDoorUse(EntityId targetId, std::uint32_t phaseRevision)
 {
     PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
-    return sendLocalEvent(DoorUseStartedEvent { EntityId { playerId.value }, targetId });
+    EntityId actorId { playerId.value };
+    return sendLocalAction(
+        DoorUseStartedEvent { actorId, targetId },
+        InteractCommand { targetId },
+        phaseRevision);
 }
 
-bool NetworkLobby::sendLocalFacing(int rotation)
+bool NetworkLobby::sendLocalFacing(int rotation, std::uint32_t phaseRevision)
 {
     PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
-    return sendLocalEvent(ActorFacingChangedEvent { EntityId { playerId.value }, rotation });
+    EntityId actorId { playerId.value };
+    return sendLocalAction(
+        ActorFacingChangedEvent { actorId, rotation },
+        FaceCommand { rotation },
+        phaseRevision);
 }
 
-bool NetworkLobby::sendLocalEvent(GameEventPayload payload)
+bool NetworkLobby::sendLocalAction(
+    GameEventPayload eventPayload,
+    GameCommandPayload commandPayload,
+    std::uint32_t phaseRevision)
 {
     if (_state != NetworkLobbyState::Ready || !_startRequested || _transport == nullptr) {
         return false;
     }
+    if (_mode == NetworkLaunchMode::Join && _recovering) {
+        return false;
+    }
+
+    PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
+    if (_mode == NetworkLaunchMode::Join) {
+        GameCommand command;
+        command.sequence.value = _nextLocalCommandSequence;
+        command.playerId = playerId;
+        command.actorId = EntityId { playerId.value };
+        command.expectedPhase = SessionPhase::Exploration;
+        command.expectedPhaseRevision = phaseRevision;
+        command.payload = std::move(commandPayload);
+
+        ProtocolEnvelope envelope;
+        envelope.sessionId = _sessionId;
+        envelope.sequence = _nextSendSequence++;
+        if (encodeGameCommand(command, envelope) != GameplayWireError::None
+            || !sendGameplayEnvelope(std::move(envelope))) {
+            return false;
+        }
+        _pendingCommandSequences.push_back(command.sequence);
+        _nextLocalCommandSequence++;
+        return true;
+    }
 
     GameEvent event;
     event.sequence.value = _nextEventSequence;
-    event.causedBy.value = _nextEventSequence;
-    event.payload = std::move(payload);
+    event.causedBy.value = _nextLocalCommandSequence;
+    event.payload = std::move(eventPayload);
+    if (!sendAuthoritativeEvent(std::move(event))) {
+        return false;
+    }
+    _nextLocalCommandSequence++;
+    return true;
+}
+
+bool NetworkLobby::sendCommandOutcome(AuthoritativeCommandResult outcome)
+{
+    if (_mode != NetworkLaunchMode::Host
+        || _state != NetworkLobbyState::Ready
+        || !_startRequested
+        || _transport == nullptr) {
+        return false;
+    }
+
+    if (outcome.event.has_value()) {
+        outcome.event->sequence.value = _nextEventSequence;
+        outcome.result.firstEventSequence = outcome.event->sequence;
+        outcome.result.eventCount = 1;
+    }
 
     ProtocolEnvelope envelope;
     envelope.sessionId = _sessionId;
     envelope.sequence = _nextSendSequence++;
-    Packet packet;
-    if (encodeGameEvent(event, envelope) != GameplayWireError::None
-        || encodeEnvelope(envelope, packet) != ProtocolError::None) {
-        fail(NetworkLobbyError::EncodeFailed);
+    if (encodeCommandResult(outcome.result, envelope) != GameplayWireError::None
+        || !sendGameplayEnvelope(std::move(envelope))) {
         return false;
     }
-    if (_transport->send(std::move(packet)) != TransportSendResult::Sent) {
-        fail(NetworkLobbyError::SendFailed);
+    return !outcome.event.has_value() || sendAuthoritativeEvent(std::move(*outcome.event));
+}
+
+bool NetworkLobby::sendAuthoritativeEvent(GameEvent event)
+{
+    if (_mode != NetworkLaunchMode::Host || event.sequence.value != _nextEventSequence) {
         return false;
     }
 
+    ProtocolEnvelope envelope;
+    envelope.sessionId = _sessionId;
+    envelope.sequence = _nextSendSequence++;
+    if (encodeGameEvent(event, envelope) != GameplayWireError::None
+        || _eventJournal.append(event) != EventJournalError::None) {
+        fail(NetworkLobbyError::EncodeFailed);
+        return false;
+    }
+    if (!sendGameplayEnvelope(std::move(envelope))) {
+        return false;
+    }
     _nextEventSequence++;
     return true;
+}
+
+bool NetworkLobby::sendGameplayEnvelope(ProtocolEnvelope envelope)
+{
+    Packet packet;
+    if (encodeEnvelope(envelope, packet) != ProtocolError::None) {
+        fail(NetworkLobbyError::EncodeFailed);
+        return false;
+    }
+    if (_transport == nullptr || _transport->send(std::move(packet)) != TransportSendResult::Sent) {
+        fail(NetworkLobbyError::SendFailed);
+        return false;
+    }
+    return true;
+}
+
+std::optional<GameCommand> NetworkLobby::takePeerCommand()
+{
+    if (_peerCommands.empty()) {
+        return std::nullopt;
+    }
+    GameCommand command = std::move(_peerCommands.front());
+    _peerCommands.pop_front();
+    return command;
+}
+
+std::optional<CommandResult> NetworkLobby::takeCommandResult()
+{
+    if (_commandResults.empty()) {
+        return std::nullopt;
+    }
+    CommandResult result = _commandResults.front();
+    _commandResults.pop_front();
+    return result;
 }
 
 std::optional<GameEvent> NetworkLobby::takePeerEvent()
@@ -143,6 +279,110 @@ std::optional<GameEvent> NetworkLobby::takePeerEvent()
     GameEvent event = std::move(_peerEvents.front());
     _peerEvents.pop_front();
     return event;
+}
+
+EventReplay NetworkLobby::replayAfter(EventSequence lastApplied) const
+{
+    return _eventJournal.replayAfter(lastApplied);
+}
+
+bool NetworkLobby::requestRecovery(EventSequence lastApplied)
+{
+    if (_mode != NetworkLaunchMode::Join
+        || _state != NetworkLobbyState::Ready
+        || !_startRequested
+        || _transport == nullptr
+        || lastApplied.value == std::numeric_limits<std::uint64_t>::max()) {
+        return false;
+    }
+
+    std::vector<std::uint8_t> body;
+    appendUInt64(body, lastApplied.value);
+    if (!sendRecoveryMessage(static_cast<std::uint8_t>(RecoveryMessageType::Request), body)) {
+        return false;
+    }
+    _recovering = true;
+    _nextExpectedEventSequence = lastApplied.value + 1;
+    _peerSnapshots.clear();
+    return true;
+}
+
+std::optional<EventSequence> NetworkLobby::takeRecoveryRequest()
+{
+    if (_recoveryRequests.empty()) {
+        return std::nullopt;
+    }
+    EventSequence sequence = _recoveryRequests.front();
+    _recoveryRequests.pop_front();
+    return sequence;
+}
+
+bool NetworkLobby::sendRecovery(EventSequence lastApplied, const WorldSnapshot& snapshot)
+{
+    if (_mode != NetworkLaunchMode::Host
+        || _state != NetworkLobbyState::Ready
+        || !_startRequested
+        || _transport == nullptr) {
+        return false;
+    }
+
+    EventReplay replay = _eventJournal.replayAfter(lastApplied);
+    if (replay.status == EventReplayStatus::InvalidFutureSequence) {
+        fail(NetworkLobbyError::ProtocolError);
+        return false;
+    }
+    if (replay.status == EventReplayStatus::SnapshotRequired) {
+        if (snapshot.lastIncludedEvent != _eventJournal.latestSequence()) {
+            return false;
+        }
+        std::vector<std::uint8_t> encodedSnapshot;
+        if (encodeSnapshot(snapshot, encodedSnapshot) != SnapshotError::None
+            || !sendRecoveryMessage(static_cast<std::uint8_t>(RecoveryMessageType::Snapshot), encodedSnapshot)) {
+            return false;
+        }
+    } else if (replay.status == EventReplayStatus::Available) {
+        for (const GameEvent& event : replay.events) {
+            ProtocolEnvelope envelope;
+            envelope.sessionId = _sessionId;
+            envelope.sequence = _nextSendSequence++;
+            if (encodeGameEvent(event, envelope) != GameplayWireError::None
+                || !sendGameplayEnvelope(std::move(envelope))) {
+                return false;
+            }
+        }
+    }
+
+    std::vector<std::uint8_t> completeBody;
+    appendUInt64(completeBody, _eventJournal.latestSequence().value);
+    return sendRecoveryMessage(static_cast<std::uint8_t>(RecoveryMessageType::Complete), completeBody);
+}
+
+std::optional<WorldSnapshot> NetworkLobby::takePeerSnapshot()
+{
+    if (_peerSnapshots.empty()) {
+        return std::nullopt;
+    }
+    WorldSnapshot snapshot = std::move(_peerSnapshots.front());
+    _peerSnapshots.pop_front();
+    return snapshot;
+}
+
+EventSequence NetworkLobby::latestAuthoritativeEvent() const
+{
+    return _eventJournal.latestSequence();
+}
+
+bool NetworkLobby::recoveryInProgress() const
+{
+    return _recovering;
+}
+
+void NetworkLobby::abortRecovery()
+{
+    if (_mode == NetworkLaunchMode::Join) {
+        _recovering = false;
+        fail(NetworkLobbyError::ProtocolError);
+    }
 }
 
 CharacterLobbyError NetworkLobby::submitLocalSheet(const CharacterCreationSheet& sheet)
@@ -232,7 +472,14 @@ void NetworkLobby::stop()
         _transport.reset();
     }
     _startRequested = false;
+    _pendingCommandSequences.clear();
+    _recoveryRequests.clear();
+    _peerCommands.clear();
+    _commandResults.clear();
     _peerEvents.clear();
+    _peerSnapshots.clear();
+    _recovering = false;
+    _eventJournal.clear();
     _state = NetworkLobbyState::Stopped;
 }
 
@@ -307,6 +554,19 @@ bool NetworkLobby::sendMessage(MessageType type, const std::vector<std::uint8_t>
     return true;
 }
 
+bool NetworkLobby::sendRecoveryMessage(std::uint8_t type, const std::vector<std::uint8_t>& body)
+{
+    ProtocolEnvelope envelope;
+    envelope.kind = MessageKind::Snapshot;
+    envelope.sessionId = _sessionId;
+    envelope.sequence = _nextSendSequence++;
+    appendUInt16(envelope.payload, kRecoveryWireVersion);
+    envelope.payload.push_back(type);
+    envelope.payload.push_back(0);
+    envelope.payload.insert(envelope.payload.end(), body.begin(), body.end());
+    return sendGameplayEnvelope(std::move(envelope));
+}
+
 void NetworkLobby::handlePacket(const Packet& packet)
 {
     ProtocolDecodeResult decoded = decodeEnvelope(packet);
@@ -318,17 +578,122 @@ void NetworkLobby::handlePacket(const Packet& packet)
     }
     _nextReceiveSequence++;
 
-    if (decoded.envelope.kind == MessageKind::Event) {
-        GameEventDecodeResult event = decodeGameEvent(decoded.envelope);
-        PlayerId peerPlayerId = _mode == NetworkLaunchMode::Host ? kGuestPlayerId : kHostPlayerId;
+    if (decoded.envelope.kind == MessageKind::Snapshot) {
         if (_state != NetworkLobbyState::Ready
             || !_startRequested
-            || !event
-            || !isSupportedLiveEvent(event.event.payload)
-            || eventActorId(event.event.payload) != EntityId { peerPlayerId.value }) {
+            || decoded.envelope.payload.size() < kRecoveryHeaderSize
+            || readUInt16(decoded.envelope.payload, 0) != kRecoveryWireVersion
+            || decoded.envelope.payload[3] != 0) {
+            fail(NetworkLobbyError::ProtocolError);
+            return;
+        }
+
+        RecoveryMessageType type = static_cast<RecoveryMessageType>(decoded.envelope.payload[2]);
+        std::vector<std::uint8_t> body(
+            decoded.envelope.payload.begin() + kRecoveryHeaderSize,
+            decoded.envelope.payload.end());
+        if (type == RecoveryMessageType::Request) {
+            if (_mode != NetworkLaunchMode::Host || body.size() != sizeof(std::uint64_t)) {
+                fail(NetworkLobbyError::UnexpectedMessage);
+                return;
+            }
+            _recoveryRequests.push_back(EventSequence { readUInt64(body, 0) });
+            return;
+        }
+        if (type == RecoveryMessageType::Snapshot) {
+            if (_mode != NetworkLaunchMode::Join || !_recovering) {
+                fail(NetworkLobbyError::UnexpectedMessage);
+                return;
+            }
+            SnapshotDecodeResult snapshot = decodeSnapshot(body);
+            if (!snapshot) {
+                fail(NetworkLobbyError::ProtocolError);
+                return;
+            }
+            if (snapshot.snapshot.lastIncludedEvent.value == std::numeric_limits<std::uint64_t>::max()) {
+                fail(NetworkLobbyError::ProtocolError);
+                return;
+            }
+            _nextExpectedEventSequence = snapshot.snapshot.lastIncludedEvent.value + 1;
+            _peerSnapshots.push_back(std::move(snapshot.snapshot));
+            return;
+        }
+        if (type == RecoveryMessageType::Complete) {
+            if (_mode != NetworkLaunchMode::Join || !_recovering || body.size() != sizeof(std::uint64_t)) {
+                fail(NetworkLobbyError::UnexpectedMessage);
+                return;
+            }
+            EventSequence latest { readUInt64(body, 0) };
+            if (_nextExpectedEventSequence == 0
+                || latest.value == std::numeric_limits<std::uint64_t>::max()
+                || latest.value + 1 != _nextExpectedEventSequence) {
+                fail(NetworkLobbyError::ProtocolError);
+                return;
+            }
+            _recovering = false;
+            return;
+        }
+        fail(NetworkLobbyError::UnexpectedMessage);
+        return;
+    }
+
+    if (decoded.envelope.kind == MessageKind::Command) {
+        GameCommandDecodeResult command = decodeGameCommand(decoded.envelope);
+        if (_mode != NetworkLaunchMode::Host
+            || _state != NetworkLobbyState::Ready
+            || !_startRequested
+            || !command
+            || command.command.playerId != kGuestPlayerId
+            || command.command.actorId != EntityId { kGuestPlayerId.value }) {
             fail(NetworkLobbyError::UnexpectedMessage);
             return;
         }
+        _peerCommands.push_back(std::move(command.command));
+        return;
+    }
+
+    if (decoded.envelope.kind == MessageKind::CommandResult) {
+        CommandResultDecodeResult result = decodeCommandResult(decoded.envelope);
+        if (_mode != NetworkLaunchMode::Join
+            || _state != NetworkLobbyState::Ready
+            || !_startRequested
+            || !result
+            || _pendingCommandSequences.empty()
+            || result.result.commandSequence != _pendingCommandSequences.front()) {
+            fail(NetworkLobbyError::UnexpectedMessage);
+            return;
+        }
+        _pendingCommandSequences.pop_front();
+        _commandResults.push_back(result.result);
+        return;
+    }
+
+    if (decoded.envelope.kind == MessageKind::Event) {
+        GameEventDecodeResult event = decodeGameEvent(decoded.envelope);
+        EntityId actorId = event ? eventActorId(event.event.payload) : EntityId {};
+        if (_mode != NetworkLaunchMode::Join
+            || _state != NetworkLobbyState::Ready
+            || !_startRequested
+            || !event
+            || !isSupportedLiveEvent(event.event.payload)
+            || (actorId != EntityId { kHostPlayerId.value }
+                && actorId != EntityId { kGuestPlayerId.value })) {
+            fail(NetworkLobbyError::UnexpectedMessage);
+            return;
+        }
+        if (event.event.sequence.value != _nextExpectedEventSequence) {
+            if (!_recovering
+                && event.event.sequence.value > _nextExpectedEventSequence
+                && _nextExpectedEventSequence > 0
+                && requestRecovery(EventSequence { _nextExpectedEventSequence - 1 })) {
+                return;
+            }
+            if (!_recovering) {
+                fail(NetworkLobbyError::UnexpectedMessage);
+            }
+            return;
+        }
+        _nextExpectedEventSequence++;
         _peerEvents.push_back(std::move(event.event));
         return;
     }

@@ -4,7 +4,9 @@
 #include <optional>
 
 #include "multiplayer/character_lobby.h"
+#include "multiplayer/command_processor.h"
 #include "multiplayer/network_bootstrap.h"
+#include "multiplayer/snapshot.h"
 
 namespace fallout {
 
@@ -18,6 +20,11 @@ bool networkWorldEnter(NetworkLaunchMode mode,
 bool networkWorldApplyPeerMove(const ActorMovementStartedEvent& movement);
 bool networkWorldApplyPeerFacing(const ActorFacingChangedEvent& facing);
 bool networkWorldApplyPeerDoorUse(const DoorUseStartedEvent& doorUse);
+AuthoritativeCommandResult networkWorldProcessCommand(const GameCommand& command);
+SessionPhase networkWorldPhase();
+std::uint32_t networkWorldPhaseRevision();
+bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot& snapshot);
+bool networkWorldApplySnapshot(const WorldSnapshot& snapshot);
 std::optional<EntityId> networkWorldFindEntity(const Object* object);
 void networkWorldLeave();
 bool networkWorldActive();

@@ -12,4 +12,8 @@ The headless test covers contiguous append, count and byte bounds, replay at the
 
 ## Current boundary
 
-These primitives do not yet alter the live host/guest connection. The current exploration path still sends movement, facing, and door events peer-to-peer. The next integration step is to route guest intents through the host, append only host-issued events to the journal, carry a peer's last applied event during reconnect, and choose journal replay or a fresh world snapshot before re-enabling input.
+Movement, facing, and door use now route guest intents through the host. Only host-issued events enter the session-wide sequence and bounded journal. The live connection detects event gaps and requests recovery from the last contiguous sequence. The host replays retained events when possible; otherwise it captures and sends the current actor-and-door snapshot. Recovery completion verifies that the guest reached the host's latest event sequence.
+
+Snapshot capture waits until player and door animations are idle. This keeps `lastIncludedEvent` aligned with the concrete tile, facing, hit-point, door-frame, and lock state represented by the snapshot instead of truncating an in-progress authoritative action.
+
+The remaining integration step is reconnecting after the TCP connection closes and authenticating the returning guest before using the same replay-or-snapshot flow. Reconnect token exchange remains disabled until the transport is authenticated or explicitly restricted to trusted LAN use.

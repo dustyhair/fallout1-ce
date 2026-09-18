@@ -11,6 +11,7 @@ enum class CommandType : std::uint8_t {
     UseDoor = 2,
     Pickup = 3,
     Loot = 4,
+    Face = 5,
 };
 
 enum class EventType : std::uint8_t {
@@ -24,6 +25,7 @@ enum class EventType : std::uint8_t {
 constexpr std::size_t kCommandHeaderSize = 28;
 constexpr std::size_t kMoveCommandSize = kCommandHeaderSize + 12;
 constexpr std::size_t kTargetCommandSize = kCommandHeaderSize + 4;
+constexpr std::size_t kFacingCommandSize = kCommandHeaderSize + 8;
 constexpr std::size_t kCommandResultSize = 24;
 constexpr std::size_t kEventHeaderSize = 20;
 constexpr std::size_t kMovementEventHeaderSize = kEventHeaderSize + 20;
@@ -164,6 +166,11 @@ GameplayWireError validateCommand(const GameCommand& command)
         }
         return GameplayWireError::None;
     }
+    if (const auto* face = std::get_if<FaceCommand>(&command.payload)) {
+        return face->rotation >= 0 && face->rotation < kActorRotationCount
+            ? GameplayWireError::None
+            : GameplayWireError::InvalidRotation;
+    }
 
     EntityId targetId;
     if (const auto* interact = std::get_if<InteractCommand>(&command.payload)) {
@@ -297,6 +304,10 @@ GameplayWireError encodeGameCommand(const GameCommand& command, ProtocolEnvelope
         appendInt32(envelope.payload, move->elevation);
         envelope.payload.push_back(move->running ? 1 : 0);
         envelope.payload.insert(envelope.payload.end(), 3, 0);
+    } else if (const auto* face = std::get_if<FaceCommand>(&command.payload)) {
+        appendCommandHeader(command, CommandType::Face, envelope.payload);
+        appendInt32(envelope.payload, face->rotation);
+        appendUInt32(envelope.payload, 0);
     } else if (const auto* interact = std::get_if<InteractCommand>(&command.payload)) {
         appendCommandHeader(command, CommandType::UseDoor, envelope.payload);
         appendUInt32(envelope.payload, interact->targetId.value);
@@ -353,6 +364,17 @@ GameCommandDecodeResult decodeGameCommand(const ProtocolEnvelope& envelope)
             readInt32(envelope.payload, 32),
             envelope.payload[36] != 0,
         };
+        break;
+    case CommandType::Face:
+        if (envelope.payload.size() != kFacingCommandSize) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        if (readUInt32(envelope.payload, 32) != 0) {
+            result.error = GameplayWireError::InvalidReservedField;
+            return result;
+        }
+        result.command.payload = FaceCommand { readInt32(envelope.payload, 28) };
         break;
     case CommandType::UseDoor:
     case CommandType::Pickup:

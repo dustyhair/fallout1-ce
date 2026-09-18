@@ -900,7 +900,9 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
                 return;
             }
 
-            multiplayer::networkRuntimeSubmitLocalMove(obj_mouse_flat->tile, map_elevation, shouldRun);
+            if (multiplayer::networkRuntimeSubmitLocalMove(obj_mouse_flat->tile, map_elevation, shouldRun)) {
+                return;
+            }
 
             if (shouldRun) {
                 dude_run(actionPoints);

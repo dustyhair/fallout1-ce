@@ -47,6 +47,7 @@ bool backgroundProcessRegistered = false;
 bool lobbyStarted = false;
 bool smokeTestEnabled = false;
 int lastSentLocalRotation = -1;
+std::optional<EventSequence> pendingRecoveryRequest;
 
 constexpr std::uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
 constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
@@ -135,6 +136,8 @@ std::uint64_t compatibilityDigest()
     hashString(digest, "fallout-ce-multiplayer-compatibility-v1");
     hashUInt64(digest, kProtocolVersion);
     hashUInt64(digest, kConnectionHandshakeVersion);
+    hashUInt64(digest, kGameplayWireVersion);
+    hashUInt64(digest, kNetworkLobbyVersion);
     hashString(digest, language);
     if (!hashArchiveSample(digest, masterDat) || !hashArchiveSample(digest, critterDat)) {
         return 0;
@@ -253,11 +256,49 @@ void networkRuntimeBackgroundProcess()
 
     lobby.poll();
     if (networkWorldActive()) {
+        if (launchOptions.mode == NetworkLaunchMode::Host) {
+            if (!pendingRecoveryRequest.has_value()) {
+                pendingRecoveryRequest = lobby.takeRecoveryRequest();
+            }
+            if (pendingRecoveryRequest.has_value()) {
+                WorldSnapshot snapshot;
+                EventReplay replay = lobby.replayAfter(*pendingRecoveryRequest);
+                bool snapshotReady = replay.status != EventReplayStatus::SnapshotRequired
+                    || networkWorldCaptureSnapshot(lobby.latestAuthoritativeEvent(), snapshot);
+                if (snapshotReady) {
+                    if (!lobby.sendRecovery(*pendingRecoveryRequest, snapshot)) {
+                        debug_printf("Multiplayer recovery response could not be sent.\n");
+                    }
+                    pendingRecoveryRequest.reset();
+                }
+            }
+            while (std::optional<GameCommand> command = lobby.takePeerCommand()) {
+                AuthoritativeCommandResult outcome = networkWorldProcessCommand(*command);
+                if (!lobby.sendCommandOutcome(std::move(outcome))) {
+                    debug_printf("Multiplayer command outcome could not be sent.\n");
+                    break;
+                }
+            }
+        }
+        while (std::optional<WorldSnapshot> snapshot = lobby.takePeerSnapshot()) {
+            if (!networkWorldApplySnapshot(*snapshot)) {
+                debug_printf("Multiplayer recovery snapshot could not be applied.\n");
+                lobby.abortRecovery();
+                break;
+            }
+        }
         if (obj_dude != nullptr
             && FID_ANIM_TYPE(obj_dude->fid) == ANIM_STAND
             && obj_dude->rotation != lastSentLocalRotation
-            && lobby.sendLocalFacing(obj_dude->rotation)) {
+            && lobby.sendLocalFacing(obj_dude->rotation, networkWorldPhaseRevision())) {
             lastSentLocalRotation = obj_dude->rotation;
+        }
+        while (std::optional<CommandResult> result = lobby.takeCommandResult()) {
+            if (result->status == CommandStatus::Rejected) {
+                debug_printf("Multiplayer command %llu rejected with reason %d.\n",
+                    static_cast<unsigned long long>(result->commandSequence.value),
+                    static_cast<int>(result->rejection));
+            }
         }
         while (std::optional<GameEvent> event = lobby.takePeerEvent()) {
             bool applied = false;
@@ -326,6 +367,7 @@ bool networkRuntimeConfigure(int argc, char** argv)
         return false;
     }
     pendingLocalSheet.reset();
+    pendingRecoveryRequest.reset();
     runtimeStatus.clear();
     lobbyStarted = false;
     return true;
@@ -785,12 +827,37 @@ bool networkRuntimeSubmitLocalMove(int destinationTile, int elevation, bool runn
         return false;
     }
 
-    return lobby.sendLocalMove(
+    int startingTile = obj_dude->tile;
+    std::vector<std::uint8_t> rotations(path.begin(), path.begin() + pathLength);
+    if (launchOptions.mode == NetworkLaunchMode::Host) {
+        register_clear(obj_dude);
+        if (register_begin(ANIMATION_REQUEST_RESERVED) == -1) {
+            return false;
+        }
+        int rc = register_object_move_along_path(obj_dude,
+            destinationTile,
+            elevation,
+            path.data(),
+            pathLength,
+            running,
+            0);
+        int endRc = register_end();
+        if (rc == -1 || endRc == -1) {
+            return false;
+        }
+    }
+
+    bool sent = lobby.sendLocalMove(
         destinationTile,
         elevation,
         running,
-        obj_dude->tile,
-        std::vector<std::uint8_t>(path.begin(), path.begin() + pathLength));
+        startingTile,
+        rotations,
+        networkWorldPhaseRevision());
+    if (!sent) {
+        debug_printf("Multiplayer movement command could not be sent.\n");
+    }
+    return true;
 }
 
 bool networkRuntimeHandleLocalDoorUse(Object* target)
@@ -805,8 +872,12 @@ bool networkRuntimeHandleLocalDoorUse(Object* target)
         return true;
     }
 
-    if (action_use_an_object(obj_dude, target) != -1 && !lobby.sendLocalDoorUse(*targetId)) {
-        debug_printf("Multiplayer door event could not be sent.\n");
+    if (launchOptions.mode == NetworkLaunchMode::Host
+        && action_use_an_object(obj_dude, target) == -1) {
+        return true;
+    }
+    if (!lobby.sendLocalDoorUse(*targetId, networkWorldPhaseRevision())) {
+        debug_printf("Multiplayer door command could not be sent.\n");
     }
     return true;
 }
@@ -814,6 +885,7 @@ bool networkRuntimeHandleLocalDoorUse(Object* target)
 void networkRuntimeLeaveWorld()
 {
     lastSentLocalRotation = -1;
+    pendingRecoveryRequest.reset();
     networkWorldLeave();
 }
 
@@ -828,6 +900,7 @@ void networkRuntimeStop()
     lobby.stop();
     bootstrap.stop();
     lobbyStarted = false;
+    pendingRecoveryRequest.reset();
 }
 
 } // namespace multiplayer

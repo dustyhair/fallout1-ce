@@ -8,7 +8,10 @@
 #include <vector>
 
 #include "multiplayer/character_lobby.h"
+#include "multiplayer/command_processor.h"
 #include "multiplayer/network_bootstrap.h"
+#include "multiplayer/session_recovery.h"
+#include "multiplayer/snapshot.h"
 #include "multiplayer/transport.h"
 #include "multiplayer/types.h"
 
@@ -46,10 +49,22 @@ public:
         int elevation,
         bool running,
         int startingTile = -1,
-        const std::vector<std::uint8_t>& path = {});
-    bool sendLocalFacing(int rotation);
-    bool sendLocalDoorUse(EntityId targetId);
+        const std::vector<std::uint8_t>& path = {},
+        std::uint32_t phaseRevision = 1);
+    bool sendLocalFacing(int rotation, std::uint32_t phaseRevision = 1);
+    bool sendLocalDoorUse(EntityId targetId, std::uint32_t phaseRevision = 1);
+    bool sendCommandOutcome(AuthoritativeCommandResult outcome);
+    std::optional<GameCommand> takePeerCommand();
+    std::optional<CommandResult> takeCommandResult();
     std::optional<GameEvent> takePeerEvent();
+    EventReplay replayAfter(EventSequence lastApplied) const;
+    bool requestRecovery(EventSequence lastApplied);
+    std::optional<EventSequence> takeRecoveryRequest();
+    bool sendRecovery(EventSequence lastApplied, const WorldSnapshot& snapshot);
+    std::optional<WorldSnapshot> takePeerSnapshot();
+    EventSequence latestAuthoritativeEvent() const;
+    bool recoveryInProgress() const;
+    void abortRecovery();
     void poll();
     void stop();
 
@@ -71,7 +86,10 @@ private:
         Start = 4,
     };
 
-    bool sendLocalEvent(GameEventPayload payload);
+    bool sendLocalAction(GameEventPayload eventPayload, GameCommandPayload commandPayload, std::uint32_t phaseRevision);
+    bool sendAuthoritativeEvent(GameEvent event);
+    bool sendRecoveryMessage(std::uint8_t type, const std::vector<std::uint8_t>& body = {});
+    bool sendGameplayEnvelope(ProtocolEnvelope envelope);
     bool sendMessage(MessageType type, const std::vector<std::uint8_t>& body = {});
     void handlePacket(const Packet& packet);
     void handleCharacterSheet(const std::vector<std::uint8_t>& body);
@@ -89,8 +107,17 @@ private:
     std::optional<CharacterCreationSheet> _localSheet;
     std::optional<CharacterCreationSheet> _peerSheet;
     bool _startRequested = false;
+    std::uint64_t _nextLocalCommandSequence = 1;
     std::uint64_t _nextEventSequence = 1;
+    std::uint64_t _nextExpectedEventSequence = 1;
+    std::deque<CommandSequence> _pendingCommandSequences;
+    std::deque<EventSequence> _recoveryRequests;
+    std::deque<GameCommand> _peerCommands;
+    std::deque<CommandResult> _commandResults;
     std::deque<GameEvent> _peerEvents;
+    std::deque<WorldSnapshot> _peerSnapshots;
+    bool _recovering = false;
+    EventJournal _eventJournal;
     std::unique_ptr<Transport> _transport;
 };
 
