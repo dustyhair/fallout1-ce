@@ -23,10 +23,32 @@ set(CMAKE_CXX_EXTENSIONS NO)
 option(ASAN "Enable address sanitizer" OFF)
 option(UBSAN "Enable undefined behaviour sanitizer" OFF)
 
+include(CTest)
+
 if (ANDROID)
     add_library(${EXECUTABLE_NAME} SHARED)
 else()
     add_executable(${EXECUTABLE_NAME} WIN32 MACOSX_BUNDLE)
+endif()
+
+add_library(fallout-multiplayer-core STATIC
+    "src/multiplayer/loopback_transport.cc"
+    "src/multiplayer/loopback_transport.h"
+    "src/multiplayer/protocol.cc"
+    "src/multiplayer/protocol.h"
+    "src/multiplayer/transport.h"
+    "src/multiplayer/types.h"
+)
+target_include_directories(fallout-multiplayer-core PUBLIC src)
+set_target_properties(fallout-multiplayer-core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(${EXECUTABLE_NAME} fallout-multiplayer-core)
+
+if (BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
+    add_executable(fallout-multiplayer-core-test
+        "tests/multiplayer_core_test.cc"
+    )
+    target_link_libraries(fallout-multiplayer-core-test PRIVATE fallout-multiplayer-core)
+    add_test(NAME multiplayer-core COMMAND fallout-multiplayer-core-test)
 endif()
 
 if(ASAN)
