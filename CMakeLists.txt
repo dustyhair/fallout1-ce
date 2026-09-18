@@ -32,6 +32,8 @@ else()
 endif()
 
 add_library(fallout-multiplayer-core STATIC
+    "src/multiplayer/entity_registry.cc"
+    "src/multiplayer/entity_registry.h"
     "src/multiplayer/loopback_transport.cc"
     "src/multiplayer/loopback_transport.h"
     "src/multiplayer/protocol.cc"

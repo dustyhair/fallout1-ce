@@ -1,8 +1,10 @@
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
+#include "multiplayer/entity_registry.h"
 #include "multiplayer/loopback_transport.h"
 #include "multiplayer/protocol.h"
 #include "multiplayer/types.h"
@@ -12,6 +14,16 @@ namespace multiplayer {
 namespace {
 
 int failures = 0;
+
+struct TestObject {
+    int legacyId = -1;
+    TestObject* owner = nullptr;
+};
+
+Object* asGameObject(TestObject& object)
+{
+    return reinterpret_cast<Object*>(&object);
+}
 
 void expect(bool condition, const std::string& message)
 {
@@ -48,6 +60,92 @@ void testCoreTypes()
     const MoveCommand* move = std::get_if<MoveCommand>(&command.payload);
     expect(move != nullptr, "game command keeps typed movement arguments");
     expect(move != nullptr && move->destinationTile == 12345, "movement destination survives assignment");
+}
+
+void testEntityRegistry()
+{
+    EntityRegistry registry;
+    TestObject hostActor;
+    TestObject guestActor;
+    TestObject clone;
+
+    EntityRegistrationResult host = registry.registerObject(asGameObject(hostActor), PlayerId { 1 });
+    EntityRegistrationResult guest = registry.registerObject(asGameObject(guestActor), PlayerId { 2 });
+    EntityRegistrationResult cloned = registry.registerObject(asGameObject(clone));
+
+    expect(static_cast<bool>(host) && host.entityId == EntityId { 1 }, "first object receives entity ID 1");
+    expect(static_cast<bool>(guest) && guest.entityId == EntityId { 2 }, "second object receives entity ID 2");
+    expect(static_cast<bool>(cloned) && cloned.entityId == EntityId { 3 }, "clone receives a distinct entity ID");
+    expect(registry.size() == 3, "registry reports registered entity count");
+    expect(registry.findObject(guest.entityId) == asGameObject(guestActor), "entity ID resolves to its object");
+    expect(registry.findEntity(asGameObject(guestActor)) == guest.entityId, "object resolves to its entity ID");
+    expect(registry.isOwnedBy(host.entityId, PlayerId { 1 }), "host actor ownership is recorded");
+    expect(!registry.isOwnedBy(host.entityId, PlayerId { 2 }), "ownership rejects another player");
+    expect(!registry.ownerOf(cloned.entityId).has_value(), "unowned entity has no player");
+
+    expect(registry.setOwner(cloned.entityId, PlayerId { 2 }) == EntityRegistryError::None, "owner can be assigned");
+    expect(registry.isOwnedBy(cloned.entityId, PlayerId { 2 }), "assigned owner is returned");
+    expect(registry.clearOwner(cloned.entityId) == EntityRegistryError::None, "owner can be cleared");
+    expect(!registry.ownerOf(cloned.entityId).has_value(), "cleared entity is unowned");
+
+    expect(registry.registerObject(nullptr).error == EntityRegistryError::NullObject, "null object is rejected");
+    expect(registry.registerObject(asGameObject(hostActor)).error == EntityRegistryError::ObjectAlreadyRegistered, "same object cannot register twice");
+    expect(registry.rebindObject(guest.entityId, asGameObject(hostActor)) == EntityRegistryError::ObjectAlreadyRegistered, "rebind cannot steal another entity's object");
+    expect(registry.setOwner(EntityId { 999 }, PlayerId { 1 }) == EntityRegistryError::EntityNotFound, "unknown entity cannot gain an owner");
+    expect(registry.setOwner(host.entityId, PlayerId {}) == EntityRegistryError::InvalidPlayerId, "player ID zero is rejected");
+
+    expect(registry.unregisterEntity(cloned.entityId) == EntityRegistryError::None, "entity can be unregistered");
+    expect(registry.unregisterEntity(cloned.entityId) == EntityRegistryError::EntityNotFound, "entity cannot be unregistered twice");
+    expect(!registry.contains(cloned.entityId), "unregistered entity is absent");
+    expect(!registry.findEntity(asGameObject(clone)).has_value(), "unregistered object is absent");
+}
+
+void testEntityRegistryAcrossEngineLifecycles()
+{
+    EntityRegistry registry;
+    TestObject inventoryOwner;
+    TestObject inventoryItem;
+    inventoryItem.legacyId = 17;
+
+    EntityRegistrationResult registered = registry.registerObject(asGameObject(inventoryItem), PlayerId { 2 });
+    expect(static_cast<bool>(registered), "inventory item registers");
+
+    inventoryItem.owner = &inventoryOwner;
+    expect(registry.findEntity(asGameObject(inventoryItem)) == registered.entityId, "inventory move keeps entity identity");
+
+    inventoryItem.legacyId = 20001;
+    expect(registry.findEntity(asGameObject(inventoryItem)) == registered.entityId, "legacy object ID rewrite does not change entity identity");
+
+    TestObject loadedItem;
+    loadedItem.legacyId = 17;
+    expect(registry.rebindObject(registered.entityId, asGameObject(loadedItem)) == EntityRegistryError::None, "map load can rebind an entity to a new object");
+    expect(registry.findObject(registered.entityId) == asGameObject(loadedItem), "rebound entity resolves to loaded object");
+    expect(!registry.findEntity(asGameObject(inventoryItem)).has_value(), "old object pointer is removed after rebind");
+    expect(registry.isOwnedBy(registered.entityId, PlayerId { 2 }), "rebind preserves ownership");
+
+    registry.clear();
+    expect(registry.size() == 0, "session clear removes all entities");
+
+    TestObject restoredActor;
+    EntityId savedEntityId { 73 };
+    expect(registry.restoreObject(savedEntityId, asGameObject(restoredActor), PlayerId { 2 }) == EntityRegistryError::None, "save metadata restores an entity ID");
+    expect(registry.isOwnedBy(savedEntityId, PlayerId { 2 }), "save metadata restores ownership");
+
+    TestObject newObject;
+    EntityRegistrationResult afterRestore = registry.registerObject(asGameObject(newObject));
+    expect(afterRestore.entityId == EntityId { 74 }, "new IDs advance beyond restored IDs");
+
+    TestObject duplicateIdObject;
+    expect(registry.restoreObject(savedEntityId, asGameObject(duplicateIdObject)) == EntityRegistryError::EntityIdInUse, "restored entity ID collision is rejected");
+    expect(registry.restoreObject(EntityId { 75 }, asGameObject(restoredActor)) == EntityRegistryError::ObjectAlreadyRegistered, "restored object collision is rejected");
+    expect(registry.restoreObject(EntityId {}, asGameObject(duplicateIdObject)) == EntityRegistryError::InvalidEntityId, "entity ID zero is rejected");
+
+    registry.clear();
+    TestObject lastObject;
+    TestObject exhaustedObject;
+    EntityId lastEntityId { std::numeric_limits<std::uint32_t>::max() };
+    expect(registry.restoreObject(lastEntityId, asGameObject(lastObject)) == EntityRegistryError::None, "largest entity ID can be restored");
+    expect(registry.registerObject(asGameObject(exhaustedObject)).error == EntityRegistryError::EntityIdsExhausted, "entity ID allocation does not wrap");
 }
 
 void testProtocolRoundTrip()
@@ -138,6 +236,8 @@ void testLoopbackTransport()
 int main()
 {
     fallout::multiplayer::testCoreTypes();
+    fallout::multiplayer::testEntityRegistry();
+    fallout::multiplayer::testEntityRegistryAcrossEngineLifecycles();
     fallout::multiplayer::testProtocolRoundTrip();
     fallout::multiplayer::testProtocolRejectsInvalidPackets();
     fallout::multiplayer::testLoopbackTransport();

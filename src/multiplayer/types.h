@@ -12,6 +12,11 @@ struct PlayerId {
     std::uint32_t value = 0;
 };
 
+constexpr bool isValid(PlayerId id)
+{
+    return id.value != 0;
+}
+
 constexpr bool operator==(PlayerId lhs, PlayerId rhs)
 {
     return lhs.value == rhs.value;
@@ -32,6 +37,11 @@ struct PlayerIdHash {
 struct EntityId {
     std::uint32_t value = 0;
 };
+
+constexpr bool isValid(EntityId id)
+{
+    return id.value != 0;
+}
 
 constexpr bool operator==(EntityId lhs, EntityId rhs)
 {

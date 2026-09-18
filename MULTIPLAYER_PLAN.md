@@ -138,9 +138,9 @@ For the first version:
 - Pause both players when either opens a modal interface that changes shared state.
 - Let harmless local panels, such as the character sheet, remain client-side when practical.
 
-Object IDs must remain stable for the session. The existing `Object::id` is already written by `obj_write_obj`, but `new_obj_id()` keeps allocator state in a function-static integer and party-member save code can rewrite IDs. Phase 0 must audit map load, inventory nesting, party persistence, object cloning, and script-created objects.
+Object IDs must remain stable for the session. The [object identity audit](docs/multiplayer/object-identity.md) found that the existing `Object::id` is serialized but not stable enough for network identity. Party persistence, script attachment, player loading, and item stacking can replace it.
 
-Prefer a host-assigned `EntityId` that reuses `Object::id` if that audit proves uniqueness for the whole session. If it does not, keep a separate session ID in the multiplayer ownership registry rather than changing the original save layout. Never expose pointers or rely on load-order addresses.
+Use a separate host-assigned `EntityId` in the multiplayer registry. The registry maps it to the current local object and supports explicit rebinding across load boundaries. Never expose pointers or rely on load-order addresses.
 
 ## Combat
 
@@ -351,7 +351,7 @@ Exit condition: a two-player session can be stopped, loaded later, and resumed w
 Keep the first reviews small enough to validate the architecture before socket code arrives:
 
 1. [x] Add the headless test target, multiplayer value types, protocol envelope, and loopback transport.
-2. [ ] Add the ownership registry and document the `Object::id` audit with tests for create, clone, inventory, map load, and save/load behavior.
+2. [x] Add the ownership registry and document the `Object::id` audit with tests for create, clone, inventory, map load, and save/load behavior.
 3. [ ] Add the local session controller and the second developer actor.
 4. [ ] Route movement and one door interaction through commands and authoritative results.
 5. [ ] Add the minimal snapshot, sectioned state digest, and recovery test.
