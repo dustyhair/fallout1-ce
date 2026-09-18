@@ -2,6 +2,7 @@
 #define FALLOUT_MULTIPLAYER_NETWORK_LOBBY_H_
 
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <optional>
 
@@ -40,6 +41,8 @@ public:
     bool start(NetworkLaunchMode mode, SessionId sessionId, std::unique_ptr<Transport> transport);
     CharacterLobbyError submitLocalSheet(const CharacterCreationSheet& sheet);
     bool requestStart();
+    bool sendLocalMove(int destinationTile, int elevation, bool running);
+    std::optional<ActorMovementStartedEvent> takePeerMove();
     void poll();
     void stop();
 
@@ -78,6 +81,8 @@ private:
     std::optional<CharacterCreationSheet> _localSheet;
     std::optional<CharacterCreationSheet> _peerSheet;
     bool _startRequested = false;
+    std::uint64_t _nextMovementSequence = 1;
+    std::deque<ActorMovementStartedEvent> _peerMoves;
     std::unique_ptr<Transport> _transport;
 };
 

@@ -2,6 +2,7 @@
 
 #include <utility>
 
+#include "multiplayer/gameplay_wire.h"
 #include "multiplayer/protocol.h"
 
 namespace fallout {
@@ -42,6 +43,8 @@ bool NetworkLobby::start(NetworkLaunchMode mode, SessionId sessionId, std::uniqu
     _localSheet.reset();
     _peerSheet.reset();
     _startRequested = false;
+    _nextMovementSequence = 1;
+    _peerMoves.clear();
 
     if ((mode != NetworkLaunchMode::Host && mode != NetworkLaunchMode::Join)
         || sessionId.value == 0
@@ -55,6 +58,52 @@ bool NetworkLobby::start(NetworkLaunchMode mode, SessionId sessionId, std::uniqu
     _transport = std::move(transport);
     _state = NetworkLobbyState::Waiting;
     return true;
+}
+
+bool NetworkLobby::sendLocalMove(int destinationTile, int elevation, bool running)
+{
+    if (_state != NetworkLobbyState::Ready || !_startRequested || _transport == nullptr) {
+        return false;
+    }
+
+    PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
+    GameEvent event;
+    event.sequence.value = _nextMovementSequence;
+    event.causedBy.value = _nextMovementSequence;
+    event.payload = ActorMovementStartedEvent {
+        EntityId { playerId.value },
+        destinationTile,
+        elevation,
+        running,
+    };
+
+    ProtocolEnvelope envelope;
+    envelope.sessionId = _sessionId;
+    envelope.sequence = _nextSendSequence++;
+    Packet packet;
+    if (encodeGameEvent(event, envelope) != GameplayWireError::None
+        || encodeEnvelope(envelope, packet) != ProtocolError::None) {
+        fail(NetworkLobbyError::EncodeFailed);
+        return false;
+    }
+    if (_transport->send(std::move(packet)) != TransportSendResult::Sent) {
+        fail(NetworkLobbyError::SendFailed);
+        return false;
+    }
+
+    _nextMovementSequence++;
+    return true;
+}
+
+std::optional<ActorMovementStartedEvent> NetworkLobby::takePeerMove()
+{
+    if (_peerMoves.empty()) {
+        return std::nullopt;
+    }
+
+    ActorMovementStartedEvent movement = _peerMoves.front();
+    _peerMoves.pop_front();
+    return movement;
 }
 
 CharacterLobbyError NetworkLobby::submitLocalSheet(const CharacterCreationSheet& sheet)
@@ -144,6 +193,7 @@ void NetworkLobby::stop()
         _transport.reset();
     }
     _startRequested = false;
+    _peerMoves.clear();
     _state = NetworkLobbyState::Stopped;
 }
 
@@ -222,16 +272,35 @@ void NetworkLobby::handlePacket(const Packet& packet)
 {
     ProtocolDecodeResult decoded = decodeEnvelope(packet);
     if (!decoded
-        || decoded.envelope.kind != MessageKind::Lobby
         || decoded.envelope.sessionId != _sessionId
-        || decoded.envelope.sequence != _nextReceiveSequence
+        || decoded.envelope.sequence != _nextReceiveSequence) {
+        fail(NetworkLobbyError::ProtocolError);
+        return;
+    }
+    _nextReceiveSequence++;
+
+    if (decoded.envelope.kind == MessageKind::Event) {
+        GameEventDecodeResult event = decodeGameEvent(decoded.envelope);
+        const auto* movement = event ? std::get_if<ActorMovementStartedEvent>(&event.event.payload) : nullptr;
+        PlayerId peerPlayerId = _mode == NetworkLaunchMode::Host ? kGuestPlayerId : kHostPlayerId;
+        if (_state != NetworkLobbyState::Ready
+            || !_startRequested
+            || movement == nullptr
+            || movement->actorId != EntityId { peerPlayerId.value }) {
+            fail(NetworkLobbyError::UnexpectedMessage);
+            return;
+        }
+        _peerMoves.push_back(*movement);
+        return;
+    }
+
+    if (decoded.envelope.kind != MessageKind::Lobby
         || decoded.envelope.payload.size() < kLobbyHeaderSize
         || readUInt16(decoded.envelope.payload, 0) != kNetworkLobbyVersion
         || decoded.envelope.payload[3] != 0) {
         fail(NetworkLobbyError::ProtocolError);
         return;
     }
-    _nextReceiveSequence++;
 
     MessageType type = static_cast<MessageType>(decoded.envelope.payload[2]);
     std::vector<std::uint8_t> body(decoded.envelope.payload.begin() + kLobbyHeaderSize, decoded.envelope.payload.end());

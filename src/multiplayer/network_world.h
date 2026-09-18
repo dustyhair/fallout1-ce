@@ -10,6 +10,7 @@ namespace multiplayer {
 bool networkWorldEnter(NetworkLaunchMode mode,
     const CharacterCreationSheet& localSheet,
     const CharacterCreationSheet& peerSheet);
+bool networkWorldApplyPeerMove(const ActorMovementStartedEvent& movement);
 void networkWorldLeave();
 bool networkWorldActive();
 

@@ -3,6 +3,7 @@
 #include "game/anim.h"
 #include "game/critter.h"
 #include "game/intface.h"
+#include "game/map_defs.h"
 #include "game/object.h"
 #include "game/protinst.h"
 #include "game/stat.h"
@@ -142,6 +143,32 @@ bool networkWorldEnter(NetworkLaunchMode mode,
 
     intface_redraw();
     return true;
+}
+
+bool networkWorldApplyPeerMove(const ActorMovementStartedEvent& movement)
+{
+    if (!session.isActive() || peerActor == nullptr) {
+        return false;
+    }
+
+    PlayerCharacterState* remotePlayer = session.players().findByActor(movement.actorId);
+    if (remotePlayer == nullptr
+        || remotePlayer->ownership != PlayerOwnership::RemoteControl
+        || session.entities().findObject(remotePlayer->actorId) != peerActor
+        || !hexGridTileIsValid(movement.destinationTile)
+        || movement.elevation != peerActor->elevation) {
+        return false;
+    }
+
+    register_clear(peerActor);
+    if (register_begin(ANIMATION_REQUEST_UNRESERVED) == -1) {
+        return false;
+    }
+    int rc = movement.running
+        ? register_object_run_to_tile(peerActor, movement.destinationTile, movement.elevation, -1, 0)
+        : register_object_move_to_tile(peerActor, movement.destinationTile, movement.elevation, -1, 0);
+    int endRc = register_end();
+    return rc != -1 && endRc != -1;
 }
 
 void networkWorldLeave()

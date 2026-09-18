@@ -1076,6 +1076,25 @@ void testNetworkCharacterLobby()
     }
     expect(host.startRequested() && guest.startRequested(),
         "host and guest observe the same game start");
+    expect(host.sendLocalMove(12345, 0, true), "host sends its local movement");
+    guest.poll();
+    std::optional<ActorMovementStartedEvent> hostMove = guest.takePeerMove();
+    expect(hostMove.has_value()
+            && hostMove->actorId == EntityId { kHostPlayerId.value }
+            && hostMove->destinationTile == 12345
+            && hostMove->elevation == 0
+            && hostMove->running,
+        "guest receives the host movement");
+    expect(!guest.takePeerMove().has_value(), "received host movement is consumed once");
+    expect(guest.sendLocalMove(12346, 1, false), "guest sends its local movement");
+    host.poll();
+    std::optional<ActorMovementStartedEvent> guestMove = host.takePeerMove();
+    expect(guestMove.has_value()
+            && guestMove->actorId == EntityId { kGuestPlayerId.value }
+            && guestMove->destinationTile == 12346
+            && guestMove->elevation == 1
+            && !guestMove->running,
+        "host receives the guest movement");
     expect(host.takeTransport() != nullptr && guest.takeTransport() != nullptr,
         "ready lobbies hand the connection to the game session");
 

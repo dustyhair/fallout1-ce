@@ -20,6 +20,7 @@
 #include "game/skilldex.h"
 #include "game/tile.h"
 #include "multiplayer/developer_local_session.h"
+#include "multiplayer/network_runtime.h"
 #include "platform_compat.h"
 #include "plib/color/color.h"
 #include "plib/gnw/gnw.h"
@@ -898,6 +899,8 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
                 multiplayer::developerLocalSessionSubmitMove(playerId, obj_mouse_flat->tile, map_elevation, shouldRun);
                 return;
             }
+
+            multiplayer::networkRuntimeSubmitLocalMove(obj_mouse_flat->tile, map_elevation, shouldRun);
 
             if (shouldRun) {
                 dude_run(actionPoints);

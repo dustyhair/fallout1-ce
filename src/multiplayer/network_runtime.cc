@@ -247,6 +247,13 @@ void networkRuntimeBackgroundProcess()
     }
 
     lobby.poll();
+    if (networkWorldActive()) {
+        while (std::optional<ActorMovementStartedEvent> movement = lobby.takePeerMove()) {
+            if (!networkWorldApplyPeerMove(*movement)) {
+                debug_printf("Multiplayer peer movement could not be applied.\n");
+            }
+        }
+    }
     reportLobbyStatus();
 }
 
@@ -740,6 +747,11 @@ bool networkRuntimeEnterWorld()
     }
     reportLobbyStatus();
     return true;
+}
+
+bool networkRuntimeSubmitLocalMove(int destinationTile, int elevation, bool running)
+{
+    return networkWorldActive() && lobby.sendLocalMove(destinationTile, elevation, running);
 }
 
 void networkRuntimeLeaveWorld()
