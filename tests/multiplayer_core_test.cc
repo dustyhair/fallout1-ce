@@ -497,12 +497,26 @@ void testLocalPlayerContext()
     }
     expect(actingPlayerState() == nullptr, "local presentation scope restores the prior acting context");
 
+    expect(bindLocalPlayer(session, kHostPlayerId) == LocalPlayerError::None, "host can become the persistent presentation player");
+    {
+        ScopedLocalPlayerBinding guestBinding(session, kGuestPlayerId);
+        expect(static_cast<bool>(guestBinding), "scoped binding selects the guest");
+        expect(localPlayerId() == kGuestPlayerId && localPlayerActor() == asGameObject(guestActor), "scoped binding exposes the guest to modal UI");
+    }
+    expect(localPlayerId() == kHostPlayerId && localPlayerActor() == asGameObject(hostActor), "leaving a scoped binding restores the host");
+    {
+        ScopedLocalPlayerBinding invalidBinding(session, PlayerId { 99 });
+        expect(!invalidBinding && invalidBinding.error() == LocalPlayerError::PlayerMissing, "scoped binding reports an unknown player");
+    }
+    expect(localPlayerId() == kHostPlayerId, "failed scoped binding leaves the current player unchanged");
+
     submitBothCharacterSheets(session);
     expect(playerStateForActor(asGameObject(hostActor)) == session.players().find(kHostPlayerId), "bound session resolves the host state from its actor");
     expect(playerStateForActor(asGameObject(guestActor)) == session.players().find(kGuestPlayerId), "bound session resolves the guest state from its actor");
     expect(session.transitionTo(SessionPhase::Loading) == LocalSessionError::None, "local-player test enters loading");
     expect(session.transitionTo(SessionPhase::Exploration) == LocalSessionError::None, "local-player test enters exploration");
     expect(session.transitionTo(SessionPhase::Transition) == LocalSessionError::None, "local-player test enters map transition");
+    expect(bindLocalPlayer(session, kGuestPlayerId) == LocalPlayerError::None, "guest is selected for the actor-rebind test");
     expect(session.rebindPlayerActor(kGuestPlayerId, asGameObject(replacementGuest)) == LocalSessionError::None, "local player actor can be rebound");
     expect(localPlayerActor() == asGameObject(replacementGuest), "local-player lookup follows actor rebinding");
 

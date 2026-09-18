@@ -26,6 +26,23 @@ Object* localPlayerActor();
 PlayerCharacterState* playerStateForActor(const Object* actor);
 bool isLocalPlayerActor(const Object* actor);
 
+class ScopedLocalPlayerBinding {
+public:
+    ScopedLocalPlayerBinding(LocalSession& session, PlayerId playerId);
+    ~ScopedLocalPlayerBinding();
+
+    ScopedLocalPlayerBinding(const ScopedLocalPlayerBinding&) = delete;
+    ScopedLocalPlayerBinding& operator=(const ScopedLocalPlayerBinding&) = delete;
+
+    explicit operator bool() const;
+    LocalPlayerError error() const;
+
+private:
+    LocalSession* _previousSession = nullptr;
+    PlayerId _previousPlayerId;
+    LocalPlayerError _error = LocalPlayerError::None;
+};
+
 class ScopedLocalPlayerContext {
 public:
     ScopedLocalPlayerContext();

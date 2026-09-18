@@ -77,6 +77,37 @@ bool isLocalPlayerActor(const Object* actor)
     return actor != nullptr && actor == localPlayerActor();
 }
 
+ScopedLocalPlayerBinding::ScopedLocalPlayerBinding(LocalSession& session, PlayerId playerId)
+    : _previousSession(boundSession)
+    , _previousPlayerId(boundPlayerId)
+    , _error(bindLocalPlayer(session, playerId))
+{
+}
+
+ScopedLocalPlayerBinding::~ScopedLocalPlayerBinding()
+{
+    if (_error != LocalPlayerError::None) {
+        return;
+    }
+
+    if (_previousSession != nullptr
+        && _previousSession->isActive()
+        && bindLocalPlayer(*_previousSession, _previousPlayerId) == LocalPlayerError::None) {
+        return;
+    }
+    clearLocalPlayer();
+}
+
+ScopedLocalPlayerBinding::operator bool() const
+{
+    return _error == LocalPlayerError::None;
+}
+
+LocalPlayerError ScopedLocalPlayerBinding::error() const
+{
+    return _error;
+}
+
 ScopedLocalPlayerContext::ScopedLocalPlayerContext()
 {
     PlayerCharacterState* player = localPlayerState();

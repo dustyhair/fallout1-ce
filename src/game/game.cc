@@ -45,6 +45,7 @@
 #include "game/trait.h"
 #include "game/version.h"
 #include "game/worldmap.h"
+#include "multiplayer/developer_local_session.h"
 #include "tts.h"
 #include "int/movie.h"
 #include "int/window.h"
@@ -72,6 +73,7 @@ static void game_unload_info();
 static void game_help();
 static int game_init_databases();
 static void game_splash_screen();
+static void game_open_inventory(bool guestInventory);
 
 // TODO: Remove.
 // 0x4F190C
@@ -425,6 +427,20 @@ void game_exit()
     gconfig_exit(true);
 }
 
+static void game_open_inventory(bool guestInventory)
+{
+    if (!intface_is_enabled()) {
+        return;
+    }
+
+    gsound_play_sfx_file("ib1p1xx1");
+    if (!guestInventory || !multiplayer::developerLocalSessionIsActive()) {
+        handle_inventory();
+    } else {
+        multiplayer::developerLocalSessionOpenGuestInventory();
+    }
+}
+
 // 0x43B748
 int game_handle_input(int eventCode, bool isInCombatMode)
 {
@@ -534,6 +550,12 @@ int game_handle_input(int eventCode, bool isInCombatMode)
         game_quit_with_confirm();
         break;
     case KEY_TAB:
+        if (keys[SDL_SCANCODE_I] != KEY_STATE_UP
+            && (keys[SDL_SCANCODE_LCTRL] != KEY_STATE_UP
+                || keys[SDL_SCANCODE_RCTRL] != KEY_STATE_UP)) {
+            game_open_inventory(true);
+            break;
+        }
         if (intface_is_enabled()
             && keys[SDL_SCANCODE_LALT] == 0
             && keys[SDL_SCANCODE_RALT] == 0) {
@@ -584,13 +606,13 @@ int game_handle_input(int eventCode, bool isInCombatMode)
         }
         break;
     case KEY_UPPERCASE_I:
-    case KEY_LOWERCASE_I:
+    case KEY_LOWERCASE_I: {
         // open inventory
-        if (intface_is_enabled()) {
-            gsound_play_sfx_file("ib1p1xx1");
-            handle_inventory();
-        }
+        bool guestInventory = keys[SDL_SCANCODE_LCTRL] != KEY_STATE_UP
+            || keys[SDL_SCANCODE_RCTRL] != KEY_STATE_UP;
+        game_open_inventory(guestInventory);
         break;
+    }
     case KEY_ESCAPE:
     case KEY_UPPERCASE_O:
     case KEY_LOWERCASE_O:

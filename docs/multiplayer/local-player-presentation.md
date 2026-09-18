@@ -19,6 +19,10 @@ The current routing covers:
 
 The binding is cleared when its session stops or is destroyed. Headless tests cover invalid selection, host/guest selection, acting-context installation, actor rebinding, and teardown.
 
+`ScopedLocalPlayerBinding` temporarily selects another registered player for synchronous modal UI. The developer session uses it for `Ctrl+I`: inventory ownership and character-rule lookups resolve to the guest while the window is open, then the prior host binding is restored.
+
+This exposes the temporary guest actor's current inventory only. Item persistence needs separate object and inventory metadata beyond the two character builds in `MULTI.DAT`.
+
 ## Current limits
 
 Player names now live with their registered character state. The story actor still mirrors its name to the legacy save field for compatibility. Camera and general mouse input remain on the Phase 2 guest-presentation path. Deferred callbacks that read character globals must carry player identity and install a context; this slice covers the synchronous HUD and modal UI paths.

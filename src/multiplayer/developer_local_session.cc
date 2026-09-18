@@ -9,6 +9,7 @@
 #include "game/critter.h"
 #include "game/editor.h"
 #include "game/intface.h"
+#include "game/inventry.h"
 #include "game/map_defs.h"
 #include "game/object.h"
 #include "game/palette.h"
@@ -420,6 +421,27 @@ void developerLocalSessionRejectLoadedSave()
         session.stop();
         commandProcessor.reset();
     }
+}
+
+bool developerLocalSessionOpenGuestInventory()
+{
+    if (!enabled
+        || !session.isActive()
+        || guestActor == nullptr
+        || session.phase() != SessionPhase::Exploration) {
+        return false;
+    }
+
+    {
+        ScopedLocalPlayerBinding guestBinding(session, kGuestPlayerId);
+        if (!guestBinding) {
+            return false;
+        }
+        handle_inventory();
+    }
+
+    intface_redraw();
+    return true;
 }
 
 bool developerLocalSessionSubmitMove(PlayerId playerId, int destinationTile, int elevation, bool running)
