@@ -45,12 +45,42 @@ std::string slotText(PlayerId playerId)
 {
     const CharacterCreationSheet* sheet = sheetForPlayer(playerId);
     if (sheet != nullptr) {
-        return sheet->name + "  -  READY";
+        return sheet->name;
     }
     if (networkRuntimeConnected()) {
-        return "WAITING FOR CHARACTER";
+        return "< UNASSIGNED >";
     }
-    return "NOT CONNECTED";
+    return "< OFFLINE >";
+}
+
+std::string slotStatus(PlayerId playerId)
+{
+    if (sheetForPlayer(playerId) != nullptr) {
+        return "STATE: READY";
+    }
+    if (networkRuntimeConnected()) {
+        return "STATE: WAITING";
+    }
+    return "STATE: NO LINK";
+}
+
+std::string terminalStatus()
+{
+    std::string status = networkRuntimeStatus();
+    constexpr const char* prefix = "MULTIPLAYER";
+    if (status.rfind(prefix, 0) == 0) {
+        status.erase(0, std::char_traits<char>::length(prefix));
+    }
+    while (!status.empty() && status.front() == ' ') {
+        status.erase(0, 1);
+    }
+    if (!status.empty() && status.front() == ':') {
+        status.erase(0, 1);
+        if (!status.empty() && status.front() == ' ') {
+            status.erase(0, 1);
+        }
+    }
+    return status;
 }
 
 std::string screenSignature(const std::string& notice)
@@ -71,32 +101,62 @@ void drawLobby(int window, unsigned char* background, const std::string& notice)
     unsigned char* buffer = win_get_buf(window);
     buf_to_buf(background, kLobbyWidth, kLobbyHeight, kLobbyWidth, buffer, kLobbyWidth);
 
+    const int green = colorTable[992];
+    const int brightGreen = colorTable[992];
+    const int dimGreen = colorTable[8804];
+
     int oldFont = text_curr();
     text_font(104);
-    win_print(window, "MULTIPLAYER", 0, 232, 25, colorTable[21091]);
+    const char* title = "MULTIPLAYER NETWORK";
+    int titleX = (kLobbyWidth - text_width(title)) / 2;
+    text_to_buf(buffer + kLobbyWidth * 24 + titleX,
+        title,
+        kLobbyWidth - titleX,
+        kLobbyWidth,
+        brightGreen);
 
-    text_font(103);
-    win_print(window, "HOST", 240, 76, 105, colorTable[21091]);
-    win_print(window, "GUEST", 240, 365, 105, colorTable[21091]);
+    draw_line(buffer, kLobbyWidth, 154, 57, 486, 57, dimGreen);
+    draw_line(buffer, kLobbyWidth, 320, 68, 320, 174, dimGreen);
 
     text_font(101);
     std::string host = slotText(kHostPlayerId);
     std::string guest = slotText(kGuestPlayerId);
-    win_print(window, host.c_str(), 240, 76, 144, colorTable[21204]);
-    win_print(window, guest.c_str(), 240, 365, 144, colorTable[21204]);
+    std::string hostStatus = slotStatus(kHostPlayerId);
+    std::string guestStatus = slotStatus(kGuestPlayerId);
+    text_to_buf(buffer + kLobbyWidth * 76 + 166, "NODE 01 // HOST", 145, kLobbyWidth, green);
+    text_to_buf(buffer + kLobbyWidth * 100 + 166, host.c_str(), 145, kLobbyWidth, brightGreen);
+    text_to_buf(buffer + kLobbyWidth * 126 + 166, hostStatus.c_str(), 145, kLobbyWidth, green);
+    text_to_buf(buffer + kLobbyWidth * 76 + 334, "NODE 02 // GUEST", 145, kLobbyWidth, green);
+    text_to_buf(buffer + kLobbyWidth * 100 + 334, guest.c_str(), 145, kLobbyWidth, brightGreen);
+    text_to_buf(buffer + kLobbyWidth * 126 + 334, guestStatus.c_str(), 145, kLobbyWidth, green);
 
-    win_print(window, "CONNECTION STATUS", 0, 76, 245, colorTable[21091]);
-    win_print(window, networkRuntimeStatus(), 488, 76, 269, colorTable[21204]);
+    draw_box(buffer, kLobbyWidth, 94, 232, 546, 316, dimGreen);
+    text_to_buf(buffer + kLobbyWidth * 244 + 108, "NETWORK LINK", 420, kLobbyWidth, brightGreen);
+    draw_line(buffer, kLobbyWidth, 108, 263, 532, 263, dimGreen);
+    std::string status = terminalStatus();
+    text_to_buf(buffer + kLobbyWidth * 275 + 108, status.c_str(), 420, kLobbyWidth, green);
     if (!notice.empty()) {
-        win_print(window, notice.c_str(), 488, 76, 298, colorTable[21091]);
+        text_to_buf(buffer + kLobbyWidth * 297 + 108, notice.c_str(), 420, kLobbyWidth, brightGreen);
     }
 
-    win_print(window, "HOST", 80, 76, 382, colorTable[21204]);
-    win_print(window, "JOIN", 80, 186, 382, colorTable[21204]);
-    win_print(window, "CHOOSE CHARACTER", 150, 296, 382, colorTable[21204]);
-    win_print(window, "START GAME", 110, 473, 382, canStartGame() ? colorTable[21091] : colorTable[21204]);
-    win_print(window, "DISCONNECT", 110, 76, 428, colorTable[21204]);
-    win_print(window, "BACK", 80, 523, 428, colorTable[21204]);
+    const char* commandsTitle = "COMMAND CONSOLE";
+    int commandsTitleX = (kLobbyWidth - text_width(commandsTitle)) / 2;
+    text_to_buf(buffer + kLobbyWidth * 347 + commandsTitleX,
+        commandsTitle,
+        kLobbyWidth - commandsTitleX,
+        kLobbyWidth,
+        brightGreen);
+    draw_line(buffer, kLobbyWidth, 55, 366, 585, 366, dimGreen);
+    text_to_buf(buffer + kLobbyWidth * 382 + 76, "HOST", 80, kLobbyWidth, green);
+    text_to_buf(buffer + kLobbyWidth * 382 + 186, "JOIN", 80, kLobbyWidth, green);
+    text_to_buf(buffer + kLobbyWidth * 382 + 296, "CHOOSE CHARACTER", 150, kLobbyWidth, green);
+    text_to_buf(buffer + kLobbyWidth * 382 + 473,
+        "START GAME",
+        110,
+        kLobbyWidth,
+        canStartGame() ? brightGreen : dimGreen);
+    text_to_buf(buffer + kLobbyWidth * 428 + 76, "DISCONNECT", 110, kLobbyWidth, green);
+    text_to_buf(buffer + kLobbyWidth * 428 + 523, "BACK", 80, kLobbyWidth, green);
 
     text_font(oldFont);
     win_draw(window);
