@@ -13,10 +13,11 @@
 namespace fallout {
 namespace multiplayer {
 
-constexpr std::uint16_t kMultiplayerSaveVersion = 1;
+constexpr std::uint16_t kMultiplayerSaveMinimumVersion = 1;
+constexpr std::uint16_t kMultiplayerSaveVersion = 2;
 constexpr std::size_t kMultiplayerSaveHeaderSize = 36;
 constexpr std::size_t kMultiplayerSavePlayerCount = 2;
-constexpr std::size_t kMultiplayerSaveMaximumSize = 64 * 1024;
+constexpr std::size_t kMultiplayerSaveMaximumSize = 4 * 1024 * 1024;
 constexpr std::uint64_t kMultiplayerSaveDigestOffset = 14695981039346656037ULL;
 
 struct SavedPlayerCharacter {
@@ -37,6 +38,7 @@ struct MultiplayerSaveSidecar {
     std::uint64_t generation = 1;
     std::uint64_t saveDatDigest = 0;
     std::array<SavedPlayerCharacter, kMultiplayerSavePlayerCount> players;
+    std::vector<std::uint8_t> guestObjectData;
 };
 
 enum class MultiplayerSaveError {
@@ -55,6 +57,7 @@ enum class MultiplayerSaveError {
     NameTooLong,
     InvalidName,
     InvalidBuild,
+    InvalidGuestObjectData,
     PayloadTooLarge,
     TruncatedPayload,
     TrailingData,

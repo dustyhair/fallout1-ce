@@ -20,6 +20,8 @@ MultiplayerSaveError developerLocalSessionCaptureSave(std::uint64_t generation,
     std::uint64_t saveDatDigest,
     MultiplayerSaveSidecar& sidecar);
 bool developerLocalSessionStageLoadedSave(const MultiplayerSaveSidecar& sidecar);
+bool developerLocalSessionWriteGuestObject(const char* relativePath);
+bool developerLocalSessionStageLoadedGuestObject(const char* relativePath);
 void developerLocalSessionRejectLoadedSave();
 bool developerLocalSessionOpenGuestInventory();
 bool developerLocalSessionSubmitMove(PlayerId playerId, int destinationTile, int elevation, bool running);

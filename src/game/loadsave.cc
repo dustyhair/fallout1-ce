@@ -2858,6 +2858,17 @@ static bool ReadSaveFile(const char* relativePath, std::size_t maximumSize, std:
     return read;
 }
 
+static bool WriteSaveFile(const char* relativePath, const std::vector<std::uint8_t>& bytes)
+{
+    DB_FILE* stream = db_fopen(relativePath, "wb");
+    if (stream == nullptr) {
+        return false;
+    }
+
+    bool written = bytes.empty() || db_fwrite(bytes.data(), 1, bytes.size(), stream) == bytes.size();
+    return db_fclose(stream) == 0 && written;
+}
+
 static bool DigestSaveDat(std::uint64_t& digest)
 {
     snprintf(gmpath, sizeof(gmpath), "%s\\%s%.2d\\%s", "SAVEGAME", "SLOT", slot_cursor + 1, "SAVE.DAT");
@@ -2957,10 +2968,18 @@ static void RemoveMultiplayerSidecar()
     compat_remove(path);
 }
 
+static void RemoveMultiplayerGuestObjectTemporary()
+{
+    char path[COMPAT_MAX_PATH];
+    MultiplayerSidecarPath(path, "MULTI.OBJ", false);
+    compat_remove(path);
+}
+
 static bool SaveMultiplayerSidecar()
 {
     if (!multiplayer::developerLocalSessionIsActive()) {
         RemoveMultiplayerSidecar();
+        RemoveMultiplayerGuestObjectTemporary();
         return true;
     }
 
@@ -2989,6 +3008,15 @@ static bool SaveMultiplayerSidecar()
         return false;
     }
 
+    MultiplayerSidecarPath(relativePath, "MULTI.OBJ", true);
+    RemoveMultiplayerGuestObjectTemporary();
+    bool capturedGuestObject = multiplayer::developerLocalSessionWriteGuestObject(relativePath)
+        && ReadSaveFile(relativePath, multiplayer::kMultiplayerSaveMaximumSize, sidecar.guestObjectData);
+    RemoveMultiplayerGuestObjectTemporary();
+    if (!capturedGuestObject || sidecar.guestObjectData.empty()) {
+        return false;
+    }
+
     std::vector<std::uint8_t> bytes;
     if (multiplayer::encodeMultiplayerSave(sidecar, bytes) != multiplayer::MultiplayerSaveError::None) {
         return false;
@@ -3013,10 +3041,17 @@ static void LoadMultiplayerSidecar()
 
     multiplayer::MultiplayerSaveDecodeResult decoded = multiplayer::decodeMultiplayerSave(bytes);
     std::uint64_t saveDatDigest;
-    if (!decoded
-        || !DigestSaveDat(saveDatDigest)
-        || decoded.sidecar.saveDatDigest != saveDatDigest
-        || !multiplayer::developerLocalSessionStageLoadedSave(decoded.sidecar)) {
+    bool valid = decoded
+        && DigestSaveDat(saveDatDigest)
+        && decoded.sidecar.saveDatDigest == saveDatDigest;
+    if (valid && !decoded.sidecar.guestObjectData.empty()) {
+        MultiplayerSidecarPath(relativePath, "MULTI.OBJ", true);
+        RemoveMultiplayerGuestObjectTemporary();
+        valid = WriteSaveFile(relativePath, decoded.sidecar.guestObjectData)
+            && multiplayer::developerLocalSessionStageLoadedGuestObject(relativePath);
+        RemoveMultiplayerGuestObjectTemporary();
+    }
+    if (!valid || !multiplayer::developerLocalSessionStageLoadedSave(decoded.sidecar)) {
         debug_printf("LOADSAVE: Multiplayer sidecar is corrupt or does not match SAVE.DAT; loading without multiplayer.\n");
         multiplayer::developerLocalSessionRejectLoadedSave();
         return;

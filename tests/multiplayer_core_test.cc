@@ -378,6 +378,7 @@ void testMultiplayerSaveSidecar()
     sidecar.players[1].build.taggedSkills = { SKILL_ENERGY_WEAPONS, SKILL_DOCTOR, SKILL_REPAIR, -1 };
     sidecar.players[1].build.level = 5;
     sidecar.players[1].build.experience = 10000;
+    sidecar.guestObjectData = { 0x00, 0x11, 0x00, 0xFE, 0xFF };
 
     expect(validateMultiplayerSave(sidecar) == MultiplayerSaveError::None, "two progressed character builds form valid save metadata");
     std::vector<std::uint8_t> packet;
@@ -390,6 +391,15 @@ void testMultiplayerSaveSidecar()
     expect(decoded.sidecar.generation == 7 && decoded.sidecar.saveDatDigest == sidecar.saveDatDigest, "sidecar keeps generation and SAVE.DAT digest");
     expect(decoded.sidecar.players[0] == sidecar.players[0], "sidecar keeps the host name and full build");
     expect(decoded.sidecar.players[1] == sidecar.players[1], "sidecar keeps the guest name and full build");
+    expect(decoded.sidecar.guestObjectData == sidecar.guestObjectData, "sidecar keeps opaque recursive guest object data");
+
+    MultiplayerSaveSidecar legacy = sidecar;
+    legacy.version = 1;
+    legacy.guestObjectData.clear();
+    std::vector<std::uint8_t> legacyPacket;
+    expect(encodeMultiplayerSave(legacy, legacyPacket) == MultiplayerSaveError::None, "version 1 character-only sidecar still encodes");
+    MultiplayerSaveDecodeResult legacyDecoded = decodeMultiplayerSave(legacyPacket);
+    expect(legacyDecoded && legacyDecoded.sidecar.version == 1 && legacyDecoded.sidecar.guestObjectData.empty(), "version 1 sidecar remains loadable with an empty guest inventory");
 
     std::uint64_t changedDigest = updateMultiplayerSaveDigest(kMultiplayerSaveDigestOffset, "legacy SAVE.DAT byteS", saveData.size());
     expect(changedDigest != sidecar.saveDatDigest, "SAVE.DAT digest detects different base-save bytes");
@@ -398,7 +408,8 @@ void testMultiplayerSaveSidecar()
     badMagic[0] = 0;
     expect(decodeMultiplayerSave(badMagic).error == MultiplayerSaveError::InvalidMagic, "sidecar rejects invalid magic");
     std::vector<std::uint8_t> badVersion = packet;
-    badVersion[5]++;
+    badVersion[4] = 0;
+    badVersion[5] = static_cast<std::uint8_t>(kMultiplayerSaveVersion + 1);
     expect(decodeMultiplayerSave(badVersion).error == MultiplayerSaveError::UnsupportedVersion, "sidecar rejects an unsupported version");
     std::vector<std::uint8_t> corrupt = packet;
     corrupt.back() ^= 1;
@@ -422,6 +433,9 @@ void testMultiplayerSaveSidecar()
     invalid = sidecar;
     invalid.players[1].build.taggedSkills[0] = SKILL_COUNT;
     expect(validateMultiplayerSave(invalid) == MultiplayerSaveError::InvalidBuild, "sidecar rejects invalid restored build values");
+    invalid = sidecar;
+    invalid.version = 1;
+    expect(validateMultiplayerSave(invalid) == MultiplayerSaveError::InvalidGuestObjectData, "version 1 sidecar cannot smuggle an unversioned guest object payload");
 
     TestObject hostActor;
     TestObject guestActor;

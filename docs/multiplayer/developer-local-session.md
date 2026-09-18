@@ -18,7 +18,7 @@ In exploration mode, a normal map click controls the host actor. Hold either Ctr
 
 Press `I` or use the inventory button to open the host inventory. Press `Ctrl+I`, or hold Ctrl while using the inventory button, to open the guest inventory. Closing the guest inventory restores the host HUD and normal inventory selection.
 
-The guest item inventory is temporary in this slice. `MULTI.DAT` stores the guest's character build, but it does not yet store carried or equipped objects. Guest items will not survive a map change or save reload.
+Guest inventory objects move to the replacement guest actor during a map change. Version 2 of `MULTI.DAT` also stores the recursive guest object record, so carried and equipped items survive save and load. Version 1 slots still load with an empty guest inventory and upgrade on their next save.
 
 The guest actor is temporary and has `OBJECT_NO_SAVE`; original map and save formats remain unchanged. Before a map load, the engine removes the temporary object. After the new map loads, it creates a replacement and rebinds the existing guest `EntityId` to it. Multiplayer slots store both names and complete character builds in the versioned sidecar described in [save-sidecar.md](save-sidecar.md).
 

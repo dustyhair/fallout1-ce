@@ -36,8 +36,91 @@ CommandProcessor commandProcessor;
 std::uint64_t nextHostCommandSequence = 1;
 std::uint64_t nextGuestCommandSequence = 1;
 std::optional<MultiplayerSaveSidecar> pendingLoadedSave;
+Object* pendingLoadedGuestObject = nullptr;
+Inventory preservedGuestInventory {};
+int preservedGuestFid = -1;
 
 void eraseGuestActor();
+
+void discardPendingGuestObject()
+{
+    if (pendingLoadedGuestObject != nullptr) {
+        pendingLoadedGuestObject->flags &= ~OBJECT_NO_REMOVE;
+        obj_erase_object(pendingLoadedGuestObject, nullptr);
+        pendingLoadedGuestObject = nullptr;
+    }
+}
+
+void discardPreservedGuestInventory()
+{
+    obj_inven_free(&preservedGuestInventory);
+    preservedGuestFid = -1;
+}
+
+void detachGuestInventory()
+{
+    discardPreservedGuestInventory();
+    if (guestActor == nullptr) {
+        return;
+    }
+
+    preservedGuestInventory = guestActor->data.inventory;
+    preservedGuestFid = guestActor->fid;
+    guestActor->data.inventory = {};
+}
+
+void attachInventory(Object* actor, Inventory& inventory)
+{
+    actor->data.inventory = inventory;
+    inventory = {};
+    for (int index = 0; index < actor->data.inventory.length; index++) {
+        actor->data.inventory.items[index].item->owner = actor;
+    }
+}
+
+void attachPreservedGuestInventory(Object* actor)
+{
+    attachInventory(actor, preservedGuestInventory);
+    if (preservedGuestFid != -1) {
+        obj_change_fid(actor, preservedGuestFid, nullptr);
+    }
+    preservedGuestFid = -1;
+}
+
+bool applyPendingGuestObject(Object* actor)
+{
+    if (pendingLoadedGuestObject == nullptr) {
+        return true;
+    }
+
+    Object* saved = pendingLoadedGuestObject;
+    pendingLoadedGuestObject = nullptr;
+    if (saved->pid != actor->pid) {
+        saved->flags &= ~OBJECT_NO_REMOVE;
+        obj_erase_object(saved, nullptr);
+        return false;
+    }
+
+    discardPreservedGuestInventory();
+    actor->data.critter = saved->data.critter;
+    actor->data.critter.combat.whoHitMe = nullptr;
+    attachInventory(actor, saved->data.inventory);
+    saved->data.inventory = {};
+
+    int savedFid = saved->fid;
+    int savedTile = saved->tile;
+    int savedElevation = saved->elevation;
+    int savedRotation = saved->rotation;
+    saved->flags &= ~OBJECT_NO_REMOVE;
+    obj_erase_object(saved, nullptr);
+
+    obj_change_fid(actor, savedFid, nullptr);
+    if (hexGridTileIsValid(savedTile) && elevationIsValid(savedElevation)) {
+        obj_attempt_placement(actor, savedTile, savedElevation, 2);
+    }
+    dude_stand(actor, savedRotation, -1);
+    return true;
+}
 
 class EngineCommandExecutor : public CommandExecutor {
 public:
@@ -166,7 +249,7 @@ bool isNewCharacterBuild(const CharacterBuild& build)
     return true;
 }
 
-bool refreshPlayerBuild(PlayerId playerId)
+bool refreshPlayerBuild(PlayerId playerId, bool healToFull = true)
 {
     PlayerCharacterState* player = session.players().find(playerId);
     Object* actor = player != nullptr ? session.entities().findObject(player->actorId) : nullptr;
@@ -176,9 +259,11 @@ bool refreshPlayerBuild(PlayerId playerId)
 
     ScopedActingPlayerContext actingPlayer(*player, actor);
     stat_recalc_derived(actor);
-    int hitPoints = critter_get_hits(actor);
-    int maximumHitPoints = stat_level(actor, STAT_MAXIMUM_HIT_POINTS);
-    critter_adjust_hits(actor, maximumHitPoints - hitPoints);
+    if (healToFull) {
+        int hitPoints = critter_get_hits(actor);
+        int maximumHitPoints = stat_level(actor, STAT_MAXIMUM_HIT_POINTS);
+        critter_adjust_hits(actor, maximumHitPoints - hitPoints);
+    }
     return updatePlayerGenderAppearance(actor) == 0;
 }
 
@@ -298,13 +383,14 @@ bool beginRestoredSession()
     if (guestActor == nullptr) {
         return false;
     }
-    if (session.start(obj_dude, guestActor) != LocalSessionError::None
+    if (!applyPendingGuestObject(guestActor)
+        || session.start(obj_dude, guestActor) != LocalSessionError::None
         || session.restorePlayerCharacters(*pendingLoadedSave) != LocalSessionError::None
         || bindLocalPlayer(session, kHostPlayerId) != LocalPlayerError::None
         || session.transitionTo(SessionPhase::Loading) != LocalSessionError::None
         || session.transitionTo(SessionPhase::Exploration) != LocalSessionError::None
-        || !refreshPlayerBuild(kHostPlayerId)
-        || !refreshPlayerBuild(kGuestPlayerId)) {
+        || !refreshPlayerBuild(kHostPlayerId, false)
+        || !refreshPlayerBuild(kGuestPlayerId, false)) {
         session.stop();
         eraseGuestActor();
         return false;
@@ -326,6 +412,15 @@ bool finishMapTransition()
         return false;
     }
 
+    if (pendingLoadedGuestObject != nullptr) {
+        if (!applyPendingGuestObject(replacement)) {
+            obj_erase_object(replacement, nullptr);
+            return false;
+        }
+    } else {
+        attachPreservedGuestInventory(replacement);
+    }
+
     if (session.rebindPlayerActor(kGuestPlayerId, replacement) != LocalSessionError::None) {
         obj_erase_object(replacement, nullptr);
         return false;
@@ -335,8 +430,8 @@ bool finishMapTransition()
     if ((pendingLoadedSave.has_value()
             && session.restorePlayerCharacters(*pendingLoadedSave) != LocalSessionError::None)
         || session.transitionTo(SessionPhase::Exploration) != LocalSessionError::None
-        || !refreshPlayerBuild(kGuestPlayerId)
-        || (pendingLoadedSave.has_value() && !refreshPlayerBuild(kHostPlayerId))) {
+        || !refreshPlayerBuild(kGuestPlayerId, false)
+        || (pendingLoadedSave.has_value() && !refreshPlayerBuild(kHostPlayerId, false))) {
         eraseGuestActor();
         session.stop();
         return false;
@@ -356,6 +451,8 @@ void developerLocalSessionConfigure(int argc, char** argv)
 {
     enabled = false;
     pendingLoadedSave.reset();
+    discardPendingGuestObject();
+    discardPreservedGuestInventory();
     for (int index = 1; index < argc; index++) {
         if (std::strcmp(argv[index], "--multiplayer-dev") == 0) {
             enabled = true;
@@ -406,16 +503,75 @@ MultiplayerSaveError developerLocalSessionCaptureSave(std::uint64_t generation,
 
 bool developerLocalSessionStageLoadedSave(const MultiplayerSaveSidecar& sidecar)
 {
-    if (!enabled || validateMultiplayerSave(sidecar) != MultiplayerSaveError::None) {
+    if (!enabled
+        || validateMultiplayerSave(sidecar) != MultiplayerSaveError::None
+        || (!sidecar.guestObjectData.empty() && pendingLoadedGuestObject == nullptr)) {
         return false;
     }
+    if (sidecar.guestObjectData.empty()) {
+        discardPendingGuestObject();
+        discardPreservedGuestInventory();
+    }
     pendingLoadedSave = sidecar;
+    return true;
+}
+
+bool developerLocalSessionWriteGuestObject(const char* relativePath)
+{
+    if (!enabled || !session.isActive() || guestActor == nullptr || relativePath == nullptr) {
+        return false;
+    }
+
+    DB_FILE* stream = db_fopen(relativePath, "wb");
+    if (stream == nullptr) {
+        return false;
+    }
+
+    int savedFlags = guestActor->flags;
+    int savedSid = guestActor->sid;
+    guestActor->flags &= ~OBJECT_NO_SAVE;
+    guestActor->sid = -1;
+    int rc = obj_save_obj(stream, guestActor);
+    guestActor->flags = savedFlags;
+    guestActor->sid = savedSid;
+    return db_fclose(stream) == 0 && rc == 0;
+}
+
+bool developerLocalSessionStageLoadedGuestObject(const char* relativePath)
+{
+    if (!enabled || relativePath == nullptr) {
+        return false;
+    }
+
+    DB_FILE* stream = db_fopen(relativePath, "rb");
+    if (stream == nullptr) {
+        return false;
+    }
+
+    Object* loaded = nullptr;
+    int rc = obj_load_obj(stream, &loaded, -1, nullptr);
+    bool consumed = rc == 0 && db_ftell(stream) == db_filelength(stream);
+    db_fclose(stream);
+    if (!consumed || loaded == nullptr || PID_TYPE(loaded->pid) != OBJ_TYPE_CRITTER) {
+        if (loaded != nullptr) {
+            loaded->flags &= ~OBJECT_NO_REMOVE;
+            obj_erase_object(loaded, nullptr);
+        }
+        return false;
+    }
+
+    discardPendingGuestObject();
+    loaded->flags |= OBJECT_NO_SAVE;
+    loaded->flags &= ~OBJECT_NO_REMOVE;
+    pendingLoadedGuestObject = loaded;
     return true;
 }
 
 void developerLocalSessionRejectLoadedSave()
 {
     pendingLoadedSave.reset();
+    discardPendingGuestObject();
+    discardPreservedGuestInventory();
     if (session.isActive()) {
         eraseGuestActor();
         session.stop();
@@ -480,12 +636,15 @@ void developerLocalSessionPrepareForWorldReset()
         return;
     }
 
+    detachGuestInventory();
     eraseGuestActor();
 }
 
 void developerLocalSessionStop()
 {
     pendingLoadedSave.reset();
+    discardPendingGuestObject();
+    discardPreservedGuestInventory();
     eraseGuestActor();
     session.stop();
     commandProcessor.reset();
