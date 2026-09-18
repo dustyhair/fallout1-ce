@@ -21,4 +21,4 @@ The binding is cleared when its session stops or is destroyed. Headless tests co
 
 ## Current limits
 
-The legacy player name is still process-wide, so distinct names belong with temporary lobby character creation. Camera and general mouse input remain on the Phase 2 guest-presentation path. Deferred callbacks that read character globals must carry player identity and install a context; this slice covers the synchronous HUD and modal UI paths.
+Player names now live with their registered character state. The story actor still mirrors its name to the legacy save field for compatibility. Camera and general mouse input remain on the Phase 2 guest-presentation path. Deferred callbacks that read character globals must carry player identity and install a context; this slice covers the synchronous HUD and modal UI paths.

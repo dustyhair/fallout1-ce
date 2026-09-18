@@ -12,6 +12,8 @@ Phase 1 starts by giving each multiplayer slot an independent character build. `
 - Player prototype flags.
 - Unspent skill points, level, and experience.
 
+`PlayerCharacterState` also owns the character's display name. The host story actor mirrors its name to Fallout's legacy player-name buffer, while guest names stay independent.
+
 Reputation and karma stay in shared world state. Inventory and equipment already belong to critter objects and are selected through the [local-player presentation context](local-player-presentation.md).
 
 The store rejects a player unless its actor exists in `EntityRegistry` and is owned by the same `PlayerId`. It also prevents two player slots from sharing an actor. Actor objects can be replaced during a map load without replacing the player state: the registry rebinds the same `EntityId` to the new pointer, and the character build remains intact.

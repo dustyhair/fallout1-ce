@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "multiplayer/acting_player_context.h"
+#include "multiplayer/character_lobby.h"
 #include "multiplayer/command_processor.h"
 #include "multiplayer/entity_registry.h"
 #include "multiplayer/local_session.h"
@@ -47,6 +48,22 @@ ProtocolEnvelope sampleEnvelope()
     envelope.sequence = 0x1112131415161718ULL;
     envelope.payload = { 0x21, 0x22, 0x23 };
     return envelope;
+}
+
+CharacterCreationSheet sampleCharacterSheet(PlayerId playerId, const std::string& name)
+{
+    CharacterCreationSheet sheet;
+    sheet.playerId = playerId;
+    sheet.name = name;
+    sheet.primaryStats = { 5, 5, 5, 5, 5, 5, 10 };
+    sheet.taggedSkills = { SKILL_SMALL_GUNS, SKILL_FIRST_AID, SKILL_SPEECH };
+    return sheet;
+}
+
+void submitBothCharacterSheets(LocalSession& session)
+{
+    expect(session.submitCharacterSheet(sampleCharacterSheet(kHostPlayerId, "Host")) == CharacterLobbyError::None, "host character sheet is accepted");
+    expect(session.submitCharacterSheet(sampleCharacterSheet(kGuestPlayerId, "Guest")) == CharacterLobbyError::None, "guest character sheet is accepted");
 }
 
 WorldSnapshot sampleSnapshot()
@@ -207,10 +224,12 @@ void testPlayerCharacterStateStore()
     hostState.actorId = host.entityId;
     hostState.ownership = PlayerOwnership::LocalControl;
     hostState.connection = ConnectionState::Local;
+    hostState.name = "Host";
     hostState.build.baseStats[0] = 8;
     hostState.build.perkRanks[0] = 1;
     hostState.build.level = 4;
     expect(players.registerPlayer(hostState, registry) == PlayerStateError::None, "host player state registers");
+    expect(players.find(kHostPlayerId)->name == "Host", "player state retains the character name");
     expect(players.registerPlayer(hostState, registry) == PlayerStateError::PlayerAlreadyRegistered, "player state rejects duplicate player IDs");
 
     PlayerCharacterState duplicateActor;
@@ -234,10 +253,13 @@ void testPlayerCharacterStateStore()
     CharacterBuild updatedGuestBuild = players.find(kGuestPlayerId)->build;
     updatedGuestBuild.unspentSkillPoints = 12;
     expect(players.setBuild(kGuestPlayerId, updatedGuestBuild) == PlayerStateError::None, "guest build can be replaced");
+    expect(players.setName(kGuestPlayerId, "Second") == PlayerStateError::None, "guest name can be replaced");
     expect(players.setConnection(kGuestPlayerId, ConnectionState::Disconnected) == PlayerStateError::None, "guest connection state can change");
     expect(players.find(kGuestPlayerId)->build.unspentSkillPoints == 12, "guest build update is retained");
+    expect(players.find(kGuestPlayerId)->name == "Second", "guest name update is retained");
     expect(players.find(kGuestPlayerId)->connection == ConnectionState::Disconnected, "guest connection update is retained");
     expect(players.setBuild(PlayerId { 99 }, updatedGuestBuild) == PlayerStateError::PlayerNotFound, "unknown player build cannot be changed");
+    expect(players.setName(PlayerId { 99 }, "Missing") == PlayerStateError::PlayerNotFound, "unknown player name cannot be changed");
 
     expect(registry.rebindObject(guest.entityId, asGameObject(replacementGuest)) == EntityRegistryError::None, "guest object can be replaced beneath player state");
     expect(players.bindingsMatch(registry), "player binding survives object pointer replacement");
@@ -248,6 +270,87 @@ void testPlayerCharacterStateStore()
     expect(players.unregisterPlayer(kGuestPlayerId) == PlayerStateError::PlayerNotFound, "player state cannot be removed twice");
     players.clear();
     expect(players.size() == 0, "clearing removes all player states");
+}
+
+void testCharacterLobbyValidationAndWireFormat()
+{
+    CharacterCreationSheet sheet = sampleCharacterSheet(kGuestPlayerId, "Guest");
+    expect(validateCharacterSheet(sheet) == CharacterLobbyError::None, "valid level-one character sheet passes validation");
+
+    CharacterCreationSheet invalid = sheet;
+    invalid.version++;
+    expect(validateCharacterSheet(invalid) == CharacterLobbyError::UnsupportedVersion, "character sheet rejects an unsupported version");
+    invalid = sheet;
+    invalid.playerId = PlayerId { 99 };
+    expect(validateCharacterSheet(invalid) == CharacterLobbyError::InvalidPlayerId, "character sheet rejects an unknown player");
+    invalid = sheet;
+    invalid.name.clear();
+    expect(validateCharacterSheet(invalid) == CharacterLobbyError::EmptyName, "character sheet requires a name");
+    invalid = sheet;
+    invalid.name.assign(kCharacterNameMaxLength + 1, 'x');
+    expect(validateCharacterSheet(invalid) == CharacterLobbyError::NameTooLong, "character sheet bounds name length");
+    invalid = sheet;
+    invalid.name = "   ";
+    expect(validateCharacterSheet(invalid) == CharacterLobbyError::InvalidName, "character sheet rejects a blank display name");
+    invalid = sheet;
+    invalid.primaryStats[0] = 0;
+    expect(validateCharacterSheet(invalid) == CharacterLobbyError::PrimaryStatOutOfRange, "character sheet bounds each SPECIAL stat");
+    invalid = sheet;
+    invalid.primaryStats[0]++;
+    expect(validateCharacterSheet(invalid) == CharacterLobbyError::InvalidPrimaryStatTotal, "character sheet enforces the forty-point SPECIAL budget");
+    invalid = sheet;
+    invalid.age = 15;
+    expect(validateCharacterSheet(invalid) == CharacterLobbyError::AgeOutOfRange, "character sheet rejects an invalid age");
+    invalid = sheet;
+    invalid.gender = 2;
+    expect(validateCharacterSheet(invalid) == CharacterLobbyError::InvalidGender, "character sheet rejects an invalid gender");
+    invalid = sheet;
+    invalid.taggedSkills[0] = SKILL_COUNT;
+    expect(validateCharacterSheet(invalid) == CharacterLobbyError::InvalidTaggedSkill, "character sheet bounds tagged skills");
+    invalid = sheet;
+    invalid.taggedSkills[1] = invalid.taggedSkills[0];
+    expect(validateCharacterSheet(invalid) == CharacterLobbyError::DuplicateTaggedSkill, "character sheet requires distinct tagged skills");
+    invalid = sheet;
+    invalid.traits[0] = TRAIT_COUNT;
+    expect(validateCharacterSheet(invalid) == CharacterLobbyError::InvalidTrait, "character sheet bounds traits");
+    invalid = sheet;
+    invalid.traits = { TRAIT_GIFTED, TRAIT_GIFTED };
+    expect(validateCharacterSheet(invalid) == CharacterLobbyError::DuplicateTrait, "character sheet rejects duplicate traits");
+    invalid = sheet;
+    invalid.traits = { -1, TRAIT_GIFTED };
+    expect(validateCharacterSheet(invalid) == CharacterLobbyError::NonCanonicalTraits, "character sheet requires packed trait slots");
+
+    CharacterBuild build = characterBuildFromSheet(sheet);
+    expect(build.baseStats[STAT_LUCK] == 10 && build.baseStats[STAT_AGE] == 25, "validated choices produce a level-one character build");
+    expect(build.level == 1 && build.experience == 0 && build.unspentSkillPoints == 0, "new character build starts without progression");
+    expect(build.skillPoints[SKILL_SMALL_GUNS] == 0 && build.perkRanks[PERK_AWARENESS] == 0, "new character build cannot inject skill points or perks");
+    expect(build.baseStats[STAT_DAMAGE_RESISTANCE_EMP] == 100, "new character build preserves the player EMP resistance default");
+    expect(characterSheetFromBuild(sheet.playerId, sheet.name, build) == sheet, "character choices round trip through the canonical build");
+
+    std::vector<std::uint8_t> packet;
+    expect(encodeCharacterSheet(sheet, packet) == CharacterLobbyError::None, "valid character sheet encodes");
+    expect(packet.size() == kCharacterSheetMinimumPacketSize + sheet.name.size(), "character sheet packet has a bounded fixed-width body");
+    CharacterSheetDecodeResult decoded = decodeCharacterSheet(packet);
+    expect(static_cast<bool>(decoded) && decoded.sheet == sheet, "character sheet survives its wire round trip");
+
+    std::vector<std::uint8_t> shortPacket(packet.begin(), packet.begin() + 6);
+    expect(decodeCharacterSheet(shortPacket).error == CharacterLobbyError::PacketTooShort, "character sheet rejects a short header");
+    std::vector<std::uint8_t> wrongVersion = packet;
+    wrongVersion[1]++;
+    expect(decodeCharacterSheet(wrongVersion).error == CharacterLobbyError::UnsupportedVersion, "character sheet wire format rejects another version");
+    std::vector<std::uint8_t> oversizedName = packet;
+    oversizedName[6] = static_cast<std::uint8_t>(kCharacterNameMaxLength + 1);
+    expect(decodeCharacterSheet(oversizedName).error == CharacterLobbyError::NameTooLong, "character sheet decoder checks name length before copying");
+    std::vector<std::uint8_t> truncated = packet;
+    truncated.pop_back();
+    expect(decodeCharacterSheet(truncated).error == CharacterLobbyError::TruncatedPacket, "character sheet rejects a truncated body");
+    std::vector<std::uint8_t> trailing = packet;
+    trailing.push_back(0);
+    expect(decodeCharacterSheet(trailing).error == CharacterLobbyError::TrailingData, "character sheet rejects trailing data");
+
+    invalid = sheet;
+    invalid.primaryStats[0] = 0;
+    expect(encodeCharacterSheet(invalid, packet) == CharacterLobbyError::PrimaryStatOutOfRange && packet.empty(), "invalid character sheet leaves no partial packet");
 }
 
 void testActingPlayerContext()
@@ -309,6 +412,9 @@ void testLocalPlayerContext()
     }
     expect(actingPlayerState() == nullptr, "local presentation scope restores the prior acting context");
 
+    submitBothCharacterSheets(session);
+    expect(playerStateForActor(asGameObject(hostActor)) == session.players().find(kHostPlayerId), "bound session resolves the host state from its actor");
+    expect(playerStateForActor(asGameObject(guestActor)) == session.players().find(kGuestPlayerId), "bound session resolves the guest state from its actor");
     expect(session.transitionTo(SessionPhase::Loading) == LocalSessionError::None, "local-player test enters loading");
     expect(session.transitionTo(SessionPhase::Exploration) == LocalSessionError::None, "local-player test enters exploration");
     expect(session.transitionTo(SessionPhase::Transition) == LocalSessionError::None, "local-player test enters map transition");
@@ -416,6 +522,7 @@ void testLocalSessionLifecycle()
 
     expect(!session.isActive(), "local session starts inactive");
     expect(session.phaseRevision() == 0, "inactive session has no phase revision");
+    expect(session.submitCharacterSheet(sampleCharacterSheet(kHostPlayerId, "Host")) == CharacterLobbyError::SessionInactive, "inactive session rejects character sheets");
     expect(session.start(nullptr, asGameObject(guestActor)) == LocalSessionError::NullActor, "local session rejects a null host actor");
     expect(session.start(asGameObject(hostActor), asGameObject(hostActor)) == LocalSessionError::SameActor, "local session requires distinct actors");
     expect(session.start(asGameObject(hostActor), asGameObject(guestActor)) == LocalSessionError::None, "local session starts with two actors");
@@ -434,14 +541,25 @@ void testLocalSessionLifecycle()
     expect(session.players().bindingsMatch(session.entities()), "local session player states match registry ownership");
     expect(!isValid(session.playerActorId(PlayerId { 99 })), "unknown player has no actor entity ID");
 
-    CharacterBuild guestBuild;
+    expect(session.transitionTo(SessionPhase::Combat) == LocalSessionError::InvalidTransition, "lobby cannot jump directly to combat");
+    expect(session.phaseRevision() == 1, "rejected transition does not change phase revision");
+    expect(session.transitionTo(SessionPhase::Loading) == LocalSessionError::LobbyNotReady, "lobby cannot load before both character sheets pass validation");
+    expect(session.submitCharacterSheet(sampleCharacterSheet(kHostPlayerId, "Host")) == CharacterLobbyError::None, "local session accepts the host character sheet");
+    expect(!session.characterLobbyReady() && session.characterLobby().isReady(kHostPlayerId), "one accepted sheet does not ready the two-player lobby");
+    expect(session.transitionTo(SessionPhase::Loading) == LocalSessionError::LobbyNotReady, "one ready player cannot leave the lobby");
+    expect(session.submitCharacterSheet(sampleCharacterSheet(kGuestPlayerId, "Guest")) == CharacterLobbyError::None, "local session accepts the guest character sheet");
+    expect(session.characterLobbyReady(), "both accepted character sheets ready the lobby");
+    expect(session.characterLobby().sheet(kGuestPlayerId) != nullptr && session.characterLobby().sheet(kGuestPlayerId)->name == "Guest", "lobby retains the accepted guest sheet");
+    expect(session.characterLobby().sheet(PlayerId { 99 }) == nullptr, "lobby has no sheet for an unknown player");
+    expect(session.players().find(kHostPlayerId)->name == "Host" && session.players().find(kGuestPlayerId)->name == "Guest", "accepted sheets assign separate character names");
+
+    CharacterBuild guestBuild = session.players().find(kGuestPlayerId)->build;
     guestBuild.baseStats[0] = 6;
     guestBuild.level = 3;
     expect(session.players().setBuild(kGuestPlayerId, guestBuild) == PlayerStateError::None, "local session accepts a guest character build");
 
-    expect(session.transitionTo(SessionPhase::Combat) == LocalSessionError::InvalidTransition, "lobby cannot jump directly to combat");
-    expect(session.phaseRevision() == 1, "rejected transition does not change phase revision");
     expect(session.transitionTo(SessionPhase::Loading) == LocalSessionError::None, "lobby can enter loading");
+    expect(session.submitCharacterSheet(sampleCharacterSheet(kGuestPlayerId, "Late")) == CharacterLobbyError::WrongPhase, "character sheets cannot change after leaving the lobby");
     expect(session.transitionTo(SessionPhase::Exploration) == LocalSessionError::None, "loading can enter exploration");
     expect(session.phaseRevision() == 3, "accepted transitions advance the phase revision");
     expect(session.transitionTo(SessionPhase::Exploration) == LocalSessionError::None, "repeating the current phase is harmless");
@@ -467,6 +585,7 @@ void testLocalSessionLifecycle()
     expect(!session.isActive(), "stopped local session is inactive");
     expect(session.entities().size() == 0, "stopping clears the local entity registry");
     expect(session.players().size() == 0, "stopping clears player character state");
+    expect(!session.characterLobbyReady(), "stopping clears lobby readiness");
     expect(session.transportFor(kHostPlayerId) == nullptr, "stopping removes local transports");
     expect(session.transitionTo(SessionPhase::Loading) == LocalSessionError::NotActive, "inactive session cannot change phase");
 }
@@ -518,6 +637,7 @@ void testAuthoritativeCommandProcessing()
     TestObject laterWorldObject;
     LocalSession session;
     expect(session.start(asGameObject(hostActor), asGameObject(guestActor)) == LocalSessionError::None, "command test session starts");
+    submitBothCharacterSheets(session);
     expect(session.transitionTo(SessionPhase::Loading) == LocalSessionError::None, "command test session enters loading");
     expect(session.transitionTo(SessionPhase::Exploration) == LocalSessionError::None, "command test session enters exploration");
 
@@ -732,6 +852,7 @@ int main()
     fallout::multiplayer::testEntityRegistry();
     fallout::multiplayer::testEntityRegistryAcrossEngineLifecycles();
     fallout::multiplayer::testPlayerCharacterStateStore();
+    fallout::multiplayer::testCharacterLobbyValidationAndWireFormat();
     fallout::multiplayer::testActingPlayerContext();
     fallout::multiplayer::testLocalPlayerContext();
     fallout::multiplayer::testProtocolRoundTrip();

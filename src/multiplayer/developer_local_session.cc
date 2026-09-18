@@ -5,13 +5,22 @@
 #include "game/actions.h"
 #include "game/anim.h"
 #include "game/combat.h"
+#include "game/critter.h"
+#include "game/editor.h"
+#include "game/intface.h"
 #include "game/map_defs.h"
 #include "game/object.h"
+#include "game/palette.h"
 #include "game/protinst.h"
+#include "game/stat.h"
+#include "multiplayer/acting_player_context.h"
 #include "multiplayer/character_build_bridge.h"
+#include "multiplayer/character_lobby.h"
 #include "multiplayer/command_processor.h"
 #include "multiplayer/local_player_context.h"
 #include "multiplayer/local_session.h"
+#include "multiplayer/presentation_bridge.h"
+#include "plib/color/color.h"
 #include "plib/gnw/debug.h"
 
 namespace fallout {
@@ -24,6 +33,8 @@ LocalSession session;
 CommandProcessor commandProcessor;
 std::uint64_t nextHostCommandSequence = 1;
 std::uint64_t nextGuestCommandSequence = 1;
+
+void eraseGuestActor();
 
 class EngineCommandExecutor : public CommandExecutor {
 public:
@@ -134,6 +145,68 @@ Object* createGuestActor()
     return actor;
 }
 
+bool isNewCharacterBuild(const CharacterBuild& build)
+{
+    if (build.level != 1 || build.experience != 0 || build.unspentSkillPoints != 0) {
+        return false;
+    }
+    for (std::int32_t points : build.skillPoints) {
+        if (points != 0) {
+            return false;
+        }
+    }
+    for (std::int32_t rank : build.perkRanks) {
+        if (rank != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool refreshPlayerBuild(PlayerId playerId)
+{
+    PlayerCharacterState* player = session.players().find(playerId);
+    Object* actor = player != nullptr ? session.entities().findObject(player->actorId) : nullptr;
+    if (player == nullptr || actor == nullptr) {
+        return false;
+    }
+
+    ScopedActingPlayerContext actingPlayer(*player, actor);
+    stat_recalc_derived(actor);
+    int hitPoints = critter_get_hits(actor);
+    int maximumHitPoints = stat_level(actor, STAT_MAXIMUM_HIT_POINTS);
+    critter_adjust_hits(actor, maximumHitPoints - hitPoints);
+    return updatePlayerGenderAppearance(actor) == 0;
+}
+
+bool submitCharacterSheet(const CharacterCreationSheet& sheet)
+{
+    std::vector<std::uint8_t> packet;
+    CharacterLobbyError error = encodeCharacterSheet(sheet, packet);
+    if (error == CharacterLobbyError::None) {
+        CharacterSheetDecodeResult decoded = decodeCharacterSheet(packet);
+        error = decoded.error;
+        if (decoded) {
+            error = session.submitCharacterSheet(decoded.sheet);
+        }
+    }
+    if (error != CharacterLobbyError::None) {
+        debug_printf("Multiplayer character sheet for player %u rejected with reason %d.\n",
+            sheet.playerId.value,
+            static_cast<int>(error));
+        return false;
+    }
+    return refreshPlayerBuild(sheet.playerId);
+}
+
+void cancelLobby()
+{
+    session.stop();
+    eraseGuestActor();
+    enabled = false;
+    debug_printf("Multiplayer developer lobby cancelled; continuing in single-player mode.\n");
+}
+
 void eraseGuestActor()
 {
     if (guestActor == nullptr) {
@@ -147,34 +220,68 @@ void eraseGuestActor()
 
 bool beginSession()
 {
+    CharacterBuild hostBuild;
+    if (!captureLegacyCharacterBuild(obj_dude, hostBuild) || !isNewCharacterBuild(hostBuild)) {
+        enabled = false;
+        debug_printf("Multiplayer developer lobby requires a new level-one character; existing-save conversion is not available yet.\n");
+        return false;
+    }
+
     guestActor = createGuestActor();
     if (guestActor == nullptr) {
         return false;
     }
 
-    if (session.start(obj_dude, guestActor) != LocalSessionError::None
-        || session.transitionTo(SessionPhase::Loading) != LocalSessionError::None
-        || session.transitionTo(SessionPhase::Exploration) != LocalSessionError::None) {
+    if (session.start(obj_dude, guestActor) != LocalSessionError::None) {
         session.stop();
         eraseGuestActor();
         return false;
     }
 
-    CharacterBuild hostBuild;
-    if (!captureLegacyCharacterBuild(obj_dude, hostBuild)
-        || session.players().setBuild(kHostPlayerId, hostBuild) != PlayerStateError::None
-        || session.players().setBuild(kGuestPlayerId, hostBuild) != PlayerStateError::None
-        || bindLocalPlayer(session, kHostPlayerId) != LocalPlayerError::None) {
-        session.stop();
-        eraseGuestActor();
+    CharacterCreationSheet hostSheet = characterSheetFromBuild(kHostPlayerId, critter_name(obj_dude), hostBuild);
+    if (!submitCharacterSheet(hostSheet)) {
+        cancelLobby();
         return false;
     }
+
+    CharacterCreationSheet guestDraft;
+    guestDraft.playerId = kGuestPlayerId;
+    guestDraft.name = "Guest";
+    PlayerCharacterState* guest = session.players().find(kGuestPlayerId);
+    if (guest == nullptr
+        || session.players().setName(kGuestPlayerId, guestDraft.name) != PlayerStateError::None
+        || session.players().setBuild(kGuestPlayerId, characterBuildFromSheet(guestDraft)) != PlayerStateError::None
+        || bindLocalPlayer(session, kGuestPlayerId) != LocalPlayerError::None
+        || !refreshPlayerBuild(kGuestPlayerId)) {
+        cancelLobby();
+        return false;
+    }
+
+    CharEditInit();
+    int editorResult = editor_design(true);
+    palette_fade_to(cmap);
+    if (editorResult != 0) {
+        cancelLobby();
+        return false;
+    }
+
+    guest = session.players().find(kGuestPlayerId);
+    CharacterCreationSheet guestSheet = characterSheetFromBuild(kGuestPlayerId, guest->name, guest->build);
+    if (!submitCharacterSheet(guestSheet)
+        || !session.characterLobbyReady()
+        || bindLocalPlayer(session, kHostPlayerId) != LocalPlayerError::None
+        || session.transitionTo(SessionPhase::Loading) != LocalSessionError::None
+        || session.transitionTo(SessionPhase::Exploration) != LocalSessionError::None) {
+        cancelLobby();
+        return false;
+    }
+    intface_redraw();
 
     commandProcessor.reset();
     nextHostCommandSequence = 1;
     nextGuestCommandSequence = 1;
 
-    debug_printf("Multiplayer developer session started with two local actors.\n");
+    debug_printf("Multiplayer developer session started with validated host and guest characters.\n");
     return true;
 }
 

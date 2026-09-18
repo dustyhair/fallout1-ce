@@ -775,7 +775,7 @@ int editor_design(bool isCreationMode)
 
     if (rc == 0) {
         if (isCreationMode) {
-            proto_dude_update_gender();
+            multiplayer::updatePlayerGenderAppearance(editor_player());
             palette_fade_to(black_palette);
         }
     }

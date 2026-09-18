@@ -8,7 +8,11 @@ Launch it with an installed Fallout data set:
 ./build/fallout-ce --multiplayer-dev
 ```
 
-Starting or loading a game creates a second actor beside the player. The actor uses the player prototype and belongs to the guest player in the multiplayer entity registry. The session also creates in-process loopback endpoints for later transport work.
+Start a new game and finish the host character first. When the first map opens, the developer session creates a second actor and opens the character editor for the guest. Accepting that character submits both sheets to the temporary host lobby. The map becomes playable only after both pass validation.
+
+Cancelling the guest editor stops the multiplayer session and continues in single-player mode. The temporary lobby accepts new level-one games only. Loading an existing save with the flag prints a diagnostic and continues without multiplayer because save conversion is not implemented yet.
+
+The guest actor uses the player prototype and belongs to the guest player in the multiplayer entity registry. The session also creates in-process loopback endpoints for later transport work.
 
 In exploration mode, a normal map click controls the host actor. Hold either Ctrl key while clicking to control the guest actor. This works for movement and usable doors. Shift still toggles walking and running. The command processor rejects these commands during combat. Movement also fails while that actor is busy.
 

@@ -25,6 +25,7 @@ LocalSessionError LocalSession::start(Object* hostActor, Object* guestActor)
     }
 
     _players.clear();
+    _characterLobby.reset();
 
     EntityRegistrationResult host = _entities.registerObject(hostActor, kHostPlayerId);
     if (!host) {
@@ -82,6 +83,7 @@ void LocalSession::stop()
 
     _transports = {};
     _players.clear();
+    _characterLobby.reset();
     _entities.clear();
     _hostActorId = {};
     _guestActorId = {};
@@ -115,6 +117,12 @@ LocalSessionError LocalSession::transitionTo(SessionPhase phase)
         return LocalSessionError::None;
     }
 
+    if (_phase == SessionPhase::Lobby
+        && phase == SessionPhase::Loading
+        && !_characterLobby.allPlayersReady()) {
+        return LocalSessionError::LobbyNotReady;
+    }
+
     if (!isTransitionAllowed(_phase, phase)) {
         return LocalSessionError::InvalidTransition;
     }
@@ -122,6 +130,22 @@ LocalSessionError LocalSession::transitionTo(SessionPhase phase)
     _phase = phase;
     _phaseRevision++;
     return LocalSessionError::None;
+}
+
+CharacterLobbyError LocalSession::submitCharacterSheet(const CharacterCreationSheet& sheet)
+{
+    if (!_active) {
+        return CharacterLobbyError::SessionInactive;
+    }
+    if (_phase != SessionPhase::Lobby) {
+        return CharacterLobbyError::WrongPhase;
+    }
+    return _characterLobby.submit(sheet, _players);
+}
+
+bool LocalSession::characterLobbyReady() const
+{
+    return _characterLobby.allPlayersReady();
 }
 
 EntityId LocalSession::playerActorId(PlayerId playerId) const
@@ -223,6 +247,11 @@ PlayerCharacterStateStore& LocalSession::players()
 const PlayerCharacterStateStore& LocalSession::players() const
 {
     return _players;
+}
+
+const CharacterLobby& LocalSession::characterLobby() const
+{
+    return _characterLobby;
 }
 
 bool LocalSession::isTransitionAllowed(SessionPhase from, SessionPhase to)

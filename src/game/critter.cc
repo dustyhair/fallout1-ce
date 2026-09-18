@@ -182,7 +182,12 @@ char* critter_name(Object* critter)
     // 0x504D40
     static char* _name_critter = _aCorpse;
 
-    if (critter == obj_dude || multiplayer::isLocalPlayerActor(critter)) {
+    multiplayer::PlayerCharacterState* player = multiplayer::playerStateForActor(critter);
+    if (player != nullptr && !player->name.empty()) {
+        return player->name.data();
+    }
+
+    if (critter == obj_dude) {
         return pc_name;
     }
 
@@ -217,7 +222,13 @@ char* critter_name(Object* critter)
 int critter_pc_set_name(const char* name)
 {
     if (strlen(name) <= DUDE_NAME_MAX_LENGTH) {
-        strncpy(pc_name, name, DUDE_NAME_MAX_LENGTH);
+        multiplayer::PlayerCharacterState* localPlayer = multiplayer::localPlayerState();
+        if (localPlayer != nullptr) {
+            localPlayer->name = name;
+        }
+        if (localPlayer == nullptr || multiplayer::localPlayerActor() == obj_dude) {
+            strncpy(pc_name, name, DUDE_NAME_MAX_LENGTH);
+        }
         return 0;
     }
 
@@ -227,7 +238,7 @@ int critter_pc_set_name(const char* name)
 // 0x427A80
 void critter_pc_reset_name()
 {
-    strncpy(pc_name, "None", DUDE_NAME_MAX_LENGTH);
+    critter_pc_set_name("None");
 }
 
 // 0x427A9C

@@ -42,6 +42,17 @@ PlayerStateError PlayerCharacterStateStore::setBuild(PlayerId playerId, const Ch
     return PlayerStateError::None;
 }
 
+PlayerStateError PlayerCharacterStateStore::setName(PlayerId playerId, const std::string& name)
+{
+    PlayerCharacterState* state = find(playerId);
+    if (state == nullptr) {
+        return PlayerStateError::PlayerNotFound;
+    }
+
+    state->name = name;
+    return PlayerStateError::None;
+}
+
 PlayerStateError PlayerCharacterStateStore::setConnection(PlayerId playerId, ConnectionState connection)
 {
     PlayerCharacterState* state = find(playerId);

@@ -8,6 +8,7 @@ struct Object;
 namespace multiplayer {
 
 Object* localPlayerActorOrStoryActor();
+int updatePlayerGenderAppearance(Object* actor);
 
 } // namespace multiplayer
 } // namespace fallout

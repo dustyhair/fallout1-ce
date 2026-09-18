@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <unordered_map>
 
 #include "game/perk_defs.h"
@@ -62,6 +63,7 @@ enum class ConnectionState {
 struct PlayerCharacterState {
     PlayerId id;
     EntityId actorId;
+    std::string name;
     CharacterBuild build;
     PlayerOwnership ownership = PlayerOwnership::RemoteControl;
     ConnectionState connection = ConnectionState::Disconnected;
@@ -81,6 +83,7 @@ enum class PlayerStateError {
 class PlayerCharacterStateStore {
 public:
     PlayerStateError registerPlayer(PlayerCharacterState state, const EntityRegistry& entities);
+    PlayerStateError setName(PlayerId playerId, const std::string& name);
     PlayerStateError setBuild(PlayerId playerId, const CharacterBuild& build);
     PlayerStateError setConnection(PlayerId playerId, ConnectionState connection);
     PlayerStateError unregisterPlayer(PlayerId playerId);

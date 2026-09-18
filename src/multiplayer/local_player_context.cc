@@ -62,6 +62,16 @@ Object* localPlayerActor()
     return player != nullptr ? boundSession->entities().findObject(player->actorId) : nullptr;
 }
 
+PlayerCharacterState* playerStateForActor(const Object* actor)
+{
+    if (boundSession == nullptr || actor == nullptr) {
+        return nullptr;
+    }
+
+    std::optional<EntityId> entityId = boundSession->entities().findEntity(const_cast<Object*>(actor));
+    return entityId.has_value() ? boundSession->players().findByActor(*entityId) : nullptr;
+}
+
 bool isLocalPlayerActor(const Object* actor)
 {
     return actor != nullptr && actor == localPlayerActor();

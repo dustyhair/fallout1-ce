@@ -2248,9 +2248,11 @@ void adjust_fid()
     if (FID_TYPE(inven_dude->fid) == OBJ_TYPE_CRITTER) {
         Proto* proto;
 
-        int v0 = art_vault_guy_num;
+        bool isLocalPlayer = inven_dude == inventory_player();
+        int localPlayerArt = art_vault_person_nums[stat_level(inven_dude, STAT_GENDER) == GENDER_FEMALE ? GENDER_FEMALE : GENDER_MALE];
+        int v0 = isLocalPlayer ? localPlayerArt : art_vault_guy_num;
 
-        if (proto_ptr(inven_pid, &proto) == -1) {
+        if (!isLocalPlayer && proto_ptr(inven_pid, &proto) != -1) {
             v0 = proto->fid & 0xFFF;
         }
 
@@ -2263,7 +2265,7 @@ void adjust_fid()
             }
 
             if (v0 == -1) {
-                v0 = art_vault_guy_num;
+                v0 = isLocalPlayer ? localPlayerArt : art_vault_guy_num;
             }
         }
 

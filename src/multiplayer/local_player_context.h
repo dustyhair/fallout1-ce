@@ -23,6 +23,7 @@ void clearLocalPlayerIfBoundTo(const LocalSession& session);
 PlayerId localPlayerId();
 PlayerCharacterState* localPlayerState();
 Object* localPlayerActor();
+PlayerCharacterState* playerStateForActor(const Object* actor);
 bool isLocalPlayerActor(const Object* actor);
 
 class ScopedLocalPlayerContext {

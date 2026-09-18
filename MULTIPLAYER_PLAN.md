@@ -1,6 +1,6 @@
 # Two-player co-op plan
 
-Status: Phase 0 is complete on the `multiplayer-plan` branch. Phase 1 is in progress: registry-backed character builds now drive command execution and local presentation. Temporary two-character creation is next.
+Status: Phase 0 is complete on the `multiplayer-plan` branch. Phase 1 is in progress: both players now submit validated character choices through a temporary lobby. Multiplayer save persistence is next.
 
 ## Goal
 
@@ -79,6 +79,7 @@ The engine assumes one player through `obj_dude` and several global character sy
 struct PlayerCharacterState {
     PlayerId id;
     EntityId actorId;
+    std::string name;
     CharacterBuild build;
     PlayerOwnership ownership;
     ConnectionState connection;
@@ -109,7 +110,7 @@ Do not switch the global `obj_dude` pointer during script execution. Fallout scr
 
 The guest critter can reuse selected party-member persistence code, but it must not enter `combat_ai` or inherit party AI behavior. Ownership, control, and persistence are separate concerns.
 
-Character creation should happen in the lobby. Each peer creates a character locally, then sends a versioned character sheet to the host. The host validates point totals, traits, skills, and perks before spawning the actor.
+Character creation happens in the lobby. Each peer creates a character locally, then sends a versioned character sheet to the host. The first sheet format carries a name, SPECIAL allocation, age, gender, three tagged skills, and up to two traits. It cannot carry perks, invested skill points, experience, or flags. The host validates the choices and constructs a fresh level-one build. See the [temporary character lobby notes](docs/multiplayer/character-lobby.md).
 
 ## Shared world and quests
 
@@ -365,7 +366,7 @@ Do not add a networking dependency, lobby UI, or broad player-state refactor in 
 1. [x] Add registry-backed player character state and seed both developer actors from the legacy build.
 2. [x] Add a scoped acting-player context and route stat, skill, perk, trait, and progression access through it.
 3. [x] Point the HUD, character sheet, inventory, and equipment views at the local actor.
-4. [ ] Add temporary two-character creation and host-side validation.
+4. [x] Add temporary two-character creation and host-side validation.
 5. [ ] Persist both builds in a versioned multiplayer sidecar and verify save/load separation.
 
 ## Testing strategy

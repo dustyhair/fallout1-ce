@@ -3,6 +3,7 @@
 
 #include <cstdint>
 
+#include "multiplayer/character_lobby.h"
 #include "multiplayer/entity_registry.h"
 #include "multiplayer/loopback_transport.h"
 #include "multiplayer/player_character_state.h"
@@ -22,6 +23,7 @@ enum class LocalSessionError {
     SameActor,
     InvalidPlayer,
     InvalidTransition,
+    LobbyNotReady,
     RegistryFailure,
 };
 
@@ -36,6 +38,8 @@ public:
     SessionPhase phase() const;
     std::uint32_t phaseRevision() const;
     LocalSessionError transitionTo(SessionPhase phase);
+    CharacterLobbyError submitCharacterSheet(const CharacterCreationSheet& sheet);
+    bool characterLobbyReady() const;
 
     EntityId playerActorId(PlayerId playerId) const;
     LocalSessionError rebindPlayerActor(PlayerId playerId, Object* replacement);
@@ -50,6 +54,7 @@ public:
     const EntityRegistry& entities() const;
     PlayerCharacterStateStore& players();
     const PlayerCharacterStateStore& players() const;
+    const CharacterLobby& characterLobby() const;
 
 private:
     static bool isTransitionAllowed(SessionPhase from, SessionPhase to);
@@ -61,6 +66,7 @@ private:
     EntityId _guestActorId;
     EntityRegistry _entities;
     PlayerCharacterStateStore _players;
+    CharacterLobby _characterLobby;
     LoopbackTransportPair _transports;
 };
 
