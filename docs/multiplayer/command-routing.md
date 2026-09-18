@@ -14,4 +14,4 @@ Only then does the engine adapter run Fallout pathfinding or schedule door use. 
 
 The developer session registers doors when a player uses them. A world reset removes these unowned mappings before the engine frees map objects. Player actor mappings remain, and the guest actor keeps its `EntityId` when the next map loads.
 
-This change does not encode command payloads for a network transport or replicate completed animation state. The next snapshot slice will add the state needed to detect and repair differences after accepted actions.
+This change does not encode command payloads for a network transport or replicate completed animation state. The [snapshot recovery format](snapshot-recovery.md) now detects and repairs the minimal actor and door state used by this experiment.

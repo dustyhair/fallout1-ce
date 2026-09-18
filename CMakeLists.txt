@@ -42,6 +42,8 @@ add_library(fallout-multiplayer-core STATIC
     "src/multiplayer/loopback_transport.h"
     "src/multiplayer/protocol.cc"
     "src/multiplayer/protocol.h"
+    "src/multiplayer/snapshot.cc"
+    "src/multiplayer/snapshot.h"
     "src/multiplayer/transport.h"
     "src/multiplayer/types.h"
 )

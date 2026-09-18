@@ -9,6 +9,7 @@
 #include "multiplayer/local_session.h"
 #include "multiplayer/loopback_transport.h"
 #include "multiplayer/protocol.h"
+#include "multiplayer/snapshot.h"
 #include "multiplayer/types.h"
 
 namespace fallout {
@@ -43,6 +44,22 @@ ProtocolEnvelope sampleEnvelope()
     envelope.sequence = 0x1112131415161718ULL;
     envelope.payload = { 0x21, 0x22, 0x23 };
     return envelope;
+}
+
+WorldSnapshot sampleSnapshot()
+{
+    WorldSnapshot snapshot;
+    snapshot.lastIncludedEvent.value = 41;
+    snapshot.phase = SessionPhase::Exploration;
+    snapshot.phaseRevision = 7;
+    snapshot.actors = {
+        ActorSnapshot { EntityId { 2 }, kGuestPlayerId, 20102, 0, 3, 28 },
+        ActorSnapshot { EntityId { 1 }, kHostPlayerId, 20100, 0, 1, 34 },
+    };
+    snapshot.doors = {
+        DoorSnapshot { EntityId { 9 }, true, false, 5 },
+    };
+    return snapshot;
 }
 
 void testCoreTypes()
@@ -420,6 +437,98 @@ void testAuthoritativeCommandProcessing()
     expect(later.entityId.value > registeredDoor.entityId.value, "world entity IDs are not reused after a reset");
 }
 
+void testSnapshotRoundTripAndRecovery()
+{
+    WorldSnapshot authoritative = sampleSnapshot();
+    std::vector<std::uint8_t> packet;
+    expect(encodeSnapshot(authoritative, packet) == SnapshotError::None, "valid snapshot encodes");
+    expect(packet.size() == kSnapshotHeaderSize + 16 + 2 * 24 + 12, "snapshot packet declares a fixed-width payload");
+    expect(packet[0] == 'F' && packet[1] == 'C' && packet[2] == 'M' && packet[3] == 'S', "snapshot magic uses network byte order");
+
+    SnapshotDecodeResult decoded = decodeSnapshot(packet);
+    expect(static_cast<bool>(decoded), "encoded snapshot decodes");
+    expect(decoded.snapshot.lastIncludedEvent == EventSequence { 41 }, "snapshot keeps the last included event");
+    expect(decoded.snapshot.phase == SessionPhase::Exploration && decoded.snapshot.phaseRevision == 7, "snapshot keeps session phase state");
+    expect(decoded.snapshot.actors.size() == 2 && decoded.snapshot.actors[0].entityId == EntityId { 1 }, "decoded actors use canonical entity order");
+    expect(decoded.snapshot.actors[1].tile == 20102 && decoded.snapshot.actors[1].hitPoints == 28, "snapshot keeps guest actor state");
+    expect(decoded.snapshot.doors.size() == 1 && decoded.snapshot.doors[0].open, "snapshot keeps door state");
+
+    SnapshotDigestResult authoritativeDigest = computeSnapshotDigest(authoritative);
+    SnapshotDigestResult decodedDigest = computeSnapshotDigest(decoded.snapshot);
+    expect(static_cast<bool>(authoritativeDigest) && authoritativeDigest.digest == decodedDigest.digest, "snapshot digest is stable across wire round trip and input order");
+    expect(firstDivergentSection(authoritativeDigest.digest, decodedDigest.digest) == SnapshotSection::None, "matching snapshots report no divergent section");
+
+    WorldSnapshot sessionDrift = decoded.snapshot;
+    sessionDrift.phaseRevision++;
+    SnapshotDigestResult sessionDriftDigest = computeSnapshotDigest(sessionDrift);
+    expect(firstDivergentSection(authoritativeDigest.digest, sessionDriftDigest.digest) == SnapshotSection::Session, "phase drift reports the session section first");
+
+    WorldSnapshot actorDrift = decoded.snapshot;
+    actorDrift.actors[1].tile++;
+    SnapshotDigestResult actorDriftDigest = computeSnapshotDigest(actorDrift);
+    expect(firstDivergentSection(authoritativeDigest.digest, actorDriftDigest.digest) == SnapshotSection::Actors, "position drift reports the actor section");
+
+    WorldSnapshot doorDrift = decoded.snapshot;
+    doorDrift.doors[0].open = false;
+    SnapshotDigestResult doorDriftDigest = computeSnapshotDigest(doorDrift);
+    expect(firstDivergentSection(authoritativeDigest.digest, doorDriftDigest.digest) == SnapshotSection::Doors, "door drift reports the door section");
+
+    SnapshotReplica replica;
+    expect(replica.apply(actorDrift) == SnapshotError::None, "replica accepts locally drifted state");
+    expect(replica.digest().digest != authoritativeDigest.digest, "drifted replica digest differs from the host");
+    expect(replica.apply(decoded.snapshot) == SnapshotError::None, "replica applies authoritative recovery snapshot");
+    expect(replica.digest().digest == authoritativeDigest.digest, "snapshot recovery reproduces the host digest");
+    expect(replica.state().actors[1].tile == 20102, "snapshot recovery restores the guest position");
+
+    WorldSnapshot invalidRecovery = decoded.snapshot;
+    invalidRecovery.actors[0].tile = -1;
+    expect(replica.apply(invalidRecovery) == SnapshotError::InvalidActorState, "replica rejects an invalid recovery snapshot");
+    expect(replica.digest().digest == authoritativeDigest.digest, "failed recovery leaves replica state unchanged");
+    replica.clear();
+    expect(!replica.hasState(), "replica clear drops recovered state");
+
+    std::vector<std::uint8_t> tooShort(packet.begin(), packet.begin() + kSnapshotHeaderSize - 1);
+    expect(decodeSnapshot(tooShort).error == SnapshotError::PacketTooShort, "snapshot rejects a short header");
+
+    std::vector<std::uint8_t> badMagic = packet;
+    badMagic[0] = 0;
+    expect(decodeSnapshot(badMagic).error == SnapshotError::InvalidMagic, "snapshot rejects invalid magic");
+
+    std::vector<std::uint8_t> badVersion = packet;
+    badVersion[4] = 0;
+    badVersion[5] = kSnapshotVersion + 1;
+    expect(decodeSnapshot(badVersion).error == SnapshotError::UnsupportedVersion, "snapshot rejects unsupported version");
+
+    std::vector<std::uint8_t> corrupt = packet;
+    corrupt.back() ^= 1;
+    expect(decodeSnapshot(corrupt).error == SnapshotError::ChecksumMismatch, "snapshot rejects a corrupt payload");
+
+    std::vector<std::uint8_t> corruptEventSequence = packet;
+    corruptEventSequence[kSnapshotHeaderSize - 1] ^= 1;
+    expect(decodeSnapshot(corruptEventSequence).error == SnapshotError::ChecksumMismatch, "snapshot checksum covers the last included event");
+
+    std::vector<std::uint8_t> truncated = packet;
+    truncated.pop_back();
+    expect(decodeSnapshot(truncated).error == SnapshotError::TruncatedPayload, "snapshot rejects a truncated payload");
+
+    std::vector<std::uint8_t> trailing = packet;
+    trailing.push_back(0);
+    expect(decodeSnapshot(trailing).error == SnapshotError::TrailingData, "snapshot rejects trailing data");
+
+    WorldSnapshot duplicateEntity = authoritative;
+    duplicateEntity.doors[0].entityId = duplicateEntity.actors[0].entityId;
+    expect(validateSnapshot(duplicateEntity) == SnapshotError::DuplicateEntityId, "snapshot rejects duplicate entity IDs across sections");
+
+    WorldSnapshot invalidActor = authoritative;
+    invalidActor.actors[0].elevation = 3;
+    expect(encodeSnapshot(invalidActor, packet) == SnapshotError::InvalidActorState, "snapshot rejects invalid actor coordinates before encoding");
+    expect(packet.empty(), "failed snapshot encoding leaves no partial packet");
+
+    WorldSnapshot invalidOwner = authoritative;
+    invalidOwner.actors[0].ownerId.value = 99;
+    expect(validateSnapshot(invalidOwner) == SnapshotError::InvalidPlayerId, "two-player snapshot rejects an unknown actor owner");
+}
+
 } // namespace
 } // namespace multiplayer
 } // namespace fallout
@@ -434,6 +543,7 @@ int main()
     fallout::multiplayer::testLoopbackTransport();
     fallout::multiplayer::testLocalSessionLifecycle();
     fallout::multiplayer::testAuthoritativeCommandProcessing();
+    fallout::multiplayer::testSnapshotRoundTripAndRecovery();
 
     if (fallout::multiplayer::failures != 0) {
         std::cerr << fallout::multiplayer::failures << " test assertion(s) failed\n";
