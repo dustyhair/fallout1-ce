@@ -25,6 +25,7 @@
 #include "game/tile.h"
 #include "game/trait.h"
 #include "game/worldmap.h"
+#include "multiplayer/acting_player_context.h"
 #include "platform_compat.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/memory.h"
@@ -1034,31 +1035,47 @@ int critter_write_data(DB_FILE* stream, CritterProtoData* critterData)
 // 0x42895C
 void pc_flag_off(int pc_flag)
 {
-    Proto* proto;
-    proto_ptr(obj_dude->pid, &proto);
-
-    proto->critter.data.flags &= ~(1 << pc_flag);
-
-    if (pc_flag == PC_FLAG_SNEAKING) {
-        queue_remove_this(obj_dude, EVENT_TYPE_SNEAK);
+    multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuild();
+    Object* playerActor = multiplayer::actingPlayerActor();
+    if (build != nullptr) {
+        build->prototypeFlags &= ~(1 << pc_flag);
+    } else {
+        Proto* proto;
+        proto_ptr(obj_dude->pid, &proto);
+        proto->critter.data.flags &= ~(1 << pc_flag);
+        playerActor = obj_dude;
     }
 
-    refresh_box_bar_win();
+    if (pc_flag == PC_FLAG_SNEAKING && playerActor != nullptr) {
+        queue_remove_this(playerActor, EVENT_TYPE_SNEAK);
+    }
+
+    if (playerActor == obj_dude) {
+        refresh_box_bar_win();
+    }
 }
 
 // 0x4289A8
 void pc_flag_on(int pc_flag)
 {
-    Proto* proto;
-    proto_ptr(obj_dude->pid, &proto);
+    multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuild();
+    Object* playerActor = multiplayer::actingPlayerActor();
+    if (build != nullptr) {
+        build->prototypeFlags |= (1 << pc_flag);
+    } else {
+        Proto* proto;
+        proto_ptr(obj_dude->pid, &proto);
+        proto->critter.data.flags |= (1 << pc_flag);
+        playerActor = obj_dude;
+    }
 
-    proto->critter.data.flags |= (1 << pc_flag);
-
-    if (pc_flag == PC_FLAG_SNEAKING) {
+    if (pc_flag == PC_FLAG_SNEAKING && playerActor == obj_dude) {
         critter_sneak_check(NULL, NULL);
     }
 
-    refresh_box_bar_win();
+    if (playerActor == obj_dude) {
+        refresh_box_bar_win();
+    }
 }
 
 // 0x428A1C
@@ -1075,6 +1092,11 @@ void pc_flag_toggle(int pc_flag)
 // 0x428A64
 bool is_pc_flag(int pc_flag)
 {
+    multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuild();
+    if (build != nullptr) {
+        return (build->prototypeFlags & (1 << pc_flag)) != 0;
+    }
+
     Proto* proto;
     proto_ptr(obj_dude->pid, &proto);
     return (proto->critter.data.flags & (1 << pc_flag)) != 0;

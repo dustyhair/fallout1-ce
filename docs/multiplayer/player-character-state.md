@@ -20,7 +20,7 @@ The store rejects a player unless its actor exists in `EntityRegistry` and is ow
 
 The developer local session captures the current legacy player data after creating both actors. It copies that data into two separate `CharacterBuild` instances, one for the host and one for the guest. The copies begin identical so the existing character remains playable, but subsequent mutations to either stored build are independent.
 
-This bridge only captures legacy state. Existing stat, skill, perk, trait, and level-up functions still read their process-wide globals. The next Phase 1 slice will add a scoped acting-player context and redirect those mechanical accessors while preserving the normal single-player path.
+The [acting-player context](acting-player-context.md) now routes stat, skill, perk, trait, and progression access to these copies while a validated command executes. Calls outside that scope still use the legacy globals. This preserves single-player behavior and gives command execution an explicit player identity.
 
 ## Invariants
 

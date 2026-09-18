@@ -9,6 +9,7 @@
 #include "game/party.h"
 #include "game/skill.h"
 #include "game/stat.h"
+#include "multiplayer/acting_player_context.h"
 #include "platform_compat.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/memory.h"
@@ -29,6 +30,8 @@ typedef struct PerkDescription {
 
 static bool perk_can_add(int perk);
 static void perk_defaults();
+static Object* perk_player_actor();
+static int perk_level_for_actor(Object* critter, int perk);
 
 // 0x506324
 static PerkDescription perk_data[PERK_COUNT] = {
@@ -199,7 +202,7 @@ static bool perk_can_add(int perk)
         return false;
     }
 
-    if (perk_lev[perk] >= perkDescription->max_rank) {
+    if (perk_level(perk) >= perkDescription->max_rank) {
         return false;
     }
 
@@ -208,13 +211,13 @@ static bool perk_can_add(int perk)
     }
 
     if (perkDescription->required_skill != -1) {
-        if (skill_level(obj_dude, perkDescription->required_skill) < perkDescription->required_skill_level) {
+        if (skill_level(perk_player_actor(), perkDescription->required_skill) < perkDescription->required_skill_level) {
             return false;
         }
     }
 
     for (stat = 0; stat < PRIMARY_STAT_COUNT; stat++) {
-        if (stat_level(obj_dude, stat) < perkDescription->required_stat_levels[stat]) {
+        if (stat_level(perk_player_actor(), stat) < perkDescription->required_stat_levels[stat]) {
             return false;
         }
     }
@@ -245,9 +248,14 @@ int perk_add(int perk)
         return -1;
     }
 
-    perk_lev[perk] += 1;
+    multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuild();
+    if (build != nullptr) {
+        build->perkRanks[perk] += 1;
+    } else {
+        perk_lev[perk] += 1;
+    }
 
-    perk_add_effect(obj_dude, perk);
+    perk_add_effect(perk_player_actor(), perk);
 
     return 0;
 }
@@ -259,13 +267,18 @@ int perk_sub(int perk)
         return -1;
     }
 
-    if (perk_lev[perk] < 1) {
+    if (perk_level(perk) < 1) {
         return -1;
     }
 
-    perk_lev[perk] -= 1;
+    multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuild();
+    if (build != nullptr) {
+        build->perkRanks[perk] -= 1;
+    } else {
+        perk_lev[perk] -= 1;
+    }
 
-    perk_remove_effect(obj_dude, perk);
+    perk_remove_effect(perk_player_actor(), perk);
 
     return 0;
 }
@@ -290,7 +303,12 @@ int perk_make_list(int* perks)
 // 0x486854
 int perk_level(int perk)
 {
-    return perk >= 0 && perk < PERK_COUNT ? perk_lev[perk] : 0;
+    if (perk < 0 || perk >= PERK_COUNT) {
+        return 0;
+    }
+
+    multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuild();
+    return build != nullptr ? build->perkRanks[perk] : perk_lev[perk];
 }
 
 // 0x486868
@@ -360,20 +378,20 @@ void perk_remove_effect(Object* critter, int perk)
 // Returns modifier to specified skill accounting for perks.
 //
 // 0x4869AC
-int perk_adjust_skill(int skill)
+int perk_adjust_skill(Object* critter, int skill)
 {
     int modifier = 0;
 
     switch (skill) {
     case SKILL_FIRST_AID:
     case SKILL_DOCTOR:
-        if (perk_level(PERK_MEDIC)) {
+        if (perk_level_for_actor(critter, PERK_MEDIC)) {
             modifier += 20;
         }
         break;
     case SKILL_SNEAK:
-        if (perk_level(PERK_GHOST)) {
-            if (obj_get_visible_light(obj_dude) <= 45875) {
+        if (perk_level_for_actor(critter, PERK_GHOST)) {
+            if (obj_get_visible_light(critter) <= 45875) {
                 modifier += 20;
             }
         }
@@ -381,26 +399,42 @@ int perk_adjust_skill(int skill)
     case SKILL_LOCKPICK:
     case SKILL_STEAL:
     case SKILL_TRAPS:
-        if (perk_level(PERK_MASTER_THIEF)) {
+        if (perk_level_for_actor(critter, PERK_MASTER_THIEF)) {
             modifier += 10;
         }
         break;
     case SKILL_SCIENCE:
     case SKILL_REPAIR:
-        if (perk_level(PERK_MR_FIXIT)) {
+        if (perk_level_for_actor(critter, PERK_MR_FIXIT)) {
             modifier += 20;
         }
 
         break;
     case SKILL_SPEECH:
     case SKILL_BARTER:
-        if (perk_level(PERK_SPEAKER)) {
+        if (perk_level_for_actor(critter, PERK_SPEAKER)) {
             modifier += 20;
         }
         break;
     }
 
     return modifier;
+}
+
+static Object* perk_player_actor()
+{
+    Object* actor = multiplayer::actingPlayerActor();
+    return actor != nullptr ? actor : obj_dude;
+}
+
+static int perk_level_for_actor(Object* critter, int perk)
+{
+    if (perk < 0 || perk >= PERK_COUNT) {
+        return 0;
+    }
+
+    multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuildFor(critter);
+    return build != nullptr ? build->perkRanks[perk] : perk_lev[perk];
 }
 
 } // namespace fallout

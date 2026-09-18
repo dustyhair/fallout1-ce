@@ -8,6 +8,7 @@
 #include "game/scripts.h"
 #include "game/skill.h"
 #include "game/stat.h"
+#include "multiplayer/acting_player_context.h"
 #include "platform_compat.h"
 
 namespace fallout {
@@ -26,6 +27,8 @@ typedef struct TraitDescription {
     // Identifier of art in `intrface.lst`.
     int art_num;
 } TraitDescription;
+
+static int trait_level_for_actor(Object* critter, int trait);
 
 // 0x508564
 static TraitDescription trait_data[TRAIT_COUNT] = {
@@ -127,8 +130,14 @@ int trait_save(DB_FILE* stream)
 // 0x4A05E8
 void trait_set(int trait1, int trait2)
 {
-    pc_trait[0] = trait1;
-    pc_trait[1] = trait2;
+    multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuild();
+    if (build != nullptr) {
+        build->traits[0] = trait1;
+        build->traits[1] = trait2;
+    } else {
+        pc_trait[0] = trait1;
+        pc_trait[1] = trait2;
+    }
 }
 
 // Returns selected traits.
@@ -136,8 +145,14 @@ void trait_set(int trait1, int trait2)
 // 0x4A05F4
 void trait_get(int* trait1, int* trait2)
 {
-    *trait1 = pc_trait[0];
-    *trait2 = pc_trait[1];
+    multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuild();
+    if (build != nullptr) {
+        *trait1 = build->traits[0];
+        *trait2 = build->traits[1];
+    } else {
+        *trait1 = pc_trait[0];
+        *trait2 = pc_trait[1];
+    }
 }
 
 // Returns a name of the specified trait, or `NULL` if the specified trait is
@@ -173,9 +188,11 @@ int trait_pic(int trait)
 int trait_level(int trait)
 {
     int index;
+    multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuild();
 
     for (index = 0; index < PC_TRAIT_MAX; index++) {
-        if (pc_trait[index] == trait) {
+        int selectedTrait = build != nullptr ? build->traits[index] : pc_trait[index];
+        if (selectedTrait == trait) {
             return 1;
         }
     }
@@ -186,24 +203,24 @@ int trait_level(int trait)
 // Returns stat modifier depending on selected traits.
 //
 // 0x4A071C
-int trait_adjust_stat(int stat)
+int trait_adjust_stat(Object* critter, int stat)
 {
     int modifier = 0;
 
     switch (stat) {
     case STAT_STRENGTH:
-        if (trait_level(TRAIT_GIFTED)) {
+        if (trait_level_for_actor(critter, TRAIT_GIFTED)) {
             modifier += 1;
         }
-        if (trait_level(TRAIT_BRUISER)) {
+        if (trait_level_for_actor(critter, TRAIT_BRUISER)) {
             modifier += 2;
         }
         break;
     case STAT_PERCEPTION:
-        if (trait_level(TRAIT_GIFTED)) {
+        if (trait_level_for_actor(critter, TRAIT_GIFTED)) {
             modifier += 1;
         }
-        if (trait_level(TRAIT_NIGHT_PERSON)) {
+        if (trait_level_for_actor(critter, TRAIT_NIGHT_PERSON)) {
             if (game_time_hour() - 600 < 1200) {
                 modifier -= 1;
             } else {
@@ -212,20 +229,20 @@ int trait_adjust_stat(int stat)
         }
         break;
     case STAT_ENDURANCE:
-        if (trait_level(TRAIT_GIFTED)) {
+        if (trait_level_for_actor(critter, TRAIT_GIFTED)) {
             modifier += 1;
         }
         break;
     case STAT_CHARISMA:
-        if (trait_level(TRAIT_GIFTED)) {
+        if (trait_level_for_actor(critter, TRAIT_GIFTED)) {
             modifier += 1;
         }
         break;
     case STAT_INTELLIGENCE:
-        if (trait_level(TRAIT_GIFTED)) {
+        if (trait_level_for_actor(critter, TRAIT_GIFTED)) {
             modifier += 1;
         }
-        if (trait_level(TRAIT_NIGHT_PERSON)) {
+        if (trait_level_for_actor(critter, TRAIT_NIGHT_PERSON)) {
             if (game_time_hour() - 600 < 1200) {
                 modifier -= 1;
             } else {
@@ -234,66 +251,66 @@ int trait_adjust_stat(int stat)
         }
         break;
     case STAT_AGILITY:
-        if (trait_level(TRAIT_GIFTED)) {
+        if (trait_level_for_actor(critter, TRAIT_GIFTED)) {
             modifier += 1;
         }
-        if (trait_level(TRAIT_SMALL_FRAME)) {
+        if (trait_level_for_actor(critter, TRAIT_SMALL_FRAME)) {
             modifier += 1;
         }
         break;
     case STAT_LUCK:
-        if (trait_level(TRAIT_GIFTED)) {
+        if (trait_level_for_actor(critter, TRAIT_GIFTED)) {
             modifier += 1;
         }
         break;
     case STAT_MAXIMUM_ACTION_POINTS:
-        if (trait_level(TRAIT_BRUISER)) {
+        if (trait_level_for_actor(critter, TRAIT_BRUISER)) {
             modifier -= 2;
         }
         break;
     case STAT_ARMOR_CLASS:
-        if (trait_level(TRAIT_KAMIKAZE)) {
-            modifier -= stat_get_base_direct(obj_dude, STAT_ARMOR_CLASS);
+        if (trait_level_for_actor(critter, TRAIT_KAMIKAZE)) {
+            modifier -= stat_get_base_direct(critter, STAT_ARMOR_CLASS);
         }
         break;
     case STAT_MELEE_DAMAGE:
-        if (trait_level(TRAIT_HEAVY_HANDED)) {
+        if (trait_level_for_actor(critter, TRAIT_HEAVY_HANDED)) {
             modifier += 4;
         }
         break;
     case STAT_CARRY_WEIGHT:
-        if (trait_level(TRAIT_SMALL_FRAME)) {
-            modifier -= 10 * stat_get_base_direct(obj_dude, STAT_STRENGTH);
+        if (trait_level_for_actor(critter, TRAIT_SMALL_FRAME)) {
+            modifier -= 10 * stat_get_base_direct(critter, STAT_STRENGTH);
         }
         break;
     case STAT_SEQUENCE:
-        if (trait_level(TRAIT_KAMIKAZE)) {
+        if (trait_level_for_actor(critter, TRAIT_KAMIKAZE)) {
             modifier += 5;
         }
         break;
     case STAT_HEALING_RATE:
-        if (trait_level(TRAIT_FAST_METABOLISM)) {
+        if (trait_level_for_actor(critter, TRAIT_FAST_METABOLISM)) {
             modifier += 2;
         }
         break;
     case STAT_CRITICAL_CHANCE:
-        if (trait_level(TRAIT_FINESSE)) {
+        if (trait_level_for_actor(critter, TRAIT_FINESSE)) {
             modifier += 10;
         }
         break;
     case STAT_BETTER_CRITICALS:
-        if (trait_level(TRAIT_HEAVY_HANDED)) {
+        if (trait_level_for_actor(critter, TRAIT_HEAVY_HANDED)) {
             modifier -= 30;
         }
         break;
     case STAT_RADIATION_RESISTANCE:
-        if (trait_level(TRAIT_FAST_METABOLISM)) {
-            modifier -= stat_get_base_direct(obj_dude, STAT_RADIATION_RESISTANCE);
+        if (trait_level_for_actor(critter, TRAIT_FAST_METABOLISM)) {
+            modifier -= stat_get_base_direct(critter, STAT_RADIATION_RESISTANCE);
         }
         break;
     case STAT_POISON_RESISTANCE:
-        if (trait_level(TRAIT_FAST_METABOLISM)) {
-            modifier -= stat_get_base_direct(obj_dude, STAT_POISON_RESISTANCE);
+        if (trait_level_for_actor(critter, TRAIT_FAST_METABOLISM)) {
+            modifier -= stat_get_base_direct(critter, STAT_POISON_RESISTANCE);
         }
         break;
     }
@@ -304,19 +321,19 @@ int trait_adjust_stat(int stat)
 // Returns skill modifier depending on selected traits.
 //
 // 0x4A0C24
-int trait_adjust_skill(int skill)
+int trait_adjust_skill(Object* critter, int skill)
 {
     int modifier = 0;
 
-    if (trait_level(TRAIT_GIFTED)) {
+    if (trait_level_for_actor(critter, TRAIT_GIFTED)) {
         modifier -= 10;
     }
 
-    if (trait_level(TRAIT_SKILLED)) {
+    if (trait_level_for_actor(critter, TRAIT_SKILLED)) {
         modifier += 10;
     }
 
-    if (trait_level(TRAIT_GOOD_NATURED)) {
+    if (trait_level_for_actor(critter, TRAIT_GOOD_NATURED)) {
         switch (skill) {
         case SKILL_SMALL_GUNS:
         case SKILL_BIG_GUNS:
@@ -336,6 +353,19 @@ int trait_adjust_skill(int skill)
     }
 
     return modifier;
+}
+
+static int trait_level_for_actor(Object* critter, int trait)
+{
+    multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuildFor(critter);
+    for (int index = 0; index < PC_TRAIT_MAX; index++) {
+        int selectedTrait = build != nullptr ? build->traits[index] : pc_trait[index];
+        if (selectedTrait == trait) {
+            return 1;
+        }
+    }
+
+    return 0;
 }
 
 } // namespace fallout

@@ -21,6 +21,7 @@
 #include "game/skill.h"
 #include "game/tile.h"
 #include "game/trait.h"
+#include "multiplayer/acting_player_context.h"
 #include "platform_compat.h"
 #include "plib/gnw/input.h"
 #include "plib/gnw/memory.h"
@@ -236,8 +237,8 @@ int stat_get_base(Object* critter, int stat)
 {
     int value = stat_get_base_direct(critter, stat);
 
-    if (critter == obj_dude) {
-        value += trait_adjust_stat(stat);
+    if (critter == obj_dude || multiplayer::isActingPlayerActor(critter)) {
+        value += trait_adjust_stat(critter, stat);
     }
 
     return value;
@@ -249,6 +250,11 @@ int stat_get_base_direct(Object* critter, int stat)
     Proto* proto;
 
     if (stat >= 0 && stat < SAVEABLE_STAT_COUNT) {
+        multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuildFor(critter);
+        if (build != nullptr) {
+            return build->baseStats[stat];
+        }
+
         proto_ptr(critter->pid, &proto);
         return proto->critter.data.baseStats[stat];
     } else {
@@ -269,6 +275,11 @@ int stat_get_base_direct(Object* critter, int stat)
 int stat_get_bonus(Object* critter, int stat)
 {
     if (stat >= 0 && stat < SAVEABLE_STAT_COUNT) {
+        multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuildFor(critter);
+        if (build != nullptr) {
+            return build->bonusStats[stat];
+        }
+
         Proto* proto;
         proto_ptr(critter->pid, &proto);
         return proto->critter.data.bonusStats[stat];
@@ -292,8 +303,8 @@ int stat_set_base(Object* critter, int stat, int value)
             return -1;
         }
 
-        if (critter == obj_dude) {
-            value -= trait_adjust_stat(stat);
+        if (critter == obj_dude || multiplayer::isActingPlayerActor(critter)) {
+            value -= trait_adjust_stat(critter, stat);
         }
 
         if (value < stat_data[stat].minimumValue) {
@@ -304,8 +315,13 @@ int stat_set_base(Object* critter, int stat, int value)
             return -3;
         }
 
-        proto_ptr(critter->pid, &proto);
-        proto->critter.data.baseStats[stat] = value;
+        multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuildFor(critter);
+        if (build != nullptr) {
+            build->baseStats[stat] = value;
+        } else {
+            proto_ptr(critter->pid, &proto);
+            proto->critter.data.baseStats[stat] = value;
+        }
 
         if (stat >= STAT_STRENGTH && stat <= STAT_LUCK) {
             stat_recalc_derived(critter);
@@ -332,8 +348,8 @@ int inc_stat(Object* critter, int stat)
 {
     int value = stat_get_base_direct(critter, stat);
 
-    if (critter == obj_dude) {
-        value += trait_adjust_stat(stat);
+    if (critter == obj_dude || multiplayer::isActingPlayerActor(critter)) {
+        value += trait_adjust_stat(critter, stat);
     }
 
     return stat_set_base(critter, stat, value + 1);
@@ -344,8 +360,8 @@ int dec_stat(Object* critter, int stat)
 {
     int value = stat_get_base_direct(critter, stat);
 
-    if (critter == obj_dude) {
-        value += trait_adjust_stat(stat);
+    if (critter == obj_dude || multiplayer::isActingPlayerActor(critter)) {
+        value += trait_adjust_stat(critter, stat);
     }
 
     return stat_set_base(critter, stat, value - 1);
@@ -359,9 +375,14 @@ int stat_set_bonus(Object* critter, int stat, int value)
     }
 
     if (stat >= 0 && stat < SAVEABLE_STAT_COUNT) {
-        Proto* proto;
-        proto_ptr(critter->pid, &proto);
-        proto->critter.data.bonusStats[stat] = value;
+        multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuildFor(critter);
+        if (build != nullptr) {
+            build->bonusStats[stat] = value;
+        } else {
+            Proto* proto;
+            proto_ptr(critter->pid, &proto);
+            proto->critter.data.bonusStats[stat] = value;
+        }
 
         if (stat >= STAT_STRENGTH && stat <= STAT_LUCK) {
             stat_recalc_derived(critter);
@@ -404,21 +425,27 @@ void stat_recalc_derived(Object* critter)
     int agility = stat_level(critter, STAT_AGILITY);
     int luck = stat_level(critter, STAT_LUCK);
 
-    Proto* proto;
-    proto_ptr(critter->pid, &proto);
-    CritterProtoData* data = &(proto->critter.data);
+    int* baseStats;
+    multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuildFor(critter);
+    if (build != nullptr) {
+        baseStats = build->baseStats.data();
+    } else {
+        Proto* proto;
+        proto_ptr(critter->pid, &proto);
+        baseStats = proto->critter.data.baseStats;
+    }
 
-    data->baseStats[STAT_MAXIMUM_HIT_POINTS] = stat_get_base(critter, STAT_STRENGTH) + stat_get_base(critter, STAT_ENDURANCE) * 2 + 15;
-    data->baseStats[STAT_MAXIMUM_ACTION_POINTS] = agility / 2 + 5;
-    data->baseStats[STAT_ARMOR_CLASS] = agility;
-    data->baseStats[STAT_MELEE_DAMAGE] = std::max(strength - 5, 1);
-    data->baseStats[STAT_CARRY_WEIGHT] = 25 * strength + 25;
-    data->baseStats[STAT_SEQUENCE] = 2 * perception;
-    data->baseStats[STAT_HEALING_RATE] = std::max(endurance / 3, 1);
-    data->baseStats[STAT_CRITICAL_CHANCE] = luck;
-    data->baseStats[STAT_BETTER_CRITICALS] = 0;
-    data->baseStats[STAT_RADIATION_RESISTANCE] = 2 * endurance;
-    data->baseStats[STAT_POISON_RESISTANCE] = 5 * endurance;
+    baseStats[STAT_MAXIMUM_HIT_POINTS] = stat_get_base(critter, STAT_STRENGTH) + stat_get_base(critter, STAT_ENDURANCE) * 2 + 15;
+    baseStats[STAT_MAXIMUM_ACTION_POINTS] = agility / 2 + 5;
+    baseStats[STAT_ARMOR_CLASS] = agility;
+    baseStats[STAT_MELEE_DAMAGE] = std::max(strength - 5, 1);
+    baseStats[STAT_CARRY_WEIGHT] = 25 * strength + 25;
+    baseStats[STAT_SEQUENCE] = 2 * perception;
+    baseStats[STAT_HEALING_RATE] = std::max(endurance / 3, 1);
+    baseStats[STAT_CRITICAL_CHANCE] = luck;
+    baseStats[STAT_BETTER_CRITICALS] = 0;
+    baseStats[STAT_RADIATION_RESISTANCE] = 2 * endurance;
+    baseStats[STAT_POISON_RESISTANCE] = 5 * endurance;
 }
 
 // 0x49CA2C
@@ -448,6 +475,18 @@ char* stat_level_description(int value)
 // 0x49CAD4
 int stat_pc_get(int pc_stat)
 {
+    multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuild();
+    if (build != nullptr) {
+        switch (pc_stat) {
+        case PC_STAT_UNSPENT_SKILL_POINTS:
+            return build->unspentSkillPoints;
+        case PC_STAT_LEVEL:
+            return build->level;
+        case PC_STAT_EXPERIENCE:
+            return build->experience;
+        }
+    }
+
     return pc_stat >= 0 && pc_stat < PC_STAT_COUNT ? curr_pc_stat[pc_stat] : 0;
 }
 
@@ -456,7 +495,7 @@ int stat_pc_set(int pc_stat, int value)
 {
     int rc;
 
-    if (pc_stat < 0 && pc_stat >= PC_STAT_COUNT) {
+    if (pc_stat < 0 || pc_stat >= PC_STAT_COUNT) {
         return -5;
     }
 
@@ -468,7 +507,16 @@ int stat_pc_set(int pc_stat, int value)
         return -3;
     }
 
-    curr_pc_stat[pc_stat] = value;
+    multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuild();
+    if (build != nullptr && pc_stat == PC_STAT_UNSPENT_SKILL_POINTS) {
+        build->unspentSkillPoints = value;
+    } else if (build != nullptr && pc_stat == PC_STAT_LEVEL) {
+        build->level = value;
+    } else if (build != nullptr && pc_stat == PC_STAT_EXPERIENCE) {
+        build->experience = value;
+    } else {
+        curr_pc_stat[pc_stat] = value;
+    }
 
     if (pc_stat == PC_STAT_EXPERIENCE) {
         rc = stat_pc_add_experience(0);
@@ -585,31 +633,45 @@ int stat_pc_add_experience(int xp)
         xp = pc_stat_data[PC_STAT_EXPERIENCE].maximumValue;
     }
 
-    curr_pc_stat[PC_STAT_EXPERIENCE] = xp;
+    multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuild();
+    if (build != nullptr) {
+        build->experience = xp;
+    } else {
+        curr_pc_stat[PC_STAT_EXPERIENCE] = xp;
+    }
+
+    Object* playerActor = multiplayer::actingPlayerActor();
+    if (playerActor == nullptr) {
+        playerActor = obj_dude;
+    }
 
     while (stat_pc_get(PC_STAT_LEVEL) < PC_LEVEL_MAX && xp >= stat_pc_min_exp()) {
         if (stat_pc_set(PC_STAT_LEVEL, stat_pc_get(PC_STAT_LEVEL) + 1) == 0) {
             MessageListItem messageListItem;
             int hp;
 
-            // You have gone up a level.
-            messageListItem.num = 600;
-            if (message_search(&stat_message_file, &messageListItem)) {
-                display_print(messageListItem.text);
+            if (playerActor == obj_dude) {
+                // You have gone up a level.
+                messageListItem.num = 600;
+                if (message_search(&stat_message_file, &messageListItem)) {
+                    display_print(messageListItem.text);
+                }
+
+                gsound_play_sfx_file("levelup");
             }
 
             pc_flag_on(PC_FLAG_LEVEL_UP_AVAILABLE);
 
-            gsound_play_sfx_file("levelup");
-
             // NOTE: Uninline.
-            hp = stat_get_base(obj_dude, STAT_ENDURANCE) / 2 + 2;
+            hp = stat_get_base(playerActor, STAT_ENDURANCE) / 2 + 2;
             hp += perk_level(PERK_LIFEGIVER) * 4;
-            critter_adjust_hits(obj_dude, hp);
+            critter_adjust_hits(playerActor, hp);
 
-            stat_set_bonus(obj_dude, STAT_MAXIMUM_HIT_POINTS, stat_get_bonus(obj_dude, STAT_MAXIMUM_HIT_POINTS) + hp);
+            stat_set_bonus(playerActor, STAT_MAXIMUM_HIT_POINTS, stat_get_bonus(playerActor, STAT_MAXIMUM_HIT_POINTS) + hp);
 
-            intface_update_hit_points(false);
+            if (playerActor == obj_dude) {
+                intface_update_hit_points(false);
+            }
         }
     }
 

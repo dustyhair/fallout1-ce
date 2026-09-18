@@ -31,7 +31,7 @@ struct AuthoritativeCommandResult {
 
 class CommandProcessor {
 public:
-    AuthoritativeCommandResult process(const GameCommand& command, const LocalSession& session, CommandExecutor& executor);
+    AuthoritativeCommandResult process(const GameCommand& command, LocalSession& session, CommandExecutor& executor);
     void reset();
 
 private:

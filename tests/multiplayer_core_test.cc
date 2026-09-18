@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "multiplayer/acting_player_context.h"
 #include "multiplayer/command_processor.h"
 #include "multiplayer/entity_registry.h"
 #include "multiplayer/local_session.h"
@@ -248,6 +249,42 @@ void testPlayerCharacterStateStore()
     expect(players.size() == 0, "clearing removes all player states");
 }
 
+void testActingPlayerContext()
+{
+    TestObject hostActor;
+    TestObject guestActor;
+    PlayerCharacterState host;
+    host.id = kHostPlayerId;
+    host.build.level = 3;
+    PlayerCharacterState guest;
+    guest.id = kGuestPlayerId;
+    guest.build.level = 7;
+
+    expect(actingPlayerState() == nullptr && actingPlayerActor() == nullptr, "acting-player context starts empty");
+    expect(actingCharacterBuild() == nullptr, "no character build is active outside a scope");
+
+    {
+        ScopedActingPlayerContext hostContext(host, asGameObject(hostActor));
+        expect(actingPlayerState() == &host, "acting-player scope exposes its player state");
+        expect(actingPlayerActor() == asGameObject(hostActor), "acting-player scope exposes its actor");
+        expect(actingCharacterBuildFor(asGameObject(hostActor)) == &host.build, "acting actor resolves its character build");
+        expect(actingCharacterBuildFor(asGameObject(guestActor)) == nullptr, "another actor cannot use the active character build");
+        actingCharacterBuild()->level = 4;
+
+        {
+            ScopedActingPlayerContext guestContext(guest, asGameObject(guestActor));
+            expect(actingPlayerState() == &guest && actingCharacterBuild() == &guest.build, "nested scope replaces the acting player");
+            expect(isActingPlayerActor(asGameObject(guestActor)), "nested scope recognizes the guest actor");
+            actingCharacterBuild()->level = 8;
+        }
+
+        expect(actingPlayerState() == &host && actingPlayerActor() == asGameObject(hostActor), "leaving a nested scope restores the prior player");
+        expect(host.build.level == 4 && guest.build.level == 8, "nested contexts mutate separate character builds");
+    }
+
+    expect(actingPlayerState() == nullptr && actingPlayerActor() == nullptr, "leaving the outer scope clears the acting player");
+}
+
 void testProtocolRoundTrip()
 {
     ProtocolEnvelope envelope = sampleEnvelope();
@@ -400,6 +437,7 @@ public:
         moveCalls++;
         lastActor = actor;
         lastMove = command;
+        recordContext();
         return nextStatus;
     }
 
@@ -408,7 +446,16 @@ public:
         doorCalls++;
         lastActor = actor;
         lastTarget = target;
+        recordContext();
         return nextStatus;
+    }
+
+    void recordContext()
+    {
+        PlayerCharacterState* player = actingPlayerState();
+        lastActingPlayerId = player != nullptr ? player->id : PlayerId {};
+        lastContextActor = actingPlayerActor();
+        lastBuild = actingCharacterBuild();
     }
 
     CommandExecutionStatus nextStatus = CommandExecutionStatus::Applied;
@@ -416,6 +463,9 @@ public:
     int doorCalls = 0;
     Object* lastActor = nullptr;
     Object* lastTarget = nullptr;
+    Object* lastContextActor = nullptr;
+    CharacterBuild* lastBuild = nullptr;
+    PlayerId lastActingPlayerId;
     MoveCommand lastMove;
 };
 
@@ -450,6 +500,10 @@ void testAuthoritativeCommandProcessing()
     expect(moved.result.rejection == CommandRejection::None, "accepted movement has no rejection reason");
     expect(moved.result.firstEventSequence == EventSequence { 1 } && moved.result.eventCount == 1, "accepted movement names its authoritative event");
     expect(executor.moveCalls == 1 && executor.lastActor == asGameObject(hostActor), "movement executes once for the owned actor");
+    expect(executor.lastActingPlayerId == kHostPlayerId, "host command executes with the host player context");
+    expect(executor.lastContextActor == asGameObject(hostActor), "host context binds the commanded actor");
+    expect(executor.lastBuild == &session.players().find(kHostPlayerId)->build, "host context exposes the registered character build");
+    expect(actingPlayerState() == nullptr, "command execution does not leak its acting-player context");
     const ActorMovementStartedEvent* moveEvent = moved.event.has_value() ? std::get_if<ActorMovementStartedEvent>(&moved.event->payload) : nullptr;
     expect(moveEvent != nullptr && moveEvent->destinationTile == 12345 && moveEvent->running, "movement event records the accepted destination and gait");
 
@@ -475,6 +529,10 @@ void testAuthoritativeCommandProcessing()
     AuthoritativeCommandResult usedDoor = processor.process(useDoor, session, executor);
     expect(usedDoor.result.status == CommandStatus::Accepted, "owned door command is accepted");
     expect(executor.doorCalls == 1 && executor.lastTarget == asGameObject(door), "door command resolves the authoritative target object");
+    expect(executor.lastActingPlayerId == kGuestPlayerId, "guest command executes with the guest player context");
+    expect(executor.lastContextActor == asGameObject(guestActor), "guest context binds the commanded actor");
+    expect(executor.lastBuild == &session.players().find(kGuestPlayerId)->build, "guest context exposes the registered character build");
+    expect(actingPlayerState() == nullptr, "guest command clears its context after execution");
     const DoorUseStartedEvent* doorEvent = usedDoor.event.has_value() ? std::get_if<DoorUseStartedEvent>(&usedDoor.event->payload) : nullptr;
     expect(doorEvent != nullptr && doorEvent->targetId == registeredDoor.entityId, "door event records the actor and target IDs");
     expect(usedDoor.event.has_value() && usedDoor.event->sequence == EventSequence { 2 }, "event sequence advances across players");
@@ -484,6 +542,7 @@ void testAuthoritativeCommandProcessing()
     AuthoritativeCommandResult invalid = processor.process(move, session, executor);
     expect(invalid.result.rejection == CommandRejection::InvalidAction, "executor can reject an impossible action");
     expect(!invalid.event.has_value(), "rejected action emits no authoritative event");
+    expect(actingPlayerState() == nullptr, "invalid action does not leak its acting-player context");
 
     move.sequence.value = 4;
     AuthoritativeCommandResult gap = processor.process(move, session, executor);
@@ -632,6 +691,7 @@ int main()
     fallout::multiplayer::testEntityRegistry();
     fallout::multiplayer::testEntityRegistryAcrossEngineLifecycles();
     fallout::multiplayer::testPlayerCharacterStateStore();
+    fallout::multiplayer::testActingPlayerContext();
     fallout::multiplayer::testProtocolRoundTrip();
     fallout::multiplayer::testProtocolRejectsInvalidPackets();
     fallout::multiplayer::testLoopbackTransport();

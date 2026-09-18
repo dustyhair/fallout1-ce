@@ -5,6 +5,8 @@
 
 namespace fallout {
 
+struct Object;
+
 // The maximum number of traits a player is allowed to select.
 #define PC_TRAIT_MAX 2
 
@@ -40,8 +42,8 @@ char* trait_name(int trait);
 char* trait_description(int trait);
 int trait_pic(int trait);
 int trait_level(int trait);
-int trait_adjust_stat(int stat);
-int trait_adjust_skill(int skill);
+int trait_adjust_stat(Object* critter, int stat);
+int trait_adjust_skill(Object* critter, int skill);
 
 } // namespace fallout
 

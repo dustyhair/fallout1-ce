@@ -22,6 +22,7 @@
 #include "game/scripts.h"
 #include "game/stat.h"
 #include "game/trait.h"
+#include "multiplayer/acting_player_context.h"
 #include "platform_compat.h"
 #include "plib/color/color.h"
 #include "plib/gnw/debug.h"
@@ -185,9 +186,14 @@ void skill_set_defaults(CritterProtoData* data)
 void skill_set_tags(int* skills, int count)
 {
     int index;
+    multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuild();
 
     for (index = 0; index < count; index++) {
-        tag_skill[index] = skills[index];
+        if (build != nullptr) {
+            build->taggedSkills[index] = skills[index];
+        } else {
+            tag_skill[index] = skills[index];
+        }
     }
 }
 
@@ -195,9 +201,10 @@ void skill_set_tags(int* skills, int count)
 void skill_get_tags(int* skills, int count)
 {
     int index;
+    multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuild();
 
     for (index = 0; index < count; index++) {
-        skills[index] = tag_skill[index];
+        skills[index] = build != nullptr ? build->taggedSkills[index] : tag_skill[index];
     }
 }
 
@@ -228,13 +235,15 @@ int skill_level(Object* critter, int skill)
 
     value = skill_description->default_value + bonus + points * skill_description->points_modifier;
 
-    if (critter == obj_dude) {
-        if (skill == tag_skill[0] || skill == tag_skill[1] || skill == tag_skill[2] || skill == tag_skill[3]) {
+    if (critter == obj_dude || multiplayer::isActingPlayerActor(critter)) {
+        multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuildFor(critter);
+        const int* taggedSkills = build != nullptr ? build->taggedSkills.data() : tag_skill;
+        if (skill == taggedSkills[0] || skill == taggedSkills[1] || skill == taggedSkills[2] || skill == taggedSkills[3]) {
             value += 20 + points * skill_description->points_modifier;
         }
 
-        value += trait_adjust_skill(skill);
-        value += perk_adjust_skill(skill);
+        value += trait_adjust_skill(critter, skill);
+        value += perk_adjust_skill(critter, skill);
         value += skill_game_difficulty(skill);
     }
 
@@ -258,6 +267,11 @@ int skill_points(Object* obj, int skill)
         return 0;
     }
 
+    multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuildFor(obj);
+    if (build != nullptr) {
+        return build->skillPoints[skill];
+    }
+
     Proto* proto;
     proto_ptr(obj->pid, &proto);
 
@@ -272,7 +286,7 @@ int skill_inc_point(Object* obj, int skill)
     int level;
     int rc;
 
-    if (obj != obj_dude) {
+    if (obj != obj_dude && !multiplayer::isActingPlayerActor(obj)) {
         return -5;
     }
 
@@ -280,7 +294,10 @@ int skill_inc_point(Object* obj, int skill)
         return -5;
     }
 
-    proto_ptr(obj->pid, &proto);
+    multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuildFor(obj);
+    if (build == nullptr) {
+        proto_ptr(obj->pid, &proto);
+    }
 
     unspent_skill_points = stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS);
     if (unspent_skill_points <= 0) {
@@ -294,7 +311,11 @@ int skill_inc_point(Object* obj, int skill)
 
     rc = stat_pc_set(PC_STAT_UNSPENT_SKILL_POINTS, unspent_skill_points - 1);
     if (rc == 0) {
-        proto->critter.data.skills[skill] += 1;
+        if (build != nullptr) {
+            build->skillPoints[skill] += 1;
+        } else {
+            proto->critter.data.skills[skill] += 1;
+        }
     }
 
     return rc;
@@ -307,7 +328,7 @@ int skill_dec_point(Object* critter, int skill)
     int unspent_skill_points;
     int rc;
 
-    if (critter != obj_dude) {
+    if (critter != obj_dude && !multiplayer::isActingPlayerActor(critter)) {
         return -5;
     }
 
@@ -315,9 +336,13 @@ int skill_dec_point(Object* critter, int skill)
         return -5;
     }
 
-    proto_ptr(critter->pid, &proto);
+    multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuildFor(critter);
+    if (build == nullptr) {
+        proto_ptr(critter->pid, &proto);
+    }
 
-    if (proto->critter.data.skills[skill] <= 0) {
+    int skillPoints = build != nullptr ? build->skillPoints[skill] : proto->critter.data.skills[skill];
+    if (skillPoints <= 0) {
         return -2;
     }
 
@@ -325,7 +350,11 @@ int skill_dec_point(Object* critter, int skill)
 
     rc = stat_pc_set(PC_STAT_UNSPENT_SKILL_POINTS, unspent_skill_points + 1);
     if (rc == 0) {
-        proto->critter.data.skills[skill] -= 1;
+        if (build != nullptr) {
+            build->skillPoints[skill] -= 1;
+        } else {
+            proto->critter.data.skills[skill] -= 1;
+        }
     }
 
     return 0;
@@ -397,7 +426,7 @@ int skill_pic(int skill)
 // 0x498738
 static void show_skill_use_messages(Object* obj, int skill, Object* a3, int a4, int criticalChanceModifier)
 {
-    if (obj != obj_dude) {
+    if (obj != obj_dude && !multiplayer::isActingPlayerActor(obj)) {
         return;
     }
 
@@ -423,7 +452,7 @@ static void show_skill_use_messages(Object* obj, int skill, Object* a3, int a4, 
     if (stat_pc_add_experience(xpToAdd) == 0 && a4 > 0) {
         MessageListItem messageListItem;
         messageListItem.num = 505; // You earn %d XP for honing your skills
-        if (message_search(&skill_message_file, &messageListItem)) {
+        if (obj == obj_dude && message_search(&skill_message_file, &messageListItem)) {
             int after = stat_pc_get(PC_STAT_EXPERIENCE);
 
             char text[60];
@@ -447,7 +476,7 @@ int skill_use(Object* obj, Object* a2, int skill, int criticalChanceModifier)
     int maximumHpToHeal = 0;
     int minimumHpToHeal = 0;
 
-    if (obj == obj_dude) {
+    if (obj == obj_dude || multiplayer::isActingPlayerActor(obj)) {
         if (skill == SKILL_FIRST_AID || skill == SKILL_DOCTOR) {
             int healerRank = perk_level(PERK_HEALER);
             minimumHpToHeal = 2 * healerRank;
@@ -784,7 +813,8 @@ int skill_check_stealing(Object* a1, Object* a2, Object* item, bool isPlanting)
 
     int stealModifier = 1 - gStealCount;
 
-    if (a1 != obj_dude || !perk_level(PERK_PICKPOCKET)) {
+    bool isPlayerActor = a1 == obj_dude || multiplayer::isActingPlayerActor(a1);
+    if (!isPlayerActor || !perk_level(PERK_PICKPOCKET)) {
         // -4% per item size
         stealModifier -= 4 * item_size(item);
 
@@ -806,7 +836,7 @@ int skill_check_stealing(Object* a1, Object* a2, Object* item, bool isPlanting)
     }
 
     int stealRoll;
-    if (a1 == obj_dude && isPartyMember(a2)) {
+    if (isPlayerActor && isPartyMember(a2)) {
         stealRoll = ROLL_CRITICAL_SUCCESS;
     } else {
         int criticalChance = stat_level(a1, STAT_CRITICAL_CHANCE);

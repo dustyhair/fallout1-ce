@@ -20,7 +20,7 @@ char* perk_name(int perk);
 char* perk_description(int perk);
 void perk_add_effect(Object* critter, int perk);
 void perk_remove_effect(Object* critter, int perk);
-int perk_adjust_skill(int skill);
+int perk_adjust_skill(Object* critter, int skill);
 
 } // namespace fallout
 

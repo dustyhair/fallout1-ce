@@ -1,6 +1,6 @@
 # Two-player co-op plan
 
-Status: Phase 0 is complete on the `multiplayer-plan` branch. Phase 1 is in progress: registry-backed player character builds exist, and scoped legacy character access is next.
+Status: Phase 0 is complete on the `multiplayer-plan` branch. Phase 1 is in progress: command execution now uses registry-backed character builds through a scoped acting-player context. Local presentation is next.
 
 ## Goal
 
@@ -87,7 +87,7 @@ struct PlayerCharacterState {
 
 `CharacterBuild` owns the data that currently behaves as process-wide player data, including the player prototype's base stats and skills, traits, perks, tagged skills, level, experience, skill points, and any other character-creation fields not stored on the critter object. Reputation and karma remain shared unless a script audit proves that a value is purely personal.
 
-The first Phase 1 slice implements this model and its ownership checks as described in the [player character state notes](docs/multiplayer/player-character-state.md). The developer local session seeds separate host and guest build copies from the current legacy character. Mechanical accessors still use the legacy globals until the scoped acting-player context is added.
+The first Phase 1 slices implement this model and its ownership checks as described in the [player character state notes](docs/multiplayer/player-character-state.md). The developer local session seeds separate host and guest build copies from the current legacy character. The [acting-player context](docs/multiplayer/acting-player-context.md) routes mechanical accessors during validated command execution without changing `obj_dude`.
 
 Keep the host character as the canonical story actor in `obj_dude` during the first implementation. Represent the guest as a player-owned critter, not as an AI party member. Three actor concepts must not be conflated:
 
@@ -363,7 +363,7 @@ Do not add a networking dependency, lobby UI, or broad player-state refactor in 
 ## Phase 1 implementation series
 
 1. [x] Add registry-backed player character state and seed both developer actors from the legacy build.
-2. [ ] Add a scoped acting-player context and route stat, skill, perk, trait, and progression access through it.
+2. [x] Add a scoped acting-player context and route stat, skill, perk, trait, and progression access through it.
 3. [ ] Point the HUD, character sheet, inventory, and equipment views at the local actor.
 4. [ ] Add temporary two-character creation and host-side validation.
 5. [ ] Persist both builds in a versioned multiplayer sidecar and verify save/load separation.

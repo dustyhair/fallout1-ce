@@ -1,9 +1,11 @@
 #include "multiplayer/command_processor.h"
 
+#include "multiplayer/acting_player_context.h"
+
 namespace fallout {
 namespace multiplayer {
 
-AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command, const LocalSession& session, CommandExecutor& executor)
+AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command, LocalSession& session, CommandExecutor& executor)
 {
     if (!isValid(command.playerId)
         || (command.playerId != kHostPlayerId && command.playerId != kGuestPlayerId)
@@ -12,14 +14,14 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
         return reject(command, CommandRejection::Malformed);
     }
 
-    auto player = _players.find(command.playerId);
+    auto commandHistory = _players.find(command.playerId);
     std::uint64_t expectedSequence = 1;
-    if (player != _players.end()) {
-        auto previousResult = player->second.results.find(command.sequence.value);
-        if (previousResult != player->second.results.end()) {
+    if (commandHistory != _players.end()) {
+        auto previousResult = commandHistory->second.results.find(command.sequence.value);
+        if (previousResult != commandHistory->second.results.end()) {
             return previousResult->second;
         }
-        expectedSequence = player->second.lastSequence + 1;
+        expectedSequence = commandHistory->second.lastSequence + 1;
     }
 
     if (command.sequence.value != expectedSequence) {
@@ -51,22 +53,35 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
         return rejectAndRemember(CommandRejection::NotOwner);
     }
 
+    PlayerCharacterState* actingState = session.players().find(command.playerId);
+    if (actingState == nullptr || actingState->actorId != command.actorId) {
+        return rejectAndRemember(CommandRejection::NotOwner);
+    }
+
     GameEvent event;
     event.sequence.value = _nextEventSequence;
     event.causedBy = command.sequence;
 
-    CommandExecutionStatus executionStatus = CommandExecutionStatus::InvalidAction;
-    if (const MoveCommand* move = std::get_if<MoveCommand>(&command.payload)) {
-        executionStatus = executor.move(actor, *move);
-        event.payload = ActorMovementStartedEvent { command.actorId, move->destinationTile, move->elevation, move->running };
-    } else if (const InteractCommand* interact = std::get_if<InteractCommand>(&command.payload)) {
-        Object* target = session.entities().findObject(interact->targetId);
+    const MoveCommand* move = std::get_if<MoveCommand>(&command.payload);
+    const InteractCommand* interact = std::get_if<InteractCommand>(&command.payload);
+    Object* target = nullptr;
+    if (interact != nullptr) {
+        target = session.entities().findObject(interact->targetId);
         if (target == nullptr) {
             return rejectAndRemember(CommandRejection::MissingEntity);
         }
+    }
 
-        executionStatus = executor.useDoor(actor, target);
-        event.payload = DoorUseStartedEvent { command.actorId, interact->targetId };
+    CommandExecutionStatus executionStatus = CommandExecutionStatus::InvalidAction;
+    {
+        ScopedActingPlayerContext actingPlayer(*actingState, actor);
+        if (move != nullptr) {
+            executionStatus = executor.move(actor, *move);
+            event.payload = ActorMovementStartedEvent { command.actorId, move->destinationTile, move->elevation, move->running };
+        } else if (interact != nullptr) {
+            executionStatus = executor.useDoor(actor, target);
+            event.payload = DoorUseStartedEvent { command.actorId, interact->targetId };
+        }
     }
 
     if (executionStatus != CommandExecutionStatus::Applied) {
