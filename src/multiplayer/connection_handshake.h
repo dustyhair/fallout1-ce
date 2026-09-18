@@ -5,17 +5,19 @@
 #include <variant>
 
 #include "multiplayer/protocol.h"
+#include "multiplayer/session_recovery.h"
 
 namespace fallout {
 namespace multiplayer {
 
-constexpr std::uint16_t kConnectionHandshakeVersion = 1;
+constexpr std::uint16_t kConnectionHandshakeVersion = 2;
 
 enum class HandshakeRejection : std::uint8_t {
     None = 0,
     ContentMismatch = 1,
     SessionFull = 2,
     ServerUnavailable = 3,
+    InvalidReconnect = 4,
 };
 
 struct HandshakeHello {
@@ -25,13 +27,26 @@ struct HandshakeHello {
 struct HandshakeWelcome {
     SessionId sessionId;
     PlayerId assignedPlayerId;
+    ReconnectToken reconnectToken;
+};
+
+struct ReconnectHello {
+    SessionId sessionId;
+    PlayerId playerId;
+    ReconnectToken reconnectToken;
+    EventSequence lastAppliedEvent;
+};
+
+struct ReconnectWelcome {
+    SessionId sessionId;
+    EventSequence latestEvent;
 };
 
 struct HandshakeRejected {
     HandshakeRejection reason = HandshakeRejection::ServerUnavailable;
 };
 
-using HandshakeMessage = std::variant<HandshakeHello, HandshakeWelcome, HandshakeRejected>;
+using HandshakeMessage = std::variant<HandshakeHello, HandshakeWelcome, HandshakeRejected, ReconnectHello, ReconnectWelcome>;
 
 enum class HandshakeError {
     None,
@@ -44,6 +59,7 @@ enum class HandshakeError {
     InvalidSessionId,
     InvalidPlayerId,
     InvalidRejection,
+    InvalidReconnectToken,
 };
 
 struct HandshakeDecodeResult {
@@ -61,6 +77,7 @@ HandshakeDecodeResult decodeHandshakeMessage(const ProtocolEnvelope& envelope);
 HandshakeMessage makeHostHandshakeResponse(const HandshakeHello& hello,
     std::uint64_t expectedContentDigest,
     SessionId sessionId,
+    const ReconnectToken& reconnectToken,
     bool guestSlotAvailable = true);
 
 } // namespace multiplayer

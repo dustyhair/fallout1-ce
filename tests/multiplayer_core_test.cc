@@ -841,9 +841,12 @@ std::unique_ptr<Transport> acceptTcpPeer(TcpListener& listener)
     return nullptr;
 }
 
-std::optional<Packet> receiveTcpPacket(Transport& transport)
+std::optional<Packet> receiveTcpPacket(Transport& transport, Transport* peer = nullptr)
 {
     for (int attempt = 0; attempt < 10000; attempt++) {
+        if (peer != nullptr) {
+            peer->poll();
+        }
         std::optional<Packet> packet = transport.receive();
         if (packet.has_value()) {
             return packet;
@@ -875,6 +878,10 @@ void testTcpTransportAndHandshake()
 
     constexpr std::uint64_t contentDigest = 0x1020304050607080ULL;
     SessionId sessionId { 0x8877665544332211ULL };
+    ReconnectToken reconnectToken;
+    for (std::size_t index = 0; index < reconnectToken.bytes.size(); index++) {
+        reconnectToken.bytes[index] = static_cast<std::uint8_t>(index + 1);
+    }
     ProtocolEnvelope helloEnvelope;
     helloEnvelope.sequence = 1;
     expect(encodeHandshakeMessage(HandshakeHello { contentDigest }, helloEnvelope) == HandshakeError::None, "guest handshake hello encodes");
@@ -883,7 +890,7 @@ void testTcpTransportAndHandshake()
     expect(encodeEnvelope(helloEnvelope, helloPacket) == ProtocolError::None, "guest handshake envelope encodes");
     expect(joining.transport->send(std::move(helloPacket)) == TransportSendResult::Sent, "guest sends its handshake");
 
-    std::optional<Packet> receivedHello = receiveTcpPacket(*host);
+    std::optional<Packet> receivedHello = receiveTcpPacket(*host, joining.transport.get());
     expect(receivedHello.has_value(), "host receives one framed handshake packet");
     if (!receivedHello.has_value()) {
         return;
@@ -896,7 +903,7 @@ void testTcpTransportAndHandshake()
         return;
     }
 
-    HandshakeMessage response = makeHostHandshakeResponse(*hello, contentDigest, sessionId);
+    HandshakeMessage response = makeHostHandshakeResponse(*hello, contentDigest, sessionId, reconnectToken);
     ProtocolEnvelope welcomeEnvelope;
     welcomeEnvelope.sequence = 1;
     expect(encodeHandshakeMessage(response, welcomeEnvelope) == HandshakeError::None, "host handshake welcome encodes");
@@ -904,29 +911,76 @@ void testTcpTransportAndHandshake()
     expect(encodeEnvelope(welcomeEnvelope, welcomePacket) == ProtocolError::None, "host handshake envelope encodes");
     expect(host->send(std::move(welcomePacket)) == TransportSendResult::Sent, "host sends its handshake response");
 
-    std::optional<Packet> receivedWelcome = receiveTcpPacket(*joining.transport);
+    std::optional<Packet> receivedWelcome = receiveTcpPacket(*joining.transport, host.get());
     expect(receivedWelcome.has_value(), "guest receives one framed welcome packet");
     if (receivedWelcome.has_value()) {
         ProtocolDecodeResult decodedWelcomeEnvelope = decodeEnvelope(*receivedWelcome);
         HandshakeDecodeResult decodedWelcome = decodedWelcomeEnvelope ? decodeHandshakeMessage(decodedWelcomeEnvelope.envelope) : HandshakeDecodeResult {};
         const HandshakeWelcome* welcome = decodedWelcome ? std::get_if<HandshakeWelcome>(&decodedWelcome.message) : nullptr;
-        expect(welcome != nullptr && welcome->sessionId == sessionId && welcome->assignedPlayerId == kGuestPlayerId, "guest accepts its session and player assignment");
+        expect(welcome != nullptr && welcome->sessionId == sessionId
+                && welcome->assignedPlayerId == kGuestPlayerId
+                && reconnectTokensEqual(welcome->reconnectToken, reconnectToken),
+            "guest accepts its session, player assignment, and reconnect credential");
     }
+    std::optional<TransportPeerIdentity> pinnedIdentity = joining.transport->peerIdentity();
+    expect(pinnedIdentity.has_value(), "TLS guest records the host certificate identity");
 
     expect(host->send(Packet { 1, 2, 3 }) == TransportSendResult::Sent, "TCP transport queues the first gameplay packet");
     expect(host->send(Packet { 4, 5 }) == TransportSendResult::Sent, "TCP transport queues a second gameplay packet");
-    std::optional<Packet> first = receiveTcpPacket(*joining.transport);
-    std::optional<Packet> second = receiveTcpPacket(*joining.transport);
+    std::optional<Packet> first = receiveTcpPacket(*joining.transport, host.get());
+    std::optional<Packet> second = receiveTcpPacket(*joining.transport, host.get());
     expect(first == Packet({ 1, 2, 3 }) && second == Packet({ 4, 5 }), "TCP framing preserves packet boundaries and order");
+
+    Packet multiRecordPacket(128 * 1024);
+    for (std::size_t index = 0; index < multiRecordPacket.size(); index++) {
+        multiRecordPacket[index] = static_cast<std::uint8_t>(index & 0xFF);
+    }
+    Packet expectedMultiRecordPacket = multiRecordPacket;
+    expect(host->send(std::move(multiRecordPacket)) == TransportSendResult::Sent
+            && receiveTcpPacket(*joining.transport, host.get()) == expectedMultiRecordPacket,
+        "TLS framing preserves a packet split across multiple encrypted records");
 
     Packet oversized(kMaxTransportPacketSize + 1);
     expect(host->send(std::move(oversized)) == TransportSendResult::PacketTooLarge, "TCP transport rejects oversized packets without disconnecting");
     expect(host->isConnected(), "oversized packet rejection leaves the TCP connection open");
 
-    HandshakeMessage mismatch = makeHostHandshakeResponse(HandshakeHello { contentDigest + 1 }, contentDigest, sessionId);
+    host->close();
+    joining.transport->close();
+    TcpConnectResult reconnecting = connectTcp("127.0.0.1", listening.listener->port(), 5000, pinnedIdentity);
+    std::unique_ptr<Transport> reconnectedHost = acceptTcpPeer(*listening.listener);
+    expect(reconnecting && reconnectedHost != nullptr, "TLS guest reconnects to the pinned host identity");
+    if (reconnecting && reconnectedHost != nullptr) {
+        expect(reconnecting.transport->send(Packet { 8, 9 }) == TransportSendResult::Sent,
+            "pinned TLS reconnect queues application data");
+        expect(receiveTcpPacket(*reconnectedHost, reconnecting.transport.get()) == Packet({ 8, 9 }),
+            "pinned TLS reconnect carries application data");
+        reconnecting.transport->close();
+        reconnectedHost->close();
+    }
+
+    if (pinnedIdentity.has_value()) {
+        TransportPeerIdentity wrongIdentity = *pinnedIdentity;
+        wrongIdentity.back() ^= 1;
+        TcpConnectResult impostor = connectTcp("127.0.0.1", listening.listener->port(), 5000, wrongIdentity);
+        std::unique_ptr<Transport> impostorHost = acceptTcpPeer(*listening.listener);
+        expect(impostor && impostorHost != nullptr, "mismatched-pin test establishes its TCP socket");
+        if (impostor && impostorHost != nullptr) {
+            expect(impostor.transport->send(Packet { 0xA5 }) == TransportSendResult::Sent,
+                "application bytes can queue while the TLS pin is checked");
+            for (int attempt = 0; attempt < 10000 && impostor.transport->isConnected(); attempt++) {
+                impostorHost->poll();
+                impostor.transport->poll();
+            }
+            expect(!impostor.transport->isConnected() && !impostorHost->receive().has_value(),
+                "TLS reconnect rejects a different host identity before releasing queued credentials");
+            impostorHost->close();
+        }
+    }
+
+    HandshakeMessage mismatch = makeHostHandshakeResponse(HandshakeHello { contentDigest + 1 }, contentDigest, sessionId, reconnectToken);
     const HandshakeRejected* mismatchRejection = std::get_if<HandshakeRejected>(&mismatch);
     expect(mismatchRejection != nullptr && mismatchRejection->reason == HandshakeRejection::ContentMismatch, "host rejects a different content digest");
-    HandshakeMessage full = makeHostHandshakeResponse(HandshakeHello { contentDigest }, contentDigest, sessionId, false);
+    HandshakeMessage full = makeHostHandshakeResponse(HandshakeHello { contentDigest }, contentDigest, sessionId, reconnectToken, false);
     const HandshakeRejected* fullRejection = std::get_if<HandshakeRejected>(&full);
     expect(fullRejection != nullptr && fullRejection->reason == HandshakeRejection::SessionFull, "host rejects a third player");
 
@@ -937,7 +991,6 @@ void testTcpTransportAndHandshake()
     malformed.payload[3] = 1;
     expect(decodeHandshakeMessage(malformed).error == HandshakeError::InvalidReservedField, "handshake rejects nonzero reserved fields");
 
-    joining.transport->close();
     expect(joining.transport->send(Packet { 9 }) == TransportSendResult::Disconnected, "closed TCP endpoint rejects sends");
     listening.listener->close();
     expect(!listening.listener->isOpen(), "TCP listener closes explicitly");
@@ -1120,6 +1173,8 @@ void testNetworkCharacterLobby()
             && hostMove->startingTile == 12340
             && hostMove->path == std::vector<std::uint8_t>({ 1, 2, 3 }),
         "guest receives the host movement");
+    expect(hostMoveEvent.has_value() && guest.confirmPeerEventApplied(hostMoveEvent->sequence),
+        "guest confirms the first event after applying it");
     expect(!guest.takePeerEvent().has_value(), "received host movement is consumed once");
     expect(guest.sendLocalMove(12346, 1, false), "guest sends its local movement");
     host.poll();
@@ -1160,6 +1215,8 @@ void testNetworkCharacterLobby()
             && guestMove->elevation == 1
             && !guestMove->running,
         "guest receives the host-authoritative movement result and event");
+    expect(guestMoveEvent.has_value() && guest.confirmPeerEventApplied(guestMoveEvent->sequence),
+        "guest advances its applied boundary after authoritative movement");
     expect(host.sendLocalDoorUse(EntityId { 77 }), "host sends its local door use");
     guest.poll();
     std::optional<GameEvent> doorEvent = guest.takePeerEvent();
@@ -1170,6 +1227,8 @@ void testNetworkCharacterLobby()
             && doorUse->actorId == EntityId { kHostPlayerId.value }
             && doorUse->targetId == EntityId { 77 },
         "guest receives the host door use");
+    expect(doorEvent.has_value() && guest.confirmPeerEventApplied(doorEvent->sequence),
+        "guest advances its applied boundary after door use");
     expect(guest.sendLocalFacing(4), "guest sends its local facing direction");
     host.poll();
     std::optional<GameCommand> facingCommand = host.takePeerCommand();
@@ -1200,6 +1259,8 @@ void testNetworkCharacterLobby()
             && facing->actorId == EntityId { kGuestPlayerId.value }
             && facing->rotation == 4,
         "guest receives the host-authoritative facing result and event");
+    expect(facingEvent.has_value() && guest.confirmPeerEventApplied(facingEvent->sequence),
+        "guest advances its applied boundary after facing");
     EventReplay completeReplay = host.replayAfter(EventSequence {});
     expect(completeReplay.status == EventReplayStatus::Available
             && completeReplay.events.size() == 4
@@ -1222,6 +1283,47 @@ void testNetworkCharacterLobby()
             && replayedFacing->sequence == EventSequence { 4 }
             && !guest.recoveryInProgress(),
         "guest applies ordered journal replay and observes recovery completion");
+
+    EventSequence guestResumePoint = guest.lastAppliedEvent();
+    expect(guestResumePoint == EventSequence { 4 } && guest.disconnectForReconnect(),
+        "guest records its last applied event and drops the old connection");
+    host.poll();
+    expect(host.state() == NetworkLobbyState::Disconnected
+            && guest.state() == NetworkLobbyState::Disconnected,
+        "both lobbies enter reconnectable state after the socket closes");
+    expect(!guest.sendLocalMove(12347, 0, false),
+        "disconnected guest input is blocked");
+    expect(host.sendLocalFacing(2)
+            && host.latestAuthoritativeEvent() == EventSequence { 5 },
+        "host continues the authoritative journal while the guest is absent");
+
+    LoopbackTransportPair resumedPair = createLoopbackTransportPair();
+    expect(host.reattachTransport(std::move(resumedPair.first))
+            && guest.reattachTransport(std::move(resumedPair.second)),
+        "both lobbies attach a freshly authenticated transport");
+    expect(host.queueRecovery(guestResumePoint)
+            && guest.beginReconnectRecovery(guestResumePoint),
+        "reconnect starts recovery from the handshake event boundary");
+    std::optional<EventSequence> reconnectRecovery = host.takeRecoveryRequest();
+    recoverySnapshot.lastIncludedEvent = host.latestAuthoritativeEvent();
+    bool reconnectSent = reconnectRecovery.has_value()
+        && reconnectRecovery == guestResumePoint
+        && host.sendRecovery(*reconnectRecovery, recoverySnapshot);
+    expect(reconnectSent,
+        "host resumes the reconnect through its retained event journal");
+    guest.poll();
+    std::optional<GameEvent> resumedFacing = guest.takePeerEvent();
+    const auto* resumedFacingPayload = resumedFacing.has_value()
+        ? std::get_if<ActorFacingChangedEvent>(&resumedFacing->payload)
+        : nullptr;
+    expect(resumedFacingPayload != nullptr
+            && resumedFacing->sequence == EventSequence { 5 }
+            && resumedFacingPayload->rotation == 2
+            && !guest.recoveryInProgress(),
+        "guest applies events created while disconnected and completes reconnect recovery");
+    expect(resumedFacing.has_value() && guest.confirmPeerEventApplied(resumedFacing->sequence)
+            && guest.lastAppliedEvent() == EventSequence { 5 },
+        "guest confirms the replayed event as its new reconnect boundary");
     expect(host.takeTransport() != nullptr && guest.takeTransport() != nullptr,
         "ready lobbies hand the connection to the game session");
 
@@ -1720,6 +1822,26 @@ void testNetworkSessionRecoveryPrimitives()
     }
     ReconnectToken wrongToken = token;
     wrongToken.bytes.back() ^= 1;
+    ReconnectToken generatedToken;
+    expect(generateReconnectToken(generatedToken) && isValid(generatedToken)
+            && !reconnectTokensEqual(generatedToken, token),
+        "reconnect credentials come from the platform cryptographic random source");
+
+    ProtocolEnvelope reconnectEnvelope;
+    reconnectEnvelope.sequence = 1;
+    ReconnectHello reconnectHello { sessionId, kGuestPlayerId, token, EventSequence { 17 } };
+    expect(encodeHandshakeMessage(reconnectHello, reconnectEnvelope) == HandshakeError::None,
+        "reconnect handshake encodes the session, slot, credential, and resume boundary");
+    HandshakeDecodeResult decodedReconnect = decodeHandshakeMessage(reconnectEnvelope);
+    const ReconnectHello* decodedHello = decodedReconnect
+        ? std::get_if<ReconnectHello>(&decodedReconnect.message)
+        : nullptr;
+    expect(decodedHello != nullptr
+            && decodedHello->sessionId == sessionId
+            && decodedHello->playerId == kGuestPlayerId
+            && reconnectTokensEqual(decodedHello->reconnectToken, token)
+            && decodedHello->lastAppliedEvent == EventSequence { 17 },
+        "reconnect handshake round-trips every authentication and recovery field");
     ReconnectTokenRegistry tokens(sessionId);
     expect(tokens.install(kGuestPlayerId, token) == ReconnectTokenError::None,
         "reconnect registry installs a nonzero token for the guest slot");

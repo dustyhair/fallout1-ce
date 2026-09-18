@@ -40,6 +40,7 @@ namespace {
 NetworkLaunchOptions launchOptions;
 NetworkBootstrap bootstrap;
 NetworkLobby lobby;
+ReconnectTokenRegistry reconnectTokens;
 NetworkBootstrapState reportedState = NetworkBootstrapState::Disabled;
 std::optional<CharacterCreationSheet> pendingLocalSheet;
 std::string runtimeStatus;
@@ -48,6 +49,10 @@ bool lobbyStarted = false;
 bool smokeTestEnabled = false;
 int lastSentLocalRotation = -1;
 std::optional<EventSequence> pendingRecoveryRequest;
+std::unique_ptr<Transport> reconnectTransport;
+std::chrono::steady_clock::time_point reconnectDeadline;
+std::chrono::steady_clock::time_point nextReconnectAttempt;
+EventSequence reconnectLastApplied;
 
 constexpr std::uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
 constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
@@ -194,11 +199,146 @@ void reportLobbyStatus()
         } else {
             setStatus("MULTIPLAYER LOBBY READY: " + host->name + " + " + guest->name);
         }
+    } else if (state == NetworkLobbyState::Disconnected) {
+        setStatus(launchOptions.mode == NetworkLaunchMode::Host
+                ? "MULTIPLAYER: GUEST DISCONNECTED, WAITING FOR RECONNECT"
+                : "MULTIPLAYER: CONNECTION LOST, RECONNECTING");
     } else if (state == NetworkLobbyState::Rejected) {
         setStatus(std::string("MULTIPLAYER CHARACTER REJECTED: ") + characterLobbyErrorMessage(lobby.sheetError()));
     } else if (state == NetworkLobbyState::Failed) {
         setStatus(std::string("MULTIPLAYER LOBBY FAILED: ") + networkLobbyErrorMessage(lobby.error()));
     }
+}
+
+bool sendReconnectHandshake(Transport& transport, const HandshakeMessage& message)
+{
+    ProtocolEnvelope envelope;
+    envelope.sequence = 1;
+    Packet packet;
+    return encodeHandshakeMessage(message, envelope) == HandshakeError::None
+        && encodeEnvelope(envelope, packet) == ProtocolError::None
+        && transport.send(std::move(packet)) == TransportSendResult::Sent;
+}
+
+std::optional<HandshakeMessage> receiveReconnectHandshake(Transport& transport)
+{
+    std::optional<Packet> packet = transport.receive();
+    if (!packet.has_value()) {
+        return std::nullopt;
+    }
+    ProtocolDecodeResult envelope = decodeEnvelope(*packet);
+    if (!envelope || envelope.envelope.sequence != 1) {
+        transport.close();
+        return std::nullopt;
+    }
+    HandshakeDecodeResult handshake = decodeHandshakeMessage(envelope.envelope);
+    if (!handshake) {
+        transport.close();
+        return std::nullopt;
+    }
+    return std::move(handshake.message);
+}
+
+void discardReconnectTransport()
+{
+    if (reconnectTransport != nullptr) {
+        reconnectTransport->close();
+        reconnectTransport.reset();
+    }
+}
+
+void pollReconnect()
+{
+    if (lobby.state() != NetworkLobbyState::Disconnected) {
+        discardReconnectTransport();
+        return;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    if (reconnectTransport != nullptr
+        && (now >= reconnectDeadline || !reconnectTransport->isConnected())) {
+        discardReconnectTransport();
+        nextReconnectAttempt = now + std::chrono::milliseconds(500);
+    }
+
+    if (launchOptions.mode == NetworkLaunchMode::Host) {
+        if (reconnectTransport == nullptr) {
+            reconnectTransport = bootstrap.acceptReconnectTransport();
+            if (reconnectTransport == nullptr) {
+                return;
+            }
+            reconnectDeadline = now + std::chrono::seconds(5);
+        }
+
+        std::optional<HandshakeMessage> message = receiveReconnectHandshake(*reconnectTransport);
+        if (!message.has_value()) {
+            return;
+        }
+        const ReconnectHello* reconnect = std::get_if<ReconnectHello>(&*message);
+        if (reconnect == nullptr
+            || reconnect->sessionId != bootstrap.sessionId()
+            || reconnect->playerId != kGuestPlayerId
+            || !reconnectTokens.validate(reconnect->sessionId, reconnect->playerId, reconnect->reconnectToken)
+            || reconnect->lastAppliedEvent.value > lobby.latestAuthoritativeEvent().value) {
+            sendReconnectHandshake(*reconnectTransport,
+                HandshakeRejected { HandshakeRejection::InvalidReconnect });
+            discardReconnectTransport();
+            return;
+        }
+        EventSequence lastApplied = reconnect->lastAppliedEvent;
+        if (!sendReconnectHandshake(*reconnectTransport,
+                ReconnectWelcome { bootstrap.sessionId(), lobby.latestAuthoritativeEvent() })
+            || !lobby.reattachTransport(std::move(reconnectTransport))
+            || !lobby.queueRecovery(lastApplied)) {
+            discardReconnectTransport();
+            return;
+        }
+        setStatus("MULTIPLAYER: GUEST RECONNECTED, RESYNCHRONIZING");
+        return;
+    }
+
+    if (reconnectTransport == nullptr) {
+        if (now < nextReconnectAttempt) {
+            return;
+        }
+        std::optional<TransportPeerIdentity> identity = bootstrap.peerIdentity();
+        if (!identity.has_value()) {
+            setStatus("MULTIPLAYER RECONNECT FAILED: MISSING HOST IDENTITY");
+            return;
+        }
+        TcpConnectResult connection = connectTcp(
+            launchOptions.address, launchOptions.port, 250, identity);
+        if (!connection) {
+            nextReconnectAttempt = now + std::chrono::milliseconds(500);
+            return;
+        }
+        reconnectTransport = std::move(connection.transport);
+        reconnectLastApplied = lobby.lastAppliedEvent();
+        reconnectDeadline = now + std::chrono::seconds(5);
+        if (!sendReconnectHandshake(*reconnectTransport,
+                ReconnectHello { bootstrap.sessionId(), kGuestPlayerId,
+                    bootstrap.reconnectToken(), reconnectLastApplied })) {
+            discardReconnectTransport();
+            nextReconnectAttempt = now + std::chrono::milliseconds(500);
+            return;
+        }
+    }
+
+    std::optional<HandshakeMessage> message = receiveReconnectHandshake(*reconnectTransport);
+    if (!message.has_value()) {
+        return;
+    }
+    const ReconnectWelcome* welcome = std::get_if<ReconnectWelcome>(&*message);
+    if (welcome == nullptr
+        || welcome->sessionId != bootstrap.sessionId()
+        || welcome->latestEvent.value < reconnectLastApplied.value
+        || !lobby.reattachTransport(std::move(reconnectTransport))
+        || !lobby.beginReconnectRecovery(reconnectLastApplied)) {
+        discardReconnectTransport();
+        nextReconnectAttempt = now + std::chrono::milliseconds(500);
+        return;
+    }
+    setStatus("MULTIPLAYER: RECONNECTED, RESYNCHRONIZING");
 }
 
 bool startLobby()
@@ -255,6 +395,7 @@ void networkRuntimeBackgroundProcess()
     }
 
     lobby.poll();
+    pollReconnect();
     if (networkWorldActive()) {
         if (launchOptions.mode == NetworkLaunchMode::Host) {
             if (!pendingRecoveryRequest.has_value()) {
@@ -286,6 +427,11 @@ void networkRuntimeBackgroundProcess()
                 lobby.abortRecovery();
                 break;
             }
+            if (!lobby.confirmSnapshotApplied(snapshot->lastIncludedEvent)) {
+                debug_printf("Multiplayer recovery snapshot boundary could not be confirmed.\n");
+                lobby.abortRecovery();
+                break;
+            }
         }
         if (obj_dude != nullptr
             && FID_ANIM_TYPE(obj_dude->fid) == ANIM_STAND
@@ -311,6 +457,8 @@ void networkRuntimeBackgroundProcess()
             }
             if (!applied) {
                 debug_printf("Multiplayer peer event could not be applied.\n");
+            } else if (!lobby.confirmPeerEventApplied(event->sequence)) {
+                debug_printf("Multiplayer peer event boundary could not be confirmed.\n");
             }
         }
     }
@@ -328,6 +476,13 @@ bool startConfiguredRuntime()
     SessionId sessionId = launchOptions.mode == NetworkLaunchMode::Host ? createSessionId() : SessionId {};
     if (!bootstrap.start(launchOptions, digest, sessionId)) {
         setStatus(std::string("MULTIPLAYER CONNECTION FAILED: ") + networkBootstrapErrorMessage(bootstrap.error()));
+        return false;
+    }
+    reconnectTokens.reset(sessionId);
+    if (launchOptions.mode == NetworkLaunchMode::Host
+        && reconnectTokens.install(kGuestPlayerId, bootstrap.reconnectToken()) != ReconnectTokenError::None) {
+        setStatus("MULTIPLAYER CONNECTION FAILED: COULD NOT INSTALL RECONNECT CREDENTIAL");
+        bootstrap.stop();
         return false;
     }
 
@@ -368,6 +523,10 @@ bool networkRuntimeConfigure(int argc, char** argv)
     }
     pendingLocalSheet.reset();
     pendingRecoveryRequest.reset();
+    discardReconnectTransport();
+    reconnectLastApplied = {};
+    reconnectTokens.invalidateAll();
+    nextReconnectAttempt = {};
     runtimeStatus.clear();
     lobbyStarted = false;
     return true;
@@ -391,7 +550,7 @@ bool networkRuntimeRunSmokeTest()
     sheet.taggedSkills = { SKILL_SMALL_GUNS, SKILL_FIRST_AID, SKILL_SPEECH };
 
     bool submitted = false;
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(25);
     while (std::chrono::steady_clock::now() < deadline) {
         networkRuntimeBackgroundProcess();
         if (lobbyStarted && !submitted && lobby.state() == NetworkLobbyState::Waiting) {
@@ -562,8 +721,105 @@ bool networkRuntimeRunSmokeTest()
                 break;
             }
 
+            GameEvent replayEvent;
+            replayEvent.sequence = EventSequence { 1 };
+            replayEvent.causedBy = moveCommand.sequence;
+            replayEvent.payload = ActorMovementStartedEvent { moveCommand.actorId, 12345, 0, true };
+            transport->close();
+
+            bool reconnectPassed = false;
+            if (launchOptions.mode == NetworkLaunchMode::Join) {
+                std::optional<TransportPeerIdentity> identity = bootstrap.peerIdentity();
+                TcpConnectResult reconnect = identity.has_value()
+                    ? connectTcp(launchOptions.address, launchOptions.port, 5000, identity)
+                    : TcpConnectResult {};
+                if (reconnect) {
+                    reconnectPassed = sendReconnectHandshake(*reconnect.transport,
+                        ReconnectHello { sessionId, kGuestPlayerId, bootstrap.reconnectToken(), EventSequence {} });
+                    bool welcomed = false;
+                    bool replayed = false;
+                    while (reconnectPassed && std::chrono::steady_clock::now() < deadline && (!welcomed || !replayed)) {
+                        reconnect.transport->poll();
+                        while (std::optional<Packet> packet = reconnect.transport->receive()) {
+                            ProtocolDecodeResult decoded = decodeEnvelope(*packet);
+                            if (!decoded || decoded.envelope.sessionId != sessionId) {
+                                reconnectPassed = false;
+                                break;
+                            }
+                            if (decoded.envelope.sequence == 1 && decoded.envelope.kind == MessageKind::Handshake) {
+                                HandshakeDecodeResult handshake = decodeHandshakeMessage(decoded.envelope);
+                                const ReconnectWelcome* welcome = handshake
+                                    ? std::get_if<ReconnectWelcome>(&handshake.message)
+                                    : nullptr;
+                                welcomed = welcome != nullptr
+                                    && welcome->sessionId == sessionId
+                                    && welcome->latestEvent == EventSequence { 1 };
+                            } else if (decoded.envelope.sequence == 2 && decoded.envelope.kind == MessageKind::Event) {
+                                GameEventDecodeResult event = decodeGameEvent(decoded.envelope);
+                                replayed = event && event.event.sequence == EventSequence { 1 };
+                            } else {
+                                reconnectPassed = false;
+                                break;
+                            }
+                        }
+                        if (!reconnect.transport->isConnected() && (!welcomed || !replayed)) {
+                            reconnectPassed = false;
+                        }
+                        if (!welcomed || !replayed) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        }
+                    }
+                    reconnectPassed = reconnectPassed && welcomed && replayed;
+                }
+            } else {
+                std::unique_ptr<Transport> resumed;
+                while (std::chrono::steady_clock::now() < deadline && resumed == nullptr) {
+                    resumed = bootstrap.acceptReconnectTransport();
+                    if (resumed == nullptr) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    }
+                }
+                std::optional<ReconnectHello> hello;
+                while (resumed != nullptr && std::chrono::steady_clock::now() < deadline && !hello.has_value()) {
+                    std::optional<HandshakeMessage> handshake = receiveReconnectHandshake(*resumed);
+                    if (handshake.has_value()) {
+                        if (const auto* decoded = std::get_if<ReconnectHello>(&*handshake)) {
+                            hello = *decoded;
+                        }
+                    }
+                    if (!hello.has_value()) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    }
+                }
+                if (resumed != nullptr
+                    && hello.has_value()
+                    && hello->sessionId == sessionId
+                    && hello->playerId == kGuestPlayerId
+                    && hello->lastAppliedEvent == EventSequence {}
+                    && reconnectTokensEqual(hello->reconnectToken, bootstrap.reconnectToken())) {
+                    ProtocolEnvelope eventEnvelope;
+                    eventEnvelope.sessionId = sessionId;
+                    eventEnvelope.sequence = 2;
+                    Packet eventPacket;
+                    reconnectPassed = sendReconnectHandshake(*resumed,
+                                            ReconnectWelcome { sessionId, EventSequence { 1 } })
+                        && encodeGameEvent(replayEvent, eventEnvelope) == GameplayWireError::None
+                        && encodeEnvelope(eventEnvelope, eventPacket) == ProtocolError::None
+                        && resumed->send(std::move(eventPacket)) == TransportSendResult::Sent;
+                    for (int attempt = 0; reconnectPassed && attempt < 100; attempt++) {
+                        resumed->poll();
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    }
+                }
+            }
+
+            if (!reconnectPassed) {
+                setStatus("MULTIPLAYER SMOKE TEST FAILED: TLS RECONNECT AND EVENT REPLAY");
+                break;
+            }
+
             std::fprintf(stdout,
-                "MULTIPLAYER_SMOKE_TEST_PASS role=%s session=%llu local=%s peer=%s command=move\n",
+                "MULTIPLAYER_SMOKE_TEST_PASS role=%s session=%llu local=%s peer=%s command=move reconnect=tls-replay\n",
                 launchOptions.mode == NetworkLaunchMode::Host ? "host" : "guest",
                 static_cast<unsigned long long>(sessionId.value),
                 sheet.name.c_str(),
@@ -899,6 +1155,8 @@ void networkRuntimeStop()
     }
     lobby.stop();
     bootstrap.stop();
+    discardReconnectTransport();
+    reconnectTokens.invalidateAll();
     lobbyStarted = false;
     pendingRecoveryRequest.reset();
 }

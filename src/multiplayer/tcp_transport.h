@@ -19,6 +19,7 @@ enum class TcpError {
     BindFailed,
     ListenFailed,
     ConnectFailed,
+    TlsInitializationFailed,
 };
 
 struct TcpListenResult;
@@ -70,7 +71,10 @@ struct TcpConnectResult {
 };
 
 TcpListenResult listenTcp(std::uint16_t port);
-TcpConnectResult connectTcp(const std::string& host, std::uint16_t port, std::uint32_t timeoutMilliseconds = 5000);
+TcpConnectResult connectTcp(const std::string& host,
+    std::uint16_t port,
+    std::uint32_t timeoutMilliseconds = 5000,
+    std::optional<TransportPeerIdentity> expectedPeerIdentity = std::nullopt);
 
 } // namespace multiplayer
 } // namespace fallout

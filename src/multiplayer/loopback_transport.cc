@@ -67,6 +67,11 @@ public:
         return _state->open[_endpoint] && _state->open[1 - _endpoint];
     }
 
+    std::optional<TransportPeerIdentity> peerIdentity() const override
+    {
+        return std::nullopt;
+    }
+
     void close() override
     {
         std::lock_guard<std::mutex> lock(_state->mutex);

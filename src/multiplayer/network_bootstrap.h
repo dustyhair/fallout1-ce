@@ -89,7 +89,10 @@ public:
     std::uint16_t port() const;
     SessionId sessionId() const;
     PlayerId localPlayerId() const;
+    ReconnectToken reconnectToken() const;
+    std::optional<TransportPeerIdentity> peerIdentity() const;
     std::unique_ptr<Transport> takeTransport();
+    std::unique_ptr<Transport> acceptReconnectTransport();
 
 private:
     bool sendHandshake(const HandshakeMessage& message);
@@ -104,6 +107,8 @@ private:
     std::uint64_t _contentDigest = 0;
     SessionId _sessionId;
     PlayerId _localPlayerId;
+    ReconnectToken _reconnectToken;
+    std::optional<TransportPeerIdentity> _peerIdentity;
     std::unique_ptr<TcpListener> _listener;
     std::unique_ptr<Transport> _transport;
 };

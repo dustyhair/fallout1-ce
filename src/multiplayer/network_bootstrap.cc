@@ -182,6 +182,8 @@ bool NetworkBootstrap::start(const NetworkLaunchOptions& options,
     _contentDigest = contentDigest;
     _sessionId = {};
     _localPlayerId = {};
+    _reconnectToken = {};
+    _peerIdentity.reset();
 
     if (options.mode == NetworkLaunchMode::Disabled) {
         _state = NetworkBootstrapState::Disabled;
@@ -207,6 +209,10 @@ bool NetworkBootstrap::start(const NetworkLaunchOptions& options,
         _options.port = _listener->port();
         _sessionId = hostSessionId;
         _localPlayerId = kHostPlayerId;
+        if (!generateReconnectToken(_reconnectToken)) {
+            fail(NetworkBootstrapError::InvalidOptions);
+            return false;
+        }
         _state = NetworkBootstrapState::Listening;
         return true;
     }
@@ -246,7 +252,6 @@ void NetworkBootstrap::poll()
         if (_transport == nullptr) {
             return;
         }
-        _listener->close();
         _state = NetworkBootstrapState::AwaitingHandshake;
     }
 
@@ -271,6 +276,8 @@ void NetworkBootstrap::stop()
         _transport->close();
         _transport.reset();
     }
+    _reconnectToken = {};
+    _peerIdentity.reset();
     _state = NetworkBootstrapState::Stopped;
 }
 
@@ -309,12 +316,33 @@ PlayerId NetworkBootstrap::localPlayerId() const
     return _localPlayerId;
 }
 
+ReconnectToken NetworkBootstrap::reconnectToken() const
+{
+    return _reconnectToken;
+}
+
+std::optional<TransportPeerIdentity> NetworkBootstrap::peerIdentity() const
+{
+    return _peerIdentity;
+}
+
 std::unique_ptr<Transport> NetworkBootstrap::takeTransport()
 {
     if (_state != NetworkBootstrapState::Connected) {
         return nullptr;
     }
     return std::move(_transport);
+}
+
+std::unique_ptr<Transport> NetworkBootstrap::acceptReconnectTransport()
+{
+    if (_options.mode != NetworkLaunchMode::Host
+        || _state != NetworkBootstrapState::Connected
+        || _listener == nullptr
+        || !_listener->isOpen()) {
+        return nullptr;
+    }
+    return _listener->accept();
 }
 
 bool NetworkBootstrap::sendHandshake(const HandshakeMessage& message)
@@ -364,7 +392,7 @@ void NetworkBootstrap::pollHostHandshake()
         return;
     }
 
-    HandshakeMessage response = makeHostHandshakeResponse(*hello, _contentDigest, _sessionId);
+    HandshakeMessage response = makeHostHandshakeResponse(*hello, _contentDigest, _sessionId, _reconnectToken);
     const HandshakeRejected* rejected = std::get_if<HandshakeRejected>(&response);
     if (!sendHandshake(response)) {
         return;
@@ -404,6 +432,12 @@ void NetworkBootstrap::pollGuestHandshake()
             return;
         }
         _sessionId = welcome->sessionId;
+        _reconnectToken = welcome->reconnectToken;
+        _peerIdentity = _transport->peerIdentity();
+        if (!_peerIdentity.has_value()) {
+            fail(NetworkBootstrapError::HandshakeError);
+            return;
+        }
         _state = NetworkBootstrapState::Connected;
         return;
     }
@@ -459,6 +493,8 @@ const char* handshakeRejectionMessage(HandshakeRejection rejection)
         return "the multiplayer session is full";
     case HandshakeRejection::ServerUnavailable:
         return "the multiplayer host is unavailable";
+    case HandshakeRejection::InvalidReconnect:
+        return "the multiplayer reconnect credential was rejected";
     }
     return "unknown rejection";
 }

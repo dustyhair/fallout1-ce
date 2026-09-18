@@ -24,6 +24,7 @@ enum class NetworkLobbyState {
     Disabled,
     Waiting,
     Ready,
+    Disconnected,
     Rejected,
     Failed,
     Stopped,
@@ -57,15 +58,22 @@ public:
     std::optional<GameCommand> takePeerCommand();
     std::optional<CommandResult> takeCommandResult();
     std::optional<GameEvent> takePeerEvent();
+    bool confirmPeerEventApplied(EventSequence sequence);
+    bool confirmSnapshotApplied(EventSequence sequence);
     EventReplay replayAfter(EventSequence lastApplied) const;
     bool requestRecovery(EventSequence lastApplied);
+    bool beginReconnectRecovery(EventSequence lastApplied);
     std::optional<EventSequence> takeRecoveryRequest();
     bool sendRecovery(EventSequence lastApplied, const WorldSnapshot& snapshot);
     std::optional<WorldSnapshot> takePeerSnapshot();
     EventSequence latestAuthoritativeEvent() const;
     bool recoveryInProgress() const;
     void abortRecovery();
+    bool reattachTransport(std::unique_ptr<Transport> transport);
+    bool queueRecovery(EventSequence lastApplied);
+    EventSequence lastAppliedEvent() const;
     void poll();
+    bool disconnectForReconnect();
     void stop();
 
     NetworkLobbyState state() const;
@@ -95,6 +103,7 @@ private:
     void handleCharacterSheet(const std::vector<std::uint8_t>& body);
     void tryReadyHost();
     void reject(CharacterLobbyError error);
+    void markDisconnected();
     void fail(NetworkLobbyError error);
 
     NetworkLaunchMode _mode = NetworkLaunchMode::Disabled;
@@ -110,6 +119,7 @@ private:
     std::uint64_t _nextLocalCommandSequence = 1;
     std::uint64_t _nextEventSequence = 1;
     std::uint64_t _nextExpectedEventSequence = 1;
+    EventSequence _lastAppliedEventSequence;
     std::deque<CommandSequence> _pendingCommandSequences;
     std::deque<EventSequence> _recoveryRequests;
     std::deque<GameCommand> _peerCommands;

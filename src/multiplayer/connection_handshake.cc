@@ -1,5 +1,7 @@
 #include "multiplayer/connection_handshake.h"
 
+#include <algorithm>
+
 namespace fallout {
 namespace multiplayer {
 namespace {
@@ -8,12 +10,16 @@ enum class HandshakeMessageType : std::uint8_t {
     Hello = 1,
     Welcome = 2,
     Rejected = 3,
+    Reconnect = 4,
+    ReconnectWelcome = 5,
 };
 
 constexpr std::size_t kHandshakeHeaderSize = 4;
 constexpr std::size_t kHelloSize = kHandshakeHeaderSize + 8;
-constexpr std::size_t kWelcomeSize = kHandshakeHeaderSize + 4 + 8;
+constexpr std::size_t kWelcomeSize = kHandshakeHeaderSize + 4 + 8 + kReconnectTokenSize;
 constexpr std::size_t kRejectedSize = kHandshakeHeaderSize + 4;
+constexpr std::size_t kReconnectSize = kHandshakeHeaderSize + 8 + 4 + kReconnectTokenSize + 8;
+constexpr std::size_t kReconnectWelcomeSize = kHandshakeHeaderSize + 8 + 8;
 
 void appendUInt16(std::vector<std::uint8_t>& bytes, std::uint16_t value)
 {
@@ -66,6 +72,7 @@ bool isKnownRejection(HandshakeRejection rejection)
     case HandshakeRejection::ContentMismatch:
     case HandshakeRejection::SessionFull:
     case HandshakeRejection::ServerUnavailable:
+    case HandshakeRejection::InvalidReconnect:
         return true;
     case HandshakeRejection::None:
         return false;
@@ -107,6 +114,40 @@ HandshakeError encodeHandshakeMessage(const HandshakeMessage& message, ProtocolE
         appendHeader(envelope.payload, HandshakeMessageType::Welcome);
         appendUInt32(envelope.payload, welcome->assignedPlayerId.value);
         appendUInt64(envelope.payload, welcome->sessionId.value);
+        if (!isValid(welcome->reconnectToken)) {
+            return HandshakeError::InvalidReconnectToken;
+        }
+        envelope.payload.insert(envelope.payload.end(), welcome->reconnectToken.bytes.begin(), welcome->reconnectToken.bytes.end());
+        envelope.sessionId = welcome->sessionId;
+        return HandshakeError::None;
+    }
+
+    if (const auto* reconnect = std::get_if<ReconnectHello>(&message)) {
+        if (reconnect->sessionId.value == 0) {
+            return HandshakeError::InvalidSessionId;
+        }
+        if (reconnect->playerId != kGuestPlayerId) {
+            return HandshakeError::InvalidPlayerId;
+        }
+        if (!isValid(reconnect->reconnectToken)) {
+            return HandshakeError::InvalidReconnectToken;
+        }
+        appendHeader(envelope.payload, HandshakeMessageType::Reconnect);
+        appendUInt64(envelope.payload, reconnect->sessionId.value);
+        appendUInt32(envelope.payload, reconnect->playerId.value);
+        envelope.payload.insert(envelope.payload.end(), reconnect->reconnectToken.bytes.begin(), reconnect->reconnectToken.bytes.end());
+        appendUInt64(envelope.payload, reconnect->lastAppliedEvent.value);
+        envelope.sessionId = reconnect->sessionId;
+        return HandshakeError::None;
+    }
+
+    if (const auto* welcome = std::get_if<ReconnectWelcome>(&message)) {
+        if (welcome->sessionId.value == 0) {
+            return HandshakeError::InvalidSessionId;
+        }
+        appendHeader(envelope.payload, HandshakeMessageType::ReconnectWelcome);
+        appendUInt64(envelope.payload, welcome->sessionId.value);
+        appendUInt64(envelope.payload, welcome->latestEvent.value);
         envelope.sessionId = welcome->sessionId;
         return HandshakeError::None;
     }
@@ -168,12 +209,19 @@ HandshakeDecodeResult decodeHandshakeMessage(const ProtocolEnvelope& envelope)
         HandshakeWelcome welcome;
         welcome.assignedPlayerId.value = readUInt32(envelope.payload, kHandshakeHeaderSize);
         welcome.sessionId.value = readUInt64(envelope.payload, kHandshakeHeaderSize + 4);
+        std::copy_n(envelope.payload.begin() + kHandshakeHeaderSize + 12,
+            kReconnectTokenSize,
+            welcome.reconnectToken.bytes.begin());
         if (welcome.assignedPlayerId != kHostPlayerId && welcome.assignedPlayerId != kGuestPlayerId) {
             result.error = HandshakeError::InvalidPlayerId;
             return result;
         }
         if (welcome.sessionId.value == 0 || envelope.sessionId != welcome.sessionId) {
             result.error = HandshakeError::InvalidSessionId;
+            return result;
+        }
+        if (!isValid(welcome.reconnectToken)) {
+            result.error = HandshakeError::InvalidReconnectToken;
             return result;
         }
         result.message = welcome;
@@ -200,6 +248,48 @@ HandshakeDecodeResult decodeHandshakeMessage(const ProtocolEnvelope& envelope)
         result.message = rejected;
         return result;
     }
+    case HandshakeMessageType::Reconnect: {
+        if (envelope.payload.size() != kReconnectSize) {
+            result.error = HandshakeError::InvalidLength;
+            return result;
+        }
+        ReconnectHello reconnect;
+        reconnect.sessionId.value = readUInt64(envelope.payload, kHandshakeHeaderSize);
+        reconnect.playerId.value = readUInt32(envelope.payload, kHandshakeHeaderSize + 8);
+        std::copy_n(envelope.payload.begin() + kHandshakeHeaderSize + 12,
+            kReconnectTokenSize,
+            reconnect.reconnectToken.bytes.begin());
+        reconnect.lastAppliedEvent.value = readUInt64(envelope.payload, kHandshakeHeaderSize + 12 + kReconnectTokenSize);
+        if (reconnect.sessionId.value == 0 || envelope.sessionId != reconnect.sessionId) {
+            result.error = HandshakeError::InvalidSessionId;
+            return result;
+        }
+        if (reconnect.playerId != kGuestPlayerId) {
+            result.error = HandshakeError::InvalidPlayerId;
+            return result;
+        }
+        if (!isValid(reconnect.reconnectToken)) {
+            result.error = HandshakeError::InvalidReconnectToken;
+            return result;
+        }
+        result.message = reconnect;
+        return result;
+    }
+    case HandshakeMessageType::ReconnectWelcome: {
+        if (envelope.payload.size() != kReconnectWelcomeSize) {
+            result.error = HandshakeError::InvalidLength;
+            return result;
+        }
+        ReconnectWelcome welcome;
+        welcome.sessionId.value = readUInt64(envelope.payload, kHandshakeHeaderSize);
+        welcome.latestEvent.value = readUInt64(envelope.payload, kHandshakeHeaderSize + 8);
+        if (welcome.sessionId.value == 0 || envelope.sessionId != welcome.sessionId) {
+            result.error = HandshakeError::InvalidSessionId;
+            return result;
+        }
+        result.message = welcome;
+        return result;
+    }
     }
 
     result.error = HandshakeError::UnknownMessageType;
@@ -209,6 +299,7 @@ HandshakeDecodeResult decodeHandshakeMessage(const ProtocolEnvelope& envelope)
 HandshakeMessage makeHostHandshakeResponse(const HandshakeHello& hello,
     std::uint64_t expectedContentDigest,
     SessionId sessionId,
+    const ReconnectToken& reconnectToken,
     bool guestSlotAvailable)
 {
     if (hello.contentDigest == 0 || hello.contentDigest != expectedContentDigest) {
@@ -217,10 +308,10 @@ HandshakeMessage makeHostHandshakeResponse(const HandshakeHello& hello,
     if (!guestSlotAvailable) {
         return HandshakeRejected { HandshakeRejection::SessionFull };
     }
-    if (sessionId.value == 0) {
+    if (sessionId.value == 0 || !isValid(reconnectToken)) {
         return HandshakeRejected { HandshakeRejection::ServerUnavailable };
     }
-    return HandshakeWelcome { sessionId, kGuestPlayerId };
+    return HandshakeWelcome { sessionId, kGuestPlayerId, reconnectToken };
 }
 
 } // namespace multiplayer

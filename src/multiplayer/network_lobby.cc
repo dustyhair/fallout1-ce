@@ -86,6 +86,7 @@ bool NetworkLobby::start(NetworkLaunchMode mode, SessionId sessionId, std::uniqu
     _nextLocalCommandSequence = 1;
     _nextEventSequence = 1;
     _nextExpectedEventSequence = 1;
+    _lastAppliedEventSequence = {};
     _pendingCommandSequences.clear();
     _recoveryRequests.clear();
     _peerCommands.clear();
@@ -150,7 +151,9 @@ bool NetworkLobby::sendLocalAction(
     GameCommandPayload commandPayload,
     std::uint32_t phaseRevision)
 {
-    if (_state != NetworkLobbyState::Ready || !_startRequested || _transport == nullptr) {
+    bool connected = _state == NetworkLobbyState::Ready && _transport != nullptr;
+    bool hostContinuing = _mode == NetworkLaunchMode::Host && _state == NetworkLobbyState::Disconnected;
+    if ((!connected && !hostContinuing) || !_startRequested) {
         return false;
     }
     if (_mode == NetworkLaunchMode::Join && _recovering) {
@@ -193,9 +196,9 @@ bool NetworkLobby::sendLocalAction(
 bool NetworkLobby::sendCommandOutcome(AuthoritativeCommandResult outcome)
 {
     if (_mode != NetworkLaunchMode::Host
-        || _state != NetworkLobbyState::Ready
+        || (_state != NetworkLobbyState::Ready && _state != NetworkLobbyState::Disconnected)
         || !_startRequested
-        || _transport == nullptr) {
+        || (_state == NetworkLobbyState::Ready && _transport == nullptr)) {
         return false;
     }
 
@@ -205,19 +208,25 @@ bool NetworkLobby::sendCommandOutcome(AuthoritativeCommandResult outcome)
         outcome.result.eventCount = 1;
     }
 
-    ProtocolEnvelope envelope;
-    envelope.sessionId = _sessionId;
-    envelope.sequence = _nextSendSequence++;
-    if (encodeCommandResult(outcome.result, envelope) != GameplayWireError::None
-        || !sendGameplayEnvelope(std::move(envelope))) {
-        return false;
+    if (_state == NetworkLobbyState::Ready) {
+        ProtocolEnvelope envelope;
+        envelope.sessionId = _sessionId;
+        envelope.sequence = _nextSendSequence++;
+        if (encodeCommandResult(outcome.result, envelope) != GameplayWireError::None
+            || !sendGameplayEnvelope(std::move(envelope))) {
+            if (_state != NetworkLobbyState::Disconnected) {
+                return false;
+            }
+        }
     }
     return !outcome.event.has_value() || sendAuthoritativeEvent(std::move(*outcome.event));
 }
 
 bool NetworkLobby::sendAuthoritativeEvent(GameEvent event)
 {
-    if (_mode != NetworkLaunchMode::Host || event.sequence.value != _nextEventSequence) {
+    if (_mode != NetworkLaunchMode::Host
+        || (_state != NetworkLobbyState::Ready && _state != NetworkLobbyState::Disconnected)
+        || event.sequence.value != _nextEventSequence) {
         return false;
     }
 
@@ -229,8 +238,10 @@ bool NetworkLobby::sendAuthoritativeEvent(GameEvent event)
         fail(NetworkLobbyError::EncodeFailed);
         return false;
     }
-    if (!sendGameplayEnvelope(std::move(envelope))) {
-        return false;
+    if (_state == NetworkLobbyState::Ready && !sendGameplayEnvelope(std::move(envelope))) {
+        if (_state != NetworkLobbyState::Disconnected) {
+            return false;
+        }
     }
     _nextEventSequence++;
     return true;
@@ -243,8 +254,19 @@ bool NetworkLobby::sendGameplayEnvelope(ProtocolEnvelope envelope)
         fail(NetworkLobbyError::EncodeFailed);
         return false;
     }
-    if (_transport == nullptr || _transport->send(std::move(packet)) != TransportSendResult::Sent) {
+    if (_transport == nullptr) {
         fail(NetworkLobbyError::SendFailed);
+        return false;
+    }
+    TransportSendResult sent = _transport->send(std::move(packet));
+    if (sent != TransportSendResult::Sent) {
+        if (sent == TransportSendResult::Disconnected
+            && _state == NetworkLobbyState::Ready
+            && _startRequested) {
+            markDisconnected();
+        } else {
+            fail(NetworkLobbyError::SendFailed);
+        }
         return false;
     }
     return true;
@@ -281,6 +303,29 @@ std::optional<GameEvent> NetworkLobby::takePeerEvent()
     return event;
 }
 
+bool NetworkLobby::confirmPeerEventApplied(EventSequence sequence)
+{
+    if (_mode != NetworkLaunchMode::Join
+        || sequence.value == 0
+        || _lastAppliedEventSequence.value == std::numeric_limits<std::uint64_t>::max()
+        || sequence.value != _lastAppliedEventSequence.value + 1) {
+        return false;
+    }
+    _lastAppliedEventSequence = sequence;
+    return true;
+}
+
+bool NetworkLobby::confirmSnapshotApplied(EventSequence sequence)
+{
+    if (_mode != NetworkLaunchMode::Join
+        || sequence.value < _lastAppliedEventSequence.value
+        || sequence.value >= _nextExpectedEventSequence) {
+        return false;
+    }
+    _lastAppliedEventSequence = sequence;
+    return true;
+}
+
 EventReplay NetworkLobby::replayAfter(EventSequence lastApplied) const
 {
     return _eventJournal.replayAfter(lastApplied);
@@ -299,6 +344,20 @@ bool NetworkLobby::requestRecovery(EventSequence lastApplied)
     std::vector<std::uint8_t> body;
     appendUInt64(body, lastApplied.value);
     if (!sendRecoveryMessage(static_cast<std::uint8_t>(RecoveryMessageType::Request), body)) {
+        return false;
+    }
+    _recovering = true;
+    _nextExpectedEventSequence = lastApplied.value + 1;
+    _peerSnapshots.clear();
+    return true;
+}
+
+bool NetworkLobby::beginReconnectRecovery(EventSequence lastApplied)
+{
+    if (_mode != NetworkLaunchMode::Join
+        || _state != NetworkLobbyState::Ready
+        || !_startRequested
+        || lastApplied.value == std::numeric_limits<std::uint64_t>::max()) {
         return false;
     }
     _recovering = true;
@@ -385,6 +444,46 @@ void NetworkLobby::abortRecovery()
     }
 }
 
+bool NetworkLobby::reattachTransport(std::unique_ptr<Transport> transport)
+{
+    if (_state != NetworkLobbyState::Disconnected
+        || transport == nullptr
+        || !transport->isConnected()) {
+        return false;
+    }
+    if (_transport != nullptr) {
+        _transport->close();
+    }
+    _transport = std::move(transport);
+    _nextSendSequence = 2;
+    _nextReceiveSequence = 2;
+    _error = NetworkLobbyError::None;
+    _pendingCommandSequences.clear();
+    _commandResults.clear();
+    _recovering = false;
+    _state = NetworkLobbyState::Ready;
+    return true;
+}
+
+bool NetworkLobby::queueRecovery(EventSequence lastApplied)
+{
+    if (_mode != NetworkLaunchMode::Host
+        || _state != NetworkLobbyState::Ready
+        || _eventJournal.replayAfter(lastApplied).status == EventReplayStatus::InvalidFutureSequence) {
+        return false;
+    }
+    _recoveryRequests.push_back(lastApplied);
+    return true;
+}
+
+EventSequence NetworkLobby::lastAppliedEvent() const
+{
+    if (_mode != NetworkLaunchMode::Join) {
+        return {};
+    }
+    return _lastAppliedEventSequence;
+}
+
 CharacterLobbyError NetworkLobby::submitLocalSheet(const CharacterCreationSheet& sheet)
 {
     CharacterLobbyError error = validateCharacterSheet(sheet);
@@ -454,7 +553,11 @@ void NetworkLobby::poll()
         std::optional<Packet> packet = _transport->receive();
         if (!packet.has_value()) {
             if (!_transport->isConnected()) {
-                fail(NetworkLobbyError::Disconnected);
+                if (_state == NetworkLobbyState::Ready && _startRequested) {
+                    markDisconnected();
+                } else {
+                    fail(NetworkLobbyError::Disconnected);
+                }
             }
             return;
         }
@@ -463,6 +566,15 @@ void NetworkLobby::poll()
             return;
         }
     }
+}
+
+bool NetworkLobby::disconnectForReconnect()
+{
+    if (_state != NetworkLobbyState::Ready || !_startRequested || _transport == nullptr) {
+        return false;
+    }
+    markDisconnected();
+    return true;
 }
 
 void NetworkLobby::stop()
@@ -793,6 +905,23 @@ void NetworkLobby::reject(CharacterLobbyError error)
         _error = NetworkLobbyError::PeerSheetRejected;
         _state = NetworkLobbyState::Rejected;
     }
+}
+
+void NetworkLobby::markDisconnected()
+{
+    if (_transport != nullptr) {
+        _transport->close();
+        _transport.reset();
+    }
+    _pendingCommandSequences.clear();
+    _recoveryRequests.clear();
+    _peerCommands.clear();
+    _commandResults.clear();
+    _peerEvents.clear();
+    _peerSnapshots.clear();
+    _recovering = false;
+    _error = NetworkLobbyError::Disconnected;
+    _state = NetworkLobbyState::Disconnected;
 }
 
 void NetworkLobby::fail(NetworkLobbyError error)

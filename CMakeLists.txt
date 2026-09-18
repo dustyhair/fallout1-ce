@@ -23,6 +23,8 @@ set(CMAKE_CXX_EXTENSIONS NO)
 option(ASAN "Enable address sanitizer" OFF)
 option(UBSAN "Enable undefined behaviour sanitizer" OFF)
 
+add_subdirectory("third_party/mbedtls")
+
 include(CTest)
 
 if (ANDROID)
@@ -70,6 +72,7 @@ add_library(fallout-multiplayer-core STATIC
     "src/multiplayer/types.h"
 )
 target_include_directories(fallout-multiplayer-core PUBLIC src)
+target_link_libraries(fallout-multiplayer-core PUBLIC MbedTLS::mbedtls MbedTLS::mbedcrypto MbedTLS::mbedx509)
 set_target_properties(fallout-multiplayer-core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(WIN32)
     target_link_libraries(fallout-multiplayer-core PUBLIC ws2_32)

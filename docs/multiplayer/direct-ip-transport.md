@@ -1,6 +1,6 @@
 # Direct-IP transport
 
-Phase 2 starts with a TCP transport that implements the same packet interface as the local loopback transport. TCP is a byte stream, so each packet has a four-byte network-order length followed by the encoded protocol envelope.
+Phase 2 uses TLS over a TCP transport that implements the same packet interface as the local loopback transport. TLS carries a byte stream, so each application packet has a four-byte network-order length followed by the encoded protocol envelope.
 
 The transport:
 
@@ -11,21 +11,26 @@ The transport:
 - Queues partial writes and reconstructs packets split across TCP reads.
 - Preserves separate packet boundaries when TCP combines multiple writes.
 - Bounds each connection attempt with a caller-controlled timeout.
+- Requires TLS 1.2 or newer and encrypts every handshake, lobby, gameplay, snapshot, and reconnect packet.
+- Generates an ephemeral P-256 host key and self-signed certificate for each hosted session.
+- Pins the certificate's SHA-256 digest on the first connection and requires that exact identity on reconnect before releasing queued application bytes.
 
-Windows uses Winsock and links `ws2_32`. Unix-like builds use the platform socket API. No new runtime library is required.
+Windows uses Winsock and links `ws2_32`. Unix-like builds use the platform socket API. Mbed TLS 3.6 LTS is fetched from its checksum-pinned official release archive and linked statically, so no new runtime library is required.
+
+Direct-IP hosting currently uses trust on first use: the first connection is encrypted but has no out-of-band certificate verification. Reconnects authenticate the exact host identity observed on that connection. This prevents reconnect credentials from being exposed to passive observers and prevents a different certificate from receiving them, but the first connection is still susceptible to an active man-in-the-middle attacker. A future join-code or account identity layer should authenticate that first contact for Internet play.
 
 ## Connection handshake
 
-The first packet from a guest is a protocol `Handshake` envelope containing handshake format version 1 and a 64-bit compatibility digest. The host compares that digest before assigning the guest player slot.
+The first TLS application packet from a guest is a protocol `Handshake` envelope containing handshake format version 2 and a 64-bit compatibility digest. The host compares that digest before assigning the guest player slot.
 
 The host replies with one of two messages:
 
-- `Welcome`, containing the authoritative session ID and assigned `PlayerId`.
+- `Welcome`, containing the authoritative session ID, assigned `PlayerId`, and a cryptographically random 256-bit reconnect credential.
 - `Rejected`, containing `ContentMismatch`, `SessionFull`, or `ServerUnavailable`.
 
 The decoder rejects unknown message types, unsupported versions, zero digests, invalid player or session IDs, nonzero reserved fields, and trailing bytes. The outer protocol decoder independently checks its magic, protocol version, message kind, payload size, and exact packet length.
 
-The localhost test opens an operating-system-assigned port, connects a guest, exchanges a complete hello and welcome, and sends two sequential gameplay packets. It verifies packet boundaries and covers content mismatch, a full session, oversized packets, malformed handshakes, and explicit shutdown.
+The localhost test opens an operating-system-assigned port, completes TLS, exchanges a hello and welcome, and sends sequential gameplay packets. It verifies packet boundaries, reconnects with the pinned identity, proves a mismatched identity cannot receive queued credentials, and covers content mismatch, a full session, oversized packets, malformed handshakes, and explicit shutdown.
 
 ## Launch modes
 
@@ -46,4 +51,4 @@ For this launch slice, the compatibility digest covers the protocol, handshake, 
 
 ## Current boundary
 
-The developer mode still uses its in-process loopback endpoints. Network host and guest modes establish a connection, validate compatibility, assign the host and guest player IDs, and pass the connected transport to the [network character lobby](network-character-lobby.md). LAN discovery, encryption, and reconnect tokens are not part of this slice.
+The developer mode still uses its in-process loopback endpoints. Network host and guest modes establish TLS, validate compatibility, assign the host and guest player IDs, and pass the connected transport to the [network character lobby](network-character-lobby.md). The host listener remains open for an authenticated guest reconnect. LAN discovery and first-contact identity verification are not yet implemented.

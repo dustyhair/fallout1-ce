@@ -75,6 +75,7 @@ struct ReconnectToken {
 
 bool isValid(const ReconnectToken& token);
 bool reconnectTokensEqual(const ReconnectToken& lhs, const ReconnectToken& rhs);
+bool generateReconnectToken(ReconnectToken& token);
 
 enum class ReconnectTokenError {
     None,

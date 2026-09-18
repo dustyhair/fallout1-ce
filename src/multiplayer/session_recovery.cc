@@ -2,6 +2,9 @@
 
 #include <limits>
 
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/entropy.h>
+
 #include "multiplayer/gameplay_wire.h"
 #include "multiplayer/protocol.h"
 
@@ -141,6 +144,31 @@ bool reconnectTokensEqual(const ReconnectToken& lhs, const ReconnectToken& rhs)
         difference |= lhs.bytes[index] ^ rhs.bytes[index];
     }
     return difference == 0;
+}
+
+bool generateReconnectToken(ReconnectToken& token)
+{
+    token = {};
+    mbedtls_entropy_context entropy;
+    mbedtls_ctr_drbg_context random;
+    mbedtls_entropy_init(&entropy);
+    mbedtls_ctr_drbg_init(&random);
+    static constexpr unsigned char personalization[] = "fallout-ce reconnect token";
+    int result = mbedtls_ctr_drbg_seed(&random,
+        mbedtls_entropy_func,
+        &entropy,
+        personalization,
+        sizeof(personalization) - 1);
+    if (result == 0) {
+        result = mbedtls_ctr_drbg_random(&random, token.bytes.data(), token.bytes.size());
+    }
+    mbedtls_ctr_drbg_free(&random);
+    mbedtls_entropy_free(&entropy);
+    if (result != 0 || !isValid(token)) {
+        token = {};
+        return false;
+    }
+    return true;
 }
 
 ReconnectTokenRegistry::ReconnectTokenRegistry(SessionId sessionId)
