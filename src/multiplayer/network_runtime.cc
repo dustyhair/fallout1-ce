@@ -16,6 +16,7 @@
 #include "game/gconfig.h"
 #include "game/mainmenu.h"
 #include "multiplayer/character_build_bridge.h"
+#include "multiplayer/gameplay_wire.h"
 #include "multiplayer/network_bootstrap.h"
 #include "multiplayer/network_lobby.h"
 #include "multiplayer/protocol.h"
@@ -304,12 +305,167 @@ bool networkRuntimeRunSmokeTest()
 
         if (lobbyStarted && lobby.state() == NetworkLobbyState::Ready) {
             const CharacterCreationSheet* peer = lobby.peerSheet();
+            if (peer == nullptr) {
+                break;
+            }
+
+            const SessionId sessionId = bootstrap.sessionId();
+            std::uint64_t nextSendSequence = lobby.nextSendSequence();
+            std::uint64_t nextReceiveSequence = lobby.nextReceiveSequence();
+            std::unique_ptr<Transport> transport = lobby.takeTransport();
+            if (transport == nullptr) {
+                setStatus("MULTIPLAYER SMOKE TEST FAILED: MISSING GAMEPLAY TRANSPORT");
+                break;
+            }
+
+            GameCommand moveCommand;
+            moveCommand.sequence = CommandSequence { 1 };
+            moveCommand.playerId = kGuestPlayerId;
+            moveCommand.actorId = EntityId { 2 };
+            moveCommand.expectedPhase = SessionPhase::Exploration;
+            moveCommand.expectedPhaseRevision = 1;
+            moveCommand.payload = MoveCommand { 12345, 0, true };
+
+            bool gameplayPassed = false;
+            if (launchOptions.mode == NetworkLaunchMode::Join) {
+                ProtocolEnvelope commandEnvelope;
+                commandEnvelope.sessionId = sessionId;
+                commandEnvelope.sequence = nextSendSequence++;
+                std::vector<std::uint8_t> commandPacket;
+                if (encodeGameCommand(moveCommand, commandEnvelope) != GameplayWireError::None
+                    || encodeEnvelope(commandEnvelope, commandPacket) != ProtocolError::None
+                    || transport->send(std::move(commandPacket)) != TransportSendResult::Sent) {
+                    setStatus("MULTIPLAYER SMOKE TEST FAILED: COULD NOT SEND MOVE COMMAND");
+                    break;
+                }
+
+                bool receivedResult = false;
+                bool receivedEvent = false;
+                while (std::chrono::steady_clock::now() < deadline && (!receivedResult || !receivedEvent)) {
+                    transport->poll();
+                    while (std::optional<Packet> packet = transport->receive()) {
+                        ProtocolDecodeResult decoded = decodeEnvelope(*packet);
+                        if (!decoded || decoded.envelope.sessionId != sessionId
+                            || decoded.envelope.sequence != nextReceiveSequence++) {
+                            setStatus("MULTIPLAYER SMOKE TEST FAILED: INVALID GAMEPLAY ENVELOPE");
+                            break;
+                        }
+                        if (decoded.envelope.kind == MessageKind::CommandResult) {
+                            CommandResultDecodeResult result = decodeCommandResult(decoded.envelope);
+                            receivedResult = result
+                                && result.result.commandSequence == moveCommand.sequence
+                                && result.result.status == CommandStatus::Accepted
+                                && result.result.firstEventSequence == EventSequence { 1 }
+                                && result.result.eventCount == 1;
+                        } else if (decoded.envelope.kind == MessageKind::Event) {
+                            GameEventDecodeResult event = decodeGameEvent(decoded.envelope);
+                            const auto* movement = event ? std::get_if<ActorMovementStartedEvent>(&event.event.payload) : nullptr;
+                            receivedEvent = movement != nullptr
+                                && event.event.sequence == EventSequence { 1 }
+                                && event.event.causedBy == moveCommand.sequence
+                                && movement->actorId == moveCommand.actorId
+                                && movement->destinationTile == 12345
+                                && movement->elevation == 0
+                                && movement->running;
+                        } else {
+                            setStatus("MULTIPLAYER SMOKE TEST FAILED: UNEXPECTED GAMEPLAY MESSAGE");
+                            break;
+                        }
+                    }
+                    if (!transport->isConnected() && (!receivedResult || !receivedEvent)) {
+                        setStatus("MULTIPLAYER SMOKE TEST FAILED: GAMEPLAY TRANSPORT DISCONNECTED");
+                        break;
+                    }
+                    if (!receivedResult || !receivedEvent) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    }
+                }
+                gameplayPassed = receivedResult && receivedEvent;
+            } else {
+                std::optional<GameCommand> receivedCommand;
+                while (std::chrono::steady_clock::now() < deadline && !receivedCommand.has_value()) {
+                    transport->poll();
+                    while (std::optional<Packet> packet = transport->receive()) {
+                        ProtocolDecodeResult decoded = decodeEnvelope(*packet);
+                        if (!decoded || decoded.envelope.sessionId != sessionId
+                            || decoded.envelope.sequence != nextReceiveSequence++) {
+                            setStatus("MULTIPLAYER SMOKE TEST FAILED: INVALID GAMEPLAY ENVELOPE");
+                            break;
+                        }
+                        GameCommandDecodeResult command = decodeGameCommand(decoded.envelope);
+                        const auto* move = command ? std::get_if<MoveCommand>(&command.command.payload) : nullptr;
+                        if (move == nullptr || command.command.sequence != moveCommand.sequence
+                            || command.command.playerId != moveCommand.playerId
+                            || command.command.actorId != moveCommand.actorId
+                            || command.command.expectedPhase != moveCommand.expectedPhase
+                            || command.command.expectedPhaseRevision != moveCommand.expectedPhaseRevision
+                            || move->destinationTile != 12345
+                            || move->elevation != 0
+                            || !move->running) {
+                            setStatus("MULTIPLAYER SMOKE TEST FAILED: INVALID MOVE COMMAND");
+                            break;
+                        }
+                        receivedCommand = command.command;
+                    }
+                    if (!transport->isConnected() && !receivedCommand.has_value()) {
+                        setStatus("MULTIPLAYER SMOKE TEST FAILED: GAMEPLAY TRANSPORT DISCONNECTED");
+                        break;
+                    }
+                    if (!receivedCommand.has_value()) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    }
+                }
+
+                if (receivedCommand.has_value()) {
+                    CommandResult commandResult;
+                    commandResult.commandSequence = receivedCommand->sequence;
+                    commandResult.status = CommandStatus::Accepted;
+                    commandResult.rejection = CommandRejection::None;
+                    commandResult.firstEventSequence = EventSequence { 1 };
+                    commandResult.eventCount = 1;
+
+                    GameEvent movementEvent;
+                    movementEvent.sequence = EventSequence { 1 };
+                    movementEvent.causedBy = receivedCommand->sequence;
+                    movementEvent.payload = ActorMovementStartedEvent { receivedCommand->actorId, 12345, 0, true };
+
+                    ProtocolEnvelope resultEnvelope;
+                    resultEnvelope.sessionId = sessionId;
+                    resultEnvelope.sequence = nextSendSequence++;
+                    ProtocolEnvelope eventEnvelope;
+                    eventEnvelope.sessionId = sessionId;
+                    eventEnvelope.sequence = nextSendSequence++;
+                    std::vector<std::uint8_t> resultPacket;
+                    std::vector<std::uint8_t> eventPacket;
+                    gameplayPassed = encodeCommandResult(commandResult, resultEnvelope) == GameplayWireError::None
+                        && encodeEnvelope(resultEnvelope, resultPacket) == ProtocolError::None
+                        && encodeGameEvent(movementEvent, eventEnvelope) == GameplayWireError::None
+                        && encodeEnvelope(eventEnvelope, eventPacket) == ProtocolError::None
+                        && transport->send(std::move(resultPacket)) == TransportSendResult::Sent
+                        && transport->send(std::move(eventPacket)) == TransportSendResult::Sent;
+                    if (gameplayPassed) {
+                        // Give the non-blocking socket a chance to flush before this test process exits.
+                        for (int attempt = 0; attempt < 50 && transport->isConnected(); attempt++) {
+                            transport->poll();
+                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        }
+                    }
+                }
+            }
+
+            if (!gameplayPassed) {
+                if (runtimeStatus.find("SMOKE TEST FAILED") == std::string::npos) {
+                    setStatus("MULTIPLAYER SMOKE TEST FAILED: GAMEPLAY WIRE EXCHANGE");
+                }
+                break;
+            }
+
             std::fprintf(stdout,
-                "MULTIPLAYER_SMOKE_TEST_PASS role=%s session=%llu local=%s peer=%s\n",
+                "MULTIPLAYER_SMOKE_TEST_PASS role=%s session=%llu local=%s peer=%s command=move\n",
                 launchOptions.mode == NetworkLaunchMode::Host ? "host" : "guest",
-                static_cast<unsigned long long>(bootstrap.sessionId().value),
+                static_cast<unsigned long long>(sessionId.value),
                 sheet.name.c_str(),
-                peer != nullptr ? peer->name.c_str() : "missing");
+                peer->name.c_str());
             std::fflush(stdout);
             return peer != nullptr;
         }

@@ -47,6 +47,8 @@ public:
     CharacterLobbyError sheetError() const;
     const CharacterCreationSheet* localSheet() const;
     const CharacterCreationSheet* peerSheet() const;
+    std::uint64_t nextSendSequence() const;
+    std::uint64_t nextReceiveSequence() const;
     std::unique_ptr<Transport> takeTransport();
 
 private:

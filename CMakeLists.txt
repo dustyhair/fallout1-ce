@@ -42,6 +42,8 @@ add_library(fallout-multiplayer-core STATIC
     "src/multiplayer/command_processor.h"
     "src/multiplayer/entity_registry.cc"
     "src/multiplayer/entity_registry.h"
+    "src/multiplayer/gameplay_wire.cc"
+    "src/multiplayer/gameplay_wire.h"
     "src/multiplayer/local_session.cc"
     "src/multiplayer/local_session.h"
     "src/multiplayer/local_player_context.cc"

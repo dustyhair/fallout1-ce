@@ -157,6 +157,16 @@ const CharacterCreationSheet* NetworkLobby::peerSheet() const
     return _peerSheet.has_value() ? &*_peerSheet : nullptr;
 }
 
+std::uint64_t NetworkLobby::nextSendSequence() const
+{
+    return _nextSendSequence;
+}
+
+std::uint64_t NetworkLobby::nextReceiveSequence() const
+{
+    return _nextReceiveSequence;
+}
+
 std::unique_ptr<Transport> NetworkLobby::takeTransport()
 {
     if (_state != NetworkLobbyState::Ready) {

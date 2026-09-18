@@ -8,7 +8,7 @@ The waiting window closes only after the host has both valid sheets and both pee
 
 ## Automated engine smoke test
 
-`--multiplayer-smoke-test` replaces movies and menu input with fixed `Smoke Host` and `Smoke Guest` sheets. It still initializes the installed game data, computes the compatibility fingerprint, opens the real TCP connection, exchanges both sheets, waits for host approval, and shuts the engine down normally. Each process prints `MULTIPLAYER_SMOKE_TEST_PASS` and exits with status 0. The mode requires either `--multiplayer-host` or `--multiplayer-join`.
+`--multiplayer-smoke-test` replaces movies and menu input with fixed `Smoke Host` and `Smoke Guest` sheets. It still initializes the installed game data, computes the compatibility fingerprint, opens the real TCP connection, exchanges both sheets, and waits for host approval. It then hands the established connection to the gameplay wire layer: the guest sends a move command and validates the host's accepted result and movement event. Each process prints `MULTIPLAYER_SMOKE_TEST_PASS` and exits with status 0. The mode requires either `--multiplayer-host` or `--multiplayer-join`.
 
 This hook makes the two-process path runnable under Xvfb:
 
@@ -19,4 +19,4 @@ fallout-ce --multiplayer-join=127.0.0.1:45455 --multiplayer-smoke-test
 
 ## Current boundary
 
-Lobby readiness gates the local new-game flow and proves that both selected character builds crossed the real TCP connection. The connected transport remains alive after the lobby. The games still load separate worlds because command, result, event, and snapshot messages are the next Phase 2 work. This is not playable co-op yet.
+Lobby readiness gates the local new-game flow and proves that both selected character builds crossed the real TCP connection. The wire format now carries movement, door-use, pickup, and loot commands plus authoritative results and events. The runtime still needs to feed live game input through the authoritative processor and apply received events, so this is not playable co-op yet.

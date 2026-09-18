@@ -11,6 +11,7 @@
 #include "multiplayer/command_processor.h"
 #include "multiplayer/connection_handshake.h"
 #include "multiplayer/entity_registry.h"
+#include "multiplayer/gameplay_wire.h"
 #include "multiplayer/local_session.h"
 #include "multiplayer/local_player_context.h"
 #include "multiplayer/loopback_transport.h"
@@ -609,6 +610,166 @@ void testProtocolRejectsInvalidPackets()
     oversized.payload.resize(kMaxProtocolPayloadSize + 1);
     expect(encodeEnvelope(oversized, packet) == ProtocolError::PayloadTooLarge, "oversized payload is rejected before encoding");
     expect(packet.empty(), "failed encoding leaves no partial packet");
+}
+
+ProtocolEnvelope gameplayEnvelope(std::uint64_t sequence)
+{
+    ProtocolEnvelope envelope;
+    envelope.sessionId.value = 0xABCDEF0123456789ULL;
+    envelope.sequence = sequence;
+    return envelope;
+}
+
+void testGameplayWireFormat()
+{
+    std::vector<GameCommand> commands = {
+        GameCommand { CommandSequence { 1 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, MoveCommand { 12345, 1, true } },
+        GameCommand { CommandSequence { 2 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, InteractCommand { EntityId { 40 } } },
+        GameCommand { CommandSequence { 3 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, PickupCommand { EntityId { 41 } } },
+        GameCommand { CommandSequence { 4 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, LootCommand { EntityId { 42 } } },
+    };
+
+    for (std::size_t index = 0; index < commands.size(); index++) {
+        ProtocolEnvelope envelope = gameplayEnvelope(index + 10);
+        expect(encodeGameCommand(commands[index], envelope) == GameplayWireError::None,
+            "gameplay command encodes");
+        expect(envelope.kind == MessageKind::Command, "gameplay command sets the command message kind");
+
+        Packet packet;
+        expect(encodeEnvelope(envelope, packet) == ProtocolError::None, "gameplay command envelope encodes");
+        ProtocolDecodeResult decodedEnvelope = decodeEnvelope(packet);
+        GameCommandDecodeResult decoded = decodedEnvelope ? decodeGameCommand(decodedEnvelope.envelope) : GameCommandDecodeResult {};
+        expect(static_cast<bool>(decoded), "gameplay command decodes through the protocol envelope");
+        if (!decoded) {
+            continue;
+        }
+        expect(decoded.command.sequence == commands[index].sequence
+                && decoded.command.playerId == commands[index].playerId
+                && decoded.command.actorId == commands[index].actorId
+                && decoded.command.expectedPhase == commands[index].expectedPhase
+                && decoded.command.expectedPhaseRevision == commands[index].expectedPhaseRevision,
+            "gameplay command header round trips");
+    }
+
+    ProtocolEnvelope moveEnvelope = gameplayEnvelope(20);
+    expect(encodeGameCommand(commands[0], moveEnvelope) == GameplayWireError::None, "movement command encodes for payload checks");
+    GameCommandDecodeResult decodedMove = decodeGameCommand(moveEnvelope);
+    const MoveCommand* move = decodedMove ? std::get_if<MoveCommand>(&decodedMove.command.payload) : nullptr;
+    expect(move != nullptr && move->destinationTile == 12345 && move->elevation == 1 && move->running,
+        "movement command payload round trips");
+
+    ProtocolEnvelope doorEnvelope = gameplayEnvelope(21);
+    encodeGameCommand(commands[1], doorEnvelope);
+    GameCommandDecodeResult decodedDoor = decodeGameCommand(doorEnvelope);
+    const InteractCommand* door = decodedDoor ? std::get_if<InteractCommand>(&decodedDoor.command.payload) : nullptr;
+    expect(door != nullptr && door->targetId == EntityId { 40 }, "door command target round trips");
+
+    ProtocolEnvelope pickupEnvelope = gameplayEnvelope(22);
+    encodeGameCommand(commands[2], pickupEnvelope);
+    GameCommandDecodeResult decodedPickup = decodeGameCommand(pickupEnvelope);
+    const PickupCommand* pickup = decodedPickup ? std::get_if<PickupCommand>(&decodedPickup.command.payload) : nullptr;
+    expect(pickup != nullptr && pickup->targetId == EntityId { 41 }, "pickup command target round trips");
+
+    ProtocolEnvelope lootEnvelope = gameplayEnvelope(23);
+    encodeGameCommand(commands[3], lootEnvelope);
+    GameCommandDecodeResult decodedLoot = decodeGameCommand(lootEnvelope);
+    const LootCommand* loot = decodedLoot ? std::get_if<LootCommand>(&decodedLoot.command.payload) : nullptr;
+    expect(loot != nullptr && loot->targetId == EntityId { 42 }, "loot command target round trips");
+
+    CommandResult accepted;
+    accepted.commandSequence.value = 1;
+    accepted.status = CommandStatus::Accepted;
+    accepted.rejection = CommandRejection::None;
+    accepted.firstEventSequence.value = 7;
+    accepted.eventCount = 1;
+    ProtocolEnvelope acceptedEnvelope = gameplayEnvelope(24);
+    expect(encodeCommandResult(accepted, acceptedEnvelope) == GameplayWireError::None,
+        "accepted command result encodes");
+    CommandResultDecodeResult decodedAccepted = decodeCommandResult(acceptedEnvelope);
+    expect(decodedAccepted
+            && decodedAccepted.result.commandSequence == accepted.commandSequence
+            && decodedAccepted.result.status == accepted.status
+            && decodedAccepted.result.rejection == accepted.rejection
+            && decodedAccepted.result.firstEventSequence == accepted.firstEventSequence
+            && decodedAccepted.result.eventCount == accepted.eventCount,
+        "accepted command result round trips");
+
+    CommandResult rejected;
+    rejected.commandSequence.value = 2;
+    rejected.status = CommandStatus::Rejected;
+    rejected.rejection = CommandRejection::NotOwner;
+    ProtocolEnvelope rejectedEnvelope = gameplayEnvelope(25);
+    expect(encodeCommandResult(rejected, rejectedEnvelope) == GameplayWireError::None,
+        "rejected command result encodes");
+    CommandResultDecodeResult decodedRejected = decodeCommandResult(rejectedEnvelope);
+    expect(decodedRejected && decodedRejected.result.rejection == CommandRejection::NotOwner,
+        "rejected command result round trips");
+
+    std::vector<GameEvent> events = {
+        GameEvent { EventSequence { 7 }, CommandSequence { 1 }, ActorMovementStartedEvent { EntityId { 20 }, 12345, 1, true } },
+        GameEvent { EventSequence { 8 }, CommandSequence { 2 }, DoorUseStartedEvent { EntityId { 20 }, EntityId { 40 } } },
+        GameEvent { EventSequence { 9 }, CommandSequence { 3 }, ItemPickupStartedEvent { EntityId { 20 }, EntityId { 41 } } },
+        GameEvent { EventSequence { 10 }, CommandSequence { 4 }, LootStartedEvent { EntityId { 20 }, EntityId { 42 } } },
+    };
+    for (std::size_t index = 0; index < events.size(); index++) {
+        ProtocolEnvelope envelope = gameplayEnvelope(30 + index);
+        expect(encodeGameEvent(events[index], envelope) == GameplayWireError::None, "gameplay event encodes");
+        GameEventDecodeResult decoded = decodeGameEvent(envelope);
+        expect(decoded
+                && decoded.event.sequence == events[index].sequence
+                && decoded.event.causedBy == events[index].causedBy,
+            "gameplay event header round trips");
+    }
+
+    ProtocolEnvelope movementEventEnvelope = gameplayEnvelope(40);
+    encodeGameEvent(events[0], movementEventEnvelope);
+    GameEventDecodeResult decodedMovementEvent = decodeGameEvent(movementEventEnvelope);
+    const ActorMovementStartedEvent* movementEvent = decodedMovementEvent
+        ? std::get_if<ActorMovementStartedEvent>(&decodedMovementEvent.event.payload)
+        : nullptr;
+    expect(movementEvent != nullptr
+            && movementEvent->actorId == EntityId { 20 }
+            && movementEvent->destinationTile == 12345
+            && movementEvent->elevation == 1
+            && movementEvent->running,
+        "movement event payload round trips");
+
+    ProtocolEnvelope missingSession = gameplayEnvelope(41);
+    missingSession.sessionId = {};
+    expect(encodeGameCommand(commands[0], missingSession) == GameplayWireError::InvalidSessionId,
+        "gameplay encoder rejects a missing session ID");
+
+    ProtocolEnvelope malformed = moveEnvelope;
+    malformed.payload[3] = 1;
+    expect(decodeGameCommand(malformed).error == GameplayWireError::InvalidReservedField,
+        "command decoder rejects a reserved header byte");
+    malformed = moveEnvelope;
+    malformed.payload[2] = 99;
+    expect(decodeGameCommand(malformed).error == GameplayWireError::UnknownPayloadType,
+        "command decoder rejects an unknown payload type");
+    malformed = moveEnvelope;
+    malformed.payload[36] = 2;
+    expect(decodeGameCommand(malformed).error == GameplayWireError::InvalidReservedField,
+        "command decoder rejects a noncanonical boolean");
+    malformed = moveEnvelope;
+    malformed.payload.push_back(0);
+    expect(decodeGameCommand(malformed).error == GameplayWireError::InvalidLength,
+        "command decoder rejects trailing bytes");
+
+    CommandResult inconsistent = accepted;
+    inconsistent.eventCount = 0;
+    ProtocolEnvelope invalidResultEnvelope = gameplayEnvelope(42);
+    expect(encodeCommandResult(inconsistent, invalidResultEnvelope) == GameplayWireError::InconsistentResult,
+        "accepted result requires its declared event range");
+    inconsistent = rejected;
+    inconsistent.rejection = static_cast<CommandRejection>(99);
+    expect(encodeCommandResult(inconsistent, invalidResultEnvelope) == GameplayWireError::InvalidRejection,
+        "rejected result requires a known rejection reason");
+
+    ProtocolEnvelope malformedEvent = movementEventEnvelope;
+    malformedEvent.payload[33] = 1;
+    expect(decodeGameEvent(malformedEvent).error == GameplayWireError::InvalidReservedField,
+        "event decoder rejects a reserved movement byte");
 }
 
 void testLoopbackTransport()
@@ -1340,6 +1501,7 @@ int main()
     fallout::multiplayer::testLocalPlayerContext();
     fallout::multiplayer::testProtocolRoundTrip();
     fallout::multiplayer::testProtocolRejectsInvalidPackets();
+    fallout::multiplayer::testGameplayWireFormat();
     fallout::multiplayer::testLoopbackTransport();
     fallout::multiplayer::testTcpTransportAndHandshake();
     fallout::multiplayer::testNetworkLaunchAndBootstrap();
