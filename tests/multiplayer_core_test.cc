@@ -1135,6 +1135,26 @@ void testNetworkCharacterLobby()
     expect(host.start(NetworkLaunchMode::Host, sessionId, std::move(pair.first)), "network host starts its character lobby");
     expect(guest.start(NetworkLaunchMode::Join, sessionId, std::move(pair.second)), "network guest starts its character lobby");
 
+    expect(!host.sendChatMessage("")
+            && !host.sendChatMessage(std::string(kMaxLobbyChatMessageLength + 1, 'x'))
+            && !host.sendChatMessage("invalid\nmessage"),
+        "network lobby rejects empty, oversized, and control-character chat");
+    expect(host.sendChatMessage("Welcome to Vault 13."), "host sends a bounded lobby chat message");
+    guest.poll();
+    std::optional<LobbyChatMessage> hostChat = guest.takeChatMessage();
+    expect(hostChat.has_value()
+            && hostChat->playerId == kHostPlayerId
+            && hostChat->text == "Welcome to Vault 13."
+            && !guest.takeChatMessage().has_value(),
+        "guest receives host chat with authenticated player ownership exactly once");
+    expect(guest.sendChatMessage("Ready when you are."), "guest sends a lobby chat reply");
+    host.poll();
+    std::optional<LobbyChatMessage> guestChat = host.takeChatMessage();
+    expect(guestChat.has_value()
+            && guestChat->playerId == kGuestPlayerId
+            && guestChat->text == "Ready when you are.",
+        "host receives guest chat with the guest player identity");
+
     CharacterCreationSheet hostSheet = sampleCharacterSheet(kHostPlayerId, "Albert");
     CharacterCreationSheet guestSheet = sampleCharacterSheet(kGuestPlayerId, "Max");
     expect(host.submitLocalSheet(hostSheet) == CharacterLobbyError::None, "network host sends its character sheet");
@@ -1355,6 +1375,36 @@ void testNetworkCharacterLobby()
     expect(rejectingHost.state() == NetworkLobbyState::Rejected
             && rejectingHost.sheetError() == CharacterLobbyError::InvalidPlayerId,
         "host rejects a peer sheet owned by the wrong player");
+
+    LoopbackTransportPair forgedChatPair = createLoopbackTransportPair();
+    NetworkLobby forgedChatHost;
+    expect(forgedChatHost.start(NetworkLaunchMode::Host, sessionId, std::move(forgedChatPair.first)),
+        "host lobby starts for forged chat validation");
+    ProtocolEnvelope forgedChatEnvelope;
+    forgedChatEnvelope.kind = MessageKind::Lobby;
+    forgedChatEnvelope.sessionId = sessionId;
+    forgedChatEnvelope.sequence = 2;
+    forgedChatEnvelope.payload = {
+        0,
+        static_cast<std::uint8_t>(kNetworkLobbyVersion),
+        5,
+        0,
+        0,
+        0,
+        0,
+        static_cast<std::uint8_t>(kHostPlayerId.value),
+        0,
+        1,
+        'x',
+    };
+    Packet forgedChatPacket;
+    expect(encodeEnvelope(forgedChatEnvelope, forgedChatPacket) == ProtocolError::None
+            && forgedChatPair.second->send(std::move(forgedChatPacket)) == TransportSendResult::Sent,
+        "hostile guest sends chat claiming the host identity");
+    forgedChatHost.poll();
+    expect(forgedChatHost.state() == NetworkLobbyState::Failed
+            && forgedChatHost.error() == NetworkLobbyError::UnexpectedMessage,
+        "lobby rejects chat whose player identity does not match the peer role");
 
     LoopbackTransportPair disconnectedPair = createLoopbackTransportPair();
     NetworkLobby disconnectedHost;

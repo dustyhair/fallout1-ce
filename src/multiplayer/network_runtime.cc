@@ -916,6 +916,16 @@ const CharacterCreationSheet* networkRuntimePeerSheet()
     return lobbyStarted ? lobby.peerSheet() : nullptr;
 }
 
+bool networkRuntimeSendChatMessage(const char* text)
+{
+    return lobbyStarted && text != nullptr && lobby.sendChatMessage(text);
+}
+
+std::optional<LobbyChatMessage> networkRuntimeTakeChatMessage()
+{
+    return lobbyStarted ? lobby.takeChatMessage() : std::nullopt;
+}
+
 bool networkRuntimeSubmitLocalCharacter(Object* actor)
 {
     if (launchOptions.mode == NetworkLaunchMode::Disabled) {

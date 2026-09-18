@@ -12,6 +12,8 @@ namespace multiplayer {
 namespace {
 
 constexpr std::size_t kLobbyHeaderSize = 4;
+constexpr std::size_t kChatHeaderSize = 6;
+constexpr std::size_t kMaxQueuedChatMessages = 32;
 constexpr std::uint16_t kRecoveryWireVersion = 1;
 constexpr std::size_t kRecoveryHeaderSize = 4;
 
@@ -23,6 +25,14 @@ enum class RecoveryMessageType : std::uint8_t {
 
 void appendUInt16(std::vector<std::uint8_t>& bytes, std::uint16_t value)
 {
+    bytes.push_back(static_cast<std::uint8_t>((value >> 8) & 0xFF));
+    bytes.push_back(static_cast<std::uint8_t>(value & 0xFF));
+}
+
+void appendUInt32(std::vector<std::uint8_t>& bytes, std::uint32_t value)
+{
+    bytes.push_back(static_cast<std::uint8_t>((value >> 24) & 0xFF));
+    bytes.push_back(static_cast<std::uint8_t>((value >> 16) & 0xFF));
     bytes.push_back(static_cast<std::uint8_t>((value >> 8) & 0xFF));
     bytes.push_back(static_cast<std::uint8_t>(value & 0xFF));
 }
@@ -41,6 +51,14 @@ std::uint16_t readUInt16(const std::vector<std::uint8_t>& bytes, std::size_t off
         | static_cast<std::uint16_t>(bytes[offset + 1]));
 }
 
+std::uint32_t readUInt32(const std::vector<std::uint8_t>& bytes, std::size_t offset)
+{
+    return (static_cast<std::uint32_t>(bytes[offset]) << 24)
+        | (static_cast<std::uint32_t>(bytes[offset + 1]) << 16)
+        | (static_cast<std::uint32_t>(bytes[offset + 2]) << 8)
+        | static_cast<std::uint32_t>(bytes[offset + 3]);
+}
+
 std::uint64_t readUInt64(const std::vector<std::uint8_t>& bytes, std::size_t offset)
 {
     std::uint64_t value = 0;
@@ -53,6 +71,19 @@ std::uint64_t readUInt64(const std::vector<std::uint8_t>& bytes, std::size_t off
 bool isKnownCharacterLobbyError(CharacterLobbyError error)
 {
     return error > CharacterLobbyError::None && error <= CharacterLobbyError::TrailingData;
+}
+
+bool isValidChatText(const std::string& text)
+{
+    if (text.empty() || text.size() > kMaxLobbyChatMessageLength) {
+        return false;
+    }
+    for (unsigned char ch : text) {
+        if (ch < 0x20 || ch > 0x7E) {
+            return false;
+        }
+    }
+    return true;
 }
 
 EntityId eventActorId(const GameEventPayload& payload)
@@ -92,6 +123,7 @@ bool NetworkLobby::start(NetworkLaunchMode mode, SessionId sessionId, std::uniqu
     _peerCommands.clear();
     _commandResults.clear();
     _peerEvents.clear();
+    _chatMessages.clear();
     _peerSnapshots.clear();
     _recovering = false;
     _eventJournal.clear();
@@ -520,6 +552,33 @@ CharacterLobbyError NetworkLobby::submitLocalSheet(const CharacterCreationSheet&
     return CharacterLobbyError::None;
 }
 
+bool NetworkLobby::sendChatMessage(const std::string& text)
+{
+    if ((_state != NetworkLobbyState::Waiting && _state != NetworkLobbyState::Ready)
+        || _transport == nullptr
+        || !isValidChatText(text)) {
+        return false;
+    }
+
+    PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
+    std::vector<std::uint8_t> body;
+    body.reserve(kChatHeaderSize + text.size());
+    appendUInt32(body, playerId.value);
+    appendUInt16(body, static_cast<std::uint16_t>(text.size()));
+    body.insert(body.end(), text.begin(), text.end());
+    return sendMessage(MessageType::Chat, body);
+}
+
+std::optional<LobbyChatMessage> NetworkLobby::takeChatMessage()
+{
+    if (_chatMessages.empty()) {
+        return std::nullopt;
+    }
+    LobbyChatMessage message = std::move(_chatMessages.front());
+    _chatMessages.pop_front();
+    return message;
+}
+
 bool NetworkLobby::requestStart()
 {
     if (_mode != NetworkLaunchMode::Host || _state != NetworkLobbyState::Ready) {
@@ -589,6 +648,7 @@ void NetworkLobby::stop()
     _peerCommands.clear();
     _commandResults.clear();
     _peerEvents.clear();
+    _chatMessages.clear();
     _peerSnapshots.clear();
     _recovering = false;
     _eventJournal.clear();
@@ -855,6 +915,29 @@ void NetworkLobby::handlePacket(const Packet& packet)
         }
         _startRequested = true;
         return;
+    case MessageType::Chat: {
+        if (body.size() < kChatHeaderSize) {
+            fail(NetworkLobbyError::UnexpectedMessage);
+            return;
+        }
+        PlayerId sender { readUInt32(body, 0) };
+        PlayerId expectedSender = _mode == NetworkLaunchMode::Host ? kGuestPlayerId : kHostPlayerId;
+        std::size_t textLength = readUInt16(body, 4);
+        if (sender != expectedSender || body.size() != kChatHeaderSize + textLength) {
+            fail(NetworkLobbyError::UnexpectedMessage);
+            return;
+        }
+        std::string text(body.begin() + kChatHeaderSize, body.end());
+        if (!isValidChatText(text)) {
+            fail(NetworkLobbyError::UnexpectedMessage);
+            return;
+        }
+        if (_chatMessages.size() == kMaxQueuedChatMessages) {
+            _chatMessages.pop_front();
+        }
+        _chatMessages.push_back(LobbyChatMessage { sender, std::move(text) });
+        return;
+    }
     }
     fail(NetworkLobbyError::UnexpectedMessage);
 }

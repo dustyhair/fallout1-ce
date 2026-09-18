@@ -4,6 +4,8 @@ After the TCP handshake, both games show the connection state at the bottom of t
 
 Each peer sends one versioned `Lobby` message containing its existing `CharacterCreationSheet` wire format. The host requires player 1 on its local sheet and player 2 on the guest sheet. It validates names, SPECIAL totals, age, gender, tagged skills, and traits before sending `Ready`. The guest also validates the host sheet. Both peers require the authoritative session ID and an exact per-direction message sequence starting at 2, after handshake sequence 1.
 
+Lobby protocol version 2 also carries chat on that ordered message stream. A chat body contains the sender player ID, a 16-bit text length, and up to 64 printable ASCII characters. The receiver requires the sender ID to match the authenticated peer role, rejects malformed or control-character text, and keeps a bounded receive queue. Chat is available after the TCP lobby starts and does not affect character readiness.
+
 The dedicated lobby enables **Start Game** only after the host has both valid sheets and both peers enter the ready state. Pressing Escape returns to the main menu without closing the connection. A player cannot replace a sheet after submitting it.
 
 ## Automated engine smoke test

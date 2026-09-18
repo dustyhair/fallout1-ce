@@ -2,9 +2,11 @@
 #define FALLOUT_MULTIPLAYER_NETWORK_RUNTIME_H_
 
 #include <cstdint>
+#include <optional>
 
 #include "multiplayer/character_lobby.h"
 #include "multiplayer/network_bootstrap.h"
+#include "multiplayer/network_lobby.h"
 
 namespace fallout {
 
@@ -23,6 +25,8 @@ bool networkRuntimeFailed();
 const char* networkRuntimeStatus();
 const CharacterCreationSheet* networkRuntimeLocalSheet();
 const CharacterCreationSheet* networkRuntimePeerSheet();
+bool networkRuntimeSendChatMessage(const char* text);
+std::optional<LobbyChatMessage> networkRuntimeTakeChatMessage();
 bool networkRuntimeSmokeTestEnabled();
 bool networkRuntimeRunSmokeTest();
 bool networkRuntimeSubmitLocalCharacter(Object* actor);

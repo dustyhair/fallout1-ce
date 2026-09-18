@@ -5,6 +5,7 @@
 #include <deque>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "multiplayer/character_lobby.h"
@@ -18,7 +19,13 @@
 namespace fallout {
 namespace multiplayer {
 
-constexpr std::uint16_t kNetworkLobbyVersion = 1;
+constexpr std::uint16_t kNetworkLobbyVersion = 2;
+constexpr std::size_t kMaxLobbyChatMessageLength = 64;
+
+struct LobbyChatMessage {
+    PlayerId playerId;
+    std::string text;
+};
 
 enum class NetworkLobbyState {
     Disabled,
@@ -45,6 +52,8 @@ class NetworkLobby {
 public:
     bool start(NetworkLaunchMode mode, SessionId sessionId, std::unique_ptr<Transport> transport);
     CharacterLobbyError submitLocalSheet(const CharacterCreationSheet& sheet);
+    bool sendChatMessage(const std::string& text);
+    std::optional<LobbyChatMessage> takeChatMessage();
     bool requestStart();
     bool sendLocalMove(int destinationTile,
         int elevation,
@@ -92,6 +101,7 @@ private:
         Ready = 2,
         Rejected = 3,
         Start = 4,
+        Chat = 5,
     };
 
     bool sendLocalAction(GameEventPayload eventPayload, GameCommandPayload commandPayload, std::uint32_t phaseRevision);
@@ -125,6 +135,7 @@ private:
     std::deque<GameCommand> _peerCommands;
     std::deque<CommandResult> _commandResults;
     std::deque<GameEvent> _peerEvents;
+    std::deque<LobbyChatMessage> _chatMessages;
     std::deque<WorldSnapshot> _peerSnapshots;
     bool _recovering = false;
     EventJournal _eventJournal;
