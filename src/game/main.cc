@@ -37,6 +37,7 @@
 #include "game/wordwrap.h"
 #include "game/worldmap.h"
 #include "multiplayer/developer_local_session.h"
+#include "multiplayer/network_runtime.h"
 #include "plib/color/color.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/gnw.h"
@@ -90,12 +91,21 @@ static bool main_death_voiceover_done;
 int gnw_main(int argc, char** argv)
 {
     multiplayer::developerLocalSessionConfigure(argc, argv);
+    if (!multiplayer::networkRuntimeConfigure(argc, argv)) {
+        return 1;
+    }
 
     if (!autorun_mutex_create()) {
         return 1;
     }
 
     if (!main_init_system(argc, argv)) {
+        return 1;
+    }
+
+    if (!multiplayer::networkRuntimeStart()) {
+        main_exit_system();
+        autorun_mutex_destroy();
         return 1;
     }
 
@@ -214,6 +224,8 @@ int gnw_main(int argc, char** argv)
             }
         }
     }
+
+    multiplayer::networkRuntimeStop();
 
     // NOTE: Uninline.
     main_exit_system();

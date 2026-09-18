@@ -24,6 +24,7 @@ public:
     virtual ~Transport() = default;
 
     virtual TransportSendResult send(Packet packet) = 0;
+    virtual void poll() = 0;
     virtual std::optional<Packet> receive() = 0;
     virtual bool isConnected() const = 0;
     virtual void close() = 0;

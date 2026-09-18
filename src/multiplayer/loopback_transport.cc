@@ -44,6 +44,10 @@ public:
         return TransportSendResult::Sent;
     }
 
+    void poll() override
+    {
+    }
+
     std::optional<Packet> receive() override
     {
         std::lock_guard<std::mutex> lock(_state->mutex);

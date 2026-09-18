@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -13,6 +14,7 @@
 #include "multiplayer/local_session.h"
 #include "multiplayer/local_player_context.h"
 #include "multiplayer/loopback_transport.h"
+#include "multiplayer/network_bootstrap.h"
 #include "multiplayer/player_character_state.h"
 #include "multiplayer/protocol.h"
 #include "multiplayer/save_sidecar.h"
@@ -752,6 +754,111 @@ void testTcpTransportAndHandshake()
     expect(connectTcp("127.0.0.1", 1, 0).error == TcpError::InvalidArgument, "TCP join rejects a zero timeout");
 }
 
+NetworkLaunchParseResult parseLaunchArguments(std::initializer_list<const char*> arguments)
+{
+    std::vector<std::string> storage(arguments.begin(), arguments.end());
+    std::vector<char*> argv;
+    argv.reserve(storage.size());
+    for (std::string& argument : storage) {
+        argv.push_back(argument.data());
+    }
+    return parseNetworkLaunchOptions(static_cast<int>(argv.size()), argv.data());
+}
+
+void pollBootstraps(NetworkBootstrap& host, NetworkBootstrap& guest)
+{
+    for (int attempt = 0; attempt < 10000; attempt++) {
+        host.poll();
+        guest.poll();
+        bool hostDone = host.state() == NetworkBootstrapState::Connected
+            || host.state() == NetworkBootstrapState::Rejected
+            || host.state() == NetworkBootstrapState::Failed;
+        bool guestDone = guest.state() == NetworkBootstrapState::Connected
+            || guest.state() == NetworkBootstrapState::Rejected
+            || guest.state() == NetworkBootstrapState::Failed;
+        if (hostDone && guestDone) {
+            return;
+        }
+    }
+}
+
+void testNetworkLaunchAndBootstrap()
+{
+    NetworkLaunchParseResult disabled = parseLaunchArguments({ "fallout-ce" });
+    expect(disabled && disabled.options.mode == NetworkLaunchMode::Disabled, "network launch defaults to single-player mode");
+
+    NetworkLaunchParseResult hostDefault = parseLaunchArguments({ "fallout-ce", "--multiplayer-host" });
+    expect(hostDefault && hostDefault.options.mode == NetworkLaunchMode::Host && hostDefault.options.port == kDefaultMultiplayerPort,
+        "host launch uses the default multiplayer port");
+
+    NetworkLaunchParseResult hostPort = parseLaunchArguments({ "fallout-ce", "--multiplayer-host=45123" });
+    expect(hostPort && hostPort.options.mode == NetworkLaunchMode::Host && hostPort.options.port == 45123,
+        "host launch accepts an explicit port");
+
+    NetworkLaunchParseResult joinDefault = parseLaunchArguments({ "fallout-ce", "--multiplayer-join", "example.test" });
+    expect(joinDefault && joinDefault.options.mode == NetworkLaunchMode::Join
+            && joinDefault.options.address == "example.test" && joinDefault.options.port == kDefaultMultiplayerPort,
+        "join launch accepts a host name and default port");
+
+    NetworkLaunchParseResult joinPort = parseLaunchArguments({ "fallout-ce", "--multiplayer-join=127.0.0.1:45124" });
+    expect(joinPort && joinPort.options.address == "127.0.0.1" && joinPort.options.port == 45124,
+        "join launch accepts a direct IPv4 address and explicit port");
+
+    NetworkLaunchParseResult joinIpv6 = parseLaunchArguments({ "fallout-ce", "--multiplayer-join=[::1]:45125" });
+    expect(joinIpv6 && joinIpv6.options.address == "::1" && joinIpv6.options.port == 45125,
+        "join launch parses a bracketed IPv6 endpoint");
+
+    expect(parseLaunchArguments({ "fallout-ce", "--multiplayer-join" }).error == NetworkLaunchParseError::MissingJoinAddress,
+        "join launch rejects a missing address");
+    expect(parseLaunchArguments({ "fallout-ce", "--multiplayer-join", "--some-other-option" }).error == NetworkLaunchParseError::MissingJoinAddress,
+        "join launch does not consume another option as its address");
+    expect(parseLaunchArguments({ "fallout-ce", "--multiplayer-host=0" }).error == NetworkLaunchParseError::InvalidPort,
+        "host launch rejects port zero");
+    expect(parseLaunchArguments({ "fallout-ce", "--multiplayer-join=localhost:70000" }).error == NetworkLaunchParseError::InvalidPort,
+        "join launch rejects an out-of-range port");
+    expect(parseLaunchArguments({ "fallout-ce", "--multiplayer-host", "--multiplayer-join=localhost" }).error == NetworkLaunchParseError::ConflictingModes,
+        "network launch rejects simultaneous host and join modes");
+    expect(parseLaunchArguments({ "fallout-ce", "--multiplayer-host", "--multiplayer-dev" }).error == NetworkLaunchParseError::DevelopmentModeConflict,
+        "network launch rejects simultaneous TCP and developer modes");
+
+    constexpr std::uint64_t contentDigest = 0xA1B2C3D4E5F60718ULL;
+    SessionId sessionId { 0x123456789ABCDEF0ULL };
+    NetworkLaunchOptions hostOptions;
+    hostOptions.mode = NetworkLaunchMode::Host;
+    hostOptions.port = 0;
+    NetworkBootstrap host;
+    expect(host.start(hostOptions, contentDigest, sessionId), "network host bootstrap listens on an available test port");
+
+    NetworkLaunchOptions guestOptions;
+    guestOptions.mode = NetworkLaunchMode::Join;
+    guestOptions.address = "127.0.0.1";
+    guestOptions.port = host.port();
+    NetworkBootstrap guest;
+    expect(guest.start(guestOptions, contentDigest), "network guest bootstrap connects and sends hello");
+    pollBootstraps(host, guest);
+    expect(host.state() == NetworkBootstrapState::Connected && guest.state() == NetworkBootstrapState::Connected,
+        "host and guest bootstraps complete the connection handshake");
+    expect(host.sessionId() == sessionId && guest.sessionId() == sessionId,
+        "host assigns its authoritative session ID to the guest");
+    expect(host.localPlayerId() == kHostPlayerId && guest.localPlayerId() == kGuestPlayerId,
+        "network launch assigns distinct local player IDs");
+    expect(host.takeTransport() != nullptr && guest.takeTransport() != nullptr,
+        "completed bootstraps hand their connected transports to the session layer");
+
+    NetworkBootstrap mismatchHost;
+    expect(mismatchHost.start(hostOptions, contentDigest, sessionId), "mismatch host listens on an available test port");
+    guestOptions.port = mismatchHost.port();
+    NetworkBootstrap mismatchGuest;
+    expect(mismatchGuest.start(guestOptions, contentDigest + 1), "mismatch guest reaches the host");
+    pollBootstraps(mismatchHost, mismatchGuest);
+    expect(mismatchHost.state() == NetworkBootstrapState::Rejected
+            && mismatchGuest.state() == NetworkBootstrapState::Rejected,
+        "host and guest report a rejected content mismatch");
+    expect(mismatchHost.rejection() == HandshakeRejection::ContentMismatch
+            && mismatchGuest.rejection() == HandshakeRejection::ContentMismatch,
+        "content mismatch preserves the rejection reason on both peers");
+}
+
 void testLocalSessionLifecycle()
 {
     LocalSession session;
@@ -1152,6 +1259,7 @@ int main()
     fallout::multiplayer::testProtocolRejectsInvalidPackets();
     fallout::multiplayer::testLoopbackTransport();
     fallout::multiplayer::testTcpTransportAndHandshake();
+    fallout::multiplayer::testNetworkLaunchAndBootstrap();
     fallout::multiplayer::testLocalSessionLifecycle();
     fallout::multiplayer::testAuthoritativeCommandProcessing();
     fallout::multiplayer::testSnapshotRoundTripAndRecovery();

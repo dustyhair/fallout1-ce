@@ -207,12 +207,17 @@ public:
         return _connected ? TransportSendResult::Sent : TransportSendResult::Disconnected;
     }
 
-    std::optional<Packet> receive() override
+    void poll() override
     {
         if (_connected) {
             flushOutbound();
             pumpInbound();
         }
+    }
+
+    std::optional<Packet> receive() override
+    {
+        poll();
 
         if (_received.empty()) {
             return std::nullopt;

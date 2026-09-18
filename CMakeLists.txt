@@ -48,6 +48,8 @@ add_library(fallout-multiplayer-core STATIC
     "src/multiplayer/local_player_context.h"
     "src/multiplayer/loopback_transport.cc"
     "src/multiplayer/loopback_transport.h"
+    "src/multiplayer/network_bootstrap.cc"
+    "src/multiplayer/network_bootstrap.h"
     "src/multiplayer/player_character_state.cc"
     "src/multiplayer/player_character_state.h"
     "src/multiplayer/protocol.cc"
@@ -72,6 +74,8 @@ target_sources(${EXECUTABLE_NAME} PRIVATE
     "src/multiplayer/character_build_bridge.h"
     "src/multiplayer/developer_local_session.cc"
     "src/multiplayer/developer_local_session.h"
+    "src/multiplayer/network_runtime.cc"
+    "src/multiplayer/network_runtime.h"
     "src/multiplayer/presentation_bridge.cc"
     "src/multiplayer/presentation_bridge.h"
 )

@@ -1,6 +1,6 @@
 # Two-player co-op plan
 
-Status: Phases 0 and 1 are complete on the `multiplayer-plan` branch. Phase 2 is in progress. A framed TCP transport and versioned content-check handshake now cover the first direct-IP connection path; game launch modes are next.
+Status: Phases 0 and 1 are complete on the `multiplayer-plan` branch. Phase 2 is in progress. Explicit host and direct-IP join modes now run the framed TCP connection and versioned compatibility handshake in the game input loop; networked lobby character sheets are next.
 
 ## Goal
 
@@ -372,7 +372,7 @@ Do not add a networking dependency, lobby UI, or broad player-state refactor in 
 ## Phase 2 implementation series
 
 1. [x] Add a [bounded, nonblocking TCP packet transport](docs/multiplayer/direct-ip-transport.md) and a versioned content-check handshake.
-2. [ ] Add explicit host and direct-IP join launch modes around the TCP connection bootstrap.
+2. [x] Add explicit host and direct-IP join launch modes around the TCP connection bootstrap.
 3. [ ] Send validated lobby character sheets through the network transport.
 4. [ ] Encode commands, results, and events for the existing authoritative processor.
 5. [ ] Add event journaling, snapshot recovery, and reconnect tokens to the network session.
