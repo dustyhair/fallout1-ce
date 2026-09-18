@@ -12,7 +12,7 @@ Phase 1 starts by giving each multiplayer slot an independent character build. `
 - Player prototype flags.
 - Unspent skill points, level, and experience.
 
-Reputation and karma stay in shared world state. Inventory and equipment already belong to critter objects and will be exposed through the local-player presentation context in a later Phase 1 change.
+Reputation and karma stay in shared world state. Inventory and equipment already belong to critter objects and are selected through the [local-player presentation context](local-player-presentation.md).
 
 The store rejects a player unless its actor exists in `EntityRegistry` and is owned by the same `PlayerId`. It also prevents two player slots from sharing an actor. Actor objects can be replaced during a map load without replacing the player state: the registry rebinds the same `EntityId` to the new pointer, and the character build remains intact.
 
@@ -20,7 +20,7 @@ The store rejects a player unless its actor exists in `EntityRegistry` and is ow
 
 The developer local session captures the current legacy player data after creating both actors. It copies that data into two separate `CharacterBuild` instances, one for the host and one for the guest. The copies begin identical so the existing character remains playable, but subsequent mutations to either stored build are independent.
 
-The [acting-player context](acting-player-context.md) now routes stat, skill, perk, trait, and progression access to these copies while a validated command executes. Calls outside that scope still use the legacy globals. This preserves single-player behavior and gives command execution an explicit player identity.
+The [acting-player context](acting-player-context.md) routes stat, skill, perk, trait, and progression access to these copies while a validated command executes. The [local-player presentation context](local-player-presentation.md) installs the same mechanical context around character UI work. Calls outside those scopes still use the legacy globals. This preserves single-player behavior and gives both simulation and presentation an explicit player identity.
 
 ## Invariants
 

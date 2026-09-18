@@ -26,6 +26,7 @@
 #include "game/trait.h"
 #include "game/worldmap.h"
 #include "multiplayer/acting_player_context.h"
+#include "multiplayer/local_player_context.h"
 #include "platform_compat.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/memory.h"
@@ -181,7 +182,7 @@ char* critter_name(Object* critter)
     // 0x504D40
     static char* _name_critter = _aCorpse;
 
-    if (critter == obj_dude) {
+    if (critter == obj_dude || multiplayer::isLocalPlayerActor(critter)) {
         return pc_name;
     }
 

@@ -230,10 +230,15 @@ static bool perk_can_add(int perk)
 // 0x486778
 static void perk_defaults()
 {
+    multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuild();
     int perk;
 
     for (perk = 0; perk < PERK_COUNT; perk++) {
-        perk_lev[perk] = 0;
+        if (build != nullptr) {
+            build->perkRanks[perk] = 0;
+        } else {
+            perk_lev[perk] = 0;
+        }
     }
 }
 

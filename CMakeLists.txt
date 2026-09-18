@@ -40,6 +40,8 @@ add_library(fallout-multiplayer-core STATIC
     "src/multiplayer/entity_registry.h"
     "src/multiplayer/local_session.cc"
     "src/multiplayer/local_session.h"
+    "src/multiplayer/local_player_context.cc"
+    "src/multiplayer/local_player_context.h"
     "src/multiplayer/loopback_transport.cc"
     "src/multiplayer/loopback_transport.h"
     "src/multiplayer/player_character_state.cc"
@@ -59,6 +61,8 @@ target_sources(${EXECUTABLE_NAME} PRIVATE
     "src/multiplayer/character_build_bridge.h"
     "src/multiplayer/developer_local_session.cc"
     "src/multiplayer/developer_local_session.h"
+    "src/multiplayer/presentation_bridge.cc"
+    "src/multiplayer/presentation_bridge.h"
 )
 
 if (BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)

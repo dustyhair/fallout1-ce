@@ -1,7 +1,14 @@
 #include "multiplayer/local_session.h"
 
+#include "multiplayer/local_player_context.h"
+
 namespace fallout {
 namespace multiplayer {
+
+LocalSession::~LocalSession()
+{
+    stop();
+}
 
 LocalSessionError LocalSession::start(Object* hostActor, Object* guestActor)
 {
@@ -64,6 +71,8 @@ LocalSessionError LocalSession::start(Object* hostActor, Object* guestActor)
 
 void LocalSession::stop()
 {
+    clearLocalPlayerIfBoundTo(*this);
+
     if (_transports.first != nullptr) {
         _transports.first->close();
     }

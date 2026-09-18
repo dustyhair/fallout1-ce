@@ -23,6 +23,6 @@ The actor check matters. An active build can replace prototype stats only when t
 
 The context covers synchronous command execution. Work deferred until after the executor returns must carry player identity and install its own scope. Movement animation callbacks do not need character globals today, but later combat and queued skill work will need that audit.
 
-Save and load handlers still read and write the legacy single-player arrays. Phase 1 will add a multiplayer sidecar after local presentation and character creation can select distinct builds. Guest sneak scheduling also remains separate because the old sneak queue has one process-wide result flag.
+Save and load handlers still read and write the legacy single-player arrays. Phase 1 will add a multiplayer sidecar after temporary character creation can select distinct builds. Guest sneak scheduling also remains separate because the old sneak queue has one process-wide result flag.
 
 Headless tests cover empty, nested, restored, host-command, and guest-command contexts. The full executable build checks the stat, skill, trait, perk, progression, and player-flag integrations.

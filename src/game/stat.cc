@@ -530,10 +530,19 @@ int stat_pc_set(int pc_stat, int value)
 // 0x49CB3C
 void stat_pc_set_defaults()
 {
+    multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuild();
     int pc_stat;
 
     for (pc_stat = 0; pc_stat < PC_STAT_COUNT; pc_stat++) {
-        curr_pc_stat[pc_stat] = pc_stat_data[pc_stat].defaultValue;
+        if (build != nullptr && pc_stat == PC_STAT_UNSPENT_SKILL_POINTS) {
+            build->unspentSkillPoints = pc_stat_data[pc_stat].defaultValue;
+        } else if (build != nullptr && pc_stat == PC_STAT_LEVEL) {
+            build->level = pc_stat_data[pc_stat].defaultValue;
+        } else if (build != nullptr && pc_stat == PC_STAT_EXPERIENCE) {
+            build->experience = pc_stat_data[pc_stat].defaultValue;
+        } else {
+            curr_pc_stat[pc_stat] = pc_stat_data[pc_stat].defaultValue;
+        }
     }
 }
 

@@ -145,9 +145,14 @@ int skill_init()
 void skill_reset()
 {
     int index;
+    multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuild();
 
     for (index = 0; index < NUM_TAGGED_SKILLS; index++) {
-        tag_skill[index] = -1;
+        if (build != nullptr) {
+            build->taggedSkills[index] = -1;
+        } else {
+            tag_skill[index] = -1;
+        }
     }
 
     // NOTE: Uninline.

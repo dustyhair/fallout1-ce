@@ -10,6 +10,7 @@
 #include "game/protinst.h"
 #include "multiplayer/character_build_bridge.h"
 #include "multiplayer/command_processor.h"
+#include "multiplayer/local_player_context.h"
 #include "multiplayer/local_session.h"
 #include "plib/gnw/debug.h"
 
@@ -162,7 +163,8 @@ bool beginSession()
     CharacterBuild hostBuild;
     if (!captureLegacyCharacterBuild(obj_dude, hostBuild)
         || session.players().setBuild(kHostPlayerId, hostBuild) != PlayerStateError::None
-        || session.players().setBuild(kGuestPlayerId, hostBuild) != PlayerStateError::None) {
+        || session.players().setBuild(kGuestPlayerId, hostBuild) != PlayerStateError::None
+        || bindLocalPlayer(session, kHostPlayerId) != LocalPlayerError::None) {
         session.stop();
         eraseGuestActor();
         return false;

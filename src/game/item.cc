@@ -24,11 +24,14 @@
 #include "game/stat.h"
 #include "game/tile.h"
 #include "game/trait.h"
+#include "multiplayer/acting_player_context.h"
 #include "platform_compat.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/memory.h"
 
 namespace fallout {
+
+static bool item_is_player_actor(Object* critter);
 
 static void item_compact(int inventoryItemIndex, Inventory* inventory);
 static int item_move_func(Object* a1, Object* a2, Object* a3, int quantity, bool a5);
@@ -42,6 +45,11 @@ static int item_wd_clear_all(Object* a1, void* data);
 static void perform_withdrawal_start(Object* obj, int perk, int a3);
 static void perform_withdrawal_end(Object* obj, int a2);
 static int pid_to_gvar(int drugPid);
+
+static bool item_is_player_actor(Object* critter)
+{
+    return critter == obj_dude || multiplayer::isActingPlayerActor(critter);
+}
 
 // Maps weapon extended flags to skill.
 //
@@ -1356,7 +1364,7 @@ int item_w_range(Object* critter, int hit_mode)
     }
 
     if (item_w_subtype(weapon, hit_mode) == ATTACK_TYPE_THROW) {
-        if (critter == obj_dude) {
+        if (item_is_player_actor(critter)) {
             max_range = 3 * (stat_level(critter, STAT_STRENGTH) + 2 * perk_level(PERK_HEAVE_HO));
         } else {
             max_range = 3 * stat_level(critter, STAT_STRENGTH);
@@ -1396,14 +1404,14 @@ int item_w_mp_cost(Object* critter, int hit_mode, bool aiming)
             action_points = item_w_secondary_mp_cost(weapon);
         }
 
-        if (critter == obj_dude) {
+        if (item_is_player_actor(critter)) {
             if (trait_level(TRAIT_FAST_SHOT)) {
                 action_points -= 1;
             }
         }
     }
 
-    if (critter == obj_dude) {
+    if (item_is_player_actor(critter)) {
         weapon_subtype = item_w_subtype(weapon, hit_mode);
 
         if (perk_level(PERK_BONUS_HTH_ATTACKS)) {
@@ -1542,7 +1550,7 @@ int item_w_called_shot(Object* critter, int hit_mode)
     Object* weapon;
     int damage_type;
 
-    if (critter == obj_dude) {
+    if (item_is_player_actor(critter)) {
         if (trait_level(TRAIT_FAST_SHOT)) {
             return 0;
         }

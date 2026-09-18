@@ -8,6 +8,7 @@
 #include "multiplayer/command_processor.h"
 #include "multiplayer/entity_registry.h"
 #include "multiplayer/local_session.h"
+#include "multiplayer/local_player_context.h"
 #include "multiplayer/loopback_transport.h"
 #include "multiplayer/player_character_state.h"
 #include "multiplayer/protocol.h"
@@ -283,6 +284,46 @@ void testActingPlayerContext()
     }
 
     expect(actingPlayerState() == nullptr && actingPlayerActor() == nullptr, "leaving the outer scope clears the acting player");
+}
+
+void testLocalPlayerContext()
+{
+    LocalSession session;
+    TestObject hostActor;
+    TestObject guestActor;
+    TestObject replacementGuest;
+
+    expect(bindLocalPlayer(session, kHostPlayerId) == LocalPlayerError::SessionInactive, "inactive session cannot bind a local player");
+    expect(session.start(asGameObject(hostActor), asGameObject(guestActor)) == LocalSessionError::None, "local-player test session starts");
+    expect(bindLocalPlayer(session, PlayerId { 99 }) == LocalPlayerError::PlayerMissing, "unknown player cannot become local");
+    expect(bindLocalPlayer(session, kGuestPlayerId) == LocalPlayerError::None, "guest player can become the local presentation player");
+    expect(localPlayerId() == kGuestPlayerId, "local-player binding exposes the selected player ID");
+    expect(localPlayerState() == session.players().find(kGuestPlayerId), "local-player binding resolves registered state");
+    expect(localPlayerActor() == asGameObject(guestActor), "local-player binding resolves the current actor object");
+    expect(isLocalPlayerActor(asGameObject(guestActor)) && !isLocalPlayerActor(asGameObject(hostActor)), "local-player identity distinguishes the selected actor");
+
+    {
+        ScopedLocalPlayerContext localContext;
+        expect(actingPlayerState() == localPlayerState(), "local presentation scope installs the selected player mechanically");
+        expect(actingPlayerActor() == asGameObject(guestActor), "local presentation scope installs the selected actor mechanically");
+    }
+    expect(actingPlayerState() == nullptr, "local presentation scope restores the prior acting context");
+
+    expect(session.transitionTo(SessionPhase::Loading) == LocalSessionError::None, "local-player test enters loading");
+    expect(session.transitionTo(SessionPhase::Exploration) == LocalSessionError::None, "local-player test enters exploration");
+    expect(session.transitionTo(SessionPhase::Transition) == LocalSessionError::None, "local-player test enters map transition");
+    expect(session.rebindPlayerActor(kGuestPlayerId, asGameObject(replacementGuest)) == LocalSessionError::None, "local player actor can be rebound");
+    expect(localPlayerActor() == asGameObject(replacementGuest), "local-player lookup follows actor rebinding");
+
+    session.stop();
+    expect(!isValid(localPlayerId()) && localPlayerState() == nullptr && localPlayerActor() == nullptr, "stopping the bound session clears local presentation state");
+
+    {
+        LocalSession scopedSession;
+        expect(scopedSession.start(asGameObject(hostActor), asGameObject(guestActor)) == LocalSessionError::None, "scoped local-player session starts");
+        expect(bindLocalPlayer(scopedSession, kHostPlayerId) == LocalPlayerError::None, "scoped local-player session binds");
+    }
+    expect(localPlayerActor() == nullptr, "destroying the bound session clears local presentation state");
 }
 
 void testProtocolRoundTrip()
@@ -692,6 +733,7 @@ int main()
     fallout::multiplayer::testEntityRegistryAcrossEngineLifecycles();
     fallout::multiplayer::testPlayerCharacterStateStore();
     fallout::multiplayer::testActingPlayerContext();
+    fallout::multiplayer::testLocalPlayerContext();
     fallout::multiplayer::testProtocolRoundTrip();
     fallout::multiplayer::testProtocolRejectsInvalidPackets();
     fallout::multiplayer::testLoopbackTransport();

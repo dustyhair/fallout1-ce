@@ -27,6 +27,8 @@ enum class LocalSessionError {
 
 class LocalSession {
 public:
+    ~LocalSession();
+
     LocalSessionError start(Object* hostActor, Object* guestActor);
     void stop();
 

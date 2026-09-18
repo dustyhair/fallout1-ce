@@ -27,6 +27,8 @@
 #include "game/trait.h"
 #include "game/wordwrap.h"
 #include "game/worldmap.h"
+#include "multiplayer/local_player_context.h"
+#include "multiplayer/presentation_bridge.h"
 #include "platform_compat.h"
 #include "plib/color/color.h"
 #include "plib/db/db.h"
@@ -249,6 +251,7 @@ static void push_perks();
 static void pop_perks();
 static int PerkCount();
 static int is_supper_bonus();
+static Object* editor_player();
 
 // 0x431C40
 static const int grph_id[EDITOR_GRAPHIC_COUNT] = {
@@ -625,9 +628,14 @@ static unsigned char free_perk;
 // 0x56ED2E
 static unsigned char first_skill_list;
 
+static multiplayer::CharacterBuild localPlayerBuildBack;
+static bool hasLocalPlayerBuildBack;
+
 // 0x42C40C
 int editor_design(bool isCreationMode)
 {
+    multiplayer::ScopedLocalPlayerContext localPlayerContext;
+
     char* messageListItemText;
     char line1[128];
     char line2[128];
@@ -644,7 +652,7 @@ int editor_design(bool isCreationMode)
 
     if (!glblmode) {
         if (UpdateLevel()) {
-            stat_recalc_derived(obj_dude);
+            stat_recalc_derived(editor_player());
             ListTraits();
             ListSkills(0);
             PrintBasicStat(RENDER_ALL_STATS, 0, 0);
@@ -1409,7 +1417,7 @@ static void CharEditEnd()
         skill_set_tags(temp_tag_skill, 3);
         trait_set(temp_trait[0], temp_trait[1]);
         info_line = 0;
-        critter_adjust_hits(obj_dude, 1000);
+        critter_adjust_hits(editor_player(), 1000);
     }
 
     enable_box_bar_win();
@@ -2024,7 +2032,7 @@ static void PrintBasicStat(int stat, bool animate, int previousValue)
 
     // TODO: The original code is different.
     if (glblmode) {
-        value = stat_get_base(obj_dude, stat) + stat_get_bonus(obj_dude, stat);
+        value = stat_get_base(editor_player(), stat) + stat_get_bonus(editor_player(), stat);
 
         flags = 0;
 
@@ -2040,7 +2048,7 @@ static void PrintBasicStat(int stat, bool animate, int previousValue)
 
         buf_to_buf(bckgnd + off, 40, text_height(), 640, win_buf + off, 640);
 
-        messageListItemId = stat_level(obj_dude, stat) + 199;
+        messageListItemId = stat_level(editor_player(), stat) + 199;
         if (messageListItemId > 210) {
             messageListItemId = 210;
         }
@@ -2048,11 +2056,11 @@ static void PrintBasicStat(int stat, bool animate, int previousValue)
         description = getmsg(&editor_message_file, &mesg, messageListItemId);
         text_to_buf(win_buf + 640 * (StatYpos[stat] + 8) + 103, description, 640, 640, color);
     } else {
-        value = stat_level(obj_dude, stat);
+        value = stat_level(editor_player(), stat);
         PrintBigNum(58, StatYpos[stat], 0, value, 0, edit_win);
         buf_to_buf(bckgnd + off, 40, text_height(), 640, win_buf + off, 640);
 
-        value = stat_level(obj_dude, stat);
+        value = stat_level(editor_player(), stat);
         if (value > 10) {
             value = 10;
         }
@@ -2072,7 +2080,7 @@ static void PrintGender()
 
     text_font(103);
 
-    gender = stat_level(obj_dude, STAT_GENDER);
+    gender = stat_level(editor_player(), STAT_GENDER);
     str = getmsg(&editor_message_file, &mesg, 107 + gender);
 
     strcpy(text, str);
@@ -2102,7 +2110,7 @@ static void PrintAgeBig()
 
     text_font(103);
 
-    age = stat_level(obj_dude, STAT_AGE);
+    age = stat_level(editor_player(), STAT_AGE);
     str = getmsg(&editor_message_file, &mesg, 104);
 
     snprintf(text, sizeof(text), "%s %d", str, age);
@@ -2133,7 +2141,7 @@ static void PrintBigname()
 
     text_font(103);
 
-    str = critter_name(obj_dude);
+    str = critter_name(editor_player());
     strcpy(text, str);
 
     if (text_width(text) > 100) {
@@ -2187,7 +2195,7 @@ static void ListDrvdStats()
     char t[420]; // TODO: Size is wrong.
     int y;
 
-    conditions = obj_dude->data.critter.combat.results;
+    conditions = editor_player()->data.critter.combat.results;
 
     text_font(101);
 
@@ -2205,11 +2213,11 @@ static void ListDrvdStats()
     int currHp;
     int maxHp;
     if (glblmode) {
-        maxHp = stat_level(obj_dude, STAT_MAXIMUM_HIT_POINTS);
+        maxHp = stat_level(editor_player(), STAT_MAXIMUM_HIT_POINTS);
         currHp = maxHp;
     } else {
-        maxHp = stat_level(obj_dude, STAT_MAXIMUM_HIT_POINTS);
-        currHp = critter_get_hits(obj_dude);
+        maxHp = stat_level(editor_player(), STAT_MAXIMUM_HIT_POINTS);
+        currHp = critter_get_hits(editor_player());
     }
 
     messageListItemText = getmsg(&editor_message_file, &mesg, 300);
@@ -2220,9 +2228,9 @@ static void ListDrvdStats()
     y += text_height() + 3;
 
     if (info_line == EDITOR_POISONED) {
-        color = critter_get_poison(obj_dude) != 0 ? colorTable[32747] : colorTable[15845];
+        color = critter_get_poison(editor_player()) != 0 ? colorTable[32747] : colorTable[15845];
     } else {
-        color = critter_get_poison(obj_dude) != 0 ? colorTable[992] : colorTable[1313];
+        color = critter_get_poison(editor_player()) != 0 ? colorTable[992] : colorTable[1313];
     }
 
     messageListItemText = getmsg(&editor_message_file, &mesg, 312);
@@ -2233,9 +2241,9 @@ static void ListDrvdStats()
     y += text_height() + 3;
 
     if (info_line == EDITOR_RADIATED) {
-        color = critter_get_rads(obj_dude) != 0 ? colorTable[32747] : colorTable[15845];
+        color = critter_get_rads(editor_player()) != 0 ? colorTable[32747] : colorTable[15845];
     } else {
-        color = critter_get_rads(obj_dude) != 0 ? colorTable[992] : colorTable[1313];
+        color = critter_get_rads(editor_player()) != 0 ? colorTable[992] : colorTable[1313];
     }
 
     messageListItemText = getmsg(&editor_message_file, &mesg, 313);
@@ -2322,7 +2330,7 @@ static void ListDrvdStats()
     snprintf(t, sizeof(t), "%s", messageListItemText);
     text_to_buf(win_buf + 640 * y + 194, t, 640, 640, color);
 
-    compat_itoa(stat_level(obj_dude, STAT_ARMOR_CLASS), t, 10);
+    compat_itoa(stat_level(editor_player(), STAT_ARMOR_CLASS), t, 10);
     text_to_buf(win_buf + 640 * y + 288, t, 640, 640, color);
 
     // Action Points
@@ -2338,7 +2346,7 @@ static void ListDrvdStats()
     snprintf(t, sizeof(t), "%s", messageListItemText);
     text_to_buf(win_buf + 640 * y + 194, t, 640, 640, color);
 
-    compat_itoa(stat_level(obj_dude, STAT_MAXIMUM_ACTION_POINTS), t, 10);
+    compat_itoa(stat_level(editor_player(), STAT_MAXIMUM_ACTION_POINTS), t, 10);
     text_to_buf(win_buf + 640 * y + 288, t, 640, 640, color);
 
     // Carry Weight
@@ -2354,7 +2362,7 @@ static void ListDrvdStats()
     snprintf(t, sizeof(t), "%s", messageListItemText);
     text_to_buf(win_buf + 640 * y + 194, t, 640, 640, color);
 
-    compat_itoa(stat_level(obj_dude, STAT_CARRY_WEIGHT), t, 10);
+    compat_itoa(stat_level(editor_player(), STAT_CARRY_WEIGHT), t, 10);
     text_to_buf(win_buf + 640 * y + 288, t, 640, 640, color);
 
     // Melee Damage
@@ -2370,7 +2378,7 @@ static void ListDrvdStats()
     snprintf(t, sizeof(t), "%s", messageListItemText);
     text_to_buf(win_buf + 640 * y + 194, t, 640, 640, color);
 
-    compat_itoa(stat_level(obj_dude, STAT_MELEE_DAMAGE), t, 10);
+    compat_itoa(stat_level(editor_player(), STAT_MELEE_DAMAGE), t, 10);
     text_to_buf(win_buf + 640 * y + 288, t, 640, 640, color);
 
     // Damage Resistance
@@ -2386,7 +2394,7 @@ static void ListDrvdStats()
     snprintf(t, sizeof(t), "%s", messageListItemText);
     text_to_buf(win_buf + 640 * y + 194, t, 640, 640, color);
 
-    snprintf(t, sizeof(t), "%d%%", stat_level(obj_dude, STAT_DAMAGE_RESISTANCE));
+    snprintf(t, sizeof(t), "%d%%", stat_level(editor_player(), STAT_DAMAGE_RESISTANCE));
     text_to_buf(win_buf + 640 * y + 288, t, 640, 640, color);
 
     // Poison Resistance
@@ -2402,7 +2410,7 @@ static void ListDrvdStats()
     snprintf(t, sizeof(t), "%s", messageListItemText);
     text_to_buf(win_buf + 640 * y + 194, t, 640, 640, color);
 
-    snprintf(t, sizeof(t), "%d%%", stat_level(obj_dude, STAT_POISON_RESISTANCE));
+    snprintf(t, sizeof(t), "%d%%", stat_level(editor_player(), STAT_POISON_RESISTANCE));
     text_to_buf(win_buf + 640 * y + 288, t, 640, 640, color);
 
     // Radiation Resistance
@@ -2418,7 +2426,7 @@ static void ListDrvdStats()
     snprintf(t, sizeof(t), "%s", messageListItemText);
     text_to_buf(win_buf + 640 * y + 194, t, 640, 640, color);
 
-    snprintf(t, sizeof(t), "%d%%", stat_level(obj_dude, STAT_RADIATION_RESISTANCE));
+    snprintf(t, sizeof(t), "%d%%", stat_level(editor_player(), STAT_RADIATION_RESISTANCE));
     text_to_buf(win_buf + 640 * y + 288, t, 640, 640, color);
 
     // Sequence
@@ -2434,7 +2442,7 @@ static void ListDrvdStats()
     snprintf(t, sizeof(t), "%s", messageListItemText);
     text_to_buf(win_buf + 640 * y + 194, t, 640, 640, color);
 
-    compat_itoa(stat_level(obj_dude, STAT_SEQUENCE), t, 10);
+    compat_itoa(stat_level(editor_player(), STAT_SEQUENCE), t, 10);
     text_to_buf(win_buf + 640 * y + 288, t, 640, 640, color);
 
     // Healing Rate
@@ -2450,7 +2458,7 @@ static void ListDrvdStats()
     snprintf(t, sizeof(t), "%s", messageListItemText);
     text_to_buf(win_buf + 640 * y + 194, t, 640, 640, color);
 
-    compat_itoa(stat_level(obj_dude, STAT_HEALING_RATE), t, 10);
+    compat_itoa(stat_level(editor_player(), STAT_HEALING_RATE), t, 10);
     text_to_buf(win_buf + 640 * y + 288, t, 640, 640, color);
 
     // Critical Chance
@@ -2466,7 +2474,7 @@ static void ListDrvdStats()
     snprintf(t, sizeof(t), "%s", messageListItemText);
     text_to_buf(win_buf + 640 * y + 194, t, 640, 640, color);
 
-    snprintf(t, sizeof(t), "%d%%", stat_level(obj_dude, STAT_CRITICAL_CHANCE));
+    snprintf(t, sizeof(t), "%d%%", stat_level(editor_player(), STAT_CRITICAL_CHANCE));
     text_to_buf(win_buf + 640 * y + 288, t, 640, 640, color);
 }
 
@@ -2543,7 +2551,7 @@ static void ListSkills(int a1)
         str = skill_name(i);
         text_to_buf(win_buf + 640 * y + 380, str, 640, 640, color);
 
-        value = skill_level(obj_dude, i);
+        value = skill_level(editor_player(), i);
         snprintf(valueString, sizeof(valueString), "%d%%", value);
 
         text_to_buf(win_buf + 640 * y + 573, valueString, 640, 640, color);
@@ -2880,7 +2888,7 @@ static int NameWindow()
     text_font(101);
 
     char name[64];
-    strcpy(name, critter_name(obj_dude));
+    strcpy(name, critter_name(editor_player()));
 
     if (strcmp(name, "None") == 0) {
         name[0] = '\0';
@@ -2929,7 +2937,7 @@ static void PrintName(unsigned char* buf, int pitch)
 
     text_font(101);
 
-    v4 = critter_name(obj_dude);
+    v4 = critter_name(editor_player());
 
     // TODO: Check.
     strcpy(str, v4);
@@ -2954,7 +2962,7 @@ static int AgeWindow()
     int change;
     int flags;
 
-    int savedAge = stat_level(obj_dude, STAT_AGE);
+    int savedAge = stat_level(editor_player(), STAT_AGE);
 
     windowWidth = GInfo[EDITOR_GRAPHIC_CHARWIN].width;
     windowHeight = GInfo[EDITOR_GRAPHIC_CHARWIN].height;
@@ -2995,7 +3003,7 @@ static int AgeWindow()
     messageListItemText = getmsg(&editor_message_file, &mesg, 100);
     text_to_buf(windowBuf + windowWidth * 44 + 50, messageListItemText, windowWidth, windowWidth, colorTable[18979]);
 
-    age = stat_level(obj_dude, STAT_AGE);
+    age = stat_level(editor_player(), STAT_AGE);
     PrintBigNum(55, 10, 0, age, 0, win);
 
     doneBtn = win_register_button(win,
@@ -3074,9 +3082,9 @@ static int AgeWindow()
         } else if (keyCode == 502) {
             change = -1;
         } else if (keyCode == KEY_PLUS || keyCode == KEY_UPPERCASE_N || keyCode == KEY_ARROW_RIGHT) {
-            previousAge = stat_level(obj_dude, STAT_AGE);
-            flags = inc_stat(obj_dude, STAT_AGE) >= 0;
-            age = stat_level(obj_dude, STAT_AGE);
+            previousAge = stat_level(editor_player(), STAT_AGE);
+            flags = inc_stat(editor_player(), STAT_AGE) >= 0;
+            age = stat_level(editor_player(), STAT_AGE);
             PrintBigNum(55, 10, flags, age, previousAge, win);
 
             if (flags == ANIMATE) {
@@ -3087,9 +3095,9 @@ static int AgeWindow()
                 win_draw(win);
             }
         } else if (keyCode == KEY_MINUS || keyCode == KEY_UPPERCASE_J || keyCode == KEY_ARROW_LEFT) {
-            previousAge = stat_level(obj_dude, STAT_AGE);
-            flags = dec_stat(obj_dude, STAT_AGE) >= 0;
-            age = stat_level(obj_dude, STAT_AGE);
+            previousAge = stat_level(editor_player(), STAT_AGE);
+            flags = dec_stat(editor_player(), STAT_AGE) >= 0;
+            age = stat_level(editor_player(), STAT_AGE);
 
             PrintBigNum(55, 10, flags, age, previousAge, win);
 
@@ -3125,19 +3133,19 @@ static int AgeWindow()
                     }
 
                     flags = ANIMATE;
-                    previousAge = stat_level(obj_dude, STAT_AGE);
+                    previousAge = stat_level(editor_player(), STAT_AGE);
 
                     if (change == 1) {
-                        if (inc_stat(obj_dude, STAT_AGE) < 0) {
+                        if (inc_stat(editor_player(), STAT_AGE) < 0) {
                             flags = 0;
                         }
                     } else {
-                        if (dec_stat(obj_dude, STAT_AGE) < 0) {
+                        if (dec_stat(editor_player(), STAT_AGE) < 0) {
                             flags = 0;
                         }
                     }
 
-                    age = stat_level(obj_dude, STAT_AGE);
+                    age = stat_level(editor_player(), STAT_AGE);
                     PrintBigNum(55, 10, flags, age, previousAge, win);
                     if (flags == ANIMATE) {
                         PrintAgeBig();
@@ -3175,7 +3183,7 @@ static int AgeWindow()
         }
     }
 
-    stat_set_base(obj_dude, STAT_AGE, savedAge);
+    stat_set_base(editor_player(), STAT_AGE, savedAge);
     PrintAgeBig();
     PrintBasicStat(RENDER_ALL_STATS, 0, 0);
     ListDrvdStats();
@@ -3273,7 +3281,7 @@ static void SexWindow()
         win_register_button_sound_func(doneBtn, gsound_red_butt_press, NULL);
     }
 
-    int savedGender = stat_level(obj_dude, STAT_GENDER);
+    int savedGender = stat_level(editor_player(), STAT_GENDER);
     win_set_button_rest_state(btns[savedGender], 1, 0);
 
     while (true) {
@@ -3300,7 +3308,7 @@ static void SexWindow()
         case 501:
         case 502:
             // TODO: Original code is slightly different.
-            stat_set_base(obj_dude, STAT_GENDER, eventCode - 501);
+            stat_set_base(editor_player(), STAT_GENDER, eventCode - 501);
             PrintBasicStat(RENDER_ALL_STATS, 0, 0);
             ListDrvdStats();
             break;
@@ -3353,8 +3361,8 @@ static void StatButton(int eventCode)
             }
 
             if (eventCode >= 510) {
-                int previousValue = stat_level(obj_dude, decrementingStat);
-                if (dec_stat(obj_dude, decrementingStat) == 0) {
+                int previousValue = stat_level(editor_player(), decrementingStat);
+                if (dec_stat(editor_player(), decrementingStat) == 0) {
                     character_points++;
                 } else {
                     cont = false;
@@ -3362,14 +3370,14 @@ static void StatButton(int eventCode)
 
                 PrintBasicStat(decrementingStat, cont ? ANIMATE : 0, previousValue);
                 PrintBigNum(126, 282, cont ? ANIMATE : 0, character_points, savedRemainingCharacterPoints, edit_win);
-                stat_recalc_derived(obj_dude);
+                stat_recalc_derived(editor_player());
                 ListDrvdStats();
                 ListSkills(0);
                 info_line = decrementingStat;
             } else {
-                int previousValue = stat_get_base(obj_dude, incrementingStat);
-                previousValue += stat_get_bonus(obj_dude, incrementingStat);
-                if (character_points > 0 && previousValue < 10 && inc_stat(obj_dude, incrementingStat) == 0) {
+                int previousValue = stat_get_base(editor_player(), incrementingStat);
+                previousValue += stat_get_bonus(editor_player(), incrementingStat);
+                if (character_points > 0 && previousValue < 10 && inc_stat(editor_player(), incrementingStat) == 0) {
                     character_points--;
                 } else {
                     cont = false;
@@ -3377,7 +3385,7 @@ static void StatButton(int eventCode)
 
                 PrintBasicStat(incrementingStat, cont ? ANIMATE : 0, previousValue);
                 PrintBigNum(126, 282, cont ? ANIMATE : 0, character_points, savedRemainingCharacterPoints, edit_win);
-                stat_recalc_derived(obj_dude);
+                stat_recalc_derived(editor_player());
                 ListDrvdStats();
                 ListSkills(0);
                 info_line = incrementingStat;
@@ -3534,7 +3542,7 @@ static int OptionWindow()
 
                     // NOTE: Uninline.
                     trait_count = get_trait_count();
-                    stat_recalc_derived(obj_dude);
+                    stat_recalc_derived(editor_player());
                     ResetScreen();
                 }
             } else if (keyCode == 502 || keyCode == KEY_UPPERCASE_P || keyCode == KEY_LOWERCASE_P) {
@@ -3650,15 +3658,15 @@ static int OptionWindow()
                             // NOTE: Uninline.
                             trait_count = get_trait_count();
 
-                            stat_recalc_derived(obj_dude);
+                            stat_recalc_derived(editor_player());
 
-                            critter_adjust_hits(obj_dude, 1000);
+                            critter_adjust_hits(editor_player(), 1000);
 
                             rc = 1;
                         } else {
                             RestorePlayer();
                             character_points = oldRemainingCharacterPoints;
-                            critter_adjust_hits(obj_dude, 1000);
+                            critter_adjust_hits(editor_player(), 1000);
                             gsound_play_sfx_file("iisxxxx1");
 
                             strcpy(string4, getmsg(&editor_message_file, &mesg, 612));
@@ -3916,7 +3924,7 @@ static int Save_as_ASCII(const char* fileName)
     snprintf(title1, sizeof(title1),
         "%s %s",
         getmsg(&editor_message_file, &mesg, 642),
-        critter_name(obj_dude));
+        critter_name(editor_player()));
 
     int paddingLength = 27 - strlen(title1);
     if (paddingLength > 0) {
@@ -3932,14 +3940,14 @@ static int Save_as_ASCII(const char* fileName)
         "%s%s %d",
         title1,
         getmsg(&editor_message_file, &mesg, 643),
-        stat_level(obj_dude, STAT_AGE));
+        stat_level(editor_player(), STAT_AGE));
 
     // Gender
     snprintf(title3, sizeof(title3),
         "%s%s %s",
         title2,
         getmsg(&editor_message_file, &mesg, 644),
-        getmsg(&editor_message_file, &mesg, 645 + stat_level(obj_dude, STAT_GENDER)));
+        getmsg(&editor_message_file, &mesg, 645 + stat_level(editor_player(), STAT_GENDER)));
 
     db_fputs(title3, stream);
     db_fputs("\n", stream);
@@ -3978,12 +3986,12 @@ static int Save_as_ASCII(const char* fileName)
     snprintf(title1, sizeof(title1),
         "%s %.2d %s %.3d/%.3d %s %.2d",
         getmsg(&editor_message_file, &mesg, 624),
-        stat_level(obj_dude, STAT_STRENGTH),
+        stat_level(editor_player(), STAT_STRENGTH),
         getmsg(&editor_message_file, &mesg, 625),
-        critter_get_hits(obj_dude),
-        stat_level(obj_dude, STAT_MAXIMUM_HIT_POINTS),
+        critter_get_hits(editor_player()),
+        stat_level(editor_player(), STAT_MAXIMUM_HIT_POINTS),
         getmsg(&editor_message_file, &mesg, 626),
-        stat_level(obj_dude, STAT_STRENGTH));
+        stat_level(editor_player(), STAT_STRENGTH));
     db_fputs(title1, stream);
     db_fputs("\n", stream);
 
@@ -3991,11 +3999,11 @@ static int Save_as_ASCII(const char* fileName)
     snprintf(title1, sizeof(title1),
         "%s %.2d %s %.3d %s %.2d",
         getmsg(&editor_message_file, &mesg, 627),
-        stat_level(obj_dude, STAT_PERCEPTION),
+        stat_level(editor_player(), STAT_PERCEPTION),
         getmsg(&editor_message_file, &mesg, 628),
-        stat_level(obj_dude, STAT_ARMOR_CLASS),
+        stat_level(editor_player(), STAT_ARMOR_CLASS),
         getmsg(&editor_message_file, &mesg, 629),
-        stat_level(obj_dude, STAT_HEALING_RATE));
+        stat_level(editor_player(), STAT_HEALING_RATE));
     db_fputs(title1, stream);
     db_fputs("\n", stream);
 
@@ -4003,11 +4011,11 @@ static int Save_as_ASCII(const char* fileName)
     snprintf(title1, sizeof(title1),
         "%s %.2d %s %.2d %s %.3d%%",
         getmsg(&editor_message_file, &mesg, 630),
-        stat_level(obj_dude, STAT_ENDURANCE),
+        stat_level(editor_player(), STAT_ENDURANCE),
         getmsg(&editor_message_file, &mesg, 631),
-        stat_level(obj_dude, STAT_MAXIMUM_ACTION_POINTS),
+        stat_level(editor_player(), STAT_MAXIMUM_ACTION_POINTS),
         getmsg(&editor_message_file, &mesg, 632),
-        stat_level(obj_dude, STAT_CRITICAL_CHANCE));
+        stat_level(editor_player(), STAT_CRITICAL_CHANCE));
     db_fputs(title1, stream);
     db_fputs("\n", stream);
 
@@ -4015,11 +4023,11 @@ static int Save_as_ASCII(const char* fileName)
     snprintf(title1, sizeof(title1),
         "%s %.2d %s %.2d %s %.3d lbs.",
         getmsg(&editor_message_file, &mesg, 633),
-        stat_level(obj_dude, STAT_CHARISMA),
+        stat_level(editor_player(), STAT_CHARISMA),
         getmsg(&editor_message_file, &mesg, 634),
-        stat_level(obj_dude, STAT_MELEE_DAMAGE),
+        stat_level(editor_player(), STAT_MELEE_DAMAGE),
         getmsg(&editor_message_file, &mesg, 635),
-        stat_level(obj_dude, STAT_CARRY_WEIGHT));
+        stat_level(editor_player(), STAT_CARRY_WEIGHT));
     db_fputs(title1, stream);
     db_fputs("\n", stream);
 
@@ -4027,9 +4035,9 @@ static int Save_as_ASCII(const char* fileName)
     snprintf(title1, sizeof(title1),
         "%s %.2d %s %.3d%%",
         getmsg(&editor_message_file, &mesg, 636),
-        stat_level(obj_dude, STAT_INTELLIGENCE),
+        stat_level(editor_player(), STAT_INTELLIGENCE),
         getmsg(&editor_message_file, &mesg, 637),
-        stat_level(obj_dude, STAT_DAMAGE_RESISTANCE));
+        stat_level(editor_player(), STAT_DAMAGE_RESISTANCE));
     db_fputs(title1, stream);
     db_fputs("\n", stream);
 
@@ -4037,9 +4045,9 @@ static int Save_as_ASCII(const char* fileName)
     snprintf(title1, sizeof(title1),
         "%s %.2d %s %.3d%%",
         getmsg(&editor_message_file, &mesg, 638),
-        stat_level(obj_dude, STAT_AGILITY),
+        stat_level(editor_player(), STAT_AGILITY),
         getmsg(&editor_message_file, &mesg, 639),
-        stat_level(obj_dude, STAT_RADIATION_RESISTANCE));
+        stat_level(editor_player(), STAT_RADIATION_RESISTANCE));
     db_fputs(title1, stream);
     db_fputs("\n", stream);
 
@@ -4047,9 +4055,9 @@ static int Save_as_ASCII(const char* fileName)
     snprintf(title1, sizeof(title1),
         "%s %.2d %s %.3d%%",
         getmsg(&editor_message_file, &mesg, 640),
-        stat_level(obj_dude, STAT_LUCK),
+        stat_level(editor_player(), STAT_LUCK),
         getmsg(&editor_message_file, &mesg, 641),
-        stat_level(obj_dude, STAT_POISON_RESISTANCE));
+        stat_level(editor_player(), STAT_POISON_RESISTANCE));
     db_fputs(title1, stream);
     db_fputs("\n", stream);
 
@@ -4224,7 +4232,7 @@ static int Save_as_ASCII(const char* fileName)
                 snprintf(title3, sizeof(title3),
                     "  %s %.3d%%        %s %.3d\n",
                     title1,
-                    skill_level(obj_dude, skill),
+                    skill_level(editor_player(), skill),
                     title2,
                     killsCount);
                 hasKillType = true;
@@ -4236,7 +4244,7 @@ static int Save_as_ASCII(const char* fileName)
             snprintf(title3, sizeof(title3),
                 "  %s %.3d%%\n",
                 title1,
-                skill_level(obj_dude, skill));
+                skill_level(editor_player(), skill));
         }
     }
 
@@ -4247,7 +4255,7 @@ static int Save_as_ASCII(const char* fileName)
     snprintf(title1, sizeof(title1), "%s\n", getmsg(&editor_message_file, &mesg, 654));
     db_fputs(title1, stream);
 
-    Inventory* inventory = &(obj_dude->data.inventory);
+    Inventory* inventory = &(editor_player()->data.inventory);
     for (int index = 0; index < inventory->length; index += 3) {
         title1[0] = '\0';
 
@@ -4284,7 +4292,7 @@ static int Save_as_ASCII(const char* fileName)
     snprintf(title1, sizeof(title1),
         "%s %d lbs.",
         getmsg(&editor_message_file, &mesg, 655),
-        item_total_weight(obj_dude));
+        item_total_weight(editor_player()));
     db_fputs(title1, stream);
 
     db_fputs("\n", stream);
@@ -4374,15 +4382,15 @@ static int CheckValidPlayer()
 {
     int stat;
 
-    stat_recalc_derived(obj_dude);
+    stat_recalc_derived(editor_player());
     stat_pc_set_defaults();
 
     for (stat = 0; stat < SAVEABLE_STAT_COUNT; stat++) {
-        stat_set_bonus(obj_dude, stat, 0);
+        stat_set_bonus(editor_player(), stat, 0);
     }
 
     perk_reset();
-    stat_recalc_derived(obj_dude);
+    stat_recalc_derived(editor_player());
 
     return 1;
 }
@@ -4391,12 +4399,18 @@ static int CheckValidPlayer()
 static void SavePlayer()
 {
     Proto* proto;
-    proto_ptr(obj_dude->pid, &proto);
-    critter_copy(&dude_data, &(proto->critter.data));
+    multiplayer::PlayerCharacterState* localPlayer = multiplayer::localPlayerState();
+    hasLocalPlayerBuildBack = localPlayer != nullptr;
+    if (localPlayer != nullptr) {
+        localPlayerBuildBack = localPlayer->build;
+    } else {
+        proto_ptr(editor_player()->pid, &proto);
+        critter_copy(&dude_data, &(proto->critter.data));
+    }
 
-    hp_back = critter_get_hits(obj_dude);
+    hp_back = critter_get_hits(editor_player());
 
-    strncpy(name_save, critter_name(obj_dude), 32);
+    strncpy(name_save, critter_name(editor_player()), 32);
 
     last_level_back = last_level;
 
@@ -4413,7 +4427,7 @@ static void SavePlayer()
 
     if (!glblmode) {
         for (int skill = 0; skill < SKILL_COUNT; skill++) {
-            skillsav[skill] = skill_level(obj_dude, skill);
+            skillsav[skill] = skill_level(editor_player(), skill);
         }
     }
 }
@@ -4426,8 +4440,13 @@ static void RestorePlayer()
 
     pop_perks();
 
-    proto_ptr(obj_dude->pid, &proto);
-    critter_copy(&(proto->critter.data), &dude_data);
+    multiplayer::PlayerCharacterState* localPlayer = multiplayer::localPlayerState();
+    if (hasLocalPlayerBuildBack && localPlayer != nullptr) {
+        localPlayer->build = localPlayerBuildBack;
+    } else {
+        proto_ptr(editor_player()->pid, &proto);
+        critter_copy(&(proto->critter.data), &dude_data);
+    }
 
     critter_pc_set_name(name_save);
 
@@ -4450,10 +4469,10 @@ static void RestorePlayer()
     // NOTE: Uninline.
     trait_count = get_trait_count();
 
-    stat_recalc_derived(obj_dude);
+    stat_recalc_derived(editor_player());
 
-    cur_hp = critter_get_hits(obj_dude);
-    critter_adjust_hits(obj_dude, hp_back - cur_hp);
+    cur_hp = critter_get_hits(editor_player());
+    critter_adjust_hits(editor_player(), hp_back - cur_hp);
 }
 
 // 0x4349A8
@@ -4813,7 +4832,7 @@ static void SliderBtn(int keyCode)
             rc = 1;
             if (keyCode == 521) {
                 if (stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS) > 0) {
-                    if (skill_inc_point(obj_dude, skill_cursor) == -3) {
+                    if (skill_inc_point(editor_player(), skill_cursor) == -3) {
                         gsound_play_sfx_file("iisxxxx1");
 
                         snprintf(title, sizeof(title), "%s:", skill_name(skill_cursor));
@@ -4833,10 +4852,10 @@ static void SliderBtn(int keyCode)
                     rc = -1;
                 }
             } else if (keyCode == 523) {
-                if (skill_level(obj_dude, skill_cursor) <= skillsav[skill_cursor]) {
+                if (skill_level(editor_player(), skill_cursor) <= skillsav[skill_cursor]) {
                     rc = 0;
                 } else {
-                    if (skill_dec_point(obj_dude, skill_cursor) == -2) {
+                    if (skill_dec_point(editor_player(), skill_cursor) == -2) {
                         rc = 0;
                     }
                 }
@@ -5089,7 +5108,7 @@ static void TraitSelect(int trait)
 
     ListTraits();
     ListSkills(0);
-    stat_recalc_derived(obj_dude);
+    stat_recalc_derived(editor_player());
     PrintBigNum(126, 282, 0, character_points, 0, edit_win);
     PrintBasicStat(RENDER_ALL_STATS, false, 0);
     ListDrvdStats();
@@ -5203,7 +5222,7 @@ static int UpdateLevel()
         for (int nextLevel = last_level + 1; nextLevel <= level; nextLevel++) {
             int sp = stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS);
             sp += 5;
-            sp += stat_get_base(obj_dude, STAT_INTELLIGENCE) * 2;
+            sp += stat_get_base(editor_player(), STAT_INTELLIGENCE) * 2;
             sp += perk_level(PERK_EDUCATED) * 2;
             if (trait_level(TRAIT_GIFTED)) {
                 sp -= 5;
@@ -5466,9 +5485,9 @@ static int perks_dialog()
                 perk_sub(PERK_MUTATE);
             }
         } else if (perk_level(PERK_LIFEGIVER) != perk_back[PERK_LIFEGIVER]) {
-            int maxHp = stat_get_bonus(obj_dude, STAT_MAXIMUM_HIT_POINTS);
-            stat_set_bonus(obj_dude, STAT_MAXIMUM_HIT_POINTS, maxHp + 4);
-            critter_adjust_hits(obj_dude, 4);
+            int maxHp = stat_get_bonus(editor_player(), STAT_MAXIMUM_HIT_POINTS);
+            stat_set_bonus(editor_player(), STAT_MAXIMUM_HIT_POINTS, maxHp + 4);
+            critter_adjust_hits(editor_player(), 4);
         } else if (perk_level(PERK_EDUCATED) != perk_back[PERK_EDUCATED]) {
             int sp = stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS);
             stat_pc_set(PC_STAT_UNSPENT_SKILL_POINTS, sp + 2);
@@ -6199,14 +6218,19 @@ static int PerkCount()
 static int is_supper_bonus()
 {
     for (int stat = 0; stat < 7; stat++) {
-        int v1 = stat_get_base(obj_dude, stat);
-        int v2 = stat_get_bonus(obj_dude, stat);
+        int v1 = stat_get_base(editor_player(), stat);
+        int v2 = stat_get_bonus(editor_player(), stat);
         if (v1 + v2 > 10) {
             return 1;
         }
     }
 
     return 0;
+}
+
+static Object* editor_player()
+{
+    return multiplayer::localPlayerActorOrStoryActor();
 }
 
 } // namespace fallout

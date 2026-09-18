@@ -97,9 +97,14 @@ int trait_init()
 void trait_reset()
 {
     int index;
+    multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuild();
 
     for (index = 0; index < PC_TRAIT_MAX; index++) {
-        pc_trait[index] = -1;
+        if (build != nullptr) {
+            build->traits[index] = -1;
+        } else {
+            pc_trait[index] = -1;
+        }
     }
 }
 
