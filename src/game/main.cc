@@ -109,6 +109,14 @@ int gnw_main(int argc, char** argv)
         return 1;
     }
 
+    if (multiplayer::networkRuntimeSmokeTestEnabled()) {
+        bool passed = multiplayer::networkRuntimeRunSmokeTest();
+        multiplayer::networkRuntimeStop();
+        main_exit_system();
+        autorun_mutex_destroy();
+        return passed ? 0 : 1;
+    }
+
     gmovie_play(MOVIE_IPLOGO, GAME_MOVIE_FADE_IN);
     gmovie_play(MOVIE_INTRO, 0);
 

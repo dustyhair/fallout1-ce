@@ -9,6 +9,8 @@ namespace multiplayer {
 
 bool networkRuntimeConfigure(int argc, char** argv);
 bool networkRuntimeStart();
+bool networkRuntimeSmokeTestEnabled();
+bool networkRuntimeRunSmokeTest();
 bool networkRuntimeSubmitLocalCharacter(Object* actor);
 bool networkRuntimeWaitForLobby();
 bool networkRuntimeLobbyReady();

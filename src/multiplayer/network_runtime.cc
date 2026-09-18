@@ -3,11 +3,13 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstring>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <optional>
 #include <string>
+#include <thread>
 
 #include "game/critter.h"
 #include "game/game.h"
@@ -37,6 +39,7 @@ std::optional<CharacterCreationSheet> pendingLocalSheet;
 std::string runtimeStatus;
 bool backgroundProcessRegistered = false;
 bool lobbyStarted = false;
+bool smokeTestEnabled = false;
 
 constexpr std::uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
 constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
@@ -251,10 +254,76 @@ bool networkRuntimeConfigure(int argc, char** argv)
         return false;
     }
     launchOptions = result.options;
+    smokeTestEnabled = false;
+    for (int index = 1; index < argc; index++) {
+        if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-test") == 0) {
+            smokeTestEnabled = true;
+        }
+    }
+    if (smokeTestEnabled && launchOptions.mode == NetworkLaunchMode::Disabled) {
+        std::fprintf(stderr, "--multiplayer-smoke-test requires --multiplayer-host or --multiplayer-join.\n");
+        return false;
+    }
     pendingLocalSheet.reset();
     runtimeStatus.clear();
     lobbyStarted = false;
     return true;
+}
+
+bool networkRuntimeSmokeTestEnabled()
+{
+    return smokeTestEnabled;
+}
+
+bool networkRuntimeRunSmokeTest()
+{
+    if (!smokeTestEnabled || launchOptions.mode == NetworkLaunchMode::Disabled) {
+        return false;
+    }
+
+    CharacterCreationSheet sheet;
+    sheet.playerId = launchOptions.mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
+    sheet.name = launchOptions.mode == NetworkLaunchMode::Host ? "Smoke Host" : "Smoke Guest";
+    sheet.primaryStats = { 5, 5, 5, 5, 5, 5, 10 };
+    sheet.taggedSkills = { SKILL_SMALL_GUNS, SKILL_FIRST_AID, SKILL_SPEECH };
+
+    bool submitted = false;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (std::chrono::steady_clock::now() < deadline) {
+        networkRuntimeBackgroundProcess();
+        if (lobbyStarted && !submitted && lobby.state() == NetworkLobbyState::Waiting) {
+            pendingLocalSheet = sheet;
+            CharacterLobbyError error = lobby.submitLocalSheet(sheet);
+            if (error != CharacterLobbyError::None) {
+                setStatus(std::string("MULTIPLAYER SMOKE TEST FAILED: ") + characterLobbyErrorMessage(error));
+                break;
+            }
+            submitted = true;
+            reportLobbyStatus();
+        }
+
+        if (lobbyStarted && lobby.state() == NetworkLobbyState::Ready) {
+            const CharacterCreationSheet* peer = lobby.peerSheet();
+            std::fprintf(stdout,
+                "MULTIPLAYER_SMOKE_TEST_PASS role=%s session=%llu local=%s peer=%s\n",
+                launchOptions.mode == NetworkLaunchMode::Host ? "host" : "guest",
+                static_cast<unsigned long long>(bootstrap.sessionId().value),
+                sheet.name.c_str(),
+                peer != nullptr ? peer->name.c_str() : "missing");
+            std::fflush(stdout);
+            return peer != nullptr;
+        }
+        if (bootstrap.state() == NetworkBootstrapState::Rejected
+            || bootstrap.state() == NetworkBootstrapState::Failed
+            || (lobbyStarted && (lobby.state() == NetworkLobbyState::Rejected || lobby.state() == NetworkLobbyState::Failed))) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    std::fprintf(stdout, "MULTIPLAYER_SMOKE_TEST_FAIL status=%s\n", runtimeStatus.c_str());
+    std::fflush(stdout);
+    return false;
 }
 
 bool networkRuntimeStart()
