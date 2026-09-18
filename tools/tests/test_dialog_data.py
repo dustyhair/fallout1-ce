@@ -1,12 +1,17 @@
+from pathlib import Path
+import tempfile
 import unittest
 
 from dialog_data import (
+    ScriptEntry,
     _call_arguments,
+    _dialog_call_references,
     _floating_roles,
     _player_name_roles,
     _player_name_text,
     _split_arguments,
     _static_message_ids,
+    load_roles,
 )
 
 
@@ -23,6 +28,10 @@ class DialogDataTest(unittest.TestCase):
         self.assertEqual(_static_message_ids("105"), {105})
         self.assertEqual(_static_message_ids("random(4, 2)"), {2, 3, 4})
         self.assertEqual(_static_message_ids("200 + random(0, 2)"), {200, 201, 202})
+        self.assertEqual(
+            _static_message_ids("110 + (get_critter_stat(dude_obj, 34) == 1)"),
+            {110, 111},
+        )
         self.assertIsNone(_static_message_ids("local_var(3)"))
 
     def test_self_floating_lines_use_calling_script_voice(self):
@@ -65,6 +74,32 @@ class DialogDataTest(unittest.TestCase):
             {603: {101, 102, 103}},
         )
         self.assertEqual({entry.message_id for entry in references}, {101, 102, 103})
+
+    def test_dialog_call_resolves_local_list_and_assigned_message(self):
+        references = _dialog_call_references(
+            "reply := 110 + (gender == 1);",
+            623,
+            "0",
+            "reply",
+            {623: {110, 111, 112}},
+        )
+        self.assertEqual(set(references), {(623, 110), (623, 111)})
+
+    def test_roles_ignore_decompiled_files_not_in_scripts_list(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ssl_dir = Path(temporary)
+            (ssl_dir / "MICHAEL.ssl").write_text("gsay_reply(320, 100);", encoding="cp1252")
+            (ssl_dir / "MICHAE~1.ssl").write_text("gsay_reply(320, 101);", encoding="cp1252")
+            references = load_roles(
+                ssl_dir,
+                {320: ScriptEntry(320, "MICHAEL", "doctor")},
+                {320: {100, 101}},
+                {},
+            )
+        self.assertEqual(
+            {(reference.message_list_id, reference.message_id) for reference in references},
+            {(320, 100)},
+        )
 
     def test_player_name_expression_uses_vault_dweller(self):
         text = _player_name_text(

@@ -303,23 +303,70 @@ def _static_message_ids(expression: str) -> set[int] | None:
         offset, first, last = (int(value) for value in offset_random_match.groups())
         return set(range(offset + min(first, last), offset + max(first, last) + 1))
 
+    boolean_offset_match = re.fullmatch(r"(\d+)\s*\+\s*\((.+)\)", expression, re.IGNORECASE)
+    if boolean_offset_match and re.search(r"==|!=|<=|>=|<|>", boolean_offset_match.group(2)):
+        offset = int(boolean_offset_match.group(1))
+        return {offset, offset + 1}
+
     return None
 
 
 def _message_references(
     expression: str,
     available_messages: dict[int, set[int]],
+    default_message_list_id: int = 0,
 ) -> list[tuple[int, int]]:
     references = []
     for message_arguments in _call_arguments(expression, "message_str"):
         fields = _split_arguments(message_arguments)
         if len(fields) < 2 or not re.fullmatch(r"\d+", fields[0]):
             continue
-        message_list_id = int(fields[0])
+        message_list_id = int(fields[0]) or default_message_list_id
         message_ids = _static_message_ids(fields[1])
         if message_ids is None:
             message_ids = available_messages.get(message_list_id, set())
         references.extend((message_list_id, message_id) for message_id in message_ids)
+    return references
+
+
+def _dialog_call_references(
+    source: str,
+    script_list_id: int,
+    message_list_expression: str,
+    message_expression: str,
+    available_messages: dict[int, set[int]],
+) -> list[tuple[int, int]]:
+    references = _message_references(
+        message_expression,
+        available_messages,
+        script_list_id,
+    )
+    if references:
+        return references
+
+    if not re.fullmatch(r"\d+", message_list_expression.strip()):
+        return []
+    message_list_id = int(message_list_expression) or script_list_id
+
+    message_ids = _static_message_ids(message_expression)
+    if message_ids is None and re.fullmatch(r"[A-Za-z_]\w*", message_expression.strip()):
+        message_ids = set()
+        variable = re.escape(message_expression.strip())
+        for assignment in re.findall(rf"\b{variable}\s*:=\s*([^;]+);", source, re.IGNORECASE):
+            assigned_ids = _static_message_ids(assignment)
+            if assigned_ids is not None:
+                message_ids.update(assigned_ids)
+            references.extend(
+                _message_references(assignment, available_messages, script_list_id)
+            )
+
+    if message_ids is not None:
+        valid_ids = available_messages.get(message_list_id, set())
+        references.extend(
+            (message_list_id, message_id)
+            for message_id in message_ids
+            if message_id in valid_ids
+        )
     return references
 
 
@@ -336,11 +383,17 @@ def _floating_roles(
             continue
         owner = float_arguments[0].strip().lower()
         role = "player" if owner == "dude_obj" or (owner == "self_obj" and player_script) else "npc"
-        message_references = _message_references(float_arguments[1], available_messages)
+        message_references = _message_references(
+            float_arguments[1],
+            available_messages,
+            script_list_id,
+        )
         if not message_references and re.fullmatch(r"[A-Za-z_]\w*", float_arguments[1]):
             variable = re.escape(float_arguments[1])
             for assignment in re.findall(rf"\b{variable}\s*:=\s*([^;]+);", source, re.IGNORECASE):
-                message_references.extend(_message_references(assignment, available_messages))
+                message_references.extend(
+                    _message_references(assignment, available_messages, script_list_id)
+                )
 
         for message_list_id, message_id in message_references:
             if role == "player" or owner == "self_obj":
@@ -368,38 +421,20 @@ def load_roles(
     message_texts: dict[tuple[int, int], str],
 ) -> list[RoleReference]:
     roles: dict[tuple[int, int], set[str]] = {}
-    patterns = {
-        "npc": (
-            r"gsay_(?:reply|message)\(\s*(\d+)\s*,\s*(\d+)",
-            r"gdialog_reply\([^,]*,\s*(\d+)\s*,\s*(\d+)",
-            r"gsay_(?:reply|message)\(\s*\d+\s*,\s*message_str\(\s*(\d+)\s*,\s*(\d+)\s*\)\s*(?:,|\))",
-        ),
-        "player": (
-            r"giq_option\([^,]*,\s*(\d+)\s*,\s*(\d+)",
-            r"gdialog_option\(\s*(\d+)\s*,\s*(\d+)",
-            r"giq_option\([^,]*,\s*\d+\s*,\s*message_str\(\s*(\d+)\s*,\s*(\d+)\s*\)\s*,",
-        ),
-    }
+    calls = (
+        ("npc", "gsay_reply", 0, 1),
+        ("npc", "gsay_message", 0, 1),
+        ("npc", "gdialog_reply", 1, 2),
+        ("npc", "sayReply", 0, 1),
+        ("player", "giq_option", 1, 2),
+        ("player", "gsay_option", 0, 1),
+        ("player", "gdialog_option", 0, 1),
+        ("player", "sayOption", None, 0),
+    )
     floating = []
     scripts_by_name = {entry.name: entry for entry in scripts.values()}
     for path in ssl_dir.glob("*.ssl"):
         source = path.read_text(encoding="cp1252", errors="replace")
-        for role, expressions in patterns.items():
-            for expression in expressions:
-                for list_id, message_id in re.findall(expression, source, re.IGNORECASE):
-                    key = (int(list_id), int(message_id))
-                    if key[0] > 0:
-                        roles.setdefault(key, set()).add(role)
-
-        for role, expression in (
-            ("npc", r"gsay_(?:reply|message)\(\s*(\d+)\s*,\s*random\(\s*(\d+)\s*,\s*(\d+)\s*\)"),
-            ("npc", r"gsay_(?:reply|message)\(\s*\d+\s*,\s*message_str\(\s*(\d+)\s*,\s*random\(\s*(\d+)\s*,\s*(\d+)\s*\)"),
-        ):
-            for list_id, first, last in re.findall(expression, source, re.IGNORECASE):
-                if int(list_id) > 0:
-                    for message_id in range(int(first), int(last) + 1):
-                        roles.setdefault((int(list_id), message_id), set()).add(role)
-
         script = scripts_by_name.get(path.stem.upper())
         if script is not None:
             if not source.strip():
@@ -417,6 +452,24 @@ def load_roles(
                         )
                     )
                 continue
+            for role, function, list_index, message_index in calls:
+                for arguments in _call_arguments(source, function):
+                    fields = _split_arguments(arguments)
+                    if message_index >= len(fields):
+                        continue
+                    message_list_expression = (
+                        str(script.list_id)
+                        if list_index is None
+                        else fields[list_index]
+                    )
+                    for message_list_id, message_id in _dialog_call_references(
+                        source,
+                        script.list_id,
+                        message_list_expression,
+                        fields[message_index],
+                        available_messages,
+                    ):
+                        roles.setdefault((message_list_id, message_id), set()).add(role)
             floating.extend(_player_name_roles(source, script.list_id, message_texts))
             floating.extend(
                 _floating_roles(

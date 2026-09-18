@@ -51,19 +51,73 @@ cmake --build build --parallel
 
 The resulting executable is `build/fallout-ce`. Run it from a directory containing legally obtained Fallout 1 assets. No game data is included in this repository.
 
-## Pre-rendering the cache
+## Generating the dialogue cache
 
-The tooling uses the official Chatterbox Turbo ONNX model with its Q4 CPU graphs. It decompiles the installed game scripts to separate NPC replies, player choices, and floating dialogue. Original voiced conversation lines are skipped. Floating lines are rendered because the game does not play their recorded-audio metadata. Large roles receive distinct synthetic voice prompts, while incidental roles share a voice suited to their script description. Ambiguous NPC scripts get male and female clips; the engine selects the matching one.
+The repository does not distribute Fallout data, generated dialogue, or model weights. The generator works from your own Fallout 1 installation and writes the finished cache beside it. The installation directory must contain `MASTER.DAT`; files under `DATA` are treated as patches when present.
 
-The process has three resumable stages:
+On Debian or Ubuntu, install the small set of system prerequisites:
 
-1. Extract `MASTER.DAT` and decompile the files in `SCRIPTS` with `int2ssl -1`.
-2. Run `tools/prepare_voice_cast.py` in a Python environment containing `kokoro-onnx`. This creates synthetic reference voices and `cast.json`.
-3. Run `tools/precompute_tts.py` in a Python environment containing ONNX Runtime, Transformers, librosa, and soundfile. Existing `.opus` files are skipped, so restarting the command resumes the render.
+```console
+sudo apt install build-essential cmake git ffmpeg python3 python3-venv libboost-program-options-dev zlib1g-dev
+```
 
-Run either Python tool with `--help` for the required paths. The renderer's `--dry-run` option audits the number of referenced replies, choices, and pending gender variants without loading the model. Its JSON Lines manifest records the source script, role, gender, text, duration, and destination for every completed clip.
+Then run one command from this repository:
 
-For the installation used during development, `tools/render_installed_game.sh` runs the cast and render stages together. It is safe to rerun. When launched as the `fallout-tts-render.service` user unit, inspect it with `systemctl --user status fallout-tts-render` and follow progress in `.tts-build/full-render.log`. Stop it with `systemctl --user stop fallout-tts-render`.
+```console
+./tools/generate_tts_cache.sh --backend auto "/path/to/Fallout"
+```
+
+`auto` selects CUDA when a working NVIDIA driver is visible and otherwise selects CPU. The first run creates isolated voice-cast and rendering environments under `Fallout/.fallout-ce-tts`, builds the two small data tools, downloads the required models, extracts `MASTER.DAT`, decompiles the scripts, creates a synthetic voice cast, and starts rendering. The separate environments avoid the incompatible NumPy requirements of Kokoro and Chatterbox. The final files go to `Fallout/TTS_CACHE`.
+
+Every stage is resumable. Run the same command again after an interruption or a failed clip. Existing model files, extracted data, voice prompts, and completed Opus files are reused.
+
+### CPU without CUDA
+
+Force the portable CPU path with:
+
+```console
+./tools/generate_tts_cache.sh --backend cpu "/path/to/Fallout"
+```
+
+This uses the official [Chatterbox Turbo ONNX export](https://huggingface.co/ResembleAI/chatterbox-turbo-ONNX) with only its Q4 graphs. It does not install PyTorch or require a GPU. Rendering the complete game is compute-intensive and can take a long time, but it can be stopped and resumed safely.
+
+### NVIDIA CUDA
+
+Use the faster CUDA path with:
+
+```console
+./tools/generate_tts_cache.sh --backend cuda "/path/to/Fallout"
+```
+
+This installs the official [Chatterbox Python package](https://github.com/resemble-ai/chatterbox) and a CUDA-enabled PyTorch 2.6 wheel in its own virtual environment. A system CUDA toolkit is not required, but the NVIDIA driver must support the bundled CUDA runtime. The default wheel uses CUDA 12.4. To select another official PyTorch wheel index, set it before the first setup:
+
+```console
+FALLOUT_TTS_TORCH_INDEX_URL=https://download.pytorch.org/whl/cu126 \
+  ./tools/generate_tts_cache.sh --backend cuda "/path/to/Fallout"
+```
+
+If the CUDA check fails, the script stops with a direct error. Re-run with `--backend cpu` to use the GPU-independent path.
+
+### Storage and customization
+
+The CPU setup downloads about 850 MB of model files. CUDA uses several gigabytes for PyTorch and Chatterbox weights. Generated audio currently needs about 550 MB, while work files and Python environments remain under `.fallout-ce-tts`. Nothing in that directory needs to be committed or copied into this repository.
+
+Useful options are available through `--help`:
+
+```console
+./tools/generate_tts_cache.sh --help
+./tools/setup_tts_generator.sh --help
+```
+
+Use `--dry-run` to extract and index dialogue, prepare the cast, and report the number of clips without loading Chatterbox. `--threads` controls CPU inference threads. `--cast-jobs` controls parallel Kokoro prompt generation. `--shard-count` and `--shard-index` let several machines render deterministic portions of the same cache.
+
+Set `FALLOUT_TTS_WORK_DIR` to keep models and temporary files outside the game directory. Set `FALLOUT_TTS_CACHE_DIR` to change the generated cache destination. If the latter is not `TTS_CACHE` under the game directory, set the matching `cache_path` in `fallout.cfg`.
+
+The generator uses [Kokoro ONNX](https://github.com/thewh1teagle/kokoro-onnx) to create synthetic reference prompts. It never uses the original actors' recordings as cloning input. Original voiced conversation lines remain untouched and take precedence in the game.
+
+For lower-level work, `tools/prepare_voice_cast.py` and `tools/precompute_tts.py` expose each stage directly. The renderer's JSON Lines manifest records the source script, role, gender, text, duration, and destination for each newly completed clip.
+
+The repo-local agent workflow is in `.agents/skills/fallout-tts/SKILL.md`. It points automated contributors back to this document and preserves the legal-data, cache-safety, backend, and parser constraints without duplicating the setup procedure.
 
 ## Scope
 
