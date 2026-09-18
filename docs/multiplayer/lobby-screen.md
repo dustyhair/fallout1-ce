@@ -1,6 +1,8 @@
 # Multiplayer lobby screen
 
-The main menu has a sixth **Multiplayer** button using the original menu button art, typography, spacing, keyboard navigation, and sound. It opens a 640x480 lobby built from Fallout's dialogue hardware. The upper CRT reports both player slots and the network state, a centered analog panel exposes the session controls, and the lower CRT is a two-player chat terminal.
+The main menu has a sixth **Multiplayer** button using the original menu button art, typography, spacing, keyboard navigation, and sound. It opens a 640x480 lobby built around a new, purpose-made Fallout-style hardware plate. The upper CRT reports both player slots and the network state, the compact analog panel exposes the session controls, and the lower CRT is a two-player chat terminal.
+
+The authored source plate lives at `assets/multiplayer/lobby-hardware-source.png`. Its 640x480 runtime BMP is converted to the Fallout palette when the lobby opens and is embedded into the executable during the build, so the installed game does not depend on a loose UI asset.
 
 The lobby supports these actions:
 

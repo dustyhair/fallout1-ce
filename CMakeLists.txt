@@ -78,11 +78,27 @@ if(WIN32)
     target_link_libraries(fallout-multiplayer-core PUBLIC ws2_32)
 endif()
 target_link_libraries(${EXECUTABLE_NAME} fallout-multiplayer-core)
+
+set(LOBBY_HARDWARE_ASSET "${CMAKE_CURRENT_SOURCE_DIR}/assets/multiplayer/lobby-hardware.bmp")
+set(LOBBY_HARDWARE_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/lobby_hardware_asset.h")
+add_custom_command(
+    OUTPUT "${LOBBY_HARDWARE_HEADER}"
+    COMMAND ${CMAKE_COMMAND}
+        -DINPUT_FILE=${LOBBY_HARDWARE_ASSET}
+        -DOUTPUT_FILE=${LOBBY_HARDWARE_HEADER}
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary.cmake"
+    DEPENDS
+        "${LOBBY_HARDWARE_ASSET}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary.cmake"
+    VERBATIM)
+
 target_sources(${EXECUTABLE_NAME} PRIVATE
     "src/multiplayer/character_build_bridge.cc"
     "src/multiplayer/character_build_bridge.h"
     "src/multiplayer/developer_local_session.cc"
     "src/multiplayer/developer_local_session.h"
+    "src/multiplayer/lobby_art.cc"
+    "src/multiplayer/lobby_art.h"
     "src/multiplayer/lobby_screen.cc"
     "src/multiplayer/lobby_screen.h"
     "src/multiplayer/network_runtime.cc"
@@ -91,7 +107,9 @@ target_sources(${EXECUTABLE_NAME} PRIVATE
     "src/multiplayer/network_world.h"
     "src/multiplayer/presentation_bridge.cc"
     "src/multiplayer/presentation_bridge.h"
+    "${LOBBY_HARDWARE_HEADER}"
 )
+target_include_directories(${EXECUTABLE_NAME} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 
 if (BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
     add_executable(fallout-multiplayer-core-test
