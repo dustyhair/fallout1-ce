@@ -138,11 +138,25 @@ struct LootCommand {
     EntityId targetId;
 };
 
+struct ItemDescriptor {
+    std::int32_t pid = -1;
+    std::int32_t extendedFlags = 0;
+    std::int32_t data0 = 0;
+    std::int32_t data1 = 0;
+};
+
+constexpr bool hasItemDescriptor(const ItemDescriptor& descriptor)
+{
+    return descriptor.pid != -1;
+}
+
 struct InventoryTransferCommand {
     EntityId sourceId;
     EntityId destinationId;
     EntityId itemId;
     std::uint32_t quantity = 0;
+    std::uint32_t sourceQuantity = 0;
+    ItemDescriptor itemDescriptor;
 };
 
 using GameCommandPayload = std::variant<MoveCommand, FaceCommand, InteractCommand, PickupCommand, LootCommand, InventoryTransferCommand>;
@@ -218,6 +232,9 @@ struct InventoryTransferredEvent {
     EntityId destinationId;
     EntityId itemId;
     std::uint32_t quantity = 0;
+    std::uint32_t sourceQuantity = 0;
+    EntityId remainderItemId;
+    ItemDescriptor itemDescriptor;
 };
 
 using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, LootStartedEvent, InventoryTransferredEvent>;

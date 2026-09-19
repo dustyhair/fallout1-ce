@@ -29,13 +29,14 @@ constexpr std::size_t kCommandHeaderSize = 28;
 constexpr std::size_t kMoveCommandSize = kCommandHeaderSize + 12;
 constexpr std::size_t kTargetCommandSize = kCommandHeaderSize + 4;
 constexpr std::size_t kFacingCommandSize = kCommandHeaderSize + 8;
-constexpr std::size_t kInventoryTransferCommandSize = kCommandHeaderSize + 16;
+constexpr std::size_t kItemDescriptorSize = 16;
+constexpr std::size_t kInventoryTransferCommandSize = kCommandHeaderSize + 20 + kItemDescriptorSize;
 constexpr std::size_t kCommandResultSize = 24;
 constexpr std::size_t kEventHeaderSize = 20;
 constexpr std::size_t kMovementEventHeaderSize = kEventHeaderSize + 20;
 constexpr std::size_t kTargetEventSize = kEventHeaderSize + 8;
 constexpr std::size_t kFacingEventSize = kEventHeaderSize + 8;
-constexpr std::size_t kInventoryTransferEventSize = kEventHeaderSize + 20;
+constexpr std::size_t kInventoryTransferEventSize = kEventHeaderSize + 28 + kItemDescriptorSize;
 
 void appendUInt16(std::vector<std::uint8_t>& bytes, std::uint16_t value)
 {
@@ -90,6 +91,35 @@ std::uint64_t readUInt64(const std::vector<std::uint8_t>& bytes, std::size_t off
 std::int32_t readInt32(const std::vector<std::uint8_t>& bytes, std::size_t offset)
 {
     return static_cast<std::int32_t>(readUInt32(bytes, offset));
+}
+
+bool isValidItemDescriptor(const ItemDescriptor& descriptor)
+{
+    if (!hasItemDescriptor(descriptor)) {
+        return descriptor.extendedFlags == 0
+            && descriptor.data0 == 0
+            && descriptor.data1 == 0;
+    }
+    return descriptor.pid >= 0
+        && (static_cast<std::uint32_t>(descriptor.pid) >> 24) == 0;
+}
+
+void appendItemDescriptor(std::vector<std::uint8_t>& bytes, const ItemDescriptor& descriptor)
+{
+    appendInt32(bytes, descriptor.pid);
+    appendInt32(bytes, descriptor.extendedFlags);
+    appendInt32(bytes, descriptor.data0);
+    appendInt32(bytes, descriptor.data1);
+}
+
+ItemDescriptor readItemDescriptor(const std::vector<std::uint8_t>& bytes, std::size_t offset)
+{
+    return ItemDescriptor {
+        readInt32(bytes, offset),
+        readInt32(bytes, offset + 4),
+        readInt32(bytes, offset + 8),
+        readInt32(bytes, offset + 12),
+    };
 }
 
 GameplayWireError validateEnvelope(const ProtocolEnvelope& envelope, MessageKind expectedKind)
@@ -179,11 +209,16 @@ GameplayWireError validateCommand(const GameCommand& command)
     if (const auto* transfer = std::get_if<InventoryTransferCommand>(&command.payload)) {
         if (!isValid(transfer->sourceId)
             || !isValid(transfer->destinationId)
-            || !isValid(transfer->itemId)
             || transfer->sourceId == transfer->destinationId) {
             return GameplayWireError::InvalidEntityId;
         }
+        if (!isValidItemDescriptor(transfer->itemDescriptor)
+            || (!isValid(transfer->itemId) && !hasItemDescriptor(transfer->itemDescriptor))) {
+            return GameplayWireError::InvalidEntityId;
+        }
         return transfer->quantity != 0
+                && transfer->quantity <= transfer->sourceQuantity
+                && transfer->sourceQuantity <= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())
                 && transfer->quantity <= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())
             ? GameplayWireError::None
             : GameplayWireError::InvalidQuantity;
@@ -267,10 +302,19 @@ GameplayWireError validateEvent(const GameEvent& event)
             || !isValid(transfer->sourceId)
             || !isValid(transfer->destinationId)
             || !isValid(transfer->itemId)
+            || (isValid(transfer->remainderItemId)
+                && (transfer->remainderItemId == transfer->itemId
+                    || transfer->remainderItemId == transfer->sourceId
+                    || transfer->remainderItemId == transfer->destinationId))
+            || !isValidItemDescriptor(transfer->itemDescriptor)
+            || !hasItemDescriptor(transfer->itemDescriptor)
+            || ((transfer->quantity < transfer->sourceQuantity) != isValid(transfer->remainderItemId))
             || transfer->sourceId == transfer->destinationId) {
             return GameplayWireError::InvalidEntityId;
         }
         return transfer->quantity != 0
+                && transfer->quantity <= transfer->sourceQuantity
+                && transfer->sourceQuantity <= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())
                 && transfer->quantity <= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())
             ? GameplayWireError::None
             : GameplayWireError::InvalidQuantity;
@@ -354,6 +398,8 @@ GameplayWireError encodeGameCommand(const GameCommand& command, ProtocolEnvelope
         appendUInt32(envelope.payload, transfer->destinationId.value);
         appendUInt32(envelope.payload, transfer->itemId.value);
         appendUInt32(envelope.payload, transfer->quantity);
+        appendUInt32(envelope.payload, transfer->sourceQuantity);
+        appendItemDescriptor(envelope.payload, transfer->itemDescriptor);
     }
     return GameplayWireError::None;
 }
@@ -439,6 +485,8 @@ GameCommandDecodeResult decodeGameCommand(const ProtocolEnvelope& envelope)
             EntityId { readUInt32(envelope.payload, 32) },
             EntityId { readUInt32(envelope.payload, 36) },
             readUInt32(envelope.payload, 40),
+            readUInt32(envelope.payload, 44),
+            readItemDescriptor(envelope.payload, 48),
         };
         break;
     default:
@@ -544,6 +592,9 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
         appendUInt32(envelope.payload, transfer->destinationId.value);
         appendUInt32(envelope.payload, transfer->itemId.value);
         appendUInt32(envelope.payload, transfer->quantity);
+        appendUInt32(envelope.payload, transfer->sourceQuantity);
+        appendUInt32(envelope.payload, transfer->remainderItemId.value);
+        appendItemDescriptor(envelope.payload, transfer->itemDescriptor);
     }
     return GameplayWireError::None;
 }
@@ -637,6 +688,9 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
             EntityId { readUInt32(envelope.payload, 28) },
             EntityId { readUInt32(envelope.payload, 32) },
             readUInt32(envelope.payload, 36),
+            readUInt32(envelope.payload, 40),
+            EntityId { readUInt32(envelope.payload, 44) },
+            readItemDescriptor(envelope.payload, 48),
         };
         break;
     default:

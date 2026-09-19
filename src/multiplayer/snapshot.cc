@@ -11,7 +11,7 @@ namespace {
 constexpr std::size_t kSnapshotPayloadHeaderSize = 20;
 constexpr std::size_t kActorSnapshotSize = 24;
 constexpr std::size_t kDoorSnapshotSize = 12;
-constexpr std::size_t kItemSnapshotSize = 20;
+constexpr std::size_t kItemSnapshotSize = 36;
 constexpr std::size_t kSnapshotProtectedOffset = 20;
 constexpr std::uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
 constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
@@ -130,6 +130,10 @@ void appendItem(std::vector<std::uint8_t>& bytes, const ItemSnapshot& item)
     appendUint32(bytes, static_cast<std::uint32_t>(item.tile));
     appendUint32(bytes, static_cast<std::uint32_t>(item.elevation));
     appendUint32(bytes, item.quantity);
+    appendUint32(bytes, static_cast<std::uint32_t>(item.itemDescriptor.pid));
+    appendUint32(bytes, static_cast<std::uint32_t>(item.itemDescriptor.extendedFlags));
+    appendUint32(bytes, static_cast<std::uint32_t>(item.itemDescriptor.data0));
+    appendUint32(bytes, static_cast<std::uint32_t>(item.itemDescriptor.data1));
 }
 
 std::uint64_t digestBytes(const std::vector<std::uint8_t>& bytes)
@@ -202,6 +206,9 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
         bool onGround = !isValid(item.holderId);
         if (item.quantity == 0
             || item.quantity > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())
+            || !hasItemDescriptor(item.itemDescriptor)
+            || item.itemDescriptor.pid < 0
+            || (static_cast<std::uint32_t>(item.itemDescriptor.pid) >> 24) != 0
             || (onGround && (item.quantity != 1 || item.tile < 0 || item.elevation < 0 || item.elevation > 2))
             || (!onGround && (item.tile != -1 || item.elevation != -1 || item.holderId == item.entityId))) {
             return SnapshotError::InvalidItemState;
@@ -389,6 +396,10 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
         item.tile = static_cast<std::int32_t>(readUint32(packet, offset));
         item.elevation = static_cast<std::int32_t>(readUint32(packet, offset));
         item.quantity = readUint32(packet, offset);
+        item.itemDescriptor.pid = static_cast<std::int32_t>(readUint32(packet, offset));
+        item.itemDescriptor.extendedFlags = static_cast<std::int32_t>(readUint32(packet, offset));
+        item.itemDescriptor.data0 = static_cast<std::int32_t>(readUint32(packet, offset));
+        item.itemDescriptor.data1 = static_cast<std::int32_t>(readUint32(packet, offset));
         result.snapshot.items.push_back(item);
     }
 

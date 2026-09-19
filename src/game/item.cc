@@ -356,6 +356,8 @@ int item_remove_mult(Object* owner, Object* itemToRemove, int quantity)
             return -1;
         }
 
+        multiplayer::networkWorldHandleItemSplit(itemToRemove, inventoryItem->item);
+
         obj_disconnect(inventoryItem->item, NULL);
 
         inventoryItem->quantity -= quantity;
@@ -452,7 +454,8 @@ int item_move(Object* a1, Object* a2, Object* a3, int quantity)
             a1,
             a2,
             a3,
-            static_cast<std::uint32_t>(quantity));
+            static_cast<std::uint32_t>(quantity),
+            static_cast<std::uint32_t>(availableQuantity));
     }
     return rc;
 }
@@ -492,6 +495,7 @@ void item_move_all(Object* a1, Object* a2)
             a1,
             a2,
             item,
+            static_cast<std::uint32_t>(quantity),
             static_cast<std::uint32_t>(quantity));
     }
 }

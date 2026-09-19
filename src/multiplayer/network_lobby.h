@@ -69,7 +69,10 @@ public:
         EntityId destinationId,
         EntityId itemId,
         std::uint32_t quantity,
-        std::uint32_t phaseRevision = 1);
+        std::uint32_t sourceQuantity,
+        std::uint32_t phaseRevision = 1,
+        EntityId remainderItemId = {},
+        ItemDescriptor itemDescriptor = {});
     bool sendCommandOutcome(AuthoritativeCommandResult outcome);
     std::optional<GameCommand> takePeerCommand();
     std::optional<CommandResult> takeCommandResult();

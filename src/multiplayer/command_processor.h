@@ -16,6 +16,13 @@ enum class CommandExecutionStatus {
     InvalidAction,
 };
 
+struct InventoryTransferExecution {
+    CommandExecutionStatus status = CommandExecutionStatus::InvalidAction;
+    EntityId itemId;
+    EntityId remainderItemId;
+    ItemDescriptor itemDescriptor;
+};
+
 class CommandExecutor {
 public:
     virtual ~CommandExecutor() = default;
@@ -25,11 +32,11 @@ public:
     virtual CommandExecutionStatus useDoor(Object* actor, Object* target) = 0;
     virtual CommandExecutionStatus pickup(Object* actor, Object* target) = 0;
     virtual CommandExecutionStatus loot(Object* actor, Object* target) = 0;
-    virtual CommandExecutionStatus transferInventory(Object* actor,
+    virtual InventoryTransferExecution transferInventory(Object* actor,
         Object* source,
         Object* destination,
         Object* item,
-        std::uint32_t quantity) = 0;
+        const InventoryTransferCommand& command) = 0;
 };
 
 struct AuthoritativeCommandResult {

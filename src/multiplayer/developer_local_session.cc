@@ -205,9 +205,9 @@ public:
         return CommandExecutionStatus::Applied;
     }
 
-    CommandExecutionStatus transferInventory(Object*, Object*, Object*, Object*, std::uint32_t) override
+    InventoryTransferExecution transferInventory(Object*, Object*, Object*, Object*, const InventoryTransferCommand&) override
     {
-        return CommandExecutionStatus::InvalidAction;
+        return {};
     }
 };
 

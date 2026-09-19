@@ -195,13 +195,16 @@ bool NetworkLobby::sendLocalInventoryTransfer(EntityId sourceId,
     EntityId destinationId,
     EntityId itemId,
     std::uint32_t quantity,
-    std::uint32_t phaseRevision)
+    std::uint32_t sourceQuantity,
+    std::uint32_t phaseRevision,
+    EntityId remainderItemId,
+    ItemDescriptor itemDescriptor)
 {
     PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
     EntityId actorId { playerId.value };
     return sendLocalAction(
-        InventoryTransferredEvent { actorId, sourceId, destinationId, itemId, quantity },
-        InventoryTransferCommand { sourceId, destinationId, itemId, quantity },
+        InventoryTransferredEvent { actorId, sourceId, destinationId, itemId, quantity, sourceQuantity, remainderItemId, itemDescriptor },
+        InventoryTransferCommand { sourceId, destinationId, itemId, quantity, sourceQuantity, itemDescriptor },
         phaseRevision);
 }
 

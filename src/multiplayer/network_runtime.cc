@@ -1222,7 +1222,8 @@ bool networkRuntimeHandleLocalLootTargetChange(Object* target)
 bool networkRuntimeHandleLocalInventoryTransfer(Object* source,
     Object* destination,
     Object* item,
-    std::uint32_t quantity)
+    std::uint32_t quantity,
+    std::uint32_t sourceQuantity)
 {
     if (!networkWorldActive()
         || networkWorldInventoryTransferInProgress()
@@ -1239,7 +1240,11 @@ bool networkRuntimeHandleLocalInventoryTransfer(Object* source,
     std::optional<EntityId> sourceId = networkWorldFindEntity(source);
     std::optional<EntityId> destinationId = networkWorldFindEntity(destination);
     std::optional<EntityId> itemId = networkWorldFindEntity(item);
-    if (!sourceId.has_value() || !destinationId.has_value() || !itemId.has_value()) {
+    ItemDescriptor itemDescriptor;
+    if (!sourceId.has_value()
+        || !destinationId.has_value()
+        || !itemId.has_value()
+        || !networkWorldDescribeItem(item, itemDescriptor)) {
         return false;
     }
 
@@ -1250,7 +1255,10 @@ bool networkRuntimeHandleLocalInventoryTransfer(Object* source,
             *destinationId,
             *itemId,
             quantity,
-            networkWorldPhaseRevision())) {
+            sourceQuantity,
+            networkWorldPhaseRevision(),
+            networkWorldTakeLastItemSplit(),
+            itemDescriptor)) {
         debug_printf("Multiplayer inventory transfer could not be published.\n");
     }
     return true;
@@ -1270,18 +1278,34 @@ NetworkInventoryTransferDisposition networkRuntimePrepareLocalInventoryTransfer(
             ? NetworkInventoryTransferDisposition::Reject
             : NetworkInventoryTransferDisposition::ApplyLocally;
     }
-    if (quantity == 0 || quantity != availableQuantity) {
+    if (quantity == 0 || quantity > availableQuantity) {
         return NetworkInventoryTransferDisposition::Reject;
     }
 
     std::optional<EntityId> sourceId = networkWorldFindEntity(source);
     std::optional<EntityId> destinationId = networkWorldFindEntity(destination);
     std::optional<EntityId> itemId = networkWorldFindEntity(item);
-    if (!sourceId.has_value() || !destinationId.has_value() || !itemId.has_value()) {
-        debug_printf("Multiplayer inventory transfer has an unregistered entity.\n");
+    ItemDescriptor itemDescriptor;
+    if (!sourceId.has_value()
+        || !destinationId.has_value()
+        || !networkWorldDescribeItem(item, itemDescriptor)) {
+        debug_printf("Multiplayer inventory transfer has an invalid entity.\n");
+        return NetworkInventoryTransferDisposition::Reject;
+    }
+    if (!itemId.has_value()
+        && (item->owner != source || item->data.inventory.length != 0)) {
+        debug_printf("Multiplayer can only introduce a direct, empty player inventory item.\n");
         return NetworkInventoryTransferDisposition::Reject;
     }
     if (launchOptions.mode == NetworkLaunchMode::Host) {
+        if (!itemId.has_value()) {
+            itemId = networkWorldEnsureItemRegistered(item);
+        }
+        if (!itemId.has_value()) {
+            debug_printf("Multiplayer host could not assign an item entity ID.\n");
+            return NetworkInventoryTransferDisposition::Reject;
+        }
+        networkWorldResetLastItemSplit();
         return NetworkInventoryTransferDisposition::ApplyLocally;
     }
     if (launchOptions.mode != NetworkLaunchMode::Join) {
@@ -1290,9 +1314,12 @@ NetworkInventoryTransferDisposition networkRuntimePrepareLocalInventoryTransfer(
 
     if (!lobby.sendLocalInventoryTransfer(*sourceId,
             *destinationId,
-            *itemId,
+            itemId.value_or(EntityId {}),
             quantity,
-            networkWorldPhaseRevision())) {
+            availableQuantity,
+            networkWorldPhaseRevision(),
+            {},
+            itemDescriptor)) {
         debug_printf("Multiplayer inventory transfer command could not be sent.\n");
         return NetworkInventoryTransferDisposition::Reject;
     }

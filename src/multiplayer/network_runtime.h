@@ -43,7 +43,8 @@ bool networkRuntimeHandleLocalLootTargetChange(Object* target);
 bool networkRuntimeHandleLocalInventoryTransfer(Object* source,
     Object* destination,
     Object* item,
-    std::uint32_t quantity);
+    std::uint32_t quantity,
+    std::uint32_t sourceQuantity);
 
 enum class NetworkInventoryTransferDisposition {
     ApplyLocally,

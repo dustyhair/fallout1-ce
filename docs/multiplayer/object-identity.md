@@ -44,8 +44,8 @@ The registry runs on the simulation thread at the safe points defined in the mul
 
 The local session controller owns the registry. Its developer mode registers both player actors and interaction targets, removes the temporary guest before a map unload, and rebinds the same guest `EntityId` after the next map loads. The multiplayer sidecar restores the guest's recursive inventory separately from the legacy map save.
 
-The live world canonically registers doors, ground items, non-player critters, and their recursive inventories. Recovery snapshots now apply registered item ownership and position. The stack-merge hook retires or rebinds the representative destroyed by `item_add_force`, keeping accepted whole-stack loot transfers aligned on both peers.
+The live world canonically registers doors, ground items, non-player critters, and their recursive inventories. Recovery snapshots apply registered item ownership, position, mutable prototype state, and can recreate a missing described item. The stack-merge hook retires or rebinds the representative destroyed by `item_add_force`. The split hook keeps the moved object's ID and binds the copied remainder to a new host-assigned ID. Unregistered player items receive identity when they first enter an authoritative loot transfer.
 
-Partial stack splitting and arbitrary script-created replicated objects still need host-assigned dynamic identity before they can enter the live protocol.
+Item script VM state and live creation outside an authoritative inventory interaction remain outside this identity layer.
 
 The headless tests cover unique creation, clone identity, inventory moves, legacy ID rewrites, pointer replacement during load, save metadata restore, ownership, collisions, session reset, and authoritative interaction-target resolution. The developer session routes movement, doors, pickup, and looting through those identities.

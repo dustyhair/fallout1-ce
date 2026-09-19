@@ -1,5 +1,7 @@
 #include "multiplayer/command_processor.h"
 
+#include <limits>
+
 #include "multiplayer/acting_player_context.h"
 
 namespace fallout {
@@ -92,10 +94,21 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     Object* destination = nullptr;
     Object* item = nullptr;
     if (transfer != nullptr) {
+        bool descriptorValid = hasItemDescriptor(transfer->itemDescriptor)
+            && transfer->itemDescriptor.pid >= 0
+            && (static_cast<std::uint32_t>(transfer->itemDescriptor.pid) >> 24) == 0;
+        if (transfer->quantity == 0
+            || transfer->quantity > transfer->sourceQuantity
+            || transfer->sourceQuantity > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())
+            || (!isValid(transfer->itemId) && !descriptorValid)) {
+            return rejectAndRemember(CommandRejection::Malformed);
+        }
         source = session.entities().findObject(transfer->sourceId);
         destination = session.entities().findObject(transfer->destinationId);
-        item = session.entities().findObject(transfer->itemId);
-        if (source == nullptr || destination == nullptr || item == nullptr) {
+        item = isValid(transfer->itemId) ? session.entities().findObject(transfer->itemId) : nullptr;
+        if (source == nullptr
+            || destination == nullptr
+            || (isValid(transfer->itemId) && item == nullptr)) {
             return rejectAndRemember(CommandRejection::MissingEntity);
         }
     }
@@ -119,17 +132,21 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
             executionStatus = executor.loot(actor, target);
             event.payload = LootStartedEvent { command.actorId, loot->targetId };
         } else if (transfer != nullptr) {
-            executionStatus = executor.transferInventory(actor,
+            InventoryTransferExecution transferExecution = executor.transferInventory(actor,
                 source,
                 destination,
                 item,
-                transfer->quantity);
+                *transfer);
+            executionStatus = transferExecution.status;
             event.payload = InventoryTransferredEvent {
                 command.actorId,
                 transfer->sourceId,
                 transfer->destinationId,
-                transfer->itemId,
+                transferExecution.itemId,
                 transfer->quantity,
+                transfer->sourceQuantity,
+                transferExecution.remainderItemId,
+                transferExecution.itemDescriptor,
             };
         }
     }

@@ -11,7 +11,7 @@ namespace fallout {
 namespace multiplayer {
 
 constexpr std::uint32_t kSnapshotMagic = 0x46434D53;
-constexpr std::uint16_t kSnapshotVersion = 2;
+constexpr std::uint16_t kSnapshotVersion = 3;
 constexpr std::size_t kSnapshotHeaderSize = 28;
 constexpr std::size_t kMaxSnapshotPayloadSize = 64 * 1024;
 constexpr std::size_t kMaxSnapshotActors = 16;
@@ -40,6 +40,7 @@ struct ItemSnapshot {
     std::int32_t tile = -1;
     std::int32_t elevation = -1;
     std::uint32_t quantity = 1;
+    ItemDescriptor itemDescriptor;
 };
 
 struct WorldSnapshot {

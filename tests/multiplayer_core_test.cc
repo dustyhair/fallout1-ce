@@ -90,8 +90,8 @@ WorldSnapshot sampleSnapshot()
         DoorSnapshot { EntityId { 9 }, true, false, 5 },
     };
     snapshot.items = {
-        ItemSnapshot { EntityId { 10 }, EntityId { 1 }, -1, -1, 2 },
-        ItemSnapshot { EntityId { 11 }, {}, 20104, 0, 1 },
+        ItemSnapshot { EntityId { 10 }, EntityId { 1 }, -1, -1, 2, ItemDescriptor { 40, 0, 0, 0 } },
+        ItemSnapshot { EntityId { 11 }, {}, 20104, 0, 1, ItemDescriptor { 41, 0, 0, 0 } },
     };
     return snapshot;
 }
@@ -634,7 +634,7 @@ void testGameplayWireFormat()
         GameCommand { CommandSequence { 3 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, PickupCommand { EntityId { 41 } } },
         GameCommand { CommandSequence { 4 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, LootCommand { EntityId { 42 } } },
         GameCommand { CommandSequence { 5 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, FaceCommand { 4 } },
-        GameCommand { CommandSequence { 6 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, InventoryTransferCommand { EntityId { 42 }, EntityId { 20 }, EntityId { 43 }, 3 } },
+        GameCommand { CommandSequence { 6 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, InventoryTransferCommand { EntityId { 42 }, EntityId { 20 }, EntityId { 43 }, 3, 5, ItemDescriptor { 40, 7, 8, 9 } } },
     };
 
     for (std::size_t index = 0; index < commands.size(); index++) {
@@ -700,13 +700,34 @@ void testGameplayWireFormat()
             && transfer->sourceId == EntityId { 42 }
             && transfer->destinationId == EntityId { 20 }
             && transfer->itemId == EntityId { 43 }
-            && transfer->quantity == 3,
+            && transfer->quantity == 3
+            && transfer->sourceQuantity == 5
+            && transfer->itemDescriptor.data1 == 9,
         "inventory transfer command round trips every authoritative entity and quantity");
+    GameCommand dynamicTransfer = commands[5];
+    InventoryTransferCommand& dynamicPayload = std::get<InventoryTransferCommand>(dynamicTransfer.payload);
+    dynamicPayload.itemId = {};
+    ProtocolEnvelope dynamicTransferEnvelope = gameplayEnvelope(26);
+    expect(encodeGameCommand(dynamicTransfer, dynamicTransferEnvelope) == GameplayWireError::None,
+        "an unregistered item can request host identity from its bounded descriptor");
+    GameCommandDecodeResult decodedDynamicTransfer = decodeGameCommand(dynamicTransferEnvelope);
+    const InventoryTransferCommand* decodedDynamicPayload = decodedDynamicTransfer
+        ? std::get_if<InventoryTransferCommand>(&decodedDynamicTransfer.command.payload)
+        : nullptr;
+    expect(decodedDynamicPayload != nullptr
+            && !isValid(decodedDynamicPayload->itemId)
+            && decodedDynamicPayload->sourceQuantity == 5
+            && decodedDynamicPayload->itemDescriptor.pid == 40,
+        "dynamic item descriptor round trips without a client-assigned entity ID");
     GameCommand invalidTransfer = commands[5];
     std::get<InventoryTransferCommand>(invalidTransfer.payload).quantity = 0;
     ProtocolEnvelope invalidTransferEnvelope = gameplayEnvelope(26);
     expect(encodeGameCommand(invalidTransfer, invalidTransferEnvelope) == GameplayWireError::InvalidQuantity,
         "inventory transfer rejects a zero quantity");
+    invalidTransfer = dynamicTransfer;
+    std::get<InventoryTransferCommand>(invalidTransfer.payload).itemDescriptor = {};
+    expect(encodeGameCommand(invalidTransfer, invalidTransferEnvelope) == GameplayWireError::InvalidEntityId,
+        "dynamic inventory transfer requires an item descriptor");
 
     CommandResult accepted;
     accepted.commandSequence.value = 1;
@@ -743,7 +764,7 @@ void testGameplayWireFormat()
         GameEvent { EventSequence { 9 }, CommandSequence { 3 }, ItemPickupStartedEvent { EntityId { 20 }, EntityId { 41 } } },
         GameEvent { EventSequence { 10 }, CommandSequence { 4 }, LootStartedEvent { EntityId { 20 }, EntityId { 42 } } },
         GameEvent { EventSequence { 11 }, CommandSequence { 5 }, ActorFacingChangedEvent { EntityId { 20 }, 4 } },
-        GameEvent { EventSequence { 12 }, CommandSequence { 6 }, InventoryTransferredEvent { EntityId { 20 }, EntityId { 42 }, EntityId { 20 }, EntityId { 43 }, 3 } },
+        GameEvent { EventSequence { 12 }, CommandSequence { 6 }, InventoryTransferredEvent { EntityId { 20 }, EntityId { 42 }, EntityId { 20 }, EntityId { 43 }, 3, 5, EntityId { 44 }, ItemDescriptor { 40, 7, 8, 9 } } },
     };
     for (std::size_t index = 0; index < events.size(); index++) {
         ProtocolEnvelope envelope = gameplayEnvelope(30 + index);
@@ -792,7 +813,10 @@ void testGameplayWireFormat()
             && transferEvent->sourceId == EntityId { 42 }
             && transferEvent->destinationId == EntityId { 20 }
             && transferEvent->itemId == EntityId { 43 }
-            && transferEvent->quantity == 3,
+            && transferEvent->quantity == 3
+            && transferEvent->sourceQuantity == 5
+            && transferEvent->remainderItemId == EntityId { 44 }
+            && transferEvent->itemDescriptor.extendedFlags == 7,
         "inventory transfer event round trips its accepted mutation");
 
     ProtocolEnvelope missingSession = gameplayEnvelope(42);
@@ -1381,7 +1405,8 @@ void testNetworkCharacterLobby()
             && lootStarted->targetId == EntityId { 90 }
             && guest.confirmPeerEventApplied(lootStartedEvent->sequence),
         "guest accepts and confirms the host loot event");
-    expect(host.sendLocalInventoryTransfer(EntityId { 90 }, EntityId { 1 }, EntityId { 91 }, 2),
+    expect(host.sendLocalInventoryTransfer(EntityId { 90 }, EntityId { 1 }, EntityId { 91 }, 2, 2,
+               1, {}, ItemDescriptor { 40, 0, 0, 0 }),
         "host publishes an inventory transfer made in the loot window");
     guest.poll();
     std::optional<GameEvent> liveTransferEvent = guest.takePeerEvent();
@@ -1663,20 +1688,25 @@ public:
         return nextStatus;
     }
 
-    CommandExecutionStatus transferInventory(Object* actor,
+    InventoryTransferExecution transferInventory(Object* actor,
         Object* source,
         Object* destination,
         Object* item,
-        std::uint32_t quantity) override
+        const InventoryTransferCommand& command) override
     {
         transferCalls++;
         lastActor = actor;
         lastSource = source;
         lastDestination = destination;
         lastTarget = item;
-        lastQuantity = quantity;
+        lastQuantity = command.quantity;
         recordContext();
-        return nextStatus;
+        return InventoryTransferExecution {
+            nextStatus,
+            isValid(command.itemId) ? command.itemId : EntityId { 88 },
+            command.quantity < command.sourceQuantity ? EntityId { 89 } : EntityId {},
+            ItemDescriptor { 40, 0, 0, 0 },
+        };
     }
 
     void recordContext()
@@ -1833,6 +1863,7 @@ void testAuthoritativeCommandProcessing()
         session.playerActorId(kGuestPlayerId),
         registeredItem.entityId,
         2,
+        2,
     };
     AuthoritativeCommandResult transferred = processor.process(transfer, session, executor);
     const InventoryTransferredEvent* transferEvent = transferred.event.has_value()
@@ -1850,8 +1881,31 @@ void testAuthoritativeCommandProcessing()
             && transferEvent->sourceId == registeredLootableCritter.entityId
             && transferEvent->destinationId == session.playerActorId(kGuestPlayerId)
             && transferEvent->itemId == registeredItem.entityId
-            && transferEvent->quantity == 2,
+            && transferEvent->quantity == 2
+            && transferEvent->sourceQuantity == 2,
         "accepted inventory mutation emits a complete authoritative transfer event");
+
+    transfer.sequence.value = 6;
+    transfer.payload = InventoryTransferCommand {
+        registeredLootableCritter.entityId,
+        session.playerActorId(kGuestPlayerId),
+        {},
+        1,
+        4,
+        ItemDescriptor { 40, 0, 0, 0 },
+    };
+    AuthoritativeCommandResult dynamicTransferred = processor.process(transfer, session, executor);
+    const InventoryTransferredEvent* dynamicTransferEvent = dynamicTransferred.event.has_value()
+        ? std::get_if<InventoryTransferredEvent>(&dynamicTransferred.event->payload)
+        : nullptr;
+    expect(dynamicTransferred.result.status == CommandStatus::Accepted
+            && executor.lastTarget == nullptr
+            && dynamicTransferEvent != nullptr
+            && dynamicTransferEvent->itemId == EntityId { 88 }
+            && dynamicTransferEvent->remainderItemId == EntityId { 89 }
+            && dynamicTransferEvent->sourceQuantity == 4
+            && dynamicTransferEvent->itemDescriptor.pid == 40,
+        "host execution assigns identities to a dynamic item and its split remainder");
 
     executor.nextStatus = CommandExecutionStatus::InvalidAction;
     move.sequence.value = 3;
@@ -1910,7 +1964,7 @@ void testSnapshotRoundTripAndRecovery()
     WorldSnapshot authoritative = sampleSnapshot();
     std::vector<std::uint8_t> packet;
     expect(encodeSnapshot(authoritative, packet) == SnapshotError::None, "valid snapshot encodes");
-    expect(packet.size() == kSnapshotHeaderSize + 20 + 2 * 24 + 12 + 2 * 20, "snapshot packet declares a fixed-width payload");
+    expect(packet.size() == kSnapshotHeaderSize + 20 + 2 * 24 + 12 + 2 * 36, "snapshot packet declares a fixed-width payload");
     expect(packet[0] == 'F' && packet[1] == 'C' && packet[2] == 'M' && packet[3] == 'S', "snapshot magic uses network byte order");
 
     SnapshotDecodeResult decoded = decodeSnapshot(packet);
@@ -1923,6 +1977,7 @@ void testSnapshotRoundTripAndRecovery()
     expect(decoded.snapshot.items.size() == 2
             && decoded.snapshot.items[0].holderId == EntityId { 1 }
             && decoded.snapshot.items[0].quantity == 2
+            && decoded.snapshot.items[0].itemDescriptor.pid == 40
             && decoded.snapshot.items[1].tile == 20104,
         "snapshot keeps canonical inventory ownership and ground-item location");
 
@@ -2019,6 +2074,10 @@ void testSnapshotRoundTripAndRecovery()
     invalidItem.items[1].quantity = 2;
     expect(validateSnapshot(invalidItem) == SnapshotError::InvalidItemState,
         "snapshot rejects an impossible ground stack");
+    invalidItem = authoritative;
+    invalidItem.items[0].itemDescriptor = {};
+    expect(validateSnapshot(invalidItem) == SnapshotError::InvalidItemState,
+        "snapshot requires enough item description to recreate a missing entity");
 }
 
 GameEvent sampleMovementEvent(std::uint64_t sequence)
