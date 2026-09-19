@@ -635,6 +635,7 @@ void testGameplayWireFormat()
         GameCommand { CommandSequence { 4 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, LootCommand { EntityId { 42 } } },
         GameCommand { CommandSequence { 5 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, FaceCommand { 4 } },
         GameCommand { CommandSequence { 6 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, InventoryTransferCommand { EntityId { 42 }, EntityId { 20 }, EntityId { 43 }, 3, 5, ItemDescriptor { 40, 7, 8, 9 } } },
+        GameCommand { CommandSequence { 7 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, ItemDropCommand { EntityId { 20 }, EntityId { 43 }, 3, 5, ItemDescriptor { 40, 7, 8, 9 } } },
     };
 
     for (std::size_t index = 0; index < commands.size(); index++) {
@@ -729,6 +730,24 @@ void testGameplayWireFormat()
     expect(encodeGameCommand(invalidTransfer, invalidTransferEnvelope) == GameplayWireError::InvalidEntityId,
         "dynamic inventory transfer requires an item descriptor");
 
+    ProtocolEnvelope dropEnvelope = gameplayEnvelope(27);
+    encodeGameCommand(commands[6], dropEnvelope);
+    GameCommandDecodeResult decodedDrop = decodeGameCommand(dropEnvelope);
+    const ItemDropCommand* drop = decodedDrop
+        ? std::get_if<ItemDropCommand>(&decodedDrop.command.payload)
+        : nullptr;
+    expect(drop != nullptr
+            && drop->sourceId == EntityId { 20 }
+            && drop->itemId == EntityId { 43 }
+            && drop->quantity == 3
+            && drop->sourceQuantity == 5
+            && drop->itemDescriptor.data0 == 8,
+        "item drop command round trips its source stack and descriptor");
+    GameCommand invalidDrop = commands[6];
+    std::get<ItemDropCommand>(invalidDrop.payload).sourceQuantity = 0;
+    expect(encodeGameCommand(invalidDrop, dropEnvelope) == GameplayWireError::InvalidQuantity,
+        "item drop rejects an empty source stack");
+
     CommandResult accepted;
     accepted.commandSequence.value = 1;
     accepted.status = CommandStatus::Accepted;
@@ -765,6 +784,7 @@ void testGameplayWireFormat()
         GameEvent { EventSequence { 10 }, CommandSequence { 4 }, LootStartedEvent { EntityId { 20 }, EntityId { 42 } } },
         GameEvent { EventSequence { 11 }, CommandSequence { 5 }, ActorFacingChangedEvent { EntityId { 20 }, 4 } },
         GameEvent { EventSequence { 12 }, CommandSequence { 6 }, InventoryTransferredEvent { EntityId { 20 }, EntityId { 42 }, EntityId { 20 }, EntityId { 43 }, 3, 5, EntityId { 44 }, ItemDescriptor { 40, 7, 8, 9 } } },
+        GameEvent { EventSequence { 13 }, CommandSequence { 7 }, ItemDroppedEvent { EntityId { 20 }, EntityId { 20 }, EntityId { 43 }, 3, 5, EntityId { 45 }, 12345, 1, ItemDescriptor { 40, 7, 8, 9 } } },
     };
     for (std::size_t index = 0; index < events.size(); index++) {
         ProtocolEnvelope envelope = gameplayEnvelope(30 + index);
@@ -818,6 +838,33 @@ void testGameplayWireFormat()
             && transferEvent->remainderItemId == EntityId { 44 }
             && transferEvent->itemDescriptor.extendedFlags == 7,
         "inventory transfer event round trips its accepted mutation");
+
+    ProtocolEnvelope dropEventEnvelope = gameplayEnvelope(43);
+    encodeGameEvent(events[6], dropEventEnvelope);
+    GameEventDecodeResult decodedDropEvent = decodeGameEvent(dropEventEnvelope);
+    const ItemDroppedEvent* dropEvent = decodedDropEvent
+        ? std::get_if<ItemDroppedEvent>(&decodedDropEvent.event.payload)
+        : nullptr;
+    expect(dropEvent != nullptr
+            && dropEvent->actorId == EntityId { 20 }
+            && dropEvent->sourceId == EntityId { 20 }
+            && dropEvent->itemId == EntityId { 43 }
+            && dropEvent->quantity == 3
+            && dropEvent->sourceQuantity == 5
+            && dropEvent->remainderItemId == EntityId { 45 }
+            && dropEvent->tile == 12345
+            && dropEvent->elevation == 1,
+        "item drop event round trips authoritative identity and ground placement");
+    GameEvent invalidDropEvent = events[6];
+    std::get<ItemDroppedEvent>(invalidDropEvent.payload).remainderItemId = {};
+    expect(encodeGameEvent(invalidDropEvent, dropEventEnvelope) == GameplayWireError::InvalidEntityId,
+        "partial item drop requires the host-assigned remainder identity");
+    GameEvent fullDropEvent = events[6];
+    ItemDroppedEvent& fullDropPayload = std::get<ItemDroppedEvent>(fullDropEvent.payload);
+    fullDropPayload.quantity = fullDropPayload.sourceQuantity;
+    fullDropPayload.remainderItemId = {};
+    expect(encodeGameEvent(fullDropEvent, dropEventEnvelope) == GameplayWireError::None,
+        "whole-stack item drop does not invent a remainder identity");
 
     ProtocolEnvelope missingSession = gameplayEnvelope(42);
     missingSession.sessionId = {};
@@ -1420,11 +1467,27 @@ void testNetworkCharacterLobby()
             && liveTransfer->quantity == 2
             && guest.confirmPeerEventApplied(liveTransferEvent->sequence),
         "guest accepts and confirms the authoritative loot transfer");
+    expect(host.sendLocalItemDrop(EntityId { 1 }, EntityId { 91 }, 1, 3,
+               1, EntityId { 92 }, 12345, 0, ItemDescriptor { 40, 0, 0, 0 }),
+        "host publishes a local inventory drop");
+    guest.poll();
+    std::optional<GameEvent> liveDropEvent = guest.takePeerEvent();
+    const auto* liveDrop = liveDropEvent.has_value()
+        ? std::get_if<ItemDroppedEvent>(&liveDropEvent->payload)
+        : nullptr;
+    expect(liveDrop != nullptr
+            && liveDrop->actorId == EntityId { 1 }
+            && liveDrop->sourceId == EntityId { 1 }
+            && liveDrop->itemId == EntityId { 91 }
+            && liveDrop->remainderItemId == EntityId { 92 }
+            && liveDrop->tile == 12345
+            && guest.confirmPeerEventApplied(liveDropEvent->sequence),
+        "guest accepts and confirms the authoritative ground drop");
     EventReplay completeReplay = host.replayAfter(EventSequence {});
     expect(completeReplay.status == EventReplayStatus::Available
-            && completeReplay.events.size() == 8
+            && completeReplay.events.size() == 9
             && completeReplay.events.front().sequence == EventSequence { 1 }
-            && completeReplay.events.back().sequence == EventSequence { 8 },
+            && completeReplay.events.back().sequence == EventSequence { 9 },
         "host journals every authoritative live event in session order");
     expect(guest.requestRecovery(EventSequence { 6 }), "guest requests recovery from its last retained event");
     host.poll();
@@ -1436,17 +1499,21 @@ void testNetworkCharacterLobby()
     guest.poll();
     std::optional<GameEvent> replayedLoot = guest.takePeerEvent();
     std::optional<GameEvent> replayedTransfer = guest.takePeerEvent();
+    std::optional<GameEvent> replayedDrop = guest.takePeerEvent();
     expect(replayedLoot.has_value()
             && replayedLoot->sequence == EventSequence { 7 }
             && std::holds_alternative<LootStartedEvent>(replayedLoot->payload)
             && replayedTransfer.has_value()
             && replayedTransfer->sequence == EventSequence { 8 }
             && std::holds_alternative<InventoryTransferredEvent>(replayedTransfer->payload)
+            && replayedDrop.has_value()
+            && replayedDrop->sequence == EventSequence { 9 }
+            && std::holds_alternative<ItemDroppedEvent>(replayedDrop->payload)
             && !guest.recoveryInProgress(),
-        "guest receives ordered loot replay and observes recovery completion");
+        "guest receives ordered loot and drop replay and observes recovery completion");
 
     EventSequence guestResumePoint = guest.lastAppliedEvent();
-    expect(guestResumePoint == EventSequence { 8 } && guest.disconnectForReconnect(),
+    expect(guestResumePoint == EventSequence { 9 } && guest.disconnectForReconnect(),
         "guest records its last applied event and drops the old connection");
     host.poll();
     expect(host.state() == NetworkLobbyState::Disconnected
@@ -1455,7 +1522,7 @@ void testNetworkCharacterLobby()
     expect(!guest.sendLocalMove(12347, 0, false),
         "disconnected guest input is blocked");
     expect(host.sendLocalFacing(2)
-            && host.latestAuthoritativeEvent() == EventSequence { 9 },
+            && host.latestAuthoritativeEvent() == EventSequence { 10 },
         "host continues the authoritative journal while the guest is absent");
 
     LoopbackTransportPair resumedPair = createLoopbackTransportPair();
@@ -1478,12 +1545,12 @@ void testNetworkCharacterLobby()
         ? std::get_if<ActorFacingChangedEvent>(&resumedFacing->payload)
         : nullptr;
     expect(resumedFacingPayload != nullptr
-            && resumedFacing->sequence == EventSequence { 9 }
+            && resumedFacing->sequence == EventSequence { 10 }
             && resumedFacingPayload->rotation == 2
             && !guest.recoveryInProgress(),
         "guest applies events created while disconnected and completes reconnect recovery");
     expect(resumedFacing.has_value() && guest.confirmPeerEventApplied(resumedFacing->sequence)
-            && guest.lastAppliedEvent() == EventSequence { 9 },
+            && guest.lastAppliedEvent() == EventSequence { 10 },
         "guest confirms the replayed event as its new reconnect boundary");
     expect(host.takeTransport() != nullptr && guest.takeTransport() != nullptr,
         "ready lobbies hand the connection to the game session");
@@ -1709,6 +1776,27 @@ public:
         };
     }
 
+    ItemDropExecution dropItem(Object* actor,
+        Object* source,
+        Object* item,
+        const ItemDropCommand& command) override
+    {
+        dropCalls++;
+        lastActor = actor;
+        lastSource = source;
+        lastTarget = item;
+        lastQuantity = command.sourceQuantity;
+        recordContext();
+        return ItemDropExecution {
+            nextStatus,
+            isValid(command.itemId) ? command.itemId : EntityId { 90 },
+            command.quantity < command.sourceQuantity ? EntityId { 91 } : EntityId {},
+            12345,
+            1,
+            ItemDescriptor { 40, 0, 0, 0 },
+        };
+    }
+
     void recordContext()
     {
         PlayerCharacterState* player = actingPlayerState();
@@ -1725,6 +1813,7 @@ public:
     int pickupCalls = 0;
     int lootCalls = 0;
     int transferCalls = 0;
+    int dropCalls = 0;
     Object* lastActor = nullptr;
     Object* lastTarget = nullptr;
     Object* lastSource = nullptr;
@@ -1906,6 +1995,35 @@ void testAuthoritativeCommandProcessing()
             && dynamicTransferEvent->sourceQuantity == 4
             && dynamicTransferEvent->itemDescriptor.pid == 40,
         "host execution assigns identities to a dynamic item and its split remainder");
+
+    GameCommand drop;
+    drop.sequence.value = 7;
+    drop.playerId = kGuestPlayerId;
+    drop.actorId = session.playerActorId(kGuestPlayerId);
+    drop.expectedPhase = SessionPhase::Exploration;
+    drop.expectedPhaseRevision = session.phaseRevision();
+    drop.payload = ItemDropCommand {
+        session.playerActorId(kGuestPlayerId),
+        registeredItem.entityId,
+        1,
+        3,
+        ItemDescriptor { 40, 0, 0, 0 },
+    };
+    AuthoritativeCommandResult dropped = processor.process(drop, session, executor);
+    const ItemDroppedEvent* dropEvent = dropped.event.has_value()
+        ? std::get_if<ItemDroppedEvent>(&dropped.event->payload)
+        : nullptr;
+    expect(dropped.result.status == CommandStatus::Accepted
+            && executor.dropCalls == 1
+            && executor.lastActor == asGameObject(guestActor)
+            && executor.lastSource == asGameObject(guestActor)
+            && executor.lastTarget == asGameObject(item)
+            && dropEvent != nullptr
+            && dropEvent->itemId == registeredItem.entityId
+            && dropEvent->remainderItemId == EntityId { 91 }
+            && dropEvent->tile == 12345
+            && dropEvent->elevation == 1,
+        "host execution emits authoritative identity and placement for a dropped stack item");
 
     executor.nextStatus = CommandExecutionStatus::InvalidAction;
     move.sequence.value = 3;

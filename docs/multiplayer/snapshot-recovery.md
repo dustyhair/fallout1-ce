@@ -24,7 +24,7 @@ The comparison reports the first section that differs. This is more useful durin
 
 ## Recovery contract
 
-`SnapshotReplica::apply` validates the entire snapshot before replacing replica state. A failed validation leaves the existing state unchanged. A successful application stores actors, doors, and items in canonical entity order. The engine adapter can recreate a missing described item, restore its mutable state, and move it between the authoritative holder and map position, including repairing a pickup or split whose journal event has expired.
+`SnapshotReplica::apply` validates the entire snapshot before replacing replica state. A failed validation leaves the existing state unchanged. A successful application stores actors, doors, and items in canonical entity order. The engine adapter can recreate a missing described item, restore its mutable state, and move it between the authoritative holder and map position, including repairing a pickup, split, or ground drop whose journal event has expired.
 
 The headless recovery test creates a host snapshot with actors, a door, an inventory stack, and a ground item. It checks independent actor, door, and item divergence before applying the host state and confirming every section digest matches again.
 

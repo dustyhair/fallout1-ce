@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <limits>
 #include <optional>
 #include <string>
 #include <thread>
@@ -17,9 +18,11 @@
 #include "game/game.h"
 #include "game/gconfig.h"
 #include "game/inventry.h"
+#include "game/item.h"
 #include "game/mainmenu.h"
 #include "game/object.h"
 #include "game/protinst.h"
+#include "game/proto_types.h"
 #include "multiplayer/character_build_bridge.h"
 #include "multiplayer/gameplay_wire.h"
 #include "multiplayer/network_bootstrap.h"
@@ -55,9 +58,52 @@ std::chrono::steady_clock::time_point reconnectDeadline;
 std::chrono::steady_clock::time_point nextReconnectAttempt;
 EventSequence reconnectLastApplied;
 
+struct PendingLocalItemDrop {
+    Object* source = nullptr;
+    Object* item = nullptr;
+    EntityId sourceId;
+    EntityId currentItemId;
+    std::uint32_t remainingQuantity = 0;
+};
+
+std::optional<PendingLocalItemDrop> pendingLocalItemDrop;
+
 constexpr std::uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
 constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
 constexpr std::size_t kArchiveSampleSize = 64 * 1024;
+
+void continuePendingLocalItemDrop(const ItemDroppedEvent& drop)
+{
+    if (launchOptions.mode != NetworkLaunchMode::Join
+        || !pendingLocalItemDrop.has_value()
+        || drop.actorId != EntityId { kGuestPlayerId.value }
+        || drop.sourceId != pendingLocalItemDrop->sourceId
+        || (isValid(pendingLocalItemDrop->currentItemId)
+            && drop.itemId != pendingLocalItemDrop->currentItemId)
+        || drop.quantity > pendingLocalItemDrop->remainingQuantity) {
+        return;
+    }
+
+    pendingLocalItemDrop->remainingQuantity -= drop.quantity;
+    if (pendingLocalItemDrop->remainingQuantity == 0) {
+        pendingLocalItemDrop.reset();
+        return;
+    }
+
+    std::uint32_t nextSourceQuantity = drop.sourceQuantity - drop.quantity;
+    if (!isValid(drop.remainderItemId)
+        || nextSourceQuantity == 0
+        || !lobby.sendLocalItemDrop(drop.sourceId,
+            drop.remainderItemId,
+            1,
+            nextSourceQuantity,
+            networkWorldPhaseRevision())) {
+        debug_printf("Multiplayer queued item drop could not continue.\n");
+        pendingLocalItemDrop.reset();
+        return;
+    }
+    pendingLocalItemDrop->currentItemId = drop.remainderItemId;
+}
 
 void hashBytes(std::uint64_t& digest, const void* data, std::size_t size)
 {
@@ -397,6 +443,9 @@ void networkRuntimeBackgroundProcess()
 
     lobby.poll();
     pollReconnect();
+    if (lobby.state() == NetworkLobbyState::Disconnected) {
+        pendingLocalItemDrop.reset();
+    }
     if (networkWorldActive()) {
         if (launchOptions.mode == NetworkLaunchMode::Host) {
             if (!pendingRecoveryRequest.has_value()) {
@@ -428,6 +477,7 @@ void networkRuntimeBackgroundProcess()
                 lobby.abortRecovery();
                 break;
             }
+            pendingLocalItemDrop.reset();
             if (!lobby.confirmSnapshotApplied(snapshot->lastIncludedEvent)) {
                 debug_printf("Multiplayer recovery snapshot boundary could not be confirmed.\n");
                 lobby.abortRecovery();
@@ -445,6 +495,7 @@ void networkRuntimeBackgroundProcess()
                 debug_printf("Multiplayer command %llu rejected with reason %d.\n",
                     static_cast<unsigned long long>(result->commandSequence.value),
                     static_cast<int>(result->rejection));
+                pendingLocalItemDrop.reset();
             }
         }
         while (std::optional<GameEvent> event = lobby.takePeerEvent()) {
@@ -461,11 +512,18 @@ void networkRuntimeBackgroundProcess()
                 applied = networkWorldApplyPeerLoot(*loot);
             } else if (const auto* transfer = std::get_if<InventoryTransferredEvent>(&event->payload)) {
                 applied = networkWorldApplyInventoryTransfer(*transfer);
+            } else if (const auto* drop = std::get_if<ItemDroppedEvent>(&event->payload)) {
+                applied = networkWorldApplyItemDrop(*drop);
             }
             if (!applied) {
                 debug_printf("Multiplayer peer event could not be applied.\n");
-            } else if (!lobby.confirmPeerEventApplied(event->sequence)) {
-                debug_printf("Multiplayer peer event boundary could not be confirmed.\n");
+            } else {
+                if (const auto* drop = std::get_if<ItemDroppedEvent>(&event->payload)) {
+                    continuePendingLocalItemDrop(*drop);
+                }
+                if (!lobby.confirmPeerEventApplied(event->sequence)) {
+                    debug_printf("Multiplayer peer event boundary could not be confirmed.\n");
+                }
             }
         }
     }
@@ -530,6 +588,7 @@ bool networkRuntimeConfigure(int argc, char** argv)
     }
     pendingLocalSheet.reset();
     pendingRecoveryRequest.reset();
+    pendingLocalItemDrop.reset();
     discardReconnectTransport();
     reconnectLastApplied = {};
     reconnectTokens.invalidateAll();
@@ -1326,10 +1385,160 @@ NetworkInventoryTransferDisposition networkRuntimePrepareLocalInventoryTransfer(
     return NetworkInventoryTransferDisposition::DeferToHost;
 }
 
+NetworkItemDropDisposition networkRuntimePrepareLocalItemDrop(Object* source,
+    Object* item,
+    std::uint32_t quantity,
+    std::uint32_t sourceQuantity)
+{
+    if (!networkWorldActive() || networkWorldItemDropInProgress()) {
+        return NetworkItemDropDisposition::ApplyLocally;
+    }
+    if (!networkWorldIsLocalItemDrop(source, item)) {
+        return NetworkItemDropDisposition::ApplyLocally;
+    }
+    if (quantity == 0
+        || quantity > sourceQuantity
+        || sourceQuantity > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
+        return NetworkItemDropDisposition::Reject;
+    }
+
+    if (launchOptions.mode == NetworkLaunchMode::Join
+        && pendingLocalItemDrop.has_value()) {
+        if (pendingLocalItemDrop->source == source
+            && pendingLocalItemDrop->item == item
+            && quantity == 1
+            && pendingLocalItemDrop->remainingQuantity < sourceQuantity) {
+            pendingLocalItemDrop->remainingQuantity++;
+            return NetworkItemDropDisposition::DeferToHost;
+        }
+        debug_printf("Multiplayer item drop is waiting for host confirmation.\n");
+        return NetworkItemDropDisposition::Reject;
+    }
+
+    std::optional<EntityId> sourceId = networkWorldFindEntity(source);
+    std::optional<EntityId> itemId = networkWorldFindEntity(item);
+    ItemDescriptor itemDescriptor;
+    if (!sourceId.has_value() || !networkWorldDescribeItem(item, itemDescriptor)) {
+        debug_printf("Multiplayer item drop has an invalid entity.\n");
+        return NetworkItemDropDisposition::Reject;
+    }
+    if (!itemId.has_value()
+        && (item->owner != source || item->data.inventory.length != 0)) {
+        debug_printf("Multiplayer can only introduce a direct, empty dropped item.\n");
+        return NetworkItemDropDisposition::Reject;
+    }
+
+    if (launchOptions.mode == NetworkLaunchMode::Host) {
+        if (!itemId.has_value()) {
+            itemId = networkWorldEnsureItemRegistered(item);
+        }
+        if (!itemId.has_value()) {
+            debug_printf("Multiplayer host could not assign a dropped item entity ID.\n");
+            return NetworkItemDropDisposition::Reject;
+        }
+        networkWorldResetLastItemSplit();
+        return NetworkItemDropDisposition::ApplyLocally;
+    }
+    if (launchOptions.mode != NetworkLaunchMode::Join) {
+        return NetworkItemDropDisposition::Reject;
+    }
+
+    if (!lobby.sendLocalItemDrop(*sourceId,
+            itemId.value_or(EntityId {}),
+            quantity,
+            sourceQuantity,
+            networkWorldPhaseRevision(),
+            {},
+            -1,
+            -1,
+            itemDescriptor)) {
+        debug_printf("Multiplayer item drop command could not be sent.\n");
+        return NetworkItemDropDisposition::Reject;
+    }
+    pendingLocalItemDrop = PendingLocalItemDrop {
+        source,
+        item,
+        *sourceId,
+        itemId.value_or(EntityId {}),
+        quantity,
+    };
+    return NetworkItemDropDisposition::DeferToHost;
+}
+
+void networkRuntimeHandleLocalItemDrop(Object* source,
+    Object* item,
+    std::uint32_t quantity,
+    std::uint32_t sourceQuantity)
+{
+    if (!networkWorldActive()
+        || networkWorldItemDropInProgress()
+        || source == nullptr
+        || item == nullptr
+        || item->owner != nullptr
+        || item->tile < 0) {
+        return;
+    }
+    if (launchOptions.mode != NetworkLaunchMode::Host) {
+        return;
+    }
+
+    std::optional<EntityId> sourceId = networkWorldFindEntity(source);
+    std::optional<EntityId> itemId = networkWorldFindEntity(item);
+    ItemDescriptor itemDescriptor;
+    if (!sourceId.has_value()
+        || !itemId.has_value()
+        || !networkWorldDescribeItem(item, itemDescriptor)) {
+        debug_printf("Multiplayer item drop could not resolve its authoritative identity.\n");
+        return;
+    }
+
+    if (!lobby.sendLocalItemDrop(*sourceId,
+            *itemId,
+            quantity,
+            sourceQuantity,
+            networkWorldPhaseRevision(),
+            networkWorldTakeLastItemSplit(),
+            item->tile,
+            item->elevation,
+            itemDescriptor)) {
+        debug_printf("Multiplayer item drop could not be published.\n");
+    }
+}
+
+bool networkRuntimeHandleLocalMoneyDrop(Object* source, Object* item, std::uint32_t quantity)
+{
+    if (!networkWorldActive()
+        || source == nullptr
+        || item == nullptr
+        || item->pid != PROTO_ID_MONEY
+        || !networkWorldIsLocalItemDrop(source, item)) {
+        return false;
+    }
+
+    int available = item_count(source, item);
+    std::uint32_t sourceQuantity = static_cast<std::uint32_t>(std::max(available, 0));
+    NetworkItemDropDisposition disposition = networkRuntimePrepareLocalItemDrop(
+        source,
+        item,
+        quantity,
+        sourceQuantity);
+    if (disposition == NetworkItemDropDisposition::Reject
+        || disposition == NetworkItemDropDisposition::DeferToHost) {
+        return true;
+    }
+    if (!networkWorldApplyLocalItemDrop(source, item, quantity)) {
+        debug_printf("Multiplayer host could not apply a local caps drop.\n");
+        return true;
+    }
+    networkRuntimeHandleLocalItemDrop(source, item, quantity, sourceQuantity);
+    return true;
+}
+
 void networkRuntimeLeaveWorld()
 {
     lastSentLocalRotation = -1;
     pendingRecoveryRequest.reset();
+    pendingLocalItemDrop.reset();
     networkWorldLeave();
 }
 
@@ -1347,6 +1556,7 @@ void networkRuntimeStop()
     reconnectTokens.invalidateAll();
     lobbyStarted = false;
     pendingRecoveryRequest.reset();
+    pendingLocalItemDrop.reset();
 }
 
 } // namespace multiplayer

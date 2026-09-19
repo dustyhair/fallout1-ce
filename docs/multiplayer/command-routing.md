@@ -1,6 +1,6 @@
 # Authoritative command routing
 
-The command processor handles movement, door use, ground-item pickup, looting, and loot-window inventory transfers. The developer session uses the interaction subset in process, while the live network host validates every guest action. Its input and output contain only multiplayer value types and entity IDs.
+The command processor handles movement, door use, ground-item pickup, looting, loot-window inventory transfers, and player item drops. The developer session uses the interaction subset in process, while the live network host validates every guest action. Its input and output contain only multiplayer value types and entity IDs.
 
 For every command, the processor checks:
 
@@ -20,4 +20,6 @@ For live pickup, the initial map's ground items receive host-compatible IDs by s
 
 Lootable critters and their recursive inventories are registered in the same canonical scan. Only the initiating player's process opens Fallout's modal loot window. Moves are sent with source, destination, item, moved quantity, and source-stack quantity; the host verifies that one side is the owned actor and the other belongs to the active loot target. A split gives the copied remainder a host-assigned ID, while identical-stack merges retire the destroyed representative on both peers. An unregistered player item is described by bounded prototype state and receives its first entity ID from the host.
 
-The [snapshot recovery format](snapshot-recovery.md) records the holder or ground position of every registered item so a recovery snapshot repairs pickup and loot mutations after their journal events have expired.
+Inventory drops use the same authority rule. Guest input stays unchanged until the host runs the drop script and publishes the dropped item ID, any split remainder ID, quantity, and final ground tile. Repeated ordinary-stack drops are serialized through successive remainder IDs; caps use one bounded bulk command so Fallout's special amount selection cannot mutate the guest ahead of the host.
+
+The [snapshot recovery format](snapshot-recovery.md) records the holder or ground position of every registered item so a recovery snapshot repairs pickup, loot, and drop mutations after their journal events have expired.

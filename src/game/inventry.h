@@ -83,6 +83,7 @@ void inven_action_cursor(int eventCode, int inventoryWindowType);
 int loot_container(Object* a1, Object* a2);
 bool inven_loot_window_is_active();
 void inven_refresh_loot_window();
+void inven_refresh_inventory_window();
 int inven_steal_container(Object* a1, Object* a2);
 int move_inventory(Object* a1, int a2, Object* a3, bool a4);
 void barter_inventory(int win, Object* a2, Object* a3, Object* a4, int a5);

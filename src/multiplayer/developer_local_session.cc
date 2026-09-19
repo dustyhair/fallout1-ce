@@ -209,6 +209,11 @@ public:
     {
         return {};
     }
+
+    ItemDropExecution dropItem(Object*, Object*, Object*, const ItemDropCommand&) override
+    {
+        return {};
+    }
 };
 
 EngineCommandExecutor commandExecutor;

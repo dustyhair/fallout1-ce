@@ -57,6 +57,22 @@ NetworkInventoryTransferDisposition networkRuntimePrepareLocalInventoryTransfer(
     Object* item,
     std::uint32_t quantity,
     std::uint32_t availableQuantity);
+
+enum class NetworkItemDropDisposition {
+    ApplyLocally,
+    DeferToHost,
+    Reject,
+};
+
+NetworkItemDropDisposition networkRuntimePrepareLocalItemDrop(Object* source,
+    Object* item,
+    std::uint32_t quantity,
+    std::uint32_t sourceQuantity);
+void networkRuntimeHandleLocalItemDrop(Object* source,
+    Object* item,
+    std::uint32_t quantity,
+    std::uint32_t sourceQuantity);
+bool networkRuntimeHandleLocalMoneyDrop(Object* source, Object* item, std::uint32_t quantity);
 void networkRuntimeLeaveWorld();
 void networkRuntimeStop();
 

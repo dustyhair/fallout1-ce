@@ -12,7 +12,7 @@ The headless test covers contiguous append, count and byte bounds, replay at the
 
 ## Current boundary
 
-Movement, facing, doors, pickup, loot initiation, and loot-window inventory transfers route guest intents through the host. Only host-issued events enter the session-wide sequence and bounded journal. The live connection detects event gaps and requests recovery from the last contiguous sequence. The host replays retained events when possible; otherwise it captures and sends the current actor, door, and registered-item snapshot. Recovery completion verifies that the guest reached the host's latest event sequence.
+Movement, facing, doors, pickup, loot initiation, loot-window inventory transfers, and inventory drops route guest intents through the host. Only host-issued events enter the session-wide sequence and bounded journal. The live connection detects event gaps and requests recovery from the last contiguous sequence. The host replays retained events when possible; otherwise it captures and sends the current actor, door, and registered-item snapshot. Recovery completion verifies that the guest reached the host's latest event sequence.
 
 Snapshot capture waits until player and door animations are idle. This keeps `lastIncludedEvent` aligned with the concrete actor, door, item-holder, and ground-item state represented by the snapshot instead of truncating an in-progress authoritative action.
 

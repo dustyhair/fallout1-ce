@@ -15,6 +15,7 @@ int obj_examine_func(Object* critter, Object* target, void (*fn)(char* string));
 int obj_pickup(Object* critter, Object* item);
 int obj_remove_from_inven(Object* critter, Object* item);
 int obj_drop(Object* a1, Object* a2);
+int obj_drop_quantity(Object* owner, Object* item, int quantity);
 int obj_destroy(Object* obj);
 int obj_use_radio(Object* item_obj);
 int protinst_use_item(Object* a1, Object* a2);

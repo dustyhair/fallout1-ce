@@ -14,6 +14,7 @@ enum class CommandType : std::uint8_t {
     Loot = 4,
     Face = 5,
     InventoryTransfer = 6,
+    ItemDrop = 7,
 };
 
 enum class EventType : std::uint8_t {
@@ -23,6 +24,7 @@ enum class EventType : std::uint8_t {
     LootStarted = 4,
     ActorFacingChanged = 5,
     InventoryTransferred = 6,
+    ItemDropped = 7,
 };
 
 constexpr std::size_t kCommandHeaderSize = 28;
@@ -31,12 +33,14 @@ constexpr std::size_t kTargetCommandSize = kCommandHeaderSize + 4;
 constexpr std::size_t kFacingCommandSize = kCommandHeaderSize + 8;
 constexpr std::size_t kItemDescriptorSize = 16;
 constexpr std::size_t kInventoryTransferCommandSize = kCommandHeaderSize + 20 + kItemDescriptorSize;
+constexpr std::size_t kItemDropCommandSize = kCommandHeaderSize + 16 + kItemDescriptorSize;
 constexpr std::size_t kCommandResultSize = 24;
 constexpr std::size_t kEventHeaderSize = 20;
 constexpr std::size_t kMovementEventHeaderSize = kEventHeaderSize + 20;
 constexpr std::size_t kTargetEventSize = kEventHeaderSize + 8;
 constexpr std::size_t kFacingEventSize = kEventHeaderSize + 8;
 constexpr std::size_t kInventoryTransferEventSize = kEventHeaderSize + 28 + kItemDescriptorSize;
+constexpr std::size_t kItemDropEventSize = kEventHeaderSize + 32 + kItemDescriptorSize;
 
 void appendUInt16(std::vector<std::uint8_t>& bytes, std::uint16_t value)
 {
@@ -223,6 +227,18 @@ GameplayWireError validateCommand(const GameCommand& command)
             ? GameplayWireError::None
             : GameplayWireError::InvalidQuantity;
     }
+    if (const auto* drop = std::get_if<ItemDropCommand>(&command.payload)) {
+        if (!isValid(drop->sourceId)
+            || !isValidItemDescriptor(drop->itemDescriptor)
+            || (!isValid(drop->itemId) && !hasItemDescriptor(drop->itemDescriptor))) {
+            return GameplayWireError::InvalidEntityId;
+        }
+        return drop->quantity != 0
+                && drop->quantity <= drop->sourceQuantity
+                && drop->sourceQuantity <= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())
+            ? GameplayWireError::None
+            : GameplayWireError::InvalidQuantity;
+    }
 
     EntityId targetId;
     if (const auto* interact = std::get_if<InteractCommand>(&command.payload)) {
@@ -319,6 +335,28 @@ GameplayWireError validateEvent(const GameEvent& event)
             ? GameplayWireError::None
             : GameplayWireError::InvalidQuantity;
     }
+    if (const auto* drop = std::get_if<ItemDroppedEvent>(&event.payload)) {
+        if (!isValid(drop->actorId)
+            || !isValid(drop->sourceId)
+            || !isValid(drop->itemId)
+            || (isValid(drop->remainderItemId)
+                && (drop->remainderItemId == drop->actorId
+                    || drop->remainderItemId == drop->sourceId
+                    || drop->remainderItemId == drop->itemId))
+            || !isValidItemDescriptor(drop->itemDescriptor)
+            || !hasItemDescriptor(drop->itemDescriptor)
+            || ((drop->quantity < drop->sourceQuantity) != isValid(drop->remainderItemId))) {
+            return GameplayWireError::InvalidEntityId;
+        }
+        if (drop->tile < 0 || drop->elevation < 0 || drop->elevation > 2) {
+            return GameplayWireError::InvalidMove;
+        }
+        return drop->quantity != 0
+                && drop->quantity <= drop->sourceQuantity
+                && drop->sourceQuantity <= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())
+            ? GameplayWireError::None
+            : GameplayWireError::InvalidQuantity;
+    }
 
     EntityId actorId;
     EntityId targetId;
@@ -391,8 +429,7 @@ GameplayWireError encodeGameCommand(const GameCommand& command, ProtocolEnvelope
     } else if (const auto* loot = std::get_if<LootCommand>(&command.payload)) {
         appendCommandHeader(command, CommandType::Loot, envelope.payload);
         appendUInt32(envelope.payload, loot->targetId.value);
-    } else {
-        const auto* transfer = std::get_if<InventoryTransferCommand>(&command.payload);
+    } else if (const auto* transfer = std::get_if<InventoryTransferCommand>(&command.payload)) {
         appendCommandHeader(command, CommandType::InventoryTransfer, envelope.payload);
         appendUInt32(envelope.payload, transfer->sourceId.value);
         appendUInt32(envelope.payload, transfer->destinationId.value);
@@ -400,6 +437,14 @@ GameplayWireError encodeGameCommand(const GameCommand& command, ProtocolEnvelope
         appendUInt32(envelope.payload, transfer->quantity);
         appendUInt32(envelope.payload, transfer->sourceQuantity);
         appendItemDescriptor(envelope.payload, transfer->itemDescriptor);
+    } else {
+        const auto* drop = std::get_if<ItemDropCommand>(&command.payload);
+        appendCommandHeader(command, CommandType::ItemDrop, envelope.payload);
+        appendUInt32(envelope.payload, drop->sourceId.value);
+        appendUInt32(envelope.payload, drop->itemId.value);
+        appendUInt32(envelope.payload, drop->quantity);
+        appendUInt32(envelope.payload, drop->sourceQuantity);
+        appendItemDescriptor(envelope.payload, drop->itemDescriptor);
     }
     return GameplayWireError::None;
 }
@@ -487,6 +532,19 @@ GameCommandDecodeResult decodeGameCommand(const ProtocolEnvelope& envelope)
             readUInt32(envelope.payload, 40),
             readUInt32(envelope.payload, 44),
             readItemDescriptor(envelope.payload, 48),
+        };
+        break;
+    case CommandType::ItemDrop:
+        if (envelope.payload.size() != kItemDropCommandSize) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.command.payload = ItemDropCommand {
+            EntityId { readUInt32(envelope.payload, 28) },
+            EntityId { readUInt32(envelope.payload, 32) },
+            readUInt32(envelope.payload, 36),
+            readUInt32(envelope.payload, 40),
+            readItemDescriptor(envelope.payload, 44),
         };
         break;
     default:
@@ -584,8 +642,7 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
         appendEventHeader(event, EventType::LootStarted, envelope.payload);
         appendUInt32(envelope.payload, loot->actorId.value);
         appendUInt32(envelope.payload, loot->targetId.value);
-    } else {
-        const auto* transfer = std::get_if<InventoryTransferredEvent>(&event.payload);
+    } else if (const auto* transfer = std::get_if<InventoryTransferredEvent>(&event.payload)) {
         appendEventHeader(event, EventType::InventoryTransferred, envelope.payload);
         appendUInt32(envelope.payload, transfer->actorId.value);
         appendUInt32(envelope.payload, transfer->sourceId.value);
@@ -595,6 +652,18 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
         appendUInt32(envelope.payload, transfer->sourceQuantity);
         appendUInt32(envelope.payload, transfer->remainderItemId.value);
         appendItemDescriptor(envelope.payload, transfer->itemDescriptor);
+    } else {
+        const auto* drop = std::get_if<ItemDroppedEvent>(&event.payload);
+        appendEventHeader(event, EventType::ItemDropped, envelope.payload);
+        appendUInt32(envelope.payload, drop->actorId.value);
+        appendUInt32(envelope.payload, drop->sourceId.value);
+        appendUInt32(envelope.payload, drop->itemId.value);
+        appendUInt32(envelope.payload, drop->quantity);
+        appendUInt32(envelope.payload, drop->sourceQuantity);
+        appendUInt32(envelope.payload, drop->remainderItemId.value);
+        appendInt32(envelope.payload, drop->tile);
+        appendInt32(envelope.payload, drop->elevation);
+        appendItemDescriptor(envelope.payload, drop->itemDescriptor);
     }
     return GameplayWireError::None;
 }
@@ -691,6 +760,23 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
             readUInt32(envelope.payload, 40),
             EntityId { readUInt32(envelope.payload, 44) },
             readItemDescriptor(envelope.payload, 48),
+        };
+        break;
+    case EventType::ItemDropped:
+        if (envelope.payload.size() != kItemDropEventSize) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.event.payload = ItemDroppedEvent {
+            EntityId { readUInt32(envelope.payload, 20) },
+            EntityId { readUInt32(envelope.payload, 24) },
+            EntityId { readUInt32(envelope.payload, 28) },
+            readUInt32(envelope.payload, 32),
+            readUInt32(envelope.payload, 36),
+            EntityId { readUInt32(envelope.payload, 40) },
+            readInt32(envelope.payload, 44),
+            readInt32(envelope.payload, 48),
+            readItemDescriptor(envelope.payload, 52),
         };
         break;
     default:

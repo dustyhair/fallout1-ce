@@ -159,7 +159,15 @@ struct InventoryTransferCommand {
     ItemDescriptor itemDescriptor;
 };
 
-using GameCommandPayload = std::variant<MoveCommand, FaceCommand, InteractCommand, PickupCommand, LootCommand, InventoryTransferCommand>;
+struct ItemDropCommand {
+    EntityId sourceId;
+    EntityId itemId;
+    std::uint32_t quantity = 0;
+    std::uint32_t sourceQuantity = 0;
+    ItemDescriptor itemDescriptor;
+};
+
+using GameCommandPayload = std::variant<MoveCommand, FaceCommand, InteractCommand, PickupCommand, LootCommand, InventoryTransferCommand, ItemDropCommand>;
 
 struct GameCommand {
     CommandSequence sequence;
@@ -237,7 +245,19 @@ struct InventoryTransferredEvent {
     ItemDescriptor itemDescriptor;
 };
 
-using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, LootStartedEvent, InventoryTransferredEvent>;
+struct ItemDroppedEvent {
+    EntityId actorId;
+    EntityId sourceId;
+    EntityId itemId;
+    std::uint32_t quantity = 0;
+    std::uint32_t sourceQuantity = 0;
+    EntityId remainderItemId;
+    std::int32_t tile = -1;
+    std::int32_t elevation = -1;
+    ItemDescriptor itemDescriptor;
+};
+
+using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, LootStartedEvent, InventoryTransferredEvent, ItemDroppedEvent>;
 
 struct GameEvent {
     EventSequence sequence;

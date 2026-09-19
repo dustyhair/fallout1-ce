@@ -70,6 +70,7 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     const PickupCommand* pickup = std::get_if<PickupCommand>(&command.payload);
     const LootCommand* loot = std::get_if<LootCommand>(&command.payload);
     const InventoryTransferCommand* transfer = std::get_if<InventoryTransferCommand>(&command.payload);
+    const ItemDropCommand* drop = std::get_if<ItemDropCommand>(&command.payload);
     Object* target = nullptr;
     EntityId targetId;
     bool hasTarget = false;
@@ -111,6 +112,21 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
             || (isValid(transfer->itemId) && item == nullptr)) {
             return rejectAndRemember(CommandRejection::MissingEntity);
         }
+    } else if (drop != nullptr) {
+        bool descriptorValid = hasItemDescriptor(drop->itemDescriptor)
+            && drop->itemDescriptor.pid >= 0
+            && (static_cast<std::uint32_t>(drop->itemDescriptor.pid) >> 24) == 0;
+        if (drop->quantity == 0
+            || drop->quantity > drop->sourceQuantity
+            || drop->sourceQuantity > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())
+            || (!isValid(drop->itemId) && !descriptorValid)) {
+            return rejectAndRemember(CommandRejection::Malformed);
+        }
+        source = session.entities().findObject(drop->sourceId);
+        item = isValid(drop->itemId) ? session.entities().findObject(drop->itemId) : nullptr;
+        if (source == nullptr || (isValid(drop->itemId) && item == nullptr)) {
+            return rejectAndRemember(CommandRejection::MissingEntity);
+        }
     }
 
     CommandExecutionStatus executionStatus = CommandExecutionStatus::InvalidAction;
@@ -147,6 +163,23 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
                 transfer->sourceQuantity,
                 transferExecution.remainderItemId,
                 transferExecution.itemDescriptor,
+            };
+        } else if (drop != nullptr) {
+            ItemDropExecution dropExecution = executor.dropItem(actor,
+                source,
+                item,
+                *drop);
+            executionStatus = dropExecution.status;
+            event.payload = ItemDroppedEvent {
+                command.actorId,
+                drop->sourceId,
+                dropExecution.itemId,
+                drop->quantity,
+                drop->sourceQuantity,
+                dropExecution.remainderItemId,
+                dropExecution.tile,
+                dropExecution.elevation,
+                dropExecution.itemDescriptor,
             };
         }
     }

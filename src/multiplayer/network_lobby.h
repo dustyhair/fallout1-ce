@@ -73,6 +73,15 @@ public:
         std::uint32_t phaseRevision = 1,
         EntityId remainderItemId = {},
         ItemDescriptor itemDescriptor = {});
+    bool sendLocalItemDrop(EntityId sourceId,
+        EntityId itemId,
+        std::uint32_t quantity,
+        std::uint32_t sourceQuantity,
+        std::uint32_t phaseRevision = 1,
+        EntityId remainderItemId = {},
+        std::int32_t tile = -1,
+        std::int32_t elevation = -1,
+        ItemDescriptor itemDescriptor = {});
     bool sendCommandOutcome(AuthoritativeCommandResult outcome);
     std::optional<GameCommand> takePeerCommand();
     std::optional<CommandResult> takeCommandResult();

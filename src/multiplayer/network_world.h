@@ -23,9 +23,12 @@ bool networkWorldApplyPeerDoorUse(const DoorUseStartedEvent& doorUse);
 bool networkWorldApplyPeerPickup(const ItemPickupStartedEvent& pickup);
 bool networkWorldApplyPeerLoot(const LootStartedEvent& loot);
 bool networkWorldApplyInventoryTransfer(const InventoryTransferredEvent& transfer, bool reverse = false);
+bool networkWorldApplyItemDrop(const ItemDroppedEvent& drop);
+bool networkWorldApplyLocalItemDrop(Object* source, Object* item, std::uint32_t quantity);
 bool networkWorldBeginLocalLoot(Object* target);
 bool networkWorldSetLocalLootTarget(Object* target);
 bool networkWorldIsLocalInventoryTransfer(Object* source, Object* destination);
+bool networkWorldIsLocalItemDrop(Object* source, Object* item);
 void networkWorldHandleItemReplacement(Object* removed, Object* replacement);
 void networkWorldHandleItemSplit(Object* original, Object* remainder);
 bool networkWorldDescribeItem(const Object* item, ItemDescriptor& descriptor);
@@ -43,6 +46,7 @@ std::optional<EntityId> networkWorldFindEntity(const Object* object);
 void networkWorldLeave();
 bool networkWorldActive();
 bool networkWorldInventoryTransferInProgress();
+bool networkWorldItemDropInProgress();
 
 } // namespace multiplayer
 } // namespace fallout

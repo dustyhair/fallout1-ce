@@ -1,5 +1,6 @@
 #include "game/protinst.h"
 
+#include <algorithm>
 #include <assert.h>
 #include <optional>
 #include <stdio.h>
@@ -27,6 +28,7 @@
 #include "game/tile.h"
 #include "game/worldmap.h"
 #include "multiplayer/local_player_context.h"
+#include "multiplayer/network_runtime.h"
 #include "multiplayer/network_world.h"
 #include "plib/color/color.h"
 #include "plib/gnw/debug.h"
@@ -583,13 +585,12 @@ int obj_remove_from_inven(Object* critter, Object* item)
     return rc;
 }
 
-// 0x48AC94
-int obj_drop(Object* a1, Object* a2)
+int obj_drop_quantity(Object* a1, Object* a2, int quantity)
 {
     int sid = -1;
     bool scriptOverrides = false;
 
-    if (a2 == NULL) {
+    if (a2 == NULL || quantity <= 0) {
         return -1;
     }
 
@@ -609,18 +610,56 @@ int obj_drop(Object* a1, Object* a2)
         return 0;
     }
 
-    if (obj_remove_from_inven(a1, a2) == 0) {
+    int removeRc = quantity == 1
+        ? obj_remove_from_inven(a1, a2)
+        : item_remove_mult(a1, a2, quantity);
+    if (removeRc == 0) {
+        if (quantity > 1 && a2->pid == PROTO_ID_MONEY) {
+            item_caps_set_amount(a2, quantity);
+        }
         Object* owner = obj_top_environment(a1);
         if (owner == NULL) {
             owner = a1;
         }
 
         Rect updatedRect;
-        obj_connect(a2, owner->tile, owner->elevation, &updatedRect);
-        tile_refresh_rect(&updatedRect, owner->elevation);
+        if (obj_connect(a2, owner->tile, owner->elevation, &updatedRect) == 0) {
+            tile_refresh_rect(&updatedRect, owner->elevation);
+        }
     }
 
     return 0;
+}
+
+// 0x48AC94
+int obj_drop(Object* a1, Object* a2)
+{
+    if (a2 == NULL) {
+        return -1;
+    }
+
+    int sourceQuantity = item_count(a1, a2);
+    multiplayer::NetworkItemDropDisposition disposition = multiplayer::networkRuntimePrepareLocalItemDrop(
+        a1,
+        a2,
+        1,
+        static_cast<std::uint32_t>(std::max(sourceQuantity, 0)));
+    if (disposition == multiplayer::NetworkItemDropDisposition::Reject) {
+        return -1;
+    }
+    if (disposition == multiplayer::NetworkItemDropDisposition::DeferToHost) {
+        return 0;
+    }
+
+    int rc = obj_drop_quantity(a1, a2, 1);
+    if (rc == 0 && a2->owner == nullptr && a2->tile >= 0) {
+        multiplayer::networkRuntimeHandleLocalItemDrop(
+            a1,
+            a2,
+            1,
+            static_cast<std::uint32_t>(sourceQuantity));
+    }
+    return rc;
 }
 
 // 0x48AD38

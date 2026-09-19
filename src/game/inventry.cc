@@ -350,6 +350,7 @@ static int i_wid_max_x;
 static Inventory* target_pud;
 
 static bool lootWindowActive;
+static int activeInventoryWindowType = -1;
 
 // 0x59CEE4
 static int barter_back_win;
@@ -543,6 +544,7 @@ void handle_inventory()
 // 0x462818
 bool setup_inventory(int inventoryWindowType)
 {
+    activeInventoryWindowType = inventoryWindowType;
     dropped_explosive = 0;
     curr_stack = 0;
     stack_offset[0] = 0;
@@ -1287,6 +1289,7 @@ void exit_inventory(bool shouldEnableIso)
     }
 
     win_delete(i_wid);
+    activeInventoryWindowType = -1;
 
     gmouse_enable();
 
@@ -3502,6 +3505,14 @@ void inven_action_cursor(int keyCode, int inventoryWindowType)
                 v56 = 1;
             }
 
+            if (v56 > 0
+                && multiplayer::networkRuntimeHandleLocalMoneyDrop(
+                    v41,
+                    item,
+                    static_cast<std::uint32_t>(v56))) {
+                break;
+            }
+
             if (v56 > 0) {
                 if (v56 == 1) {
                     item_caps_set_amount(item, 1);
@@ -4130,6 +4141,20 @@ void inven_refresh_loot_window()
         std::max(pud->length - inven_cur_disp, 0));
     display_target_inventory(target_stack_offset[target_curr_stack], -1, target_pud, INVENTORY_WINDOW_TYPE_LOOT);
     display_inventory(stack_offset[curr_stack], -1, INVENTORY_WINDOW_TYPE_LOOT);
+}
+
+void inven_refresh_inventory_window()
+{
+    if (activeInventoryWindowType != INVENTORY_WINDOW_TYPE_NORMAL || pud == nullptr) {
+        return;
+    }
+
+    stack_offset[curr_stack] = std::min(
+        stack_offset[curr_stack],
+        std::max(pud->length - inven_cur_disp, 0));
+    display_inventory(stack_offset[curr_stack], -1, INVENTORY_WINDOW_TYPE_NORMAL);
+    display_stats();
+    win_draw(i_wid);
 }
 
 bool inven_loot_window_is_active()

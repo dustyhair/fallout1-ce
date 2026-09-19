@@ -36,6 +36,7 @@ std::vector<std::pair<EntityId, Object*>> worldItems;
 std::unordered_set<EntityId, EntityIdHash> reservedPickupTargets;
 std::unordered_map<Object*, Object*> activeLootTargets;
 bool inventoryTransferInProgress = false;
+bool itemDropInProgress = false;
 NetworkLaunchMode worldMode = NetworkLaunchMode::Disabled;
 EntityId expectedSplitEntityId;
 EntityId lastSplitEntityId;
@@ -159,6 +160,37 @@ bool applyInventoryTransfer(Object* source,
     inventoryTransferInProgress = false;
     expectedSplitEntityId = {};
     return rc == 0
+        && (!validateRemainder
+            || ((isValid(lastSplitEntityId) == isValid(expectedRemainderId))
+                && (!isValid(expectedRemainderId) || lastSplitEntityId == expectedRemainderId)));
+}
+
+bool applyItemDrop(Object* source,
+    Object* item,
+    std::uint32_t quantity,
+    EntityId expectedRemainderId = {},
+    bool validateRemainder = false)
+{
+    if (source == nullptr
+        || item == nullptr
+        || quantity == 0
+        || quantity > static_cast<std::uint32_t>(item_count(source, item))
+        || (quantity > 1 && item->pid != PROTO_ID_MONEY)) {
+        return false;
+    }
+
+    expectedSplitEntityId = expectedRemainderId;
+    lastSplitEntityId = {};
+    itemDropInProgress = true;
+    int rc = quantity == 1
+        ? obj_drop(source, item)
+        : obj_drop_quantity(source, item, static_cast<int>(quantity));
+    itemDropInProgress = false;
+    expectedSplitEntityId = {};
+    return rc == 0
+        && item->owner == nullptr
+        && item->tile >= 0
+        && elevationIsValid(item->elevation)
         && (!validateRemainder
             || ((isValid(lastSplitEntityId) == isValid(expectedRemainderId))
                 && (!isValid(expectedRemainderId) || lastSplitEntityId == expectedRemainderId)));
@@ -351,6 +383,70 @@ public:
             return execution;
         }
         execution.remainderItemId = lastSplitEntityId;
+        execution.status = CommandExecutionStatus::Applied;
+        return execution;
+    }
+
+    ItemDropExecution dropItem(Object* actor,
+        Object* source,
+        Object* item,
+        const ItemDropCommand& command) override
+    {
+        ItemDropExecution execution;
+        if (actor == nullptr
+            || source == nullptr
+            || isInCombat()
+            || topEnvironmentOrSelf(source) != actor
+            || !hexGridTileIsValid(actor->tile)
+            || !elevationIsValid(actor->elevation)) {
+            return execution;
+        }
+
+        bool created = false;
+        if (item == nullptr) {
+            if (isValid(command.itemId)
+                || !hasItemDescriptor(command.itemDescriptor)
+                || hasDirectItemWithDescriptor(source, command.itemDescriptor)) {
+                return execution;
+            }
+            item = createItem(command.itemDescriptor);
+            if (item == nullptr
+                || item_add_force(source, item, static_cast<int>(command.sourceQuantity)) != 0) {
+                if (item != nullptr) {
+                    obj_erase_object(item, nullptr);
+                }
+                return execution;
+            }
+            EntityRegistrationResult registration = registerItem(item);
+            if (!registration) {
+                item_remove_mult(source, item, static_cast<int>(command.sourceQuantity));
+                obj_erase_object(item, nullptr);
+                return execution;
+            }
+            execution.itemId = registration.entityId;
+            created = true;
+        } else {
+            execution.itemId = command.itemId;
+        }
+
+        if (item_count(source, item) != static_cast<int>(command.sourceQuantity)
+            || (command.quantity > 1 && item->pid != PROTO_ID_MONEY)
+            || !applyItemDrop(source, item, command.quantity)
+            || !describeItem(item, execution.itemDescriptor)) {
+            if (created && item->owner == source) {
+                session.entities().unregisterEntity(execution.itemId);
+                worldItems.erase(std::remove_if(worldItems.begin(), worldItems.end(), [&](const auto& entry) {
+                    return entry.first == execution.itemId;
+                }), worldItems.end());
+                item_remove_mult(source, item, static_cast<int>(command.sourceQuantity));
+                obj_erase_object(item, nullptr);
+            }
+            return execution;
+        }
+
+        execution.remainderItemId = lastSplitEntityId;
+        execution.tile = item->tile;
+        execution.elevation = item->elevation;
         execution.status = CommandExecutionStatus::Applied;
         return execution;
     }
@@ -763,6 +859,16 @@ bool networkWorldIsLocalInventoryTransfer(Object* source, Object* destination)
         || (destinationTop == obj_dude && sourceTop == activeLoot->second);
 }
 
+bool networkWorldIsLocalItemDrop(Object* source, Object* item)
+{
+    return session.isActive()
+        && obj_dude != nullptr
+        && source != nullptr
+        && item != nullptr
+        && topEnvironmentOrSelf(source) == obj_dude
+        && item_count(source, item) > 0;
+}
+
 void networkWorldHandleItemReplacement(Object* removed, Object* replacement)
 {
     if (!session.isActive() || removed == nullptr || replacement == nullptr || removed == replacement) {
@@ -931,6 +1037,109 @@ bool networkWorldApplyInventoryTransfer(const InventoryTransferredEvent& transfe
         inven_refresh_loot_window();
     }
     return applied;
+}
+
+bool networkWorldApplyItemDrop(const ItemDroppedEvent& drop)
+{
+    if (!session.isActive()) {
+        return false;
+    }
+
+    PlayerCharacterState* player = session.players().findByActor(drop.actorId);
+    Object* actor = player != nullptr ? session.entities().findObject(player->actorId) : nullptr;
+    Object* source = session.entities().findObject(drop.sourceId);
+    Object* item = session.entities().findObject(drop.itemId);
+    if (player == nullptr
+        || actor == nullptr
+        || source == nullptr
+        || topEnvironmentOrSelf(source) != actor
+        || !hexGridTileIsValid(drop.tile)
+        || !elevationIsValid(drop.elevation)) {
+        return false;
+    }
+
+    if (item == nullptr) {
+        Inventory* inventory = &source->data.inventory;
+        bool descriptorMatchFound = false;
+        for (int index = 0; index < inventory->length; index++) {
+            Object* candidate = inventory->items[index].item;
+            ItemDescriptor candidateDescriptor;
+            bool descriptorMatches = describeItem(candidate, candidateDescriptor)
+                && (drop.quantity > 1
+                        ? candidateDescriptor.pid == PROTO_ID_MONEY
+                        : itemDescriptorsEqual(candidateDescriptor, drop.itemDescriptor));
+            if (descriptorMatches) {
+                if (descriptorMatchFound
+                    || session.entities().findEntity(candidate).has_value()
+                    || inventory->items[index].quantity != static_cast<int>(drop.sourceQuantity)) {
+                    return false;
+                }
+                descriptorMatchFound = true;
+                item = candidate;
+            }
+        }
+
+        bool created = false;
+        if (item == nullptr) {
+            item = createItem(drop.itemDescriptor);
+            if (item == nullptr
+                || item_add_force(source, item, static_cast<int>(drop.sourceQuantity)) != 0) {
+                if (item != nullptr) {
+                    obj_erase_object(item, nullptr);
+                }
+                return false;
+            }
+            created = true;
+        }
+        if (session.entities().restoreObject(drop.itemId, item) != EntityRegistryError::None) {
+            if (created) {
+                item_remove_mult(source, item, static_cast<int>(drop.sourceQuantity));
+                obj_erase_object(item, nullptr);
+            }
+            return false;
+        }
+        trackWorldItem(drop.itemId, item);
+    }
+
+    ItemDescriptor actualDescriptor;
+    if (!describeItem(item, actualDescriptor)
+        || (drop.quantity == 1 && !itemDescriptorsEqual(actualDescriptor, drop.itemDescriptor))
+        || (drop.quantity > 1 && actualDescriptor.pid != PROTO_ID_MONEY)) {
+        return false;
+    }
+    if (item->owner == nullptr && item->tile == drop.tile && item->elevation == drop.elevation) {
+        if (!itemDescriptorsEqual(actualDescriptor, drop.itemDescriptor)) {
+            return false;
+        }
+        inven_refresh_inventory_window();
+        inven_refresh_loot_window();
+        return true;
+    }
+    if (item_count(source, item) != static_cast<int>(drop.sourceQuantity)
+        || !applyItemDrop(source, item, drop.quantity, drop.remainderItemId, true)
+        || !describeItem(item, actualDescriptor)
+        || !itemDescriptorsEqual(actualDescriptor, drop.itemDescriptor)) {
+        return false;
+    }
+
+    if (item->tile != drop.tile || item->elevation != drop.elevation) {
+        Rect dirtyRect;
+        if (obj_move_to_tile(item, drop.tile, drop.elevation, &dirtyRect) == -1) {
+            return false;
+        }
+        tile_refresh_rect(&dirtyRect, drop.elevation);
+    }
+    inven_refresh_inventory_window();
+    inven_refresh_loot_window();
+    intface_redraw();
+    return true;
+}
+
+bool networkWorldApplyLocalItemDrop(Object* source, Object* item, std::uint32_t quantity)
+{
+    return session.isActive()
+        && networkWorldIsLocalItemDrop(source, item)
+        && applyItemDrop(source, item, quantity);
 }
 
 bool networkWorldBeginLocalPickup(Object* target)
@@ -1219,6 +1428,7 @@ void networkWorldLeave()
     worldItems.clear();
     reservedPickupTargets.clear();
     activeLootTargets.clear();
+    itemDropInProgress = false;
     expectedSplitEntityId = {};
     lastSplitEntityId = {};
     worldMode = NetworkLaunchMode::Disabled;
@@ -1228,6 +1438,11 @@ void networkWorldLeave()
 bool networkWorldInventoryTransferInProgress()
 {
     return inventoryTransferInProgress;
+}
+
+bool networkWorldItemDropInProgress()
+{
+    return itemDropInProgress;
 }
 
 bool networkWorldActive()

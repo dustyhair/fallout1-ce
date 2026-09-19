@@ -100,7 +100,8 @@ bool isSupportedLiveEvent(const GameEventPayload& payload)
         || std::holds_alternative<DoorUseStartedEvent>(payload)
         || std::holds_alternative<ItemPickupStartedEvent>(payload)
         || std::holds_alternative<LootStartedEvent>(payload)
-        || std::holds_alternative<InventoryTransferredEvent>(payload);
+        || std::holds_alternative<InventoryTransferredEvent>(payload)
+        || std::holds_alternative<ItemDroppedEvent>(payload);
 }
 
 } // namespace
@@ -205,6 +206,24 @@ bool NetworkLobby::sendLocalInventoryTransfer(EntityId sourceId,
     return sendLocalAction(
         InventoryTransferredEvent { actorId, sourceId, destinationId, itemId, quantity, sourceQuantity, remainderItemId, itemDescriptor },
         InventoryTransferCommand { sourceId, destinationId, itemId, quantity, sourceQuantity, itemDescriptor },
+        phaseRevision);
+}
+
+bool NetworkLobby::sendLocalItemDrop(EntityId sourceId,
+    EntityId itemId,
+    std::uint32_t quantity,
+    std::uint32_t sourceQuantity,
+    std::uint32_t phaseRevision,
+    EntityId remainderItemId,
+    std::int32_t tile,
+    std::int32_t elevation,
+    ItemDescriptor itemDescriptor)
+{
+    PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
+    EntityId actorId { playerId.value };
+    return sendLocalAction(
+        ItemDroppedEvent { actorId, sourceId, itemId, quantity, sourceQuantity, remainderItemId, tile, elevation, itemDescriptor },
+        ItemDropCommand { sourceId, itemId, quantity, sourceQuantity, itemDescriptor },
         phaseRevision);
 }
 

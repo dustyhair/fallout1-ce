@@ -23,6 +23,15 @@ struct InventoryTransferExecution {
     ItemDescriptor itemDescriptor;
 };
 
+struct ItemDropExecution {
+    CommandExecutionStatus status = CommandExecutionStatus::InvalidAction;
+    EntityId itemId;
+    EntityId remainderItemId;
+    std::int32_t tile = -1;
+    std::int32_t elevation = -1;
+    ItemDescriptor itemDescriptor;
+};
+
 class CommandExecutor {
 public:
     virtual ~CommandExecutor() = default;
@@ -37,6 +46,10 @@ public:
         Object* destination,
         Object* item,
         const InventoryTransferCommand& command) = 0;
+    virtual ItemDropExecution dropItem(Object* actor,
+        Object* source,
+        Object* item,
+        const ItemDropCommand& command) = 0;
 };
 
 struct AuthoritativeCommandResult {
