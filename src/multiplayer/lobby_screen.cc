@@ -24,6 +24,7 @@
 #include "plib/gnw/input.h"
 #include "plib/gnw/intrface.h"
 #include "plib/gnw/kb.h"
+#include "plib/gnw/mouse.h"
 #include "plib/gnw/svga.h"
 #include "plib/gnw/text.h"
 
@@ -35,6 +36,8 @@ constexpr int kLobbyWidth = 640;
 constexpr int kLobbyHeight = 480;
 constexpr int kControlPanelTop = 216;
 constexpr int kControlPanelBottom = 291;
+constexpr int kControlHitPaddingX = 2;
+constexpr int kControlHitPaddingY = 4;
 constexpr int kControlMouseEnterEventBase = 1200;
 constexpr int kControlMouseExitEventBase = 1300;
 constexpr int kJoinEndpointInputLength = 48;
@@ -75,6 +78,31 @@ constexpr std::array<ControlDefinition, static_cast<std::size_t>(LobbyOption::Co
     { LobbyOption::Disconnect, "DISCONNECT", 418, 50 },
     { LobbyOption::Back, "BACK", 468, 38 },
 } };
+
+constexpr int controlIndexAt(int x, int y)
+{
+    if (y < kControlPanelTop + 8 - kControlHitPaddingY
+        || y >= kControlPanelBottom - 4 + kControlHitPaddingY) {
+        return -1;
+    }
+    for (std::size_t index = 0; index < kControls.size(); index++) {
+        const ControlDefinition& control = kControls[index];
+        int left = control.centerX - control.width / 2 - kControlHitPaddingX;
+        int right = control.centerX + (control.width + 1) / 2 + kControlHitPaddingX;
+        if (x >= left && x < right) {
+            return static_cast<int>(index);
+        }
+    }
+    return -1;
+}
+
+static_assert(controlIndexAt(115, 267) == static_cast<int>(LobbyOption::Host));
+static_assert(controlIndexAt(161, 267) == static_cast<int>(LobbyOption::Join));
+static_assert(controlIndexAt(214, 267) == static_cast<int>(LobbyOption::ChooseCharacter));
+static_assert(controlIndexAt(282, 267) == static_cast<int>(LobbyOption::StartGame));
+static_assert(controlIndexAt(418, 267) == static_cast<int>(LobbyOption::Disconnect));
+static_assert(controlIndexAt(468, 267) == static_cast<int>(LobbyOption::Back));
+static_assert(controlIndexAt(320, 267) == -1);
 
 const CharacterCreationSheet* sheetForPlayer(PlayerId playerId)
 {
@@ -363,10 +391,10 @@ int registerControlHotspot(int window, const ControlDefinition& control)
 {
     int optionIndex = static_cast<int>(control.option);
     int button = win_register_button(window,
-        control.centerX - control.width / 2,
-        kControlPanelTop + 8,
-        control.width,
-        kControlPanelBottom - kControlPanelTop - 12,
+        control.centerX - control.width / 2 - kControlHitPaddingX,
+        kControlPanelTop + 8 - kControlHitPaddingY,
+        control.width + kControlHitPaddingX * 2,
+        kControlPanelBottom - kControlPanelTop - 12 + kControlHitPaddingY * 2,
         kControlMouseEnterEventBase + optionIndex,
         kControlMouseExitEventBase + optionIndex,
         -1,
@@ -492,6 +520,7 @@ MultiplayerLobbyScreenResult multiplayerLobbyScreen()
     std::string drawnSignature;
     std::deque<LobbyChatMessage> chatMessages;
     int highlightedOption = -1;
+    int pressedOption = -1;
     MultiplayerLobbyScreenResult result = MultiplayerLobbyScreenResult::Back;
     bool done = false;
     while (!done && game_user_wants_to_quit == 0) {
@@ -517,6 +546,26 @@ MultiplayerLobbyScreenResult multiplayerLobbyScreen()
         }
 
         int keyCode = get_input();
+        int mouseButtons = mouse_get_buttons();
+        int mouseX;
+        int mouseY;
+        mouseGetPositionInWindow(window, &mouseX, &mouseY);
+        int mouseOption = controlIndexAt(mouseX, mouseY);
+        if ((mouseButtons & MOUSE_EVENT_LEFT_BUTTON_DOWN) != 0) {
+            pressedOption = mouseOption;
+        }
+        if ((mouseButtons & MOUSE_EVENT_LEFT_BUTTON_UP) != 0) {
+            bool hoverEvent = (keyCode >= kControlMouseEnterEventBase
+                                  && keyCode < kControlMouseEnterEventBase + static_cast<int>(LobbyOption::Count))
+                || (keyCode >= kControlMouseExitEventBase
+                    && keyCode < kControlMouseExitEventBase + static_cast<int>(LobbyOption::Count));
+            if ((keyCode == -1 || hoverEvent)
+                && pressedOption != -1
+                && pressedOption == mouseOption) {
+                keyCode = KEY_1 + pressedOption;
+            }
+            pressedOption = -1;
+        }
         if (keyCode >= kControlMouseEnterEventBase
             && keyCode < kControlMouseEnterEventBase + static_cast<int>(LobbyOption::Count)) {
             highlightedOption = keyCode - kControlMouseEnterEventBase;
