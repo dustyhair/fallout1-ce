@@ -1,5 +1,6 @@
 #include "game/item.h"
 
+#include <algorithm>
 #include <stdio.h>
 #include <string.h>
 
@@ -25,6 +26,8 @@
 #include "game/tile.h"
 #include "game/trait.h"
 #include "multiplayer/acting_player_context.h"
+#include "multiplayer/network_runtime.h"
+#include "multiplayer/network_world.h"
 #include "platform_compat.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/memory.h"
@@ -306,6 +309,7 @@ int item_add_force(Object* owner, Object* itemToAdd, int quantity)
         inventory->items[index].quantity += quantity;
     }
 
+    multiplayer::networkWorldHandleItemReplacement(inventory->items[index].item, itemToAdd);
     obj_erase_object(inventory->items[index].item, NULL);
     inventory->items[index].item = itemToAdd;
     itemToAdd->owner = owner;
@@ -426,7 +430,31 @@ static int item_move_func(Object* a1, Object* a2, Object* a3, int quantity, bool
 // 0x46A1DC
 int item_move(Object* a1, Object* a2, Object* a3, int quantity)
 {
-    return item_move_func(a1, a2, a3, quantity, false);
+    if (quantity <= 0) {
+        return -1;
+    }
+    int availableQuantity = item_count(a1, a3);
+    multiplayer::NetworkInventoryTransferDisposition disposition = multiplayer::networkRuntimePrepareLocalInventoryTransfer(
+        a1,
+        a2,
+        a3,
+        static_cast<std::uint32_t>(quantity),
+        static_cast<std::uint32_t>(std::max(availableQuantity, 0)));
+    if (disposition == multiplayer::NetworkInventoryTransferDisposition::Reject) {
+        return -1;
+    }
+    if (disposition == multiplayer::NetworkInventoryTransferDisposition::DeferToHost) {
+        return 0;
+    }
+    int rc = item_move_func(a1, a2, a3, quantity, false);
+    if (rc == 0) {
+        multiplayer::networkRuntimeHandleLocalInventoryTransfer(
+            a1,
+            a2,
+            a3,
+            static_cast<std::uint32_t>(quantity));
+    }
+    return rc;
 }
 
 // 0x46A1E4
@@ -439,9 +467,32 @@ int item_move_force(Object* a1, Object* a2, Object* a3, int quantity)
 void item_move_all(Object* a1, Object* a2)
 {
     Inventory* inventory = &(a1->data.inventory);
-    while (inventory->length > 0) {
-        InventoryItem* inventoryItem = &(inventory->items[0]);
-        item_move_func(a1, a2, inventoryItem->item, inventoryItem->quantity, true);
+    int index = 0;
+    while (index < inventory->length) {
+        InventoryItem* inventoryItem = &(inventory->items[index]);
+        Object* item = inventoryItem->item;
+        int quantity = inventoryItem->quantity;
+        multiplayer::NetworkInventoryTransferDisposition disposition = multiplayer::networkRuntimePrepareLocalInventoryTransfer(
+            a1,
+            a2,
+            item,
+            static_cast<std::uint32_t>(quantity),
+            static_cast<std::uint32_t>(quantity));
+        if (disposition == multiplayer::NetworkInventoryTransferDisposition::Reject) {
+            break;
+        }
+        if (disposition == multiplayer::NetworkInventoryTransferDisposition::DeferToHost) {
+            index++;
+            continue;
+        }
+        if (item_move_func(a1, a2, item, quantity, true) != 0) {
+            break;
+        }
+        multiplayer::networkRuntimeHandleLocalInventoryTransfer(
+            a1,
+            a2,
+            item,
+            static_cast<std::uint32_t>(quantity));
     }
 }
 

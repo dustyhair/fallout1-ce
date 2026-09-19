@@ -1,15 +1,17 @@
 #include "multiplayer/snapshot.h"
 
 #include <algorithm>
+#include <limits>
 #include <unordered_set>
 
 namespace fallout {
 namespace multiplayer {
 namespace {
 
-constexpr std::size_t kSnapshotPayloadHeaderSize = 16;
+constexpr std::size_t kSnapshotPayloadHeaderSize = 20;
 constexpr std::size_t kActorSnapshotSize = 24;
 constexpr std::size_t kDoorSnapshotSize = 12;
+constexpr std::size_t kItemSnapshotSize = 20;
 constexpr std::size_t kSnapshotProtectedOffset = 20;
 constexpr std::uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
 constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
@@ -96,6 +98,9 @@ WorldSnapshot canonicalize(const WorldSnapshot& snapshot)
     std::sort(canonical.doors.begin(), canonical.doors.end(), [](const DoorSnapshot& lhs, const DoorSnapshot& rhs) {
         return lhs.entityId.value < rhs.entityId.value;
     });
+    std::sort(canonical.items.begin(), canonical.items.end(), [](const ItemSnapshot& lhs, const ItemSnapshot& rhs) {
+        return lhs.entityId.value < rhs.entityId.value;
+    });
     return canonical;
 }
 
@@ -116,6 +121,15 @@ void appendDoor(std::vector<std::uint8_t>& bytes, const DoorSnapshot& door)
     appendUint8(bytes, door.locked ? 1 : 0);
     appendUint16(bytes, 0);
     appendUint32(bytes, static_cast<std::uint32_t>(door.frame));
+}
+
+void appendItem(std::vector<std::uint8_t>& bytes, const ItemSnapshot& item)
+{
+    appendUint32(bytes, item.entityId.value);
+    appendUint32(bytes, item.holderId.value);
+    appendUint32(bytes, static_cast<std::uint32_t>(item.tile));
+    appendUint32(bytes, static_cast<std::uint32_t>(item.elevation));
+    appendUint32(bytes, item.quantity);
 }
 
 std::uint64_t digestBytes(const std::vector<std::uint8_t>& bytes)
@@ -141,6 +155,9 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
     }
     if (snapshot.doors.size() > kMaxSnapshotDoors) {
         return SnapshotError::TooManyDoors;
+    }
+    if (snapshot.items.size() > kMaxSnapshotItems) {
+        return SnapshotError::TooManyItems;
     }
 
     std::unordered_set<std::uint32_t> entityIds;
@@ -175,9 +192,26 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
         }
     }
 
+    for (const ItemSnapshot& item : snapshot.items) {
+        if (!isValid(item.entityId)) {
+            return SnapshotError::InvalidEntityId;
+        }
+        if (!entityIds.insert(item.entityId.value).second) {
+            return SnapshotError::DuplicateEntityId;
+        }
+        bool onGround = !isValid(item.holderId);
+        if (item.quantity == 0
+            || item.quantity > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())
+            || (onGround && (item.quantity != 1 || item.tile < 0 || item.elevation < 0 || item.elevation > 2))
+            || (!onGround && (item.tile != -1 || item.elevation != -1 || item.holderId == item.entityId))) {
+            return SnapshotError::InvalidItemState;
+        }
+    }
+
     std::size_t payloadSize = kSnapshotPayloadHeaderSize
         + snapshot.actors.size() * kActorSnapshotSize
-        + snapshot.doors.size() * kDoorSnapshotSize;
+        + snapshot.doors.size() * kDoorSnapshotSize
+        + snapshot.items.size() * kItemSnapshotSize;
     if (payloadSize > kMaxSnapshotPayloadSize) {
         return SnapshotError::PayloadTooLarge;
     }
@@ -197,7 +231,8 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
     std::vector<std::uint8_t> payload;
     payload.reserve(kSnapshotPayloadHeaderSize
         + canonical.actors.size() * kActorSnapshotSize
-        + canonical.doors.size() * kDoorSnapshotSize);
+        + canonical.doors.size() * kDoorSnapshotSize
+        + canonical.items.size() * kItemSnapshotSize);
 
     appendUint8(payload, static_cast<std::uint8_t>(canonical.phase));
     appendUint8(payload, 0);
@@ -205,11 +240,15 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
     appendUint32(payload, canonical.phaseRevision);
     appendUint32(payload, static_cast<std::uint32_t>(canonical.actors.size()));
     appendUint32(payload, static_cast<std::uint32_t>(canonical.doors.size()));
+    appendUint32(payload, static_cast<std::uint32_t>(canonical.items.size()));
     for (const ActorSnapshot& actor : canonical.actors) {
         appendActor(payload, actor);
     }
     for (const DoorSnapshot& door : canonical.doors) {
         appendDoor(payload, door);
+    }
+    for (const ItemSnapshot& item : canonical.items) {
+        appendItem(payload, item);
     }
 
     std::vector<std::uint8_t> protectedBytes;
@@ -286,6 +325,7 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
     result.snapshot.phaseRevision = readUint32(packet, offset);
     std::uint32_t actorCount = readUint32(packet, offset);
     std::uint32_t doorCount = readUint32(packet, offset);
+    std::uint32_t itemCount = readUint32(packet, offset);
 
     if (actorCount > kMaxSnapshotActors) {
         result.error = SnapshotError::TooManyActors;
@@ -295,10 +335,15 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
         result.error = SnapshotError::TooManyDoors;
         return result;
     }
+    if (itemCount > kMaxSnapshotItems) {
+        result.error = SnapshotError::TooManyItems;
+        return result;
+    }
 
     std::size_t expectedPayloadSize = kSnapshotPayloadHeaderSize
         + static_cast<std::size_t>(actorCount) * kActorSnapshotSize
-        + static_cast<std::size_t>(doorCount) * kDoorSnapshotSize;
+        + static_cast<std::size_t>(doorCount) * kDoorSnapshotSize
+        + static_cast<std::size_t>(itemCount) * kItemSnapshotSize;
     if (payloadSize < expectedPayloadSize) {
         result.error = SnapshotError::TruncatedPayload;
         return result;
@@ -334,6 +379,17 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
         door.locked = locked != 0;
         door.frame = static_cast<std::int32_t>(readUint32(packet, offset));
         result.snapshot.doors.push_back(door);
+    }
+
+    result.snapshot.items.reserve(itemCount);
+    for (std::uint32_t index = 0; index < itemCount; index++) {
+        ItemSnapshot item;
+        item.entityId.value = readUint32(packet, offset);
+        item.holderId.value = readUint32(packet, offset);
+        item.tile = static_cast<std::int32_t>(readUint32(packet, offset));
+        item.elevation = static_cast<std::int32_t>(readUint32(packet, offset));
+        item.quantity = readUint32(packet, offset);
+        result.snapshot.items.push_back(item);
     }
 
     result.error = validateSnapshot(result.snapshot);
@@ -374,10 +430,18 @@ SnapshotDigestResult computeSnapshotDigest(const WorldSnapshot& snapshot)
     }
     result.digest.doors = digestBytes(doorBytes);
 
+    std::vector<std::uint8_t> itemBytes;
+    appendUint32(itemBytes, static_cast<std::uint32_t>(canonical.items.size()));
+    for (const ItemSnapshot& item : canonical.items) {
+        appendItem(itemBytes, item);
+    }
+    result.digest.items = digestBytes(itemBytes);
+
     std::vector<std::uint8_t> overallBytes;
     appendUint64(overallBytes, result.digest.session);
     appendUint64(overallBytes, result.digest.actors);
     appendUint64(overallBytes, result.digest.doors);
+    appendUint64(overallBytes, result.digest.items);
     result.digest.overall = digestBytes(overallBytes);
     return result;
 }
@@ -392,6 +456,9 @@ SnapshotSection firstDivergentSection(const SectionedStateDigest& expected, cons
     }
     if (expected.doors != actual.doors) {
         return SnapshotSection::Doors;
+    }
+    if (expected.items != actual.items) {
+        return SnapshotSection::Items;
     }
     return SnapshotSection::None;
 }

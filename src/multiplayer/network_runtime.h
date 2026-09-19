@@ -38,6 +38,24 @@ bool networkRuntimeEnterWorld();
 bool networkRuntimeSubmitLocalMove(int destinationTile, int elevation, bool running);
 bool networkRuntimeHandleLocalDoorUse(Object* target);
 bool networkRuntimeHandleLocalPickup(Object* target);
+bool networkRuntimeHandleLocalLoot(Object* target);
+bool networkRuntimeHandleLocalLootTargetChange(Object* target);
+bool networkRuntimeHandleLocalInventoryTransfer(Object* source,
+    Object* destination,
+    Object* item,
+    std::uint32_t quantity);
+
+enum class NetworkInventoryTransferDisposition {
+    ApplyLocally,
+    DeferToHost,
+    Reject,
+};
+
+NetworkInventoryTransferDisposition networkRuntimePrepareLocalInventoryTransfer(Object* source,
+    Object* destination,
+    Object* item,
+    std::uint32_t quantity,
+    std::uint32_t availableQuantity);
 void networkRuntimeLeaveWorld();
 void networkRuntimeStop();
 

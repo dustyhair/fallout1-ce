@@ -949,7 +949,7 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
                                     ? multiplayer::kGuestPlayerId
                                     : multiplayer::kHostPlayerId;
                                 multiplayer::developerLocalSessionSubmitLoot(playerId, target);
-                            } else {
+                            } else if (!multiplayer::networkRuntimeHandleLocalLoot(target)) {
                                 action_loot_container(obj_dude, target);
                             }
                         }
@@ -1181,7 +1181,7 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
                                     ? multiplayer::kGuestPlayerId
                                     : multiplayer::kHostPlayerId;
                                 multiplayer::developerLocalSessionSubmitLoot(playerId, target);
-                            } else {
+                            } else if (!multiplayer::networkRuntimeHandleLocalLoot(target)) {
                                 action_loot_container(obj_dude, target);
                             }
                             break;

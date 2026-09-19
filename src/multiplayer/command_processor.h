@@ -25,6 +25,11 @@ public:
     virtual CommandExecutionStatus useDoor(Object* actor, Object* target) = 0;
     virtual CommandExecutionStatus pickup(Object* actor, Object* target) = 0;
     virtual CommandExecutionStatus loot(Object* actor, Object* target) = 0;
+    virtual CommandExecutionStatus transferInventory(Object* actor,
+        Object* source,
+        Object* destination,
+        Object* item,
+        std::uint32_t quantity) = 0;
 };
 
 struct AuthoritativeCommandResult {

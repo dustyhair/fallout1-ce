@@ -89,6 +89,10 @@ WorldSnapshot sampleSnapshot()
     snapshot.doors = {
         DoorSnapshot { EntityId { 9 }, true, false, 5 },
     };
+    snapshot.items = {
+        ItemSnapshot { EntityId { 10 }, EntityId { 1 }, -1, -1, 2 },
+        ItemSnapshot { EntityId { 11 }, {}, 20104, 0, 1 },
+    };
     return snapshot;
 }
 
@@ -630,6 +634,7 @@ void testGameplayWireFormat()
         GameCommand { CommandSequence { 3 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, PickupCommand { EntityId { 41 } } },
         GameCommand { CommandSequence { 4 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, LootCommand { EntityId { 42 } } },
         GameCommand { CommandSequence { 5 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, FaceCommand { 4 } },
+        GameCommand { CommandSequence { 6 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, InventoryTransferCommand { EntityId { 42 }, EntityId { 20 }, EntityId { 43 }, 3 } },
     };
 
     for (std::size_t index = 0; index < commands.size(); index++) {
@@ -685,6 +690,24 @@ void testGameplayWireFormat()
     const FaceCommand* face = decodedFace ? std::get_if<FaceCommand>(&decodedFace.command.payload) : nullptr;
     expect(face != nullptr && face->rotation == 4, "facing command rotation round trips");
 
+    ProtocolEnvelope transferEnvelope = gameplayEnvelope(25);
+    encodeGameCommand(commands[5], transferEnvelope);
+    GameCommandDecodeResult decodedTransfer = decodeGameCommand(transferEnvelope);
+    const InventoryTransferCommand* transfer = decodedTransfer
+        ? std::get_if<InventoryTransferCommand>(&decodedTransfer.command.payload)
+        : nullptr;
+    expect(transfer != nullptr
+            && transfer->sourceId == EntityId { 42 }
+            && transfer->destinationId == EntityId { 20 }
+            && transfer->itemId == EntityId { 43 }
+            && transfer->quantity == 3,
+        "inventory transfer command round trips every authoritative entity and quantity");
+    GameCommand invalidTransfer = commands[5];
+    std::get<InventoryTransferCommand>(invalidTransfer.payload).quantity = 0;
+    ProtocolEnvelope invalidTransferEnvelope = gameplayEnvelope(26);
+    expect(encodeGameCommand(invalidTransfer, invalidTransferEnvelope) == GameplayWireError::InvalidQuantity,
+        "inventory transfer rejects a zero quantity");
+
     CommandResult accepted;
     accepted.commandSequence.value = 1;
     accepted.status = CommandStatus::Accepted;
@@ -720,6 +743,7 @@ void testGameplayWireFormat()
         GameEvent { EventSequence { 9 }, CommandSequence { 3 }, ItemPickupStartedEvent { EntityId { 20 }, EntityId { 41 } } },
         GameEvent { EventSequence { 10 }, CommandSequence { 4 }, LootStartedEvent { EntityId { 20 }, EntityId { 42 } } },
         GameEvent { EventSequence { 11 }, CommandSequence { 5 }, ActorFacingChangedEvent { EntityId { 20 }, 4 } },
+        GameEvent { EventSequence { 12 }, CommandSequence { 6 }, InventoryTransferredEvent { EntityId { 20 }, EntityId { 42 }, EntityId { 20 }, EntityId { 43 }, 3 } },
     };
     for (std::size_t index = 0; index < events.size(); index++) {
         ProtocolEnvelope envelope = gameplayEnvelope(30 + index);
@@ -756,6 +780,20 @@ void testGameplayWireFormat()
             && facingEvent->actorId == EntityId { 20 }
             && facingEvent->rotation == 4,
         "facing event payload round trips");
+
+    ProtocolEnvelope transferEventEnvelope = gameplayEnvelope(42);
+    encodeGameEvent(events[5], transferEventEnvelope);
+    GameEventDecodeResult decodedTransferEvent = decodeGameEvent(transferEventEnvelope);
+    const InventoryTransferredEvent* transferEvent = decodedTransferEvent
+        ? std::get_if<InventoryTransferredEvent>(&decodedTransferEvent.event.payload)
+        : nullptr;
+    expect(transferEvent != nullptr
+            && transferEvent->actorId == EntityId { 20 }
+            && transferEvent->sourceId == EntityId { 42 }
+            && transferEvent->destinationId == EntityId { 20 }
+            && transferEvent->itemId == EntityId { 43 }
+            && transferEvent->quantity == 3,
+        "inventory transfer event round trips its accepted mutation");
 
     ProtocolEnvelope missingSession = gameplayEnvelope(42);
     missingSession.sessionId = {};
@@ -1332,33 +1370,58 @@ void testNetworkCharacterLobby()
         "guest receives the host-authoritative pickup result and event");
     expect(guestPickupEvent.has_value() && guest.confirmPeerEventApplied(guestPickupEvent->sequence),
         "guest advances its applied boundary after its accepted pickup");
+    expect(host.sendLocalLoot(EntityId { 90 }), "host sends its local loot interaction");
+    guest.poll();
+    std::optional<GameEvent> lootStartedEvent = guest.takePeerEvent();
+    const auto* lootStarted = lootStartedEvent.has_value()
+        ? std::get_if<LootStartedEvent>(&lootStartedEvent->payload)
+        : nullptr;
+    expect(lootStarted != nullptr
+            && lootStarted->actorId == EntityId { kHostPlayerId.value }
+            && lootStarted->targetId == EntityId { 90 }
+            && guest.confirmPeerEventApplied(lootStartedEvent->sequence),
+        "guest accepts and confirms the host loot event");
+    expect(host.sendLocalInventoryTransfer(EntityId { 90 }, EntityId { 1 }, EntityId { 91 }, 2),
+        "host publishes an inventory transfer made in the loot window");
+    guest.poll();
+    std::optional<GameEvent> liveTransferEvent = guest.takePeerEvent();
+    const auto* liveTransfer = liveTransferEvent.has_value()
+        ? std::get_if<InventoryTransferredEvent>(&liveTransferEvent->payload)
+        : nullptr;
+    expect(liveTransfer != nullptr
+            && liveTransfer->sourceId == EntityId { 90 }
+            && liveTransfer->destinationId == EntityId { 1 }
+            && liveTransfer->itemId == EntityId { 91 }
+            && liveTransfer->quantity == 2
+            && guest.confirmPeerEventApplied(liveTransferEvent->sequence),
+        "guest accepts and confirms the authoritative loot transfer");
     EventReplay completeReplay = host.replayAfter(EventSequence {});
     expect(completeReplay.status == EventReplayStatus::Available
-            && completeReplay.events.size() == 6
+            && completeReplay.events.size() == 8
             && completeReplay.events.front().sequence == EventSequence { 1 }
-            && completeReplay.events.back().sequence == EventSequence { 6 },
+            && completeReplay.events.back().sequence == EventSequence { 8 },
         "host journals every authoritative live event in session order");
-    expect(guest.requestRecovery(EventSequence { 4 }), "guest requests recovery from its last retained event");
+    expect(guest.requestRecovery(EventSequence { 6 }), "guest requests recovery from its last retained event");
     host.poll();
     std::optional<EventSequence> recoveryRequest = host.takeRecoveryRequest();
-    expect(recoveryRequest == EventSequence { 4 }, "host receives the guest recovery boundary");
+    expect(recoveryRequest == EventSequence { 6 }, "host receives the guest recovery boundary");
     WorldSnapshot recoverySnapshot = sampleSnapshot();
     recoverySnapshot.lastIncludedEvent = host.latestAuthoritativeEvent();
     expect(host.sendRecovery(*recoveryRequest, recoverySnapshot), "host sends retained journal events for a short recovery gap");
     guest.poll();
-    std::optional<GameEvent> replayedHostPickup = guest.takePeerEvent();
-    std::optional<GameEvent> replayedGuestPickup = guest.takePeerEvent();
-    expect(replayedHostPickup.has_value()
-            && replayedHostPickup->sequence == EventSequence { 5 }
-            && std::holds_alternative<ItemPickupStartedEvent>(replayedHostPickup->payload)
-            && replayedGuestPickup.has_value()
-            && replayedGuestPickup->sequence == EventSequence { 6 }
-            && std::holds_alternative<ItemPickupStartedEvent>(replayedGuestPickup->payload)
+    std::optional<GameEvent> replayedLoot = guest.takePeerEvent();
+    std::optional<GameEvent> replayedTransfer = guest.takePeerEvent();
+    expect(replayedLoot.has_value()
+            && replayedLoot->sequence == EventSequence { 7 }
+            && std::holds_alternative<LootStartedEvent>(replayedLoot->payload)
+            && replayedTransfer.has_value()
+            && replayedTransfer->sequence == EventSequence { 8 }
+            && std::holds_alternative<InventoryTransferredEvent>(replayedTransfer->payload)
             && !guest.recoveryInProgress(),
-        "guest receives ordered pickup replay and observes recovery completion");
+        "guest receives ordered loot replay and observes recovery completion");
 
     EventSequence guestResumePoint = guest.lastAppliedEvent();
-    expect(guestResumePoint == EventSequence { 6 } && guest.disconnectForReconnect(),
+    expect(guestResumePoint == EventSequence { 8 } && guest.disconnectForReconnect(),
         "guest records its last applied event and drops the old connection");
     host.poll();
     expect(host.state() == NetworkLobbyState::Disconnected
@@ -1367,7 +1430,7 @@ void testNetworkCharacterLobby()
     expect(!guest.sendLocalMove(12347, 0, false),
         "disconnected guest input is blocked");
     expect(host.sendLocalFacing(2)
-            && host.latestAuthoritativeEvent() == EventSequence { 7 },
+            && host.latestAuthoritativeEvent() == EventSequence { 9 },
         "host continues the authoritative journal while the guest is absent");
 
     LoopbackTransportPair resumedPair = createLoopbackTransportPair();
@@ -1390,12 +1453,12 @@ void testNetworkCharacterLobby()
         ? std::get_if<ActorFacingChangedEvent>(&resumedFacing->payload)
         : nullptr;
     expect(resumedFacingPayload != nullptr
-            && resumedFacing->sequence == EventSequence { 7 }
+            && resumedFacing->sequence == EventSequence { 9 }
             && resumedFacingPayload->rotation == 2
             && !guest.recoveryInProgress(),
         "guest applies events created while disconnected and completes reconnect recovery");
     expect(resumedFacing.has_value() && guest.confirmPeerEventApplied(resumedFacing->sequence)
-            && guest.lastAppliedEvent() == EventSequence { 7 },
+            && guest.lastAppliedEvent() == EventSequence { 9 },
         "guest confirms the replayed event as its new reconnect boundary");
     expect(host.takeTransport() != nullptr && guest.takeTransport() != nullptr,
         "ready lobbies hand the connection to the game session");
@@ -1600,6 +1663,22 @@ public:
         return nextStatus;
     }
 
+    CommandExecutionStatus transferInventory(Object* actor,
+        Object* source,
+        Object* destination,
+        Object* item,
+        std::uint32_t quantity) override
+    {
+        transferCalls++;
+        lastActor = actor;
+        lastSource = source;
+        lastDestination = destination;
+        lastTarget = item;
+        lastQuantity = quantity;
+        recordContext();
+        return nextStatus;
+    }
+
     void recordContext()
     {
         PlayerCharacterState* player = actingPlayerState();
@@ -1615,8 +1694,12 @@ public:
     int doorCalls = 0;
     int pickupCalls = 0;
     int lootCalls = 0;
+    int transferCalls = 0;
     Object* lastActor = nullptr;
     Object* lastTarget = nullptr;
+    Object* lastSource = nullptr;
+    Object* lastDestination = nullptr;
+    std::uint32_t lastQuantity = 0;
     Object* lastContextActor = nullptr;
     CharacterBuild* lastBuild = nullptr;
     PlayerId lastActingPlayerId;
@@ -1739,6 +1822,37 @@ void testAuthoritativeCommandProcessing()
     expect(lootEvent != nullptr && lootEvent->actorId == session.playerActorId(kGuestPlayerId) && lootEvent->targetId == registeredLootableCritter.entityId, "loot event records the actor and target IDs");
     expect(looted.event.has_value() && looted.event->sequence == EventSequence { 4 }, "item interactions share the authoritative event sequence");
 
+    GameCommand transfer;
+    transfer.sequence.value = 5;
+    transfer.playerId = kGuestPlayerId;
+    transfer.actorId = session.playerActorId(kGuestPlayerId);
+    transfer.expectedPhase = SessionPhase::Exploration;
+    transfer.expectedPhaseRevision = session.phaseRevision();
+    transfer.payload = InventoryTransferCommand {
+        registeredLootableCritter.entityId,
+        session.playerActorId(kGuestPlayerId),
+        registeredItem.entityId,
+        2,
+    };
+    AuthoritativeCommandResult transferred = processor.process(transfer, session, executor);
+    const InventoryTransferredEvent* transferEvent = transferred.event.has_value()
+        ? std::get_if<InventoryTransferredEvent>(&transferred.event->payload)
+        : nullptr;
+    expect(transferred.result.status == CommandStatus::Accepted
+            && executor.transferCalls == 1
+            && executor.lastSource == asGameObject(lootableCritter)
+            && executor.lastDestination == asGameObject(guestActor)
+            && executor.lastTarget == asGameObject(item)
+            && executor.lastQuantity == 2,
+        "host resolves and executes an owned guest inventory transfer");
+    expect(transferEvent != nullptr
+            && transferEvent->actorId == session.playerActorId(kGuestPlayerId)
+            && transferEvent->sourceId == registeredLootableCritter.entityId
+            && transferEvent->destinationId == session.playerActorId(kGuestPlayerId)
+            && transferEvent->itemId == registeredItem.entityId
+            && transferEvent->quantity == 2,
+        "accepted inventory mutation emits a complete authoritative transfer event");
+
     executor.nextStatus = CommandExecutionStatus::InvalidAction;
     move.sequence.value = 3;
     AuthoritativeCommandResult invalid = processor.process(move, session, executor);
@@ -1796,7 +1910,7 @@ void testSnapshotRoundTripAndRecovery()
     WorldSnapshot authoritative = sampleSnapshot();
     std::vector<std::uint8_t> packet;
     expect(encodeSnapshot(authoritative, packet) == SnapshotError::None, "valid snapshot encodes");
-    expect(packet.size() == kSnapshotHeaderSize + 16 + 2 * 24 + 12, "snapshot packet declares a fixed-width payload");
+    expect(packet.size() == kSnapshotHeaderSize + 20 + 2 * 24 + 12 + 2 * 20, "snapshot packet declares a fixed-width payload");
     expect(packet[0] == 'F' && packet[1] == 'C' && packet[2] == 'M' && packet[3] == 'S', "snapshot magic uses network byte order");
 
     SnapshotDecodeResult decoded = decodeSnapshot(packet);
@@ -1806,6 +1920,11 @@ void testSnapshotRoundTripAndRecovery()
     expect(decoded.snapshot.actors.size() == 2 && decoded.snapshot.actors[0].entityId == EntityId { 1 }, "decoded actors use canonical entity order");
     expect(decoded.snapshot.actors[1].tile == 20102 && decoded.snapshot.actors[1].hitPoints == 28, "snapshot keeps guest actor state");
     expect(decoded.snapshot.doors.size() == 1 && decoded.snapshot.doors[0].open, "snapshot keeps door state");
+    expect(decoded.snapshot.items.size() == 2
+            && decoded.snapshot.items[0].holderId == EntityId { 1 }
+            && decoded.snapshot.items[0].quantity == 2
+            && decoded.snapshot.items[1].tile == 20104,
+        "snapshot keeps canonical inventory ownership and ground-item location");
 
     SnapshotDigestResult authoritativeDigest = computeSnapshotDigest(authoritative);
     SnapshotDigestResult decodedDigest = computeSnapshotDigest(decoded.snapshot);
@@ -1826,6 +1945,12 @@ void testSnapshotRoundTripAndRecovery()
     doorDrift.doors[0].open = false;
     SnapshotDigestResult doorDriftDigest = computeSnapshotDigest(doorDrift);
     expect(firstDivergentSection(authoritativeDigest.digest, doorDriftDigest.digest) == SnapshotSection::Doors, "door drift reports the door section");
+
+    WorldSnapshot itemDrift = decoded.snapshot;
+    itemDrift.items[0].quantity++;
+    SnapshotDigestResult itemDriftDigest = computeSnapshotDigest(itemDrift);
+    expect(firstDivergentSection(authoritativeDigest.digest, itemDriftDigest.digest) == SnapshotSection::Items,
+        "inventory drift reports the item section");
 
     SnapshotReplica replica;
     expect(replica.apply(actorDrift) == SnapshotError::None, "replica accepts locally drifted state");
@@ -1881,6 +2006,19 @@ void testSnapshotRoundTripAndRecovery()
     WorldSnapshot invalidOwner = authoritative;
     invalidOwner.actors[0].ownerId.value = 99;
     expect(validateSnapshot(invalidOwner) == SnapshotError::InvalidPlayerId, "two-player snapshot rejects an unknown actor owner");
+
+    WorldSnapshot invalidItem = authoritative;
+    invalidItem.items[0].quantity = 0;
+    expect(validateSnapshot(invalidItem) == SnapshotError::InvalidItemState,
+        "snapshot rejects an empty inventory stack");
+    invalidItem = authoritative;
+    invalidItem.items[0].holderId = invalidItem.items[0].entityId;
+    expect(validateSnapshot(invalidItem) == SnapshotError::InvalidItemState,
+        "snapshot rejects an item that contains itself");
+    invalidItem = authoritative;
+    invalidItem.items[1].quantity = 2;
+    expect(validateSnapshot(invalidItem) == SnapshotError::InvalidItemState,
+        "snapshot rejects an impossible ground stack");
 }
 
 GameEvent sampleMovementEvent(std::uint64_t sequence)

@@ -21,6 +21,12 @@ bool networkWorldApplyPeerMove(const ActorMovementStartedEvent& movement);
 bool networkWorldApplyPeerFacing(const ActorFacingChangedEvent& facing);
 bool networkWorldApplyPeerDoorUse(const DoorUseStartedEvent& doorUse);
 bool networkWorldApplyPeerPickup(const ItemPickupStartedEvent& pickup);
+bool networkWorldApplyPeerLoot(const LootStartedEvent& loot);
+bool networkWorldApplyInventoryTransfer(const InventoryTransferredEvent& transfer, bool reverse = false);
+bool networkWorldBeginLocalLoot(Object* target);
+bool networkWorldSetLocalLootTarget(Object* target);
+bool networkWorldIsLocalInventoryTransfer(Object* source, Object* destination);
+void networkWorldHandleItemReplacement(Object* removed, Object* replacement);
 bool networkWorldBeginLocalPickup(Object* target);
 void networkWorldFinishPickup(Object* target, bool succeeded);
 AuthoritativeCommandResult networkWorldProcessCommand(const GameCommand& command);
@@ -31,6 +37,7 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot);
 std::optional<EntityId> networkWorldFindEntity(const Object* object);
 void networkWorldLeave();
 bool networkWorldActive();
+bool networkWorldInventoryTransferInProgress();
 
 } // namespace multiplayer
 } // namespace fallout

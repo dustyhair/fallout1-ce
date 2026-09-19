@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -11,6 +12,8 @@
 #include "game/combat.h"
 #include "game/critter.h"
 #include "game/intface.h"
+#include "game/inventry.h"
+#include "game/item.h"
 #include "game/map_defs.h"
 #include "game/object.h"
 #include "game/protinst.h"
@@ -29,7 +32,56 @@ LocalSession session;
 Object* peerActor = nullptr;
 CommandProcessor commandProcessor;
 std::vector<std::pair<EntityId, Object*>> worldDoors;
+std::vector<std::pair<EntityId, Object*>> worldItems;
 std::unordered_set<EntityId, EntityIdHash> reservedPickupTargets;
+std::unordered_map<Object*, Object*> activeLootTargets;
+bool inventoryTransferInProgress = false;
+
+Object* topEnvironmentOrSelf(Object* object)
+{
+    Object* top = obj_top_environment(object);
+    return top != nullptr ? top : object;
+}
+
+bool applyInventoryTransfer(Object* source,
+    Object* destination,
+    Object* item,
+    std::uint32_t quantity,
+    bool force)
+{
+    if (source == nullptr
+        || destination == nullptr
+        || item == nullptr
+        || source == destination
+        || quantity == 0
+        || item->owner != source
+        || item_count(source, item) < static_cast<int>(quantity)) {
+        return false;
+    }
+
+    inventoryTransferInProgress = true;
+    int rc = force
+        ? item_move_force(source, destination, item, static_cast<int>(quantity))
+        : item_move(source, destination, item, static_cast<int>(quantity));
+    inventoryTransferInProgress = false;
+    return rc == 0;
+}
+
+bool setInventoryQuantity(Object* holder, Object* item, std::uint32_t quantity)
+{
+    if (holder == nullptr || item == nullptr || quantity == 0) {
+        return false;
+    }
+    Inventory* inventory = &holder->data.inventory;
+    for (int index = 0; index < inventory->length; index++) {
+        InventoryItem* entry = &inventory->items[index];
+        if (entry->item == item) {
+            entry->quantity = static_cast<int>(quantity);
+            return true;
+        }
+    }
+    return false;
+}
 
 bool beginPickup(Object* actor, Object* target)
 {
@@ -132,8 +184,31 @@ public:
             || actor == target
             || target == nullptr
             || actor->elevation != target->elevation
-            || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER
-            || action_loot_container(actor, target) == -1) {
+            || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        activeLootTargets[actor] = target;
+        return CommandExecutionStatus::Applied;
+    }
+
+    CommandExecutionStatus transferInventory(Object* actor,
+        Object* source,
+        Object* destination,
+        Object* item,
+        std::uint32_t quantity) override
+    {
+        if (actor == nullptr || source == nullptr || destination == nullptr || item == nullptr) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        auto activeLoot = activeLootTargets.find(actor);
+        Object* sourceTop = topEnvironmentOrSelf(source);
+        Object* destinationTop = topEnvironmentOrSelf(destination);
+        Object* otherTop = sourceTop == actor ? destinationTop : sourceTop;
+        if (isInCombat()
+            || (sourceTop != actor && destinationTop != actor)
+            || activeLoot == activeLootTargets.end()
+            || activeLoot->second != otherTop
+            || !applyInventoryTransfer(source, destination, item, quantity, false)) {
             return CommandExecutionStatus::InvalidAction;
         }
         return CommandExecutionStatus::Applied;
@@ -145,9 +220,12 @@ NetworkCommandExecutor commandExecutor;
 bool registerWorldObjects()
 {
     worldDoors.clear();
+    worldItems.clear();
     reservedPickupTargets.clear();
+    activeLootTargets.clear();
     std::vector<Object*> doors;
     std::vector<Object*> items;
+    std::vector<Object*> critters;
     for (Object* object = obj_find_first(); object != nullptr; object = obj_find_next()) {
         if (obj_is_a_portal(object)) {
             doors.push_back(object);
@@ -155,6 +233,10 @@ bool registerWorldObjects()
             && object->owner == nullptr
             && object->tile >= 0) {
             items.push_back(object);
+        } else if (FID_TYPE(object->fid) == OBJ_TYPE_CRITTER
+            && object != obj_dude
+            && object != peerActor) {
+            critters.push_back(object);
         }
     }
 
@@ -164,6 +246,28 @@ bool registerWorldObjects()
     };
     std::sort(doors.begin(), doors.end(), stableObjectOrder);
     std::sort(items.begin(), items.end(), stableObjectOrder);
+    std::sort(critters.begin(), critters.end(), stableObjectOrder);
+
+    auto registerInventory = [&](auto&& self, Object* owner) -> bool {
+        std::vector<Object*> inventoryItems;
+        Inventory* inventory = &owner->data.inventory;
+        inventoryItems.reserve(inventory->length);
+        for (int index = 0; index < inventory->length; index++) {
+            inventoryItems.push_back(inventory->items[index].item);
+        }
+        std::sort(inventoryItems.begin(), inventoryItems.end(), stableObjectOrder);
+        for (Object* item : inventoryItems) {
+            EntityRegistrationResult registration = session.registerWorldObject(item);
+            if (!registration) {
+                return false;
+            }
+            worldItems.emplace_back(registration.entityId, item);
+            if (!self(self, item)) {
+                return false;
+            }
+        }
+        return true;
+    };
 
     for (Object* door : doors) {
         EntityRegistrationResult registration = session.registerWorldObject(door);
@@ -173,7 +277,18 @@ bool registerWorldObjects()
         worldDoors.emplace_back(registration.entityId, door);
     }
     for (Object* item : items) {
-        if (!session.registerWorldObject(item)) {
+        EntityRegistrationResult registration = session.registerWorldObject(item);
+        if (!registration) {
+            return false;
+        }
+        worldItems.emplace_back(registration.entityId, item);
+        if (!registerInventory(registerInventory, item)) {
+            return false;
+        }
+    }
+    for (Object* critter : critters) {
+        if (!session.registerWorldObject(critter)
+            || !registerInventory(registerInventory, critter)) {
             return false;
         }
     }
@@ -439,6 +554,122 @@ bool networkWorldApplyPeerPickup(const ItemPickupStartedEvent& pickup)
     return beginPickup(actor, target);
 }
 
+bool networkWorldApplyPeerLoot(const LootStartedEvent& loot)
+{
+    if (!session.isActive()) {
+        return false;
+    }
+    PlayerCharacterState* player = session.players().findByActor(loot.actorId);
+    Object* actor = player != nullptr ? session.entities().findObject(player->actorId) : nullptr;
+    Object* target = session.entities().findObject(loot.targetId);
+    if (player == nullptr
+        || actor == nullptr
+        || target == nullptr
+        || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER
+        || actor->elevation != target->elevation) {
+        return false;
+    }
+    if (actor != obj_dude) {
+        return true;
+    }
+    activeLootTargets[actor] = target;
+    if (inven_loot_window_is_active()) {
+        return true;
+    }
+    ScopedActingPlayerContext actingPlayer(*player, actor);
+    return action_loot_container(actor, target) != -1;
+}
+
+bool networkWorldBeginLocalLoot(Object* target)
+{
+    if (!session.isActive()
+        || obj_dude == nullptr
+        || target == nullptr
+        || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER
+        || obj_dude->elevation != target->elevation) {
+        return false;
+    }
+    activeLootTargets[obj_dude] = target;
+    return action_loot_container(obj_dude, target) != -1;
+}
+
+bool networkWorldSetLocalLootTarget(Object* target)
+{
+    if (!session.isActive()
+        || obj_dude == nullptr
+        || target == nullptr
+        || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER
+        || obj_dude->elevation != target->elevation) {
+        return false;
+    }
+    activeLootTargets[obj_dude] = target;
+    return true;
+}
+
+bool networkWorldIsLocalInventoryTransfer(Object* source, Object* destination)
+{
+    if (!session.isActive() || obj_dude == nullptr || source == nullptr || destination == nullptr) {
+        return false;
+    }
+    auto activeLoot = activeLootTargets.find(obj_dude);
+    if (activeLoot == activeLootTargets.end()) {
+        return false;
+    }
+    Object* sourceTop = topEnvironmentOrSelf(source);
+    Object* destinationTop = topEnvironmentOrSelf(destination);
+    return (sourceTop == obj_dude && destinationTop == activeLoot->second)
+        || (destinationTop == obj_dude && sourceTop == activeLoot->second);
+}
+
+void networkWorldHandleItemReplacement(Object* removed, Object* replacement)
+{
+    if (!session.isActive() || removed == nullptr || replacement == nullptr || removed == replacement) {
+        return;
+    }
+    std::optional<EntityId> removedId = session.entities().findEntity(removed);
+    if (!removedId.has_value()) {
+        return;
+    }
+    std::optional<EntityId> replacementId = session.entities().findEntity(replacement);
+    if (replacementId.has_value()) {
+        session.entities().unregisterEntity(*removedId);
+        worldItems.erase(std::remove_if(worldItems.begin(), worldItems.end(), [&](const auto& entry) {
+            return entry.first == *removedId;
+        }), worldItems.end());
+    } else if (session.entities().rebindObject(*removedId, replacement) == EntityRegistryError::None) {
+        for (auto& entry : worldItems) {
+            if (entry.first == *removedId) {
+                entry.second = replacement;
+                break;
+            }
+        }
+    }
+}
+
+bool networkWorldApplyInventoryTransfer(const InventoryTransferredEvent& transfer, bool reverse)
+{
+    if (!session.isActive()) {
+        return false;
+    }
+    EntityId sourceId = reverse ? transfer.destinationId : transfer.sourceId;
+    EntityId destinationId = reverse ? transfer.sourceId : transfer.destinationId;
+    Object* source = session.entities().findObject(sourceId);
+    Object* destination = session.entities().findObject(destinationId);
+    Object* item = session.entities().findObject(transfer.itemId);
+    if (source == nullptr || destination == nullptr || item == nullptr) {
+        return false;
+    }
+    if (item->owner == destination) {
+        inven_refresh_loot_window();
+        return true;
+    }
+    bool applied = applyInventoryTransfer(source, destination, item, transfer.quantity, true);
+    if (applied) {
+        inven_refresh_loot_window();
+    }
+    return applied;
+}
+
 bool networkWorldBeginLocalPickup(Object* target)
 {
     if (!session.isActive() || obj_dude == nullptr || target == nullptr) {
@@ -543,6 +774,31 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
             door->frame,
         });
     }
+    for (const auto& entry : worldItems) {
+        Object* item = entry.second;
+        if (item == nullptr || session.entities().findObject(entry.first) != item) {
+            return false;
+        }
+        ItemSnapshot itemState;
+        itemState.entityId = entry.first;
+        if (item->owner == nullptr) {
+            if (item->tile < 0 || !elevationIsValid(item->elevation)) {
+                return false;
+            }
+            itemState.tile = item->tile;
+            itemState.elevation = item->elevation;
+            itemState.quantity = 1;
+        } else {
+            std::optional<EntityId> holderId = session.entities().findEntity(item->owner);
+            int quantity = item_count(item->owner, item);
+            if (!holderId.has_value() || quantity <= 0) {
+                return false;
+            }
+            itemState.holderId = *holderId;
+            itemState.quantity = static_cast<std::uint32_t>(quantity);
+        }
+        captured.items.push_back(itemState);
+    }
     if (validateSnapshot(captured) != SnapshotError::None) {
         return false;
     }
@@ -576,6 +832,15 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
             return false;
         }
     }
+    for (const ItemSnapshot& itemState : snapshot.items) {
+        Object* item = session.entities().findObject(itemState.entityId);
+        Object* holder = isValid(itemState.holderId)
+            ? session.entities().findObject(itemState.holderId)
+            : nullptr;
+        if (item == nullptr || (isValid(itemState.holderId) && holder == nullptr)) {
+            return false;
+        }
+    }
 
     for (const ActorSnapshot& actorState : snapshot.actors) {
         Object* actor = session.entities().findObject(actorState.entityId);
@@ -598,6 +863,55 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
         }
         tile_refresh_rect(&dirtyRect, door->elevation);
     }
+    for (const ItemSnapshot& itemState : snapshot.items) {
+        Object* item = session.entities().findObject(itemState.entityId);
+        Object* desiredHolder = isValid(itemState.holderId)
+            ? session.entities().findObject(itemState.holderId)
+            : nullptr;
+        if (desiredHolder != nullptr) {
+            if (item->owner == desiredHolder) {
+                if (!setInventoryQuantity(desiredHolder, item, itemState.quantity)) {
+                    return false;
+                }
+                continue;
+            } else if (item->owner != nullptr) {
+                if (!applyInventoryTransfer(item->owner, desiredHolder, item,
+                        static_cast<std::uint32_t>(item_count(item->owner, item)), true)) {
+                    return false;
+                }
+            } else {
+                inventoryTransferInProgress = true;
+                int rc = item_add_force(desiredHolder, item, 1);
+                if (rc == 0) {
+                    rc = obj_disconnect(item, nullptr);
+                }
+                inventoryTransferInProgress = false;
+                if (rc != 0) {
+                    return false;
+                }
+            }
+            if (!setInventoryQuantity(desiredHolder, item, itemState.quantity)) {
+                return false;
+            }
+        } else if (item->owner != nullptr) {
+            Object* currentHolder = item->owner;
+            inventoryTransferInProgress = true;
+            int rc = item_remove_mult(currentHolder, item, static_cast<int>(itemState.quantity));
+            if (rc == 0) {
+                rc = obj_connect(item, itemState.tile, itemState.elevation, nullptr);
+            }
+            inventoryTransferInProgress = false;
+            if (rc != 0) {
+                return false;
+            }
+        } else if (item->tile != itemState.tile || item->elevation != itemState.elevation) {
+            Rect dirtyRect;
+            if (obj_move_to_tile(item, itemState.tile, itemState.elevation, &dirtyRect) == -1) {
+                return false;
+            }
+            tile_refresh_rect(&dirtyRect, itemState.elevation);
+        }
+    }
     intface_redraw();
     return true;
 }
@@ -614,8 +928,15 @@ void networkWorldLeave()
 {
     session.stop();
     worldDoors.clear();
+    worldItems.clear();
     reservedPickupTargets.clear();
+    activeLootTargets.clear();
     erasePeerActor();
+}
+
+bool networkWorldInventoryTransferInProgress()
+{
+    return inventoryTransferInProgress;
 }
 
 bool networkWorldActive()

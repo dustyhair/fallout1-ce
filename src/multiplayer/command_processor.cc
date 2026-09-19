@@ -67,6 +67,7 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     const InteractCommand* interact = std::get_if<InteractCommand>(&command.payload);
     const PickupCommand* pickup = std::get_if<PickupCommand>(&command.payload);
     const LootCommand* loot = std::get_if<LootCommand>(&command.payload);
+    const InventoryTransferCommand* transfer = std::get_if<InventoryTransferCommand>(&command.payload);
     Object* target = nullptr;
     EntityId targetId;
     bool hasTarget = false;
@@ -83,6 +84,18 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     if (hasTarget) {
         target = session.entities().findObject(targetId);
         if (target == nullptr) {
+            return rejectAndRemember(CommandRejection::MissingEntity);
+        }
+    }
+
+    Object* source = nullptr;
+    Object* destination = nullptr;
+    Object* item = nullptr;
+    if (transfer != nullptr) {
+        source = session.entities().findObject(transfer->sourceId);
+        destination = session.entities().findObject(transfer->destinationId);
+        item = session.entities().findObject(transfer->itemId);
+        if (source == nullptr || destination == nullptr || item == nullptr) {
             return rejectAndRemember(CommandRejection::MissingEntity);
         }
     }
@@ -105,6 +118,19 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
         } else if (loot != nullptr) {
             executionStatus = executor.loot(actor, target);
             event.payload = LootStartedEvent { command.actorId, loot->targetId };
+        } else if (transfer != nullptr) {
+            executionStatus = executor.transferInventory(actor,
+                source,
+                destination,
+                item,
+                transfer->quantity);
+            event.payload = InventoryTransferredEvent {
+                command.actorId,
+                transfer->sourceId,
+                transfer->destinationId,
+                transfer->itemId,
+                transfer->quantity,
+            };
         }
     }
 

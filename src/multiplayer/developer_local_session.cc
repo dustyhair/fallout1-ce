@@ -204,6 +204,11 @@ public:
 
         return CommandExecutionStatus::Applied;
     }
+
+    CommandExecutionStatus transferInventory(Object*, Object*, Object*, Object*, std::uint32_t) override
+    {
+        return CommandExecutionStatus::InvalidAction;
+    }
 };
 
 EngineCommandExecutor commandExecutor;

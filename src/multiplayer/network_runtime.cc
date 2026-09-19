@@ -16,6 +16,7 @@
 #include "game/critter.h"
 #include "game/game.h"
 #include "game/gconfig.h"
+#include "game/inventry.h"
 #include "game/mainmenu.h"
 #include "game/object.h"
 #include "game/protinst.h"
@@ -456,6 +457,10 @@ void networkRuntimeBackgroundProcess()
                 applied = networkWorldApplyPeerDoorUse(*doorUse);
             } else if (const auto* pickup = std::get_if<ItemPickupStartedEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerPickup(*pickup);
+            } else if (const auto* loot = std::get_if<LootStartedEvent>(&event->payload)) {
+                applied = networkWorldApplyPeerLoot(*loot);
+            } else if (const auto* transfer = std::get_if<InventoryTransferredEvent>(&event->payload)) {
+                applied = networkWorldApplyInventoryTransfer(*transfer);
             }
             if (!applied) {
                 debug_printf("Multiplayer peer event could not be applied.\n");
@@ -1170,6 +1175,128 @@ bool networkRuntimeHandleLocalPickup(Object* target)
         debug_printf("Multiplayer pickup command could not be sent.\n");
     }
     return true;
+}
+
+bool networkRuntimeHandleLocalLoot(Object* target)
+{
+    if (!networkWorldActive() || target == nullptr || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER) {
+        return false;
+    }
+
+    std::optional<EntityId> targetId = networkWorldFindEntity(target);
+    if (!targetId.has_value()) {
+        debug_printf("Multiplayer loot target is missing a shared entity ID.\n");
+        return true;
+    }
+    if (launchOptions.mode == NetworkLaunchMode::Host
+        && !networkWorldBeginLocalLoot(target)) {
+        return true;
+    }
+    if (!lobby.sendLocalLoot(*targetId, networkWorldPhaseRevision())) {
+        debug_printf("Multiplayer loot command could not be sent.\n");
+    }
+    return true;
+}
+
+bool networkRuntimeHandleLocalLootTargetChange(Object* target)
+{
+    if (!networkWorldActive() || target == nullptr || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER) {
+        return false;
+    }
+
+    std::optional<EntityId> targetId = networkWorldFindEntity(target);
+    if (!targetId.has_value()) {
+        debug_printf("Multiplayer loot target is missing a shared entity ID.\n");
+        return true;
+    }
+    if (launchOptions.mode == NetworkLaunchMode::Host
+        && !networkWorldSetLocalLootTarget(target)) {
+        return true;
+    }
+    if (!lobby.sendLocalLoot(*targetId, networkWorldPhaseRevision())) {
+        debug_printf("Multiplayer loot target change could not be sent.\n");
+    }
+    return true;
+}
+
+bool networkRuntimeHandleLocalInventoryTransfer(Object* source,
+    Object* destination,
+    Object* item,
+    std::uint32_t quantity)
+{
+    if (!networkWorldActive()
+        || networkWorldInventoryTransferInProgress()
+        || source == nullptr
+        || destination == nullptr
+        || item == nullptr
+        || quantity == 0) {
+        return false;
+    }
+    if (!networkWorldIsLocalInventoryTransfer(source, destination)) {
+        return false;
+    }
+
+    std::optional<EntityId> sourceId = networkWorldFindEntity(source);
+    std::optional<EntityId> destinationId = networkWorldFindEntity(destination);
+    std::optional<EntityId> itemId = networkWorldFindEntity(item);
+    if (!sourceId.has_value() || !destinationId.has_value() || !itemId.has_value()) {
+        return false;
+    }
+
+    if (launchOptions.mode != NetworkLaunchMode::Host) {
+        return true;
+    }
+    if (!lobby.sendLocalInventoryTransfer(*sourceId,
+            *destinationId,
+            *itemId,
+            quantity,
+            networkWorldPhaseRevision())) {
+        debug_printf("Multiplayer inventory transfer could not be published.\n");
+    }
+    return true;
+}
+
+NetworkInventoryTransferDisposition networkRuntimePrepareLocalInventoryTransfer(Object* source,
+    Object* destination,
+    Object* item,
+    std::uint32_t quantity,
+    std::uint32_t availableQuantity)
+{
+    if (!networkWorldActive() || networkWorldInventoryTransferInProgress()) {
+        return NetworkInventoryTransferDisposition::ApplyLocally;
+    }
+    if (!networkWorldIsLocalInventoryTransfer(source, destination)) {
+        return inven_loot_window_is_active()
+            ? NetworkInventoryTransferDisposition::Reject
+            : NetworkInventoryTransferDisposition::ApplyLocally;
+    }
+    if (quantity == 0 || quantity != availableQuantity) {
+        return NetworkInventoryTransferDisposition::Reject;
+    }
+
+    std::optional<EntityId> sourceId = networkWorldFindEntity(source);
+    std::optional<EntityId> destinationId = networkWorldFindEntity(destination);
+    std::optional<EntityId> itemId = networkWorldFindEntity(item);
+    if (!sourceId.has_value() || !destinationId.has_value() || !itemId.has_value()) {
+        debug_printf("Multiplayer inventory transfer has an unregistered entity.\n");
+        return NetworkInventoryTransferDisposition::Reject;
+    }
+    if (launchOptions.mode == NetworkLaunchMode::Host) {
+        return NetworkInventoryTransferDisposition::ApplyLocally;
+    }
+    if (launchOptions.mode != NetworkLaunchMode::Join) {
+        return NetworkInventoryTransferDisposition::Reject;
+    }
+
+    if (!lobby.sendLocalInventoryTransfer(*sourceId,
+            *destinationId,
+            *itemId,
+            quantity,
+            networkWorldPhaseRevision())) {
+        debug_printf("Multiplayer inventory transfer command could not be sent.\n");
+        return NetworkInventoryTransferDisposition::Reject;
+    }
+    return NetworkInventoryTransferDisposition::DeferToHost;
 }
 
 void networkRuntimeLeaveWorld()

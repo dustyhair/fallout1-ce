@@ -98,7 +98,9 @@ bool isSupportedLiveEvent(const GameEventPayload& payload)
     return std::holds_alternative<ActorMovementStartedEvent>(payload)
         || std::holds_alternative<ActorFacingChangedEvent>(payload)
         || std::holds_alternative<DoorUseStartedEvent>(payload)
-        || std::holds_alternative<ItemPickupStartedEvent>(payload);
+        || std::holds_alternative<ItemPickupStartedEvent>(payload)
+        || std::holds_alternative<LootStartedEvent>(payload)
+        || std::holds_alternative<InventoryTransferredEvent>(payload);
 }
 
 } // namespace
@@ -176,6 +178,30 @@ bool NetworkLobby::sendLocalPickup(EntityId targetId, std::uint32_t phaseRevisio
     return sendLocalAction(
         ItemPickupStartedEvent { actorId, targetId },
         PickupCommand { targetId },
+        phaseRevision);
+}
+
+bool NetworkLobby::sendLocalLoot(EntityId targetId, std::uint32_t phaseRevision)
+{
+    PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
+    EntityId actorId { playerId.value };
+    return sendLocalAction(
+        LootStartedEvent { actorId, targetId },
+        LootCommand { targetId },
+        phaseRevision);
+}
+
+bool NetworkLobby::sendLocalInventoryTransfer(EntityId sourceId,
+    EntityId destinationId,
+    EntityId itemId,
+    std::uint32_t quantity,
+    std::uint32_t phaseRevision)
+{
+    PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
+    EntityId actorId { playerId.value };
+    return sendLocalAction(
+        InventoryTransferredEvent { actorId, sourceId, destinationId, itemId, quantity },
+        InventoryTransferCommand { sourceId, destinationId, itemId, quantity },
         phaseRevision);
 }
 

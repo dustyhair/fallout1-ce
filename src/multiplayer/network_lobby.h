@@ -64,6 +64,12 @@ public:
     bool sendLocalFacing(int rotation, std::uint32_t phaseRevision = 1);
     bool sendLocalDoorUse(EntityId targetId, std::uint32_t phaseRevision = 1);
     bool sendLocalPickup(EntityId targetId, std::uint32_t phaseRevision = 1);
+    bool sendLocalLoot(EntityId targetId, std::uint32_t phaseRevision = 1);
+    bool sendLocalInventoryTransfer(EntityId sourceId,
+        EntityId destinationId,
+        EntityId itemId,
+        std::uint32_t quantity,
+        std::uint32_t phaseRevision = 1);
     bool sendCommandOutcome(AuthoritativeCommandResult outcome);
     std::optional<GameCommand> takePeerCommand();
     std::optional<CommandResult> takeCommandResult();

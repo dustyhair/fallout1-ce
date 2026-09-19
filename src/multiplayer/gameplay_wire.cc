@@ -1,5 +1,6 @@
 #include "multiplayer/gameplay_wire.h"
 
+#include <limits>
 #include <variant>
 
 namespace fallout {
@@ -12,6 +13,7 @@ enum class CommandType : std::uint8_t {
     Pickup = 3,
     Loot = 4,
     Face = 5,
+    InventoryTransfer = 6,
 };
 
 enum class EventType : std::uint8_t {
@@ -20,17 +22,20 @@ enum class EventType : std::uint8_t {
     ItemPickupStarted = 3,
     LootStarted = 4,
     ActorFacingChanged = 5,
+    InventoryTransferred = 6,
 };
 
 constexpr std::size_t kCommandHeaderSize = 28;
 constexpr std::size_t kMoveCommandSize = kCommandHeaderSize + 12;
 constexpr std::size_t kTargetCommandSize = kCommandHeaderSize + 4;
 constexpr std::size_t kFacingCommandSize = kCommandHeaderSize + 8;
+constexpr std::size_t kInventoryTransferCommandSize = kCommandHeaderSize + 16;
 constexpr std::size_t kCommandResultSize = 24;
 constexpr std::size_t kEventHeaderSize = 20;
 constexpr std::size_t kMovementEventHeaderSize = kEventHeaderSize + 20;
 constexpr std::size_t kTargetEventSize = kEventHeaderSize + 8;
 constexpr std::size_t kFacingEventSize = kEventHeaderSize + 8;
+constexpr std::size_t kInventoryTransferEventSize = kEventHeaderSize + 20;
 
 void appendUInt16(std::vector<std::uint8_t>& bytes, std::uint16_t value)
 {
@@ -171,6 +176,18 @@ GameplayWireError validateCommand(const GameCommand& command)
             ? GameplayWireError::None
             : GameplayWireError::InvalidRotation;
     }
+    if (const auto* transfer = std::get_if<InventoryTransferCommand>(&command.payload)) {
+        if (!isValid(transfer->sourceId)
+            || !isValid(transfer->destinationId)
+            || !isValid(transfer->itemId)
+            || transfer->sourceId == transfer->destinationId) {
+            return GameplayWireError::InvalidEntityId;
+        }
+        return transfer->quantity != 0
+                && transfer->quantity <= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())
+            ? GameplayWireError::None
+            : GameplayWireError::InvalidQuantity;
+    }
 
     EntityId targetId;
     if (const auto* interact = std::get_if<InteractCommand>(&command.payload)) {
@@ -245,6 +262,19 @@ GameplayWireError validateEvent(const GameEvent& event)
         }
         return GameplayWireError::None;
     }
+    if (const auto* transfer = std::get_if<InventoryTransferredEvent>(&event.payload)) {
+        if (!isValid(transfer->actorId)
+            || !isValid(transfer->sourceId)
+            || !isValid(transfer->destinationId)
+            || !isValid(transfer->itemId)
+            || transfer->sourceId == transfer->destinationId) {
+            return GameplayWireError::InvalidEntityId;
+        }
+        return transfer->quantity != 0
+                && transfer->quantity <= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())
+            ? GameplayWireError::None
+            : GameplayWireError::InvalidQuantity;
+    }
 
     EntityId actorId;
     EntityId targetId;
@@ -314,10 +344,16 @@ GameplayWireError encodeGameCommand(const GameCommand& command, ProtocolEnvelope
     } else if (const auto* pickup = std::get_if<PickupCommand>(&command.payload)) {
         appendCommandHeader(command, CommandType::Pickup, envelope.payload);
         appendUInt32(envelope.payload, pickup->targetId.value);
-    } else {
-        const auto* loot = std::get_if<LootCommand>(&command.payload);
+    } else if (const auto* loot = std::get_if<LootCommand>(&command.payload)) {
         appendCommandHeader(command, CommandType::Loot, envelope.payload);
         appendUInt32(envelope.payload, loot->targetId.value);
+    } else {
+        const auto* transfer = std::get_if<InventoryTransferCommand>(&command.payload);
+        appendCommandHeader(command, CommandType::InventoryTransfer, envelope.payload);
+        appendUInt32(envelope.payload, transfer->sourceId.value);
+        appendUInt32(envelope.payload, transfer->destinationId.value);
+        appendUInt32(envelope.payload, transfer->itemId.value);
+        appendUInt32(envelope.payload, transfer->quantity);
     }
     return GameplayWireError::None;
 }
@@ -393,6 +429,18 @@ GameCommandDecodeResult decodeGameCommand(const ProtocolEnvelope& envelope)
         }
         break;
     }
+    case CommandType::InventoryTransfer:
+        if (envelope.payload.size() != kInventoryTransferCommandSize) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.command.payload = InventoryTransferCommand {
+            EntityId { readUInt32(envelope.payload, 28) },
+            EntityId { readUInt32(envelope.payload, 32) },
+            EntityId { readUInt32(envelope.payload, 36) },
+            readUInt32(envelope.payload, 40),
+        };
+        break;
     default:
         result.error = GameplayWireError::UnknownPayloadType;
         return result;
@@ -484,11 +532,18 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
         appendEventHeader(event, EventType::ItemPickupStarted, envelope.payload);
         appendUInt32(envelope.payload, pickup->actorId.value);
         appendUInt32(envelope.payload, pickup->targetId.value);
-    } else {
-        const auto* loot = std::get_if<LootStartedEvent>(&event.payload);
+    } else if (const auto* loot = std::get_if<LootStartedEvent>(&event.payload)) {
         appendEventHeader(event, EventType::LootStarted, envelope.payload);
         appendUInt32(envelope.payload, loot->actorId.value);
         appendUInt32(envelope.payload, loot->targetId.value);
+    } else {
+        const auto* transfer = std::get_if<InventoryTransferredEvent>(&event.payload);
+        appendEventHeader(event, EventType::InventoryTransferred, envelope.payload);
+        appendUInt32(envelope.payload, transfer->actorId.value);
+        appendUInt32(envelope.payload, transfer->sourceId.value);
+        appendUInt32(envelope.payload, transfer->destinationId.value);
+        appendUInt32(envelope.payload, transfer->itemId.value);
+        appendUInt32(envelope.payload, transfer->quantity);
     }
     return GameplayWireError::None;
 }
@@ -571,6 +626,19 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
         }
         break;
     }
+    case EventType::InventoryTransferred:
+        if (envelope.payload.size() != kInventoryTransferEventSize) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.event.payload = InventoryTransferredEvent {
+            EntityId { readUInt32(envelope.payload, 20) },
+            EntityId { readUInt32(envelope.payload, 24) },
+            EntityId { readUInt32(envelope.payload, 28) },
+            EntityId { readUInt32(envelope.payload, 32) },
+            readUInt32(envelope.payload, 36),
+        };
+        break;
     default:
         result.error = GameplayWireError::UnknownPayloadType;
         return result;
@@ -615,6 +683,8 @@ const char* gameplayWireErrorMessage(GameplayWireError error)
         return "invalid movement payload";
     case GameplayWireError::InvalidRotation:
         return "invalid actor rotation";
+    case GameplayWireError::InvalidQuantity:
+        return "invalid inventory quantity";
     case GameplayWireError::InvalidStatus:
         return "invalid command status";
     case GameplayWireError::InvalidRejection:

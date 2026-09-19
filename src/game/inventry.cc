@@ -36,6 +36,7 @@
 #include "game/tile.h"
 #include "int/dialog.h"
 #include "multiplayer/local_player_context.h"
+#include "multiplayer/network_runtime.h"
 #include "multiplayer/presentation_bridge.h"
 #include "platform_compat.h"
 #include "plib/color/color.h"
@@ -347,6 +348,8 @@ static int i_wid_max_x;
 
 // 0x59CED4
 static Inventory* target_pud;
+
+static bool lootWindowActive;
 
 // 0x59CEE4
 static int barter_back_win;
@@ -3821,6 +3824,7 @@ static int loot_container_for_current_player(Object* a1, Object* a2)
     display_inventory(stack_offset[curr_stack], -1, INVENTORY_WINDOW_TYPE_LOOT);
     display_body(a2->fid, INVENTORY_WINDOW_TYPE_LOOT);
     inven_set_mouse(INVENTORY_WINDOW_CURSOR_HAND);
+    lootWindowActive = true;
 
     bool isCaughtStealing = false;
     int stealingXp = 0;
@@ -3877,6 +3881,7 @@ static int loot_container_for_current_player(Object* a1, Object* a2)
                 }
 
                 a2 = critters[critterIndex];
+                multiplayer::networkRuntimeHandleLocalLootTargetChange(a2);
                 target_pud = &(a2->data.inventory);
                 target_stack[0] = a2;
                 target_curr_stack = 0;
@@ -3899,6 +3904,7 @@ static int loot_container_for_current_player(Object* a1, Object* a2)
                 }
 
                 a2 = critters[critterIndex];
+                multiplayer::networkRuntimeHandleLocalLootTargetChange(a2);
                 target_pud = &(a2->data.inventory);
                 target_stack[0] = a2;
                 target_curr_stack = 0;
@@ -4021,6 +4027,8 @@ static int loot_container_for_current_player(Object* a1, Object* a2)
         sharedFpsLimiter.throttle();
     }
 
+    lootWindowActive = false;
+
     if (critterCount != 0) {
         obj_delete_list(critters);
 
@@ -4106,6 +4114,27 @@ int loot_container(Object* a1, Object* a2)
     }
     inven_reset_dude();
     return rc;
+}
+
+void inven_refresh_loot_window()
+{
+    if (!lootWindowActive || target_pud == nullptr) {
+        return;
+    }
+
+    target_stack_offset[target_curr_stack] = std::min(
+        target_stack_offset[target_curr_stack],
+        std::max(target_pud->length - inven_cur_disp, 0));
+    stack_offset[curr_stack] = std::min(
+        stack_offset[curr_stack],
+        std::max(pud->length - inven_cur_disp, 0));
+    display_target_inventory(target_stack_offset[target_curr_stack], -1, target_pud, INVENTORY_WINDOW_TYPE_LOOT);
+    display_inventory(stack_offset[curr_stack], -1, INVENTORY_WINDOW_TYPE_LOOT);
+}
+
+bool inven_loot_window_is_active()
+{
+    return lootWindowActive;
 }
 
 // 0x467658

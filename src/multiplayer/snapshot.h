@@ -11,11 +11,12 @@ namespace fallout {
 namespace multiplayer {
 
 constexpr std::uint32_t kSnapshotMagic = 0x46434D53;
-constexpr std::uint16_t kSnapshotVersion = 1;
+constexpr std::uint16_t kSnapshotVersion = 2;
 constexpr std::size_t kSnapshotHeaderSize = 28;
 constexpr std::size_t kMaxSnapshotPayloadSize = 64 * 1024;
 constexpr std::size_t kMaxSnapshotActors = 16;
 constexpr std::size_t kMaxSnapshotDoors = 1024;
+constexpr std::size_t kMaxSnapshotItems = 4096;
 
 struct ActorSnapshot {
     EntityId entityId;
@@ -33,6 +34,14 @@ struct DoorSnapshot {
     std::int32_t frame = 0;
 };
 
+struct ItemSnapshot {
+    EntityId entityId;
+    EntityId holderId;
+    std::int32_t tile = -1;
+    std::int32_t elevation = -1;
+    std::uint32_t quantity = 1;
+};
+
 struct WorldSnapshot {
     std::uint16_t version = kSnapshotVersion;
     EventSequence lastIncludedEvent;
@@ -40,6 +49,7 @@ struct WorldSnapshot {
     std::uint32_t phaseRevision = 0;
     std::vector<ActorSnapshot> actors;
     std::vector<DoorSnapshot> doors;
+    std::vector<ItemSnapshot> items;
 };
 
 enum class SnapshotError {
@@ -56,11 +66,13 @@ enum class SnapshotError {
     InvalidPhaseRevision,
     TooManyActors,
     TooManyDoors,
+    TooManyItems,
     InvalidEntityId,
     InvalidPlayerId,
     DuplicateEntityId,
     InvalidActorState,
     InvalidDoorState,
+    InvalidItemState,
 };
 
 struct SnapshotDecodeResult {
@@ -78,12 +90,14 @@ enum class SnapshotSection {
     Session,
     Actors,
     Doors,
+    Items,
 };
 
 struct SectionedStateDigest {
     std::uint64_t session = 0;
     std::uint64_t actors = 0;
     std::uint64_t doors = 0;
+    std::uint64_t items = 0;
     std::uint64_t overall = 0;
 };
 
@@ -92,6 +106,7 @@ constexpr bool operator==(const SectionedStateDigest& lhs, const SectionedStateD
     return lhs.session == rhs.session
         && lhs.actors == rhs.actors
         && lhs.doors == rhs.doors
+        && lhs.items == rhs.items
         && lhs.overall == rhs.overall;
 }
 

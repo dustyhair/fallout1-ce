@@ -1,6 +1,6 @@
 # Authoritative command routing
 
-The command processor handles movement, door use, ground-item pickup, and looting. The developer session uses it in process, while the live network host uses it to validate guest movement, doors, facing, and ground-item pickup. Its input and output contain only multiplayer value types and entity IDs.
+The command processor handles movement, door use, ground-item pickup, looting, and loot-window inventory transfers. The developer session uses the interaction subset in process, while the live network host validates every guest action. Its input and output contain only multiplayer value types and entity IDs.
 
 For every command, the processor checks:
 
@@ -10,7 +10,7 @@ For every command, the processor checks:
 - The actor exists and belongs to the sending player.
 - An interaction target exists in the entity registry.
 
-Only then does the engine adapter run Fallout pathfinding or schedule the interaction. An accepted command receives one session-wide event sequence. The event records the action the engine scheduled, not a claim that an animation or inventory transfer has already finished. Rejected commands have a specific reason and emit no event.
+Only then does the engine adapter run Fallout pathfinding, schedule the interaction, or apply the inventory mutation. An accepted command receives one session-wide event sequence. Rejected commands have a specific reason and emit no event. Guest inventory moves remain deferred until their authoritative event arrives, so rejection does not require an identity-sensitive rollback.
 
 The developer session registers doors, ground items, and lootable critters when a player interacts with them. A world reset removes these unowned mappings before the engine frees map objects. Player actor mappings remain, and the guest actor keeps its `EntityId` when the next map loads.
 
@@ -18,4 +18,6 @@ Fallout defers pickup and loot callbacks until the acting character reaches the 
 
 For live pickup, the initial map's ground items receive host-compatible IDs by sorting the same map objects before registry insertion. The host reserves an accepted target until the deferred callback reports success or failure, preventing two actors from scheduling the same item. An accepted event makes each peer schedule the same actor/item interaction; a failed callback releases the reservation for a later attempt.
 
-This change does not encode command payloads for a network transport or replicate completed animation state. The [snapshot recovery format](snapshot-recovery.md) now detects and repairs the minimal actor and door state used by this experiment.
+Lootable critters and their recursive inventories are registered in the same canonical scan. Only the initiating player's process opens Fallout's modal loot window. Whole-stack moves are sent with source, destination, item, and quantity; the host verifies that one side is the owned actor and the other belongs to the active loot target. Identical-stack merges retire the destroyed representative from the registry on both peers.
+
+The [snapshot recovery format](snapshot-recovery.md) records the holder or ground position of every registered item so a recovery snapshot repairs pickup and loot mutations after their journal events have expired.
