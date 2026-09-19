@@ -97,7 +97,8 @@ bool isSupportedLiveEvent(const GameEventPayload& payload)
 {
     return std::holds_alternative<ActorMovementStartedEvent>(payload)
         || std::holds_alternative<ActorFacingChangedEvent>(payload)
-        || std::holds_alternative<DoorUseStartedEvent>(payload);
+        || std::holds_alternative<DoorUseStartedEvent>(payload)
+        || std::holds_alternative<ItemPickupStartedEvent>(payload);
 }
 
 } // namespace
@@ -165,6 +166,16 @@ bool NetworkLobby::sendLocalDoorUse(EntityId targetId, std::uint32_t phaseRevisi
     return sendLocalAction(
         DoorUseStartedEvent { actorId, targetId },
         InteractCommand { targetId },
+        phaseRevision);
+}
+
+bool NetworkLobby::sendLocalPickup(EntityId targetId, std::uint32_t phaseRevision)
+{
+    PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
+    EntityId actorId { playerId.value };
+    return sendLocalAction(
+        ItemPickupStartedEvent { actorId, targetId },
+        PickupCommand { targetId },
         phaseRevision);
 }
 

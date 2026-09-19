@@ -454,6 +454,8 @@ void networkRuntimeBackgroundProcess()
                 applied = networkWorldApplyPeerFacing(*facing);
             } else if (const auto* doorUse = std::get_if<DoorUseStartedEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerDoorUse(*doorUse);
+            } else if (const auto* pickup = std::get_if<ItemPickupStartedEvent>(&event->payload)) {
+                applied = networkWorldApplyPeerPickup(*pickup);
             }
             if (!applied) {
                 debug_printf("Multiplayer peer event could not be applied.\n");
@@ -1144,6 +1146,28 @@ bool networkRuntimeHandleLocalDoorUse(Object* target)
     }
     if (!lobby.sendLocalDoorUse(*targetId, networkWorldPhaseRevision())) {
         debug_printf("Multiplayer door command could not be sent.\n");
+    }
+    return true;
+}
+
+bool networkRuntimeHandleLocalPickup(Object* target)
+{
+    if (!networkWorldActive() || target == nullptr || FID_TYPE(target->fid) != OBJ_TYPE_ITEM) {
+        return false;
+    }
+
+    std::optional<EntityId> targetId = networkWorldFindEntity(target);
+    if (!targetId.has_value()) {
+        debug_printf("Multiplayer ground item is missing a shared entity ID.\n");
+        return true;
+    }
+
+    if (launchOptions.mode == NetworkLaunchMode::Host
+        && !networkWorldBeginLocalPickup(target)) {
+        return true;
+    }
+    if (!lobby.sendLocalPickup(*targetId, networkWorldPhaseRevision())) {
+        debug_printf("Multiplayer pickup command could not be sent.\n");
     }
     return true;
 }

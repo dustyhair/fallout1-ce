@@ -19,7 +19,7 @@
 namespace fallout {
 namespace multiplayer {
 
-constexpr std::uint16_t kNetworkLobbyVersion = 2;
+constexpr std::uint16_t kNetworkLobbyVersion = 3;
 constexpr std::size_t kMaxLobbyChatMessageLength = 64;
 
 struct LobbyChatMessage {
@@ -63,6 +63,7 @@ public:
         std::uint32_t phaseRevision = 1);
     bool sendLocalFacing(int rotation, std::uint32_t phaseRevision = 1);
     bool sendLocalDoorUse(EntityId targetId, std::uint32_t phaseRevision = 1);
+    bool sendLocalPickup(EntityId targetId, std::uint32_t phaseRevision = 1);
     bool sendCommandOutcome(AuthoritativeCommandResult outcome);
     std::optional<GameCommand> takePeerCommand();
     std::optional<CommandResult> takeCommandResult();

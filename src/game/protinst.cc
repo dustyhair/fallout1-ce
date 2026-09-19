@@ -27,6 +27,7 @@
 #include "game/tile.h"
 #include "game/worldmap.h"
 #include "multiplayer/local_player_context.h"
+#include "multiplayer/network_world.h"
 #include "plib/color/color.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/rect.h"
@@ -488,12 +489,14 @@ int obj_pickup(Object* critter, Object* item)
 
         Script* script;
         if (scr_ptr(sid, &script) == -1) {
+            multiplayer::networkWorldFinishPickup(item, false);
             return -1;
         }
 
         overriden = script->scriptOverrides;
     }
 
+    bool pickedUp = false;
     if (!overriden) {
         int rc;
         if (item->pid == PROTO_ID_MONEY) {
@@ -511,6 +514,7 @@ int obj_pickup(Object* critter, Object* item)
         }
 
         if (rc == 0) {
+            pickedUp = true;
             Rect rect;
             obj_disconnect(item, &rect);
             tile_refresh_rect(&rect, item->elevation);
@@ -523,6 +527,8 @@ int obj_pickup(Object* critter, Object* item)
             }
         }
     }
+
+    multiplayer::networkWorldFinishPickup(item, pickedUp);
 
     return 0;
 }

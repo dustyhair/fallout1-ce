@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <tuple>
+#include <unordered_set>
 #include <vector>
 
 #include "game/actions.h"
@@ -28,6 +29,32 @@ LocalSession session;
 Object* peerActor = nullptr;
 CommandProcessor commandProcessor;
 std::vector<std::pair<EntityId, Object*>> worldDoors;
+std::unordered_set<EntityId, EntityIdHash> reservedPickupTargets;
+
+bool beginPickup(Object* actor, Object* target)
+{
+    if (isInCombat()
+        || actor == nullptr
+        || target == nullptr
+        || actor == target
+        || actor->elevation != target->elevation
+        || FID_TYPE(target->fid) != OBJ_TYPE_ITEM
+        || target->owner != nullptr) {
+        return false;
+    }
+
+    std::optional<EntityId> targetId = session.entities().findEntity(target);
+    if (!targetId.has_value() || reservedPickupTargets.find(*targetId) != reservedPickupTargets.end()) {
+        return false;
+    }
+
+    reservedPickupTargets.insert(*targetId);
+    if (action_get_an_object(actor, target) == -1) {
+        reservedPickupTargets.erase(*targetId);
+        return false;
+    }
+    return true;
+}
 
 class NetworkCommandExecutor : public CommandExecutor {
 public:
@@ -94,16 +121,9 @@ public:
 
     CommandExecutionStatus pickup(Object* actor, Object* target) override
     {
-        if (isInCombat()
-            || actor == target
-            || target == nullptr
-            || actor->elevation != target->elevation
-            || FID_TYPE(target->fid) != OBJ_TYPE_ITEM
-            || target->owner != nullptr
-            || action_get_an_object(actor, target) == -1) {
-            return CommandExecutionStatus::InvalidAction;
-        }
-        return CommandExecutionStatus::Applied;
+        return beginPickup(actor, target)
+            ? CommandExecutionStatus::Applied
+            : CommandExecutionStatus::InvalidAction;
     }
 
     CommandExecutionStatus loot(Object* actor, Object* target) override
@@ -122,20 +142,28 @@ public:
 
 NetworkCommandExecutor commandExecutor;
 
-bool registerWorldDoors()
+bool registerWorldObjects()
 {
     worldDoors.clear();
+    reservedPickupTargets.clear();
     std::vector<Object*> doors;
+    std::vector<Object*> items;
     for (Object* object = obj_find_first(); object != nullptr; object = obj_find_next()) {
         if (obj_is_a_portal(object)) {
             doors.push_back(object);
+        } else if (FID_TYPE(object->fid) == OBJ_TYPE_ITEM
+            && object->owner == nullptr
+            && object->tile >= 0) {
+            items.push_back(object);
         }
     }
 
-    std::sort(doors.begin(), doors.end(), [](const Object* lhs, const Object* rhs) {
+    auto stableObjectOrder = [](const Object* lhs, const Object* rhs) {
         return std::tie(lhs->elevation, lhs->tile, lhs->pid, lhs->id, lhs->fid)
             < std::tie(rhs->elevation, rhs->tile, rhs->pid, rhs->id, rhs->fid);
-    });
+    };
+    std::sort(doors.begin(), doors.end(), stableObjectOrder);
+    std::sort(items.begin(), items.end(), stableObjectOrder);
 
     for (Object* door : doors) {
         EntityRegistrationResult registration = session.registerWorldObject(door);
@@ -143,6 +171,11 @@ bool registerWorldDoors()
             return false;
         }
         worldDoors.emplace_back(registration.entityId, door);
+    }
+    for (Object* item : items) {
+        if (!session.registerWorldObject(item)) {
+            return false;
+        }
     }
     return true;
 }
@@ -263,7 +296,7 @@ bool networkWorldEnter(NetworkLaunchMode mode,
     localPlayer->connection = ConnectionState::Connected;
     remotePlayer->ownership = PlayerOwnership::RemoteControl;
     remotePlayer->connection = ConnectionState::Connected;
-    if (!registerWorldDoors()
+    if (!registerWorldObjects()
         || !refreshPlayer(kHostPlayerId)
         || !refreshPlayer(kGuestPlayerId)) {
         session.stop();
@@ -387,6 +420,52 @@ bool networkWorldApplyPeerDoorUse(const DoorUseStartedEvent& doorUse)
 
     ScopedActingPlayerContext actingPlayer(*player, actor);
     return action_use_an_object(actor, target) != -1;
+}
+
+bool networkWorldApplyPeerPickup(const ItemPickupStartedEvent& pickup)
+{
+    if (!session.isActive()) {
+        return false;
+    }
+
+    PlayerCharacterState* player = session.players().findByActor(pickup.actorId);
+    Object* actor = player != nullptr ? session.entities().findObject(player->actorId) : nullptr;
+    Object* target = session.entities().findObject(pickup.targetId);
+    if (player == nullptr || actor == nullptr || target == nullptr) {
+        return false;
+    }
+
+    ScopedActingPlayerContext actingPlayer(*player, actor);
+    return beginPickup(actor, target);
+}
+
+bool networkWorldBeginLocalPickup(Object* target)
+{
+    if (!session.isActive() || obj_dude == nullptr || target == nullptr) {
+        return false;
+    }
+
+    PlayerId localPlayerId = session.entities().findObject(session.playerActorId(kHostPlayerId)) == obj_dude
+        ? kHostPlayerId
+        : kGuestPlayerId;
+    PlayerCharacterState* player = session.players().find(localPlayerId);
+    if (player == nullptr) {
+        return false;
+    }
+
+    ScopedActingPlayerContext actingPlayer(*player, obj_dude);
+    return beginPickup(obj_dude, target);
+}
+
+void networkWorldFinishPickup(Object* target, bool succeeded)
+{
+    if (!session.isActive() || target == nullptr || succeeded) {
+        return;
+    }
+    std::optional<EntityId> targetId = session.entities().findEntity(target);
+    if (targetId.has_value()) {
+        reservedPickupTargets.erase(*targetId);
+    }
 }
 
 AuthoritativeCommandResult networkWorldProcessCommand(const GameCommand& command)
@@ -535,6 +614,7 @@ void networkWorldLeave()
 {
     session.stop();
     worldDoors.clear();
+    reservedPickupTargets.clear();
     erasePeerActor();
 }
 

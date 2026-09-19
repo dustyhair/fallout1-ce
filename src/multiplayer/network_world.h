@@ -20,6 +20,9 @@ bool networkWorldEnter(NetworkLaunchMode mode,
 bool networkWorldApplyPeerMove(const ActorMovementStartedEvent& movement);
 bool networkWorldApplyPeerFacing(const ActorFacingChangedEvent& facing);
 bool networkWorldApplyPeerDoorUse(const DoorUseStartedEvent& doorUse);
+bool networkWorldApplyPeerPickup(const ItemPickupStartedEvent& pickup);
+bool networkWorldBeginLocalPickup(Object* target);
+void networkWorldFinishPickup(Object* target, bool succeeded);
 AuthoritativeCommandResult networkWorldProcessCommand(const GameCommand& command);
 SessionPhase networkWorldPhase();
 std::uint32_t networkWorldPhaseRevision();

@@ -3,6 +3,7 @@
 #include <iostream>
 #include <limits>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1281,31 +1282,83 @@ void testNetworkCharacterLobby()
         "guest receives the host-authoritative facing result and event");
     expect(facingEvent.has_value() && guest.confirmPeerEventApplied(facingEvent->sequence),
         "guest advances its applied boundary after facing");
+    expect(host.sendLocalPickup(EntityId { 88 }), "host sends its local ground-item pickup");
+    guest.poll();
+    std::optional<GameEvent> hostPickupEvent = guest.takePeerEvent();
+    const auto* hostPickup = hostPickupEvent.has_value()
+        ? std::get_if<ItemPickupStartedEvent>(&hostPickupEvent->payload)
+        : nullptr;
+    expect(hostPickup != nullptr
+            && hostPickup->actorId == EntityId { kHostPlayerId.value }
+            && hostPickup->targetId == EntityId { 88 },
+        "guest receives the host pickup with shared actor and item IDs");
+    expect(hostPickupEvent.has_value() && guest.confirmPeerEventApplied(hostPickupEvent->sequence),
+        "guest advances its applied boundary after the host pickup");
+    expect(guest.sendLocalPickup(EntityId { 89 }), "guest sends a ground-item pickup command");
+    host.poll();
+    std::optional<GameCommand> pickupCommand = host.takePeerCommand();
+    const auto* pickupIntent = pickupCommand.has_value()
+        ? std::get_if<PickupCommand>(&pickupCommand->payload)
+        : nullptr;
+    expect(pickupIntent != nullptr
+            && pickupCommand->playerId == kGuestPlayerId
+            && pickupCommand->actorId == EntityId { kGuestPlayerId.value }
+            && pickupIntent->targetId == EntityId { 89 },
+        "host receives the guest pickup intent without a client object pointer");
+    AuthoritativeCommandResult pickupOutcome;
+    pickupOutcome.result.commandSequence = pickupCommand->sequence;
+    pickupOutcome.result.status = CommandStatus::Accepted;
+    pickupOutcome.result.rejection = CommandRejection::None;
+    pickupOutcome.event = GameEvent {
+        EventSequence { 1 },
+        pickupCommand->sequence,
+        ItemPickupStartedEvent { EntityId { kGuestPlayerId.value }, EntityId { 89 } },
+    };
+    expect(host.sendCommandOutcome(std::move(pickupOutcome)),
+        "host publishes an accepted guest pickup");
+    guest.poll();
+    std::optional<CommandResult> pickupResult = guest.takeCommandResult();
+    std::optional<GameEvent> guestPickupEvent = guest.takePeerEvent();
+    const auto* guestPickup = guestPickupEvent.has_value()
+        ? std::get_if<ItemPickupStartedEvent>(&guestPickupEvent->payload)
+        : nullptr;
+    expect(pickupResult.has_value()
+            && pickupResult->status == CommandStatus::Accepted
+            && pickupResult->firstEventSequence == EventSequence { 6 }
+            && guestPickup != nullptr
+            && guestPickupEvent->sequence == EventSequence { 6 }
+            && guestPickup->actorId == EntityId { kGuestPlayerId.value }
+            && guestPickup->targetId == EntityId { 89 },
+        "guest receives the host-authoritative pickup result and event");
+    expect(guestPickupEvent.has_value() && guest.confirmPeerEventApplied(guestPickupEvent->sequence),
+        "guest advances its applied boundary after its accepted pickup");
     EventReplay completeReplay = host.replayAfter(EventSequence {});
     expect(completeReplay.status == EventReplayStatus::Available
-            && completeReplay.events.size() == 4
+            && completeReplay.events.size() == 6
             && completeReplay.events.front().sequence == EventSequence { 1 }
-            && completeReplay.events.back().sequence == EventSequence { 4 },
+            && completeReplay.events.back().sequence == EventSequence { 6 },
         "host journals every authoritative live event in session order");
-    expect(guest.requestRecovery(EventSequence { 2 }), "guest requests recovery from its last retained event");
+    expect(guest.requestRecovery(EventSequence { 4 }), "guest requests recovery from its last retained event");
     host.poll();
     std::optional<EventSequence> recoveryRequest = host.takeRecoveryRequest();
-    expect(recoveryRequest == EventSequence { 2 }, "host receives the guest recovery boundary");
+    expect(recoveryRequest == EventSequence { 4 }, "host receives the guest recovery boundary");
     WorldSnapshot recoverySnapshot = sampleSnapshot();
     recoverySnapshot.lastIncludedEvent = host.latestAuthoritativeEvent();
     expect(host.sendRecovery(*recoveryRequest, recoverySnapshot), "host sends retained journal events for a short recovery gap");
     guest.poll();
-    std::optional<GameEvent> replayedDoor = guest.takePeerEvent();
-    std::optional<GameEvent> replayedFacing = guest.takePeerEvent();
-    expect(replayedDoor.has_value()
-            && replayedDoor->sequence == EventSequence { 3 }
-            && replayedFacing.has_value()
-            && replayedFacing->sequence == EventSequence { 4 }
+    std::optional<GameEvent> replayedHostPickup = guest.takePeerEvent();
+    std::optional<GameEvent> replayedGuestPickup = guest.takePeerEvent();
+    expect(replayedHostPickup.has_value()
+            && replayedHostPickup->sequence == EventSequence { 5 }
+            && std::holds_alternative<ItemPickupStartedEvent>(replayedHostPickup->payload)
+            && replayedGuestPickup.has_value()
+            && replayedGuestPickup->sequence == EventSequence { 6 }
+            && std::holds_alternative<ItemPickupStartedEvent>(replayedGuestPickup->payload)
             && !guest.recoveryInProgress(),
-        "guest applies ordered journal replay and observes recovery completion");
+        "guest receives ordered pickup replay and observes recovery completion");
 
     EventSequence guestResumePoint = guest.lastAppliedEvent();
-    expect(guestResumePoint == EventSequence { 4 } && guest.disconnectForReconnect(),
+    expect(guestResumePoint == EventSequence { 6 } && guest.disconnectForReconnect(),
         "guest records its last applied event and drops the old connection");
     host.poll();
     expect(host.state() == NetworkLobbyState::Disconnected
@@ -1314,7 +1367,7 @@ void testNetworkCharacterLobby()
     expect(!guest.sendLocalMove(12347, 0, false),
         "disconnected guest input is blocked");
     expect(host.sendLocalFacing(2)
-            && host.latestAuthoritativeEvent() == EventSequence { 5 },
+            && host.latestAuthoritativeEvent() == EventSequence { 7 },
         "host continues the authoritative journal while the guest is absent");
 
     LoopbackTransportPair resumedPair = createLoopbackTransportPair();
@@ -1337,12 +1390,12 @@ void testNetworkCharacterLobby()
         ? std::get_if<ActorFacingChangedEvent>(&resumedFacing->payload)
         : nullptr;
     expect(resumedFacingPayload != nullptr
-            && resumedFacing->sequence == EventSequence { 5 }
+            && resumedFacing->sequence == EventSequence { 7 }
             && resumedFacingPayload->rotation == 2
             && !guest.recoveryInProgress(),
         "guest applies events created while disconnected and completes reconnect recovery");
     expect(resumedFacing.has_value() && guest.confirmPeerEventApplied(resumedFacing->sequence)
-            && guest.lastAppliedEvent() == EventSequence { 5 },
+            && guest.lastAppliedEvent() == EventSequence { 7 },
         "guest confirms the replayed event as its new reconnect boundary");
     expect(host.takeTransport() != nullptr && guest.takeTransport() != nullptr,
         "ready lobbies hand the connection to the game session");
@@ -1532,6 +1585,9 @@ public:
         lastActor = actor;
         lastTarget = target;
         recordContext();
+        if (reservePickups && !reservedPickupTargets.insert(target).second) {
+            return CommandExecutionStatus::InvalidAction;
+        }
         return nextStatus;
     }
 
@@ -1553,6 +1609,7 @@ public:
     }
 
     CommandExecutionStatus nextStatus = CommandExecutionStatus::Applied;
+    bool reservePickups = false;
     int moveCalls = 0;
     int faceCalls = 0;
     int doorCalls = 0;
@@ -1565,6 +1622,7 @@ public:
     PlayerId lastActingPlayerId;
     MoveCommand lastMove;
     FaceCommand lastFace;
+    std::unordered_set<Object*> reservedPickupTargets;
 };
 
 void testAuthoritativeCommandProcessing()
@@ -1648,14 +1706,26 @@ void testAuthoritativeCommandProcessing()
     pickup.expectedPhase = SessionPhase::Exploration;
     pickup.expectedPhaseRevision = session.phaseRevision();
     pickup.payload = PickupCommand { registeredItem.entityId };
+    executor.reservePickups = true;
     AuthoritativeCommandResult pickedUp = processor.process(pickup, session, executor);
     expect(pickedUp.result.status == CommandStatus::Accepted, "owned pickup command is accepted");
     expect(executor.pickupCalls == 1 && executor.lastActor == asGameObject(hostActor) && executor.lastTarget == asGameObject(item), "pickup resolves the owned actor and authoritative item");
     const ItemPickupStartedEvent* pickupEvent = pickedUp.event.has_value() ? std::get_if<ItemPickupStartedEvent>(&pickedUp.event->payload) : nullptr;
     expect(pickupEvent != nullptr && pickupEvent->actorId == session.playerActorId(kHostPlayerId) && pickupEvent->targetId == registeredItem.entityId, "pickup event records the actor and item IDs");
 
+    GameCommand contestedPickup = pickup;
+    contestedPickup.sequence.value = 3;
+    contestedPickup.playerId = kGuestPlayerId;
+    contestedPickup.actorId = session.playerActorId(kGuestPlayerId);
+    AuthoritativeCommandResult contested = processor.process(contestedPickup, session, executor);
+    expect(contested.result.status == CommandStatus::Rejected
+            && contested.result.rejection == CommandRejection::InvalidAction
+            && !contested.event.has_value()
+            && executor.pickupCalls == 2,
+        "a second actor cannot claim an item reserved by an in-flight pickup");
+
     GameCommand loot;
-    loot.sequence.value = 3;
+    loot.sequence.value = 4;
     loot.playerId = kGuestPlayerId;
     loot.actorId = session.playerActorId(kGuestPlayerId);
     loot.expectedPhase = SessionPhase::Exploration;

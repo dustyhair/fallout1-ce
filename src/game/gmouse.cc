@@ -922,7 +922,7 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
                             ? multiplayer::kGuestPlayerId
                             : multiplayer::kHostPlayerId;
                         multiplayer::developerLocalSessionSubmitPickup(playerId, target);
-                    } else {
+                    } else if (!multiplayer::networkRuntimeHandleLocalPickup(target)) {
                         action_get_an_object(obj_dude, target);
                     }
                     break;
@@ -1191,7 +1191,7 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
                                     ? multiplayer::kGuestPlayerId
                                     : multiplayer::kHostPlayerId;
                                 multiplayer::developerLocalSessionSubmitPickup(playerId, target);
-                            } else {
+                            } else if (!multiplayer::networkRuntimeHandleLocalPickup(target)) {
                                 action_get_an_object(obj_dude, target);
                             }
                             break;
