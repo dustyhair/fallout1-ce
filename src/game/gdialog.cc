@@ -7,6 +7,7 @@
 #include <string>
 #include <utility>
 
+#include "agent_journal.h"
 #include "game/actions.h"
 #include "game/combat.h"
 #include "game/combatai.h"
@@ -1564,6 +1565,9 @@ static int gDialogProcessChoice(int a1)
 
     GameDialogOptionEntry* dialogOptionEntry = a1 != -1 ? &(dialogBlock.options[a1]) : &dummy;
     if (a1 >= 0 && a1 < gdNumOptions) {
+        agentJournalWriteText("dialogue_choice", dialogOptionEntry->text);
+    }
+    if (a1 >= 0 && a1 < gdNumOptions) {
         gdialog_free_speech();
     }
     if (a1 >= 0 && a1 < gdNumOptions && ttsShouldSpeakOptions()) {
@@ -1911,6 +1915,9 @@ static void gDialogProcessUpdate()
         false,
         gender,
         gdialog_reply_has_recorded_speech);
+    agentJournalWriteNamedText("dialogue_reply",
+        dialog_target != nullptr ? object_name(dialog_target) : "",
+        dialogBlock.replyText);
 
     int color = colorTable[992] | 0x2000000;
 
@@ -1971,6 +1978,8 @@ static void gDialogProcessUpdate()
                 return;
             }
         }
+
+        agentJournalWriteDialogueOption(index + 1, dialogOptionEntry->text);
 
         if (optionRect.uly < optionRect.lry) {
             int y = optionRect.uly;

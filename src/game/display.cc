@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include "agent_journal.h"
 #include "game/art.h"
 #include "game/combat.h"
 #include "game/gmouse.h"
@@ -191,6 +192,8 @@ void display_print(char* str)
 {
     // 0x56E2E8
     static unsigned int lastTime;
+
+    agentJournalWriteText("display", str);
 
     if (!disp_init) {
         return;

@@ -43,6 +43,7 @@ std::uint32_t networkWorldPhaseRevision();
 bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot& snapshot);
 bool networkWorldApplySnapshot(const WorldSnapshot& snapshot);
 std::optional<EntityId> networkWorldFindEntity(const Object* object);
+Object* networkWorldPlayerActor(PlayerId playerId);
 void networkWorldLeave();
 bool networkWorldActive();
 bool networkWorldInventoryTransferInProgress();

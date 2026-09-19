@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "agent_journal.h"
 #include "game/game.h"
 #include "game/gmouse.h"
 #include "game/gsound.h"
@@ -441,6 +442,10 @@ ChatEntryResult enterChatMessage(int window, std::deque<LobbyChatMessage>& messa
         return ChatEntryResult::Failed;
     }
     PlayerId localPlayer = networkRuntimeMode() == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
+    agentJournalWriteChat("outgoing",
+        localPlayer.value,
+        localPlayer == kHostPlayerId ? "HOST" : "GUEST",
+        text.c_str());
     appendChatMessage(messages, LobbyChatMessage { localPlayer, std::move(text) });
     return ChatEntryResult::Sent;
 }
@@ -493,6 +498,10 @@ MultiplayerLobbyScreenResult multiplayerLobbyScreen()
         sharedFpsLimiter.mark();
 
         while (std::optional<LobbyChatMessage> message = networkRuntimeTakeChatMessage()) {
+            agentJournalWriteChat("incoming",
+                message->playerId.value,
+                message->playerId == kHostPlayerId ? "HOST" : "GUEST",
+                message->text.c_str());
             appendChatMessage(chatMessages, std::move(*message));
         }
 

@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include "agent_journal.h"
 #include "game/gconfig.h"
 #include "game/object.h"
 #include "game/tile.h"
@@ -313,6 +314,10 @@ int text_object_create(Object* object, char* string, int font, int color, int a5
 
     text_object_list[text_object_index] = textObject;
     text_object_index++;
+
+    agentJournalWriteNamedText("floating_text",
+        object != NULL ? object_name(object) : "",
+        string);
 
     text_font(oldFont);
 

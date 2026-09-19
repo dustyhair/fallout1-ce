@@ -1421,6 +1421,14 @@ std::optional<EntityId> networkWorldFindEntity(const Object* object)
     return session.entities().findEntity(object);
 }
 
+Object* networkWorldPlayerActor(PlayerId playerId)
+{
+    if (!session.isActive()) {
+        return nullptr;
+    }
+    return session.entities().findObject(session.playerActorId(playerId));
+}
+
 void networkWorldLeave()
 {
     session.stop();

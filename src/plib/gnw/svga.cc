@@ -82,13 +82,22 @@ void GNW95_ShowRect(unsigned char* src, unsigned int srcPitch, unsigned int a3, 
 
 bool svga_init(VideoOptions* video_options)
 {
-    SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
+    const char* requestedRenderDriver = SDL_getenv("SDL_RENDER_DRIVER");
+    bool useSoftwareRenderer = requestedRenderDriver != NULL
+        && SDL_strcasecmp(requestedRenderDriver, "software") == 0;
+
+    if (!useSoftwareRenderer) {
+        SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
+    }
 
     if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
         return false;
     }
 
-    Uint32 windowFlags = SDL_WINDOW_OPENGL | SDL_WINDOW_ALLOW_HIGHDPI;
+    Uint32 windowFlags = SDL_WINDOW_ALLOW_HIGHDPI;
+    if (!useSoftwareRenderer) {
+        windowFlags |= SDL_WINDOW_OPENGL;
+    }
 
     if (video_options->fullscreen) {
         windowFlags |= SDL_WINDOW_FULLSCREEN;

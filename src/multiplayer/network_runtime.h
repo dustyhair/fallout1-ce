@@ -27,6 +27,7 @@ const CharacterCreationSheet* networkRuntimeLocalSheet();
 const CharacterCreationSheet* networkRuntimePeerSheet();
 bool networkRuntimeSendChatMessage(const char* text);
 std::optional<LobbyChatMessage> networkRuntimeTakeChatMessage();
+bool networkRuntimeHandleGameChatInput(int keyCode);
 bool networkRuntimeSmokeTestEnabled();
 bool networkRuntimeRunSmokeTest();
 bool networkRuntimeSubmitLocalCharacter(Object* actor);

@@ -40,6 +40,10 @@ $ sudo apt install libsdl2-2.0-0
 
 This modified build reads unvoiced NPC dialogue, player dialogue choices, and floating dialogue aloud. Cached voices can differ by speaker, role, and gender. It uses native Linux audio and does not require Wine. See [TTS.md](TTS.md) for controls, cache generation, configuration, and build requirements.
 
+### Game-control agent journal
+
+Launch with `--agent-journal=/path/to/game.jsonl` to expose multiplayer state, chat, dialogue, and on-screen action messages to a local game-control agent without continuous screenshots. See the [agent journal documentation](docs/agent-journal.md) for the record format and monitoring workflow.
+
 ### macOS
 
 > **NOTE**: macOS 10.11 (El Capitan) or higher is required. Runs natively on Intel-based Macs and Apple Silicon.

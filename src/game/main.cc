@@ -13,6 +13,7 @@
 #include <limits.h>
 #include <stddef.h>
 
+#include "agent_journal.h"
 #include "game/amutex.h"
 #include "game/art.h"
 #include "game/credits.h"
@@ -92,6 +93,9 @@ static bool main_death_voiceover_done;
 // 0x4725E8
 int gnw_main(int argc, char** argv)
 {
+    if (!agentJournalConfigure(argc, argv)) {
+        return 1;
+    }
     multiplayer::developerLocalSessionConfigure(argc, argv);
     if (!multiplayer::networkRuntimeConfigure(argc, argv)) {
         return 1;
@@ -372,7 +376,9 @@ static void main_game_loop()
         multiplayer::developerLocalSessionEnsureStarted();
 
         int keyCode = get_input();
-        game_handle_input(keyCode, false);
+        if (!multiplayer::networkRuntimeHandleGameChatInput(keyCode)) {
+            game_handle_input(keyCode, false);
+        }
 
         scripts_check_state();
 

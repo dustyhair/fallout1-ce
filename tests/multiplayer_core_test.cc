@@ -1289,6 +1289,14 @@ void testNetworkCharacterLobby()
     }
     expect(host.startRequested() && guest.startRequested(),
         "host and guest observe the same game start");
+    expect(host.sendChatMessage("Meet me by the vault door."),
+        "host sends chat after the game starts");
+    guest.poll();
+    std::optional<LobbyChatMessage> startedChat = guest.takeChatMessage();
+    expect(startedChat.has_value()
+            && startedChat->playerId == kHostPlayerId
+            && startedChat->text == "Meet me by the vault door.",
+        "guest receives authenticated chat after the game starts");
     expect(host.sendLocalMove(12345, 0, true, 12340, { 1, 2, 3 }), "host sends its local movement");
     guest.poll();
     std::optional<GameEvent> hostMoveEvent = guest.takePeerEvent();

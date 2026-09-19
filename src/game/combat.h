@@ -32,6 +32,7 @@ void combat_data_init(Object* obj);
 void combat_over_from_load();
 void combat_give_exps(int exp_points);
 int combat_in_range(Object* critter);
+bool combat_is_critter_involved(const Object* critter);
 void combat_end();
 void combat_turn_run();
 void combat_end_turn();

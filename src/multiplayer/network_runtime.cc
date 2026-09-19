@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <cstdint>
@@ -12,17 +13,23 @@
 #include <string>
 #include <thread>
 
+#include "agent_journal.h"
 #include "game/actions.h"
 #include "game/anim.h"
+#include "game/combat.h"
 #include "game/critter.h"
+#include "game/display.h"
 #include "game/game.h"
 #include "game/gconfig.h"
 #include "game/inventry.h"
 #include "game/item.h"
 #include "game/mainmenu.h"
+#include "game/map.h"
 #include "game/object.h"
 #include "game/protinst.h"
 #include "game/proto_types.h"
+#include "game/textobj.h"
+#include "game/tile.h"
 #include "multiplayer/character_build_bridge.h"
 #include "multiplayer/gameplay_wire.h"
 #include "multiplayer/network_bootstrap.h"
@@ -33,6 +40,7 @@
 #include "plib/gnw/debug.h"
 #include "plib/gnw/gnw.h"
 #include "plib/gnw/input.h"
+#include "plib/gnw/intrface.h"
 #include "plib/gnw/kb.h"
 #include "plib/gnw/svga.h"
 #include "plib/gnw/text.h"
@@ -214,6 +222,7 @@ void setStatus(const std::string& status)
         return;
     }
     runtimeStatus = status;
+    agentJournalWriteText("multiplayer_status", runtimeStatus.c_str());
     main_menu_set_multiplayer_status(runtimeStatus.c_str());
     std::fprintf(stderr, "%s\n", runtimeStatus.c_str());
     debug_printf("%s\n", runtimeStatus.c_str());
@@ -222,6 +231,225 @@ void setStatus(const std::string& status)
 std::string playerLabel(PlayerId playerId)
 {
     return playerId == kHostPlayerId ? "HOST" : "GUEST";
+}
+
+const CharacterCreationSheet* playerSheet(PlayerId playerId)
+{
+    const CharacterCreationSheet* local = lobby.localSheet();
+    if (local != nullptr && local->playerId == playerId) {
+        return local;
+    }
+    const CharacterCreationSheet* peer = lobby.peerSheet();
+    if (peer != nullptr && peer->playerId == playerId) {
+        return peer;
+    }
+    return nullptr;
+}
+
+std::string trimmedChatText(const char* input)
+{
+    std::string text = input != nullptr ? input : "";
+    text.erase(text.begin(), std::find_if(text.begin(), text.end(), [](unsigned char ch) {
+        return !std::isspace(ch);
+    }));
+    text.erase(std::find_if(text.rbegin(), text.rend(), [](unsigned char ch) {
+        return !std::isspace(ch);
+    }).base(), text.end());
+    return text;
+}
+
+void presentGameChatMessage(const LobbyChatMessage& message, const char* direction)
+{
+    const CharacterCreationSheet* sheet = playerSheet(message.playerId);
+    std::string name = sheet != nullptr ? sheet->name : playerLabel(message.playerId);
+    agentJournalWriteChat(direction, message.playerId.value, name.c_str(), message.text.c_str());
+    std::array<char, 128> monitorText = {};
+    std::snprintf(monitorText.data(), monitorText.size(), "%s: %s", name.c_str(), message.text.c_str());
+    display_print(monitorText.data());
+
+    Object* actor = networkWorldPlayerActor(message.playerId);
+    if (actor == nullptr || actor->elevation != map_elevation) {
+        return;
+    }
+    std::array<char, kMaxLobbyChatMessageLength + 1> floatingText = {};
+    std::snprintf(floatingText.data(), floatingText.size(), "%s", message.text.c_str());
+    Rect rect;
+    if (text_object_create(actor,
+            floatingText.data(),
+            101,
+            colorTable[32747],
+            colorTable[0],
+            &rect)
+        != -1) {
+        tile_refresh_rect(&rect, actor->elevation);
+    }
+}
+
+void presentPendingGameChatMessages()
+{
+    while (std::optional<LobbyChatMessage> message = lobby.takeChatMessage()) {
+        presentGameChatMessage(*message, "incoming");
+    }
+}
+
+const char* phaseLabel(SessionPhase phase)
+{
+    switch (phase) {
+    case SessionPhase::Lobby:
+        return "lobby";
+    case SessionPhase::Loading:
+        return "loading";
+    case SessionPhase::Exploration:
+        return "exploration";
+    case SessionPhase::Combat:
+        return "combat";
+    case SessionPhase::Dialogue:
+        return "dialogue";
+    case SessionPhase::Transition:
+        return "transition";
+    case SessionPhase::Ending:
+        return "ending";
+    }
+    return "unknown";
+}
+
+AgentJournalActorState actorJournalState(PlayerId playerId, bool local)
+{
+    AgentJournalActorState state;
+    state.playerId = playerId.value;
+    state.local = local;
+    const CharacterCreationSheet* sheet = playerSheet(playerId);
+    state.name = sheet != nullptr ? sheet->name : playerLabel(playerId);
+    Object* actor = networkWorldPlayerActor(playerId);
+    if (actor != nullptr) {
+        state.tile = actor->tile;
+        state.elevation = actor->elevation;
+        state.rotation = actor->rotation;
+        if (actor->elevation == map_elevation) {
+            Rect bounds;
+            obj_bound(actor, &bounds);
+            state.screenX = (bounds.ulx + bounds.lrx) / 2;
+            state.screenY = (bounds.uly + bounds.lry) / 2;
+        }
+        state.hitPoints = critter_get_hits(actor);
+        state.actionPoints = actor->data.critter.combat.ap;
+    }
+    return state;
+}
+
+bool isOnScreen(const Rect& bounds)
+{
+    return bounds.lrx >= 0
+        && bounds.lry >= 0
+        && bounds.ulx < screenGetWidth()
+        && bounds.uly < screenGetHeight();
+}
+
+std::string critterDisposition(Object* critter, Object* localActor, Object* hostActor, Object* guestActor)
+{
+    if (critter_is_dead(critter)) {
+        return "dead";
+    }
+    int playerTeam = localActor->data.critter.combat.team;
+    if (critter->data.critter.combat.team == playerTeam) {
+        return "friendly";
+    }
+
+    Object* whoHitCritter = critter->data.critter.combat.whoHitMe;
+    bool attackedByPlayer = whoHitCritter == hostActor || whoHitCritter == guestActor;
+    auto wasAttackedByCritterTeam = [&](Object* player) {
+        Object* attacker = player != nullptr ? player->data.critter.combat.whoHitMe : nullptr;
+        return attacker != nullptr
+            && attacker->data.critter.combat.team == critter->data.critter.combat.team;
+    };
+    if (attackedByPlayer
+        || wasAttackedByCritterTeam(hostActor)
+        || wasAttackedByCritterTeam(guestActor)
+        || combat_is_critter_involved(critter)) {
+        return "hostile";
+    }
+    return "neutral";
+}
+
+std::vector<AgentJournalCritterState> visibleCritterJournalStates(Object* localActor,
+    Object* hostActor,
+    Object* guestActor)
+{
+    std::vector<AgentJournalCritterState> states;
+    Object** critters = nullptr;
+    int critterCount = obj_create_list(-1, map_elevation, OBJ_TYPE_CRITTER, &critters);
+    for (int index = 0; index < critterCount; index++) {
+        Object* critter = critters[index];
+        if (critter == nullptr
+            || critter == hostActor
+            || critter == guestActor
+            || critter->tile < 0
+            || (critter->flags & OBJECT_HIDDEN) != 0) {
+            continue;
+        }
+        Rect bounds;
+        obj_bound(critter, &bounds);
+        if (!isOnScreen(bounds)) {
+            continue;
+        }
+
+        AgentJournalCritterState state;
+        if (std::optional<EntityId> entityId = networkWorldFindEntity(critter)) {
+            state.entityId = entityId->value;
+        }
+        state.pid = critter->pid;
+        const char* name = object_name(critter);
+        state.name = name != nullptr ? name : "";
+        state.disposition = critterDisposition(critter, localActor, hostActor, guestActor);
+        state.team = critter->data.critter.combat.team;
+        state.tile = critter->tile;
+        state.elevation = critter->elevation;
+        state.rotation = critter->rotation;
+        state.screenX = (bounds.ulx + bounds.lrx) / 2;
+        state.screenY = (bounds.uly + bounds.lry) / 2;
+        state.distance = obj_dist(localActor, critter);
+        state.hitPoints = critter_get_hits(critter);
+        states.push_back(std::move(state));
+    }
+    if (critters != nullptr) {
+        obj_delete_list(critters);
+    }
+    std::sort(states.begin(), states.end(), [](const auto& left, const auto& right) {
+        if (left.entityId != right.entityId) {
+            return left.entityId < right.entityId;
+        }
+        if (left.tile != right.tile) {
+            return left.tile < right.tile;
+        }
+        return left.pid < right.pid;
+    });
+    return states;
+}
+
+void reportAgentWorldState()
+{
+    if (!agentJournalEnabled()) {
+        return;
+    }
+    if (!networkWorldActive()) {
+        agentJournalWriteWorldExit();
+        return;
+    }
+    bool hostIsLocal = launchOptions.mode == NetworkLaunchMode::Host;
+    AgentJournalWorldState state;
+    state.map = map_data.name;
+    state.phase = phaseLabel(networkWorldPhase());
+    state.connected = networkRuntimeConnected();
+    state.combat = isInCombat();
+    state.host = actorJournalState(kHostPlayerId, hostIsLocal);
+    state.guest = actorJournalState(kGuestPlayerId, !hostIsLocal);
+    Object* hostActor = networkWorldPlayerActor(kHostPlayerId);
+    Object* guestActor = networkWorldPlayerActor(kGuestPlayerId);
+    Object* localActor = hostIsLocal ? hostActor : guestActor;
+    if (localActor != nullptr) {
+        state.visibleCritters = visibleCritterJournalStates(localActor, hostActor, guestActor);
+    }
+    agentJournalWriteWorldState(state);
 }
 
 void reportLobbyStatus()
@@ -438,6 +666,7 @@ void networkRuntimeBackgroundProcess()
         if (bootstrap.state() == NetworkBootstrapState::Connected) {
             startLobby();
         }
+        reportAgentWorldState();
         return;
     }
 
@@ -447,6 +676,7 @@ void networkRuntimeBackgroundProcess()
         pendingLocalItemDrop.reset();
     }
     if (networkWorldActive()) {
+        presentPendingGameChatMessages();
         if (launchOptions.mode == NetworkLaunchMode::Host) {
             if (!pendingRecoveryRequest.has_value()) {
                 pendingRecoveryRequest = lobby.takeRecoveryRequest();
@@ -527,6 +757,7 @@ void networkRuntimeBackgroundProcess()
             }
         }
     }
+    reportAgentWorldState();
     reportLobbyStatus();
 }
 
@@ -990,6 +1221,39 @@ bool networkRuntimeSendChatMessage(const char* text)
 std::optional<LobbyChatMessage> networkRuntimeTakeChatMessage()
 {
     return lobbyStarted ? lobby.takeChatMessage() : std::nullopt;
+}
+
+bool networkRuntimeHandleGameChatInput(int keyCode)
+{
+    if (keyCode != KEY_RETURN || !networkWorldActive() || !networkRuntimeConnected()) {
+        return false;
+    }
+
+    char input[kMaxLobbyChatMessageLength + 2] = {};
+    if (win_get_str(input,
+            static_cast<int>(kMaxLobbyChatMessageLength),
+            "Say to the other player:",
+            80,
+            80)
+        != 0) {
+        return true;
+    }
+
+    std::string text = trimmedChatText(input);
+    if (text.empty()) {
+        return true;
+    }
+    if (!lobby.sendChatMessage(text)) {
+        char failure[] = "Multiplayer message could not be sent.";
+        display_print(failure);
+        return true;
+    }
+
+    PlayerId localPlayerId = launchOptions.mode == NetworkLaunchMode::Host
+        ? kHostPlayerId
+        : kGuestPlayerId;
+    presentGameChatMessage(LobbyChatMessage { localPlayerId, std::move(text) }, "outgoing");
+    return true;
 }
 
 bool networkRuntimeSubmitLocalCharacter(Object* actor)
@@ -1540,12 +1804,14 @@ void networkRuntimeLeaveWorld()
     pendingRecoveryRequest.reset();
     pendingLocalItemDrop.reset();
     networkWorldLeave();
+    agentJournalWriteWorldExit();
 }
 
 void networkRuntimeStop()
 {
     set_background_processing_when_inactive(false);
     networkWorldLeave();
+    agentJournalWriteWorldExit();
     if (backgroundProcessRegistered) {
         remove_bk_process(networkRuntimeBackgroundProcess);
         backgroundProcessRegistered = false;

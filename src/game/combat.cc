@@ -1950,6 +1950,19 @@ int combat_in_range(Object* critter)
     return 0;
 }
 
+bool combat_is_critter_involved(const Object* critter)
+{
+    if (!isInCombat() || critter == nullptr) {
+        return false;
+    }
+    for (int index = 0; index < list_com; index++) {
+        if (combat_list[index] == critter) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Compares critters by sequence.
 //
 // 0x420288

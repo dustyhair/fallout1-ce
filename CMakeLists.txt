@@ -112,6 +112,14 @@ target_sources(${EXECUTABLE_NAME} PRIVATE
 target_include_directories(${EXECUTABLE_NAME} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 
 if (BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
+    add_executable(fallout-agent-journal-test
+        "src/agent_journal.cc"
+        "tests/agent_journal_test.cc"
+    )
+    target_include_directories(fallout-agent-journal-test PRIVATE src)
+    add_test(NAME agent-journal
+        COMMAND fallout-agent-journal-test "${CMAKE_CURRENT_BINARY_DIR}/agent-journal-test.jsonl")
+
     add_executable(fallout-multiplayer-core-test
         "tests/multiplayer_core_test.cc"
     )
@@ -131,6 +139,8 @@ endif()
 target_include_directories(${EXECUTABLE_NAME} PUBLIC src)
 
 target_sources(${EXECUTABLE_NAME} PUBLIC
+    "src/agent_journal.cc"
+    "src/agent_journal.h"
     "src/game/actions.cc"
     "src/game/actions.h"
     "src/game/amutex.cc"
