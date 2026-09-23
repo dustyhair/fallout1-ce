@@ -1,6 +1,6 @@
 # Two-player co-op plan
 
-Status: Phases 0 and 1 are complete on the `multiplayer-plan` branch. The Phase 2 transport, lobby, event journal, snapshot recovery, authenticated reconnect, and complete gameplay-content manifest are implemented. Same-map movement, facing, doors, pickup, looting, inventory transfer, and item drops are partial Phase 3A work. Authority convergence is now the active milestone: live host and guest exploration inputs use the same command processor, door and completed-pickup events carry authoritative results, replicas no longer rerun pickup or attack gameplay functions, and periodic corrections contain actors, critters, doors, and items. The developer agent interface now exposes visible entity IDs and submits semantic movement, facing, door, pickup, and loot commands through that same authority path. First-contact identity verification, script/global result coverage, deterministic two-process scenarios, and engine integration scenarios remain open. Combat wire primitives exist, but live multiplayer attacks are intentionally blocked until authoritative phase and turn ownership are implemented.
+Status: Phases 0 and 1 are complete on the `multiplayer-plan` branch. The Phase 2 transport, lobby, event journal, snapshot recovery, authenticated reconnect, complete gameplay-content manifest, and explicit first-contact fingerprint verification are implemented. Same-map movement, facing, doors, pickup, looting, inventory transfer, and item drops are partial Phase 3A work. Authority convergence is now the active milestone: live host and guest exploration inputs use the same command processor, door and completed-pickup events carry authoritative results, replicas no longer rerun pickup or attack gameplay functions, and periodic corrections contain actors, critters, doors, and items. The developer agent interface now exposes visible entity IDs and submits semantic movement, facing, door, pickup, and loot commands through that same authority path. Script/global result coverage, deterministic two-process scenarios, and engine integration scenarios remain open. Combat wire primitives exist, but live multiplayer attacks are intentionally blocked until authoritative phase and turn ownership are implemented.
 
 ## Goal
 
@@ -307,7 +307,7 @@ Exit condition: both characters retain distinct builds through save and load.
 
 Exit condition: a guest can join, move, interact, disconnect, and reconnect on one map.
 
-Direct-IP TLS currently uses trust on first use. Treat it as trusted-LAN/explicit-fingerprint functionality until a join code or another out-of-band identity check authenticates the first connection. Encryption and reconnect certificate pinning do not by themselves authenticate first contact.
+Direct-IP TLS displays an ephemeral host-certificate fingerprint and accepts it as an explicit guest launch option. When players compare that value over a trusted channel, the first connection is authenticated before application data is released. Omitting it deliberately falls back to trusted-LAN/TOFU behavior. A join code or account layer remains desirable for usability.
 
 ### Phase 2.25: authority convergence
 
@@ -453,7 +453,7 @@ Do not add a networking dependency, lobby UI, or broad player-state refactor in 
 5. [x] Encode commands, results, and events for the existing authoritative processor.
 6. [x] Add event journaling, snapshot recovery, reconnect tokens, pinned-identity reconnect, and reconnect-after-TCP-disconnect.
 7. [x] Replace the sampled archive digest with a complete full-archive, scripts/maps/prototypes/messages, and gameplay-configuration manifest.
-8. [ ] Add an explicit first-contact identity mechanism for untrusted direct-IP play; until then document the mode as trusted LAN/TOFU.
+8. [x] Add an explicit first-contact host fingerprint for authenticated direct-IP play, while clearly labeling omission as trusted LAN/TOFU.
 
 ## Testing strategy
 
@@ -519,7 +519,7 @@ Use these as provisional defaults. They keep Phase 0 unblocked and give later ph
 | --- | --- | --- |
 | First host and guest platforms | Linux and Windows desktop | Phase 2 transport selection |
 | Internet connection model | LAN and direct IP only, no relay in the MVP | Phase 2 lobby work |
-| Direct-IP first contact | Trusted LAN/TOFU initially; require a displayed fingerprint or join code before describing Internet play as authenticated | Phase 2 completion |
+| Direct-IP first contact | Display an ephemeral SHA-256 host fingerprint and verify it when supplied out of band; omission is explicitly trusted LAN/TOFU | Phase 2 completion |
 | Tied dialogue vote | The talker decides after both votes are visible | Phase 5 |
 | Shared XP | Grant the original full award to both characters | Phase 1 progression tests |
 | Disconnected guest | The actor passes in combat and becomes unavailable for new exploration actions until reconnection | Phase 4 |

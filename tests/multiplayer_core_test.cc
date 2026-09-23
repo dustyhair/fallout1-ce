@@ -1315,6 +1315,25 @@ void testNetworkLaunchAndBootstrap()
     expect(joinIpv6 && joinIpv6.options.address == "::1" && joinIpv6.options.port == 45125,
         "join launch parses a bracketed IPv6 endpoint");
 
+    TransportPeerIdentity expectedIdentity;
+    for (std::size_t index = 0; index < expectedIdentity.size(); index++) {
+        expectedIdentity[index] = static_cast<std::uint8_t>(index);
+    }
+    std::string formattedIdentity = formatTransportPeerIdentity(expectedIdentity);
+    TransportPeerIdentity parsedIdentity;
+    expect(formattedIdentity.size() == expectedIdentity.size() * 2
+            && parseTransportPeerIdentity(formattedIdentity, parsedIdentity)
+            && parsedIdentity == expectedIdentity,
+        "host certificate fingerprints format and parse without losing bytes");
+    std::string fingerprintArgument = "--multiplayer-host-fingerprint=" + formattedIdentity;
+    NetworkLaunchParseResult pinnedJoin = parseLaunchArguments({
+        "fallout-ce",
+        "--multiplayer-join=127.0.0.1:45124",
+        fingerprintArgument.c_str(),
+    });
+    expect(pinnedJoin && pinnedJoin.options.expectedHostIdentity == expectedIdentity,
+        "join launch accepts an explicit host certificate fingerprint");
+
     std::string address;
     std::uint16_t port = 0;
     expect(parseNetworkJoinEndpoint("localhost", address, port)
@@ -1338,6 +1357,15 @@ void testNetworkLaunchAndBootstrap()
         "network launch rejects simultaneous host and join modes");
     expect(parseLaunchArguments({ "fallout-ce", "--multiplayer-host", "--multiplayer-dev" }).error == NetworkLaunchParseError::DevelopmentModeConflict,
         "network launch rejects simultaneous TCP and developer modes");
+    expect(parseLaunchArguments({ "fallout-ce", "--multiplayer-join=localhost", "--multiplayer-host-fingerprint=1234" }).error == NetworkLaunchParseError::InvalidHostIdentity,
+        "join launch rejects an invalid host certificate fingerprint");
+    expect(parseLaunchArguments({ "fallout-ce", "--multiplayer-host", fingerprintArgument.c_str() }).error == NetworkLaunchParseError::HostIdentityWithoutJoin,
+        "host launch rejects a guest-only certificate fingerprint");
+    expect(parseLaunchArguments({ "fallout-ce", "--multiplayer-join=localhost", fingerprintArgument.c_str(),
+               "--multiplayer-host-fingerprint", formattedIdentity.c_str() })
+            .error
+            == NetworkLaunchParseError::DuplicateHostIdentity,
+        "join launch rejects duplicate host certificate fingerprints");
 
     constexpr std::uint64_t contentDigest = 0xA1B2C3D4E5F60718ULL;
     SessionId sessionId { 0x123456789ABCDEF0ULL };
@@ -1346,11 +1374,13 @@ void testNetworkLaunchAndBootstrap()
     hostOptions.port = 0;
     NetworkBootstrap host;
     expect(host.start(hostOptions, contentDigest, sessionId), "network host bootstrap listens on an available test port");
+    expect(host.localIdentity().has_value(), "network host exposes its certificate fingerprint before accepting a guest");
 
     NetworkLaunchOptions guestOptions;
     guestOptions.mode = NetworkLaunchMode::Join;
     guestOptions.address = "127.0.0.1";
     guestOptions.port = host.port();
+    guestOptions.expectedHostIdentity = host.localIdentity();
     NetworkBootstrap guest;
     expect(guest.start(guestOptions, contentDigest), "network guest bootstrap connects and sends hello");
     pollBootstraps(host, guest);
@@ -1366,6 +1396,7 @@ void testNetworkLaunchAndBootstrap()
     NetworkBootstrap mismatchHost;
     expect(mismatchHost.start(hostOptions, contentDigest, sessionId), "mismatch host listens on an available test port");
     guestOptions.port = mismatchHost.port();
+    guestOptions.expectedHostIdentity.reset();
     NetworkBootstrap mismatchGuest;
     expect(mismatchGuest.start(guestOptions, contentDigest + 1), "mismatch guest reaches the host");
     pollBootstraps(mismatchHost, mismatchGuest);
@@ -1375,6 +1406,19 @@ void testNetworkLaunchAndBootstrap()
     expect(mismatchHost.rejection() == HandshakeRejection::ContentMismatch
             && mismatchGuest.rejection() == HandshakeRejection::ContentMismatch,
         "content mismatch preserves the rejection reason on both peers");
+
+    NetworkBootstrap identityHost;
+    expect(identityHost.start(hostOptions, contentDigest, sessionId), "identity-mismatch host listens on an available test port");
+    TransportPeerIdentity wrongIdentity = identityHost.localIdentity().value_or(TransportPeerIdentity {});
+    wrongIdentity.front() ^= 1;
+    guestOptions.port = identityHost.port();
+    guestOptions.expectedHostIdentity = wrongIdentity;
+    NetworkBootstrap identityGuest;
+    expect(identityGuest.start(guestOptions, contentDigest), "identity-mismatch guest establishes its TCP socket");
+    pollBootstraps(identityHost, identityGuest);
+    expect(identityGuest.state() == NetworkBootstrapState::Failed
+            && identityGuest.error() == NetworkBootstrapError::HostIdentityMismatch,
+        "guest reports a specific failure when the host certificate fingerprint differs");
 }
 
 void pollNetworkLobbies(NetworkLobby& host, NetworkLobby& guest)

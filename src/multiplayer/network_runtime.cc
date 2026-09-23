@@ -907,9 +907,14 @@ bool startConfiguredRuntime()
 
     reportedState = bootstrap.state();
     if (launchOptions.mode == NetworkLaunchMode::Host) {
-        setStatus("MULTIPLAYER HOST: WAITING ON PORT " + std::to_string(bootstrap.port()));
+        std::string status = "MULTIPLAYER HOST: WAITING ON PORT " + std::to_string(bootstrap.port());
+        if (std::optional<TransportPeerIdentity> identity = bootstrap.localIdentity()) {
+            status += " FINGERPRINT " + formatTransportPeerIdentity(*identity);
+        }
+        setStatus(status);
     } else {
-        setStatus("MULTIPLAYER GUEST: CONNECTING TO " + launchOptions.address + ":" + std::to_string(launchOptions.port));
+        setStatus("MULTIPLAYER GUEST: CONNECTING TO " + launchOptions.address + ":" + std::to_string(launchOptions.port)
+            + (launchOptions.expectedHostIdentity.has_value() ? " WITH VERIFIED FINGERPRINT" : " USING TOFU"));
     }
 
     if (!backgroundProcessRegistered) {

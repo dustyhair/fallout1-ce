@@ -278,6 +278,7 @@ struct TlsServerIdentity {
         std::size_t encodedSize = static_cast<std::size_t>(result);
         const unsigned char* encodedStart = encoded.data() + encoded.size() - encodedSize;
         if (mbedtls_x509_crt_parse_der(&certificate, encodedStart, encodedSize) != 0
+            || mbedtls_sha256(certificate.raw.p, certificate.raw.len, identity.data(), 0) != 0
             || mbedtls_ssl_config_defaults(&config, MBEDTLS_SSL_IS_SERVER,
                    MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT)
                 != 0) {
@@ -294,6 +295,7 @@ struct TlsServerIdentity {
     mbedtls_pk_context key;
     mbedtls_x509_crt certificate;
     mbedtls_ssl_config config;
+    TransportPeerIdentity identity {};
 };
 
 class TlsTransport : public Transport {
@@ -336,9 +338,9 @@ public:
             if (result == 0) {
                 mbedtls_ssl_conf_min_tls_version(&_clientConfig, MBEDTLS_SSL_VERSION_TLS1_2);
                 mbedtls_ssl_conf_rng(&_clientConfig, mbedtls_ctr_drbg_random, &_clientRandom);
-                // The first direct-IP connection uses trust-on-first-use. A reconnect
-                // pins the exact certificate digest before queued application bytes
-                // are written.
+                // Callers can pin the displayed host fingerprint on first contact.
+                // If they omit it, the initial connection uses trust on first use;
+                // reconnects always pin the observed certificate digest.
                 mbedtls_ssl_conf_authmode(&_clientConfig, MBEDTLS_SSL_VERIFY_NONE);
                 result = mbedtls_ssl_setup(&_ssl, &_clientConfig);
             }
@@ -395,6 +397,7 @@ public:
 
     bool isConnected() const override { return _connected; }
     std::optional<TransportPeerIdentity> peerIdentity() const override { return _peerIdentity; }
+    bool peerIdentityMismatch() const override { return _peerIdentityMismatch; }
 
     void close() override
     {
@@ -452,8 +455,12 @@ private:
         const mbedtls_x509_crt* certificate = mbedtls_ssl_get_peer_cert(&_ssl);
         TransportPeerIdentity identity;
         if (certificate == nullptr || certificate->raw.p == nullptr
-            || mbedtls_sha256(certificate->raw.p, certificate->raw.len, identity.data(), 0) != 0
-            || (_expectedPeerIdentity.has_value() && !identitiesEqual(*_expectedPeerIdentity, identity))) {
+            || mbedtls_sha256(certificate->raw.p, certificate->raw.len, identity.data(), 0) != 0) {
+            disconnect();
+            return;
+        }
+        if (_expectedPeerIdentity.has_value() && !identitiesEqual(*_expectedPeerIdentity, identity)) {
+            _peerIdentityMismatch = true;
             disconnect();
             return;
         }
@@ -549,6 +556,7 @@ private:
     std::shared_ptr<TlsServerIdentity> _serverIdentity;
     std::optional<TransportPeerIdentity> _expectedPeerIdentity;
     std::optional<TransportPeerIdentity> _peerIdentity;
+    bool _peerIdentityMismatch = false;
     mbedtls_ssl_context _ssl;
     mbedtls_entropy_context _clientEntropy;
     mbedtls_ctr_drbg_context _clientRandom;
@@ -625,6 +633,12 @@ std::unique_ptr<Transport> TcpListener::accept()
 }
 
 std::uint16_t TcpListener::port() const { return _impl != nullptr ? _impl->port : 0; }
+std::optional<TransportPeerIdentity> TcpListener::identity() const
+{
+    return _impl != nullptr && _impl->tlsIdentity != nullptr
+        ? std::optional<TransportPeerIdentity>(_impl->tlsIdentity->identity)
+        : std::nullopt;
+}
 bool TcpListener::isOpen() const { return _impl != nullptr && _impl->socket != kInvalidSocket; }
 
 void TcpListener::close()

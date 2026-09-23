@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <optional>
 #include <utility>
 #include <variant>
 
@@ -76,6 +77,15 @@ bool setMode(NetworkLaunchParseResult& result, NetworkLaunchMode mode)
     return true;
 }
 
+int hexDigitValue(unsigned char ch)
+{
+    if (ch >= '0' && ch <= '9') {
+        return ch - '0';
+    }
+    ch = static_cast<unsigned char>(std::tolower(ch));
+    return ch >= 'a' && ch <= 'f' ? ch - 'a' + 10 : -1;
+}
+
 } // namespace
 
 bool parseNetworkJoinEndpoint(const std::string& value, std::string& address, std::uint16_t& port)
@@ -83,15 +93,77 @@ bool parseNetworkJoinEndpoint(const std::string& value, std::string& address, st
     return parseJoinAddress(value, address, port);
 }
 
+bool parseTransportPeerIdentity(const std::string& value, TransportPeerIdentity& identity)
+{
+    std::string hexadecimal;
+    hexadecimal.reserve(identity.size() * 2);
+    for (unsigned char ch : value) {
+        if (ch == ':' || ch == '-' || std::isspace(ch)) {
+            continue;
+        }
+        if (hexDigitValue(ch) < 0) {
+            return false;
+        }
+        hexadecimal.push_back(static_cast<char>(ch));
+    }
+    if (hexadecimal.size() != identity.size() * 2) {
+        return false;
+    }
+    for (std::size_t index = 0; index < identity.size(); index++) {
+        int high = hexDigitValue(static_cast<unsigned char>(hexadecimal[index * 2]));
+        int low = hexDigitValue(static_cast<unsigned char>(hexadecimal[index * 2 + 1]));
+        identity[index] = static_cast<std::uint8_t>((high << 4) | low);
+    }
+    return true;
+}
+
+std::string formatTransportPeerIdentity(const TransportPeerIdentity& identity)
+{
+    static constexpr char kHexDigits[] = "0123456789abcdef";
+    std::string value;
+    value.reserve(identity.size() * 2);
+    for (std::uint8_t byte : identity) {
+        value.push_back(kHexDigits[byte >> 4]);
+        value.push_back(kHexDigits[byte & 0x0F]);
+    }
+    return value;
+}
+
 NetworkLaunchParseResult parseNetworkLaunchOptions(int argc, char* const* argv)
 {
     NetworkLaunchParseResult result;
     bool developerMode = false;
+    bool hostIdentitySpecified = false;
 
     for (int index = 1; index < argc; index++) {
         std::string argument = argv[index] != nullptr ? argv[index] : "";
         if (argument == "--multiplayer-dev") {
             developerMode = true;
+            continue;
+        }
+
+        constexpr const char* identityPrefix = "--multiplayer-host-fingerprint=";
+        if (argument == "--multiplayer-host-fingerprint"
+            || argument.rfind(identityPrefix, 0) == 0) {
+            if (hostIdentitySpecified) {
+                result.error = NetworkLaunchParseError::DuplicateHostIdentity;
+                return result;
+            }
+            hostIdentitySpecified = true;
+            std::string fingerprint;
+            if (argument.rfind(identityPrefix, 0) == 0) {
+                fingerprint = argument.substr(std::char_traits<char>::length(identityPrefix));
+            } else if (index + 1 < argc && argv[index + 1] != nullptr) {
+                fingerprint = argv[++index];
+            }
+            TransportPeerIdentity identity;
+            if (fingerprint.empty()
+                || fingerprint.rfind("--", 0) == 0
+                || !parseTransportPeerIdentity(fingerprint, identity)) {
+                result.error = NetworkLaunchParseError::InvalidHostIdentity;
+                return result;
+            }
+            result.options.expectedHostIdentity = identity;
             continue;
         }
 
@@ -147,6 +219,8 @@ NetworkLaunchParseResult parseNetworkLaunchOptions(int argc, char* const* argv)
 
     if (developerMode && result.options.mode != NetworkLaunchMode::Disabled) {
         result.error = NetworkLaunchParseError::DevelopmentModeConflict;
+    } else if (hostIdentitySpecified && result.options.mode != NetworkLaunchMode::Join) {
+        result.error = NetworkLaunchParseError::HostIdentityWithoutJoin;
     }
     return result;
 }
@@ -164,6 +238,12 @@ const char* networkLaunchParseErrorMessage(NetworkLaunchParseError error)
         return "join mode requires a host address";
     case NetworkLaunchParseError::InvalidPort:
         return "the multiplayer port must be between 1 and 65535";
+    case NetworkLaunchParseError::InvalidHostIdentity:
+        return "the host fingerprint must contain exactly 64 hexadecimal digits";
+    case NetworkLaunchParseError::DuplicateHostIdentity:
+        return "the host fingerprint was specified more than once";
+    case NetworkLaunchParseError::HostIdentityWithoutJoin:
+        return "a host fingerprint can only be used with join mode";
     case NetworkLaunchParseError::DevelopmentModeConflict:
         return "network host/join mode cannot be combined with --multiplayer-dev";
     }
@@ -183,6 +263,7 @@ bool NetworkBootstrap::start(const NetworkLaunchOptions& options,
     _sessionId = {};
     _localPlayerId = {};
     _reconnectToken = {};
+    _localIdentity.reset();
     _peerIdentity.reset();
 
     if (options.mode == NetworkLaunchMode::Disabled) {
@@ -206,6 +287,11 @@ bool NetworkBootstrap::start(const NetworkLaunchOptions& options,
             return false;
         }
         _listener = std::move(listening.listener);
+        _localIdentity = _listener->identity();
+        if (!_localIdentity.has_value()) {
+            fail(NetworkBootstrapError::ListenFailed);
+            return false;
+        }
         _options.port = _listener->port();
         _sessionId = hostSessionId;
         _localPlayerId = kHostPlayerId;
@@ -222,7 +308,11 @@ bool NetworkBootstrap::start(const NetworkLaunchOptions& options,
         return false;
     }
 
-    TcpConnectResult connection = connectTcp(options.address, options.port, connectTimeoutMilliseconds);
+    TcpConnectResult connection = connectTcp(
+        options.address,
+        options.port,
+        connectTimeoutMilliseconds,
+        options.expectedHostIdentity);
     if (!connection) {
         fail(NetworkBootstrapError::ConnectFailed);
         return false;
@@ -277,6 +367,7 @@ void NetworkBootstrap::stop()
         _transport.reset();
     }
     _reconnectToken = {};
+    _localIdentity.reset();
     _peerIdentity.reset();
     _state = NetworkBootstrapState::Stopped;
 }
@@ -321,6 +412,11 @@ ReconnectToken NetworkBootstrap::reconnectToken() const
     return _reconnectToken;
 }
 
+std::optional<TransportPeerIdentity> NetworkBootstrap::localIdentity() const
+{
+    return _localIdentity;
+}
+
 std::optional<TransportPeerIdentity> NetworkBootstrap::peerIdentity() const
 {
     return _peerIdentity;
@@ -359,8 +455,14 @@ bool NetworkBootstrap::sendHandshake(const HandshakeMessage& message)
         fail(NetworkBootstrapError::EncodeFailed);
         return false;
     }
-    if (_transport == nullptr || _transport->send(std::move(packet)) != TransportSendResult::Sent) {
+    if (_transport == nullptr) {
         fail(NetworkBootstrapError::SendFailed);
+        return false;
+    }
+    if (_transport->send(std::move(packet)) != TransportSendResult::Sent) {
+        fail(_transport->peerIdentityMismatch()
+                ? NetworkBootstrapError::HostIdentityMismatch
+                : NetworkBootstrapError::SendFailed);
         return false;
     }
     return true;
@@ -410,7 +512,9 @@ void NetworkBootstrap::pollGuestHandshake()
     std::optional<Packet> packet = _transport->receive();
     if (!packet.has_value()) {
         if (!_transport->isConnected()) {
-            fail(NetworkBootstrapError::Disconnected);
+            fail(_transport->peerIdentityMismatch()
+                    ? NetworkBootstrapError::HostIdentityMismatch
+                    : NetworkBootstrapError::Disconnected);
         }
         return;
     }
@@ -476,6 +580,8 @@ const char* networkBootstrapErrorMessage(NetworkBootstrapError error)
         return "received an invalid connection handshake";
     case NetworkBootstrapError::UnexpectedHandshake:
         return "received an unexpected connection handshake";
+    case NetworkBootstrapError::HostIdentityMismatch:
+        return "the host certificate does not match the expected fingerprint";
     case NetworkBootstrapError::Disconnected:
         return "the multiplayer peer disconnected";
     }

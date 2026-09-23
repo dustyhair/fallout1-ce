@@ -30,6 +30,7 @@ public:
     virtual std::optional<Packet> receive() = 0;
     virtual bool isConnected() const = 0;
     virtual std::optional<TransportPeerIdentity> peerIdentity() const = 0;
+    virtual bool peerIdentityMismatch() const { return false; }
     virtual void close() = 0;
 };
 

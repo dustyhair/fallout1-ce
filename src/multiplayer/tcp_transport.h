@@ -36,6 +36,7 @@ public:
 
     std::unique_ptr<Transport> accept();
     std::uint16_t port() const;
+    std::optional<TransportPeerIdentity> identity() const;
     bool isOpen() const;
     void close();
 

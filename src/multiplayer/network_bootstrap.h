@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "multiplayer/connection_handshake.h"
@@ -25,6 +26,7 @@ struct NetworkLaunchOptions {
     NetworkLaunchMode mode = NetworkLaunchMode::Disabled;
     std::string address;
     std::uint16_t port = kDefaultMultiplayerPort;
+    std::optional<TransportPeerIdentity> expectedHostIdentity;
 };
 
 enum class NetworkLaunchParseError {
@@ -33,6 +35,9 @@ enum class NetworkLaunchParseError {
     ConflictingModes,
     MissingJoinAddress,
     InvalidPort,
+    InvalidHostIdentity,
+    DuplicateHostIdentity,
+    HostIdentityWithoutJoin,
     DevelopmentModeConflict,
 };
 
@@ -48,6 +53,8 @@ struct NetworkLaunchParseResult {
 
 NetworkLaunchParseResult parseNetworkLaunchOptions(int argc, char* const* argv);
 bool parseNetworkJoinEndpoint(const std::string& value, std::string& address, std::uint16_t& port);
+bool parseTransportPeerIdentity(const std::string& value, TransportPeerIdentity& identity);
+std::string formatTransportPeerIdentity(const TransportPeerIdentity& identity);
 const char* networkLaunchParseErrorMessage(NetworkLaunchParseError error);
 
 enum class NetworkBootstrapState {
@@ -70,6 +77,7 @@ enum class NetworkBootstrapError {
     ProtocolError,
     HandshakeError,
     UnexpectedHandshake,
+    HostIdentityMismatch,
     Disconnected,
 };
 
@@ -90,6 +98,7 @@ public:
     SessionId sessionId() const;
     PlayerId localPlayerId() const;
     ReconnectToken reconnectToken() const;
+    std::optional<TransportPeerIdentity> localIdentity() const;
     std::optional<TransportPeerIdentity> peerIdentity() const;
     std::unique_ptr<Transport> takeTransport();
     std::unique_ptr<Transport> acceptReconnectTransport();
@@ -108,6 +117,7 @@ private:
     SessionId _sessionId;
     PlayerId _localPlayerId;
     ReconnectToken _reconnectToken;
+    std::optional<TransportPeerIdentity> _localIdentity;
     std::optional<TransportPeerIdentity> _peerIdentity;
     std::unique_ptr<TcpListener> _listener;
     std::unique_ptr<Transport> _transport;
