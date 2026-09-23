@@ -360,7 +360,8 @@ Exit condition: an automated local client can observe the journal, control one p
 ### Phase 3A: same-map exploration
 
 - Replicate movement, doors, containers, item pickup, skill use, traps, and map-script results.
-- Add range rules and define pause behavior for modal screens.
+- [x] Require the acting player to remain adjacent to the active loot target when starting loot and when applying every inventory transfer; the deterministic loot scenario also proves a remote command is rejected without publishing an event.
+- Define pause behavior for modal screens.
 - Add a minimal host-authoritative player-to-player item/caps transfer command for practical co-op testing; the full transactional trade UI remains Phase 6.
 - Audit script-facing player assumptions used during exploration and classify each as story actor, acting player, or shared party state.
 

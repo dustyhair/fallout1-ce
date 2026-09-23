@@ -1112,6 +1112,10 @@ bool networkRuntimeRunSmokeTest()
             } else if (smokeScenario == SmokeScenario::Loot) {
                 scenarioTargetId = networkWorldPrepareLootSmokeTest();
                 scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
+                if (scenarioTargetId.has_value()
+                    && !networkWorldVerifyLootRangeSmokeTest(*scenarioTargetId)) {
+                    scenarioTargetId.reset();
+                }
             } else if (scenarioActor != nullptr) {
                 for (int distance = 1; distance <= 4 && scenarioDestinationTile == -1; distance++) {
                     for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {

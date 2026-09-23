@@ -60,6 +60,7 @@ bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts)
 std::optional<EntityId> networkWorldPrepareDoorSmokeTest();
 std::optional<EntityId> networkWorldPreparePickupSmokeTest();
 std::optional<EntityId> networkWorldPrepareLootSmokeTest();
+bool networkWorldVerifyLootRangeSmokeTest(EntityId targetId);
 
 } // namespace multiplayer
 } // namespace fallout

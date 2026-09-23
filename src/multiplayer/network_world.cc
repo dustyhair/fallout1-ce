@@ -318,6 +318,16 @@ Object* topEnvironmentOrSelf(Object* object)
     return top != nullptr ? top : object;
 }
 
+bool lootTargetIsInRange(Object* actor, Object* target)
+{
+    return actor != nullptr
+        && target != nullptr
+        && actor != target
+        && FID_TYPE(target->fid) == OBJ_TYPE_CRITTER
+        && actor->elevation == target->elevation
+        && obj_dist(actor, target) == 1;
+}
+
 bool applyInventoryTransfer(Object* source,
     Object* destination,
     Object* item,
@@ -500,10 +510,7 @@ public:
     CommandExecutionStatus loot(Object* actor, Object* target) override
     {
         if (isInCombat()
-            || actor == target
-            || target == nullptr
-            || actor->elevation != target->elevation
-            || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER) {
+            || !lootTargetIsInRange(actor, target)) {
             return CommandExecutionStatus::InvalidAction;
         }
         activeLootTargets[actor] = target;
@@ -537,7 +544,8 @@ public:
         if (isInCombat()
             || (sourceTop != actor && destinationTop != actor)
             || activeLoot == activeLootTargets.end()
-            || activeLoot->second != otherTop) {
+            || activeLoot->second != otherTop
+            || !lootTargetIsInRange(actor, otherTop)) {
             return execution;
         }
 
@@ -1068,7 +1076,7 @@ bool networkWorldApplyPeerLoot(const LootStartedEvent& loot)
         || actor == nullptr
         || target == nullptr
         || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER
-        || actor->elevation != target->elevation) {
+        || !lootTargetIsInRange(actor, target)) {
         return false;
     }
     if (actor != obj_dude) {
@@ -1350,12 +1358,57 @@ std::optional<EntityId> networkWorldPrepareLootSmokeTest()
             int tile = tile_num_in_direction(critter->tile, rotation, 1);
             if (hexGridTileIsValid(tile)
                 && obj_blocking_at(actor, tile, critter->elevation) == nullptr
-                && obj_move_to_tile(actor, tile, critter->elevation, nullptr) == 0) {
+                && obj_move_to_tile(actor, tile, critter->elevation, nullptr) == 0
+                && lootTargetIsInRange(actor, critter)) {
                 return entry.first;
             }
         }
     }
     return std::nullopt;
+}
+
+bool networkWorldVerifyLootRangeSmokeTest(EntityId targetId)
+{
+    Object* actor = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+    Object* target = session.entities().findObject(targetId);
+    if (!session.isActive() || !lootTargetIsInRange(actor, target)) {
+        return false;
+    }
+
+    int adjacentTile = actor->tile;
+    int elevation = actor->elevation;
+    int remoteTile = -1;
+    for (int distance = 2; distance <= 4 && remoteTile == -1; distance++) {
+        for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+            int candidate = tile_num_in_direction(target->tile, rotation, distance);
+            if (hexGridTileIsValid(candidate)
+                && obj_blocking_at(actor, candidate, elevation) == nullptr) {
+                remoteTile = candidate;
+                break;
+            }
+        }
+    }
+    if (remoteTile == -1 || obj_move_to_tile(actor, remoteTile, elevation, nullptr) == -1) {
+        return false;
+    }
+
+    GameCommand command;
+    command.sequence = CommandSequence { 1 };
+    command.playerId = kGuestPlayerId;
+    command.actorId = session.playerActorId(kGuestPlayerId);
+    command.expectedPhase = SessionPhase::Exploration;
+    command.expectedPhaseRevision = session.phaseRevision();
+    command.payload = LootCommand { targetId };
+    AuthoritativeCommandResult outcome = networkWorldProcessCommand(command);
+    bool rejected = outcome.result.status == CommandStatus::Rejected
+        && outcome.result.rejection == CommandRejection::InvalidAction
+        && !outcome.event.has_value()
+        && activeLootTargets.find(actor) == activeLootTargets.end();
+
+    commandProcessor.reset();
+    bool restored = obj_move_to_tile(actor, adjacentTile, elevation, nullptr) == 0
+        && lootTargetIsInRange(actor, target);
+    return rejected && restored;
 }
 
 bool networkWorldBeginLocalLoot(Object* target)
