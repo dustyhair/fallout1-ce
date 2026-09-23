@@ -18,6 +18,11 @@ Object* localPlayerActorOrStoryActor()
     return actor != nullptr ? actor : obj_dude;
 }
 
+bool isPresentedPlayerActor(const Object* actor)
+{
+    return actor != nullptr && actor == localPlayerActorOrStoryActor();
+}
+
 int updatePlayerGenderAppearance(Object* actor)
 {
     if (actor == nullptr) {

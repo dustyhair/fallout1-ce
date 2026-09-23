@@ -25,6 +25,7 @@ private:
 PlayerCharacterState* actingPlayerState();
 CharacterBuild* actingCharacterBuild();
 Object* actingPlayerActor();
+Object* actingPlayerActorOr(Object* fallback);
 CharacterBuild* actingCharacterBuildFor(const Object* actor);
 bool isActingPlayerActor(const Object* actor);
 

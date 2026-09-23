@@ -30,15 +30,16 @@
 #include "multiplayer/local_player_context.h"
 #include "multiplayer/network_runtime.h"
 #include "multiplayer/network_world.h"
+#include "multiplayer/presentation_bridge.h"
 #include "plib/color/color.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/rect.h"
 
 namespace fallout {
 
-static int obj_use_book(Object* item_obj);
+static int obj_use_book(Object* critter, Object* item_obj);
 static int obj_use_flare(Object* critter_obj, Object* item_obj);
-static int obj_use_explosive(Object* explosive);
+static int obj_use_explosive(Object* critter, Object* explosive);
 static int protinst_default_use_item(Object* a1, Object* a2, Object* item);
 static int rebuild_all_light();
 static int set_door_state_open(Object* a1, Object* a2);
@@ -271,7 +272,7 @@ int obj_examine_func(Object* critter, Object* target, void (*fn)(char* string))
         }
     }
 
-    if (critter == NULL || critter != obj_dude) {
+    if (!multiplayer::isPresentedPlayerActor(critter)) {
         return 0;
     }
 
@@ -279,7 +280,7 @@ int obj_examine_func(Object* critter, Object* target, void (*fn)(char* string))
 
     int type = PID_TYPE(target->pid);
     if (type == OBJ_TYPE_CRITTER) {
-        if (target != obj_dude && perk_level(PERK_AWARENESS) && !critter_is_dead(target)) {
+        if (target != critter && perk_level(PERK_AWARENESS) && !critter_is_dead(target)) {
             MessageListItem hpMessageListItem;
 
             if (critter_body_type(target) != BODY_TYPE_BIPED) {
@@ -401,7 +402,7 @@ int obj_examine_func(Object* critter, Object* target, void (*fn)(char* string))
             }
 
             MessageListItem v66;
-            if (target == obj_dude) {
+            if (target == critter) {
                 // You look %s
                 v66.num = 520 + v12;
                 if (!message_search(&proto_main_msg_file, &v66)) {
@@ -436,7 +437,7 @@ int obj_examine_func(Object* critter, Object* target, void (*fn)(char* string))
             MessageListItem v63;
             v63.num = maxiumHitPoints >= currentHitPoints ? 531 : 530;
 
-            if (target == obj_dude) {
+            if (target == critter) {
                 v63.num += 2;
             }
 
@@ -692,9 +693,10 @@ int obj_destroy(Object* obj)
 // Read a book.
 //
 // 0x48AD88
-static int obj_use_book(Object* book)
+static int obj_use_book(Object* critter, Object* book)
 {
     MessageListItem messageListItem;
+    bool shouldPresent = multiplayer::isPresentedPlayerActor(critter);
 
     int messageId = -1;
     int skill;
@@ -734,41 +736,45 @@ static int obj_use_book(Object* book)
     if (isInCombat()) {
         // You cannot do that in combat.
         messageListItem.num = 902;
-        if (message_search(&proto_main_msg_file, &messageListItem)) {
+        if (shouldPresent && message_search(&proto_main_msg_file, &messageListItem)) {
             display_print(messageListItem.text);
         }
 
         return 0;
     }
 
-    int increase = (100 - skill_level(obj_dude, skill)) / 10;
+    int increase = (100 - skill_level(critter, skill)) / 10;
     if (increase <= 0) {
         messageId = 801;
     } else {
         for (int i = 0; i < increase; i++) {
             if (stat_pc_set(PC_STAT_UNSPENT_SKILL_POINTS, stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS) + 1) == 0) {
-                skill_inc_point(obj_dude, skill);
+                skill_inc_point(critter, skill);
             }
         }
     }
 
-    palette_fade_to(black_palette);
+    if (shouldPresent) {
+        palette_fade_to(black_palette);
+    }
 
-    int intelligence = stat_level(obj_dude, STAT_INTELLIGENCE);
+    int intelligence = stat_level(critter, STAT_INTELLIGENCE);
     inc_game_time_in_seconds(3600 * (11 - intelligence));
 
     scr_exec_map_update_scripts();
 
-    palette_fade_to(cmap);
+    if (shouldPresent) {
+        palette_fade_to(cmap);
+    }
 
     // You read the book.
     messageListItem.num = 800;
-    if (message_search(&proto_main_msg_file, &messageListItem)) {
+    if (shouldPresent && message_search(&proto_main_msg_file, &messageListItem)) {
         display_print(messageListItem.text);
     }
 
     messageListItem.num = messageId;
-    if (message_search(&proto_main_msg_file, &messageListItem)) {
+    if (shouldPresent && message_search(&proto_main_msg_file, &messageListItem)) {
         display_print(messageListItem.text);
     }
 
@@ -781,6 +787,7 @@ static int obj_use_book(Object* book)
 static int obj_use_flare(Object* critter_obj, Object* flare)
 {
     MessageListItem messageListItem;
+    bool shouldPresent = multiplayer::isPresentedPlayerActor(critter_obj);
 
     if (flare->pid != PROTO_ID_FLARE) {
         return -1;
@@ -789,13 +796,13 @@ static int obj_use_flare(Object* critter_obj, Object* flare)
     if ((flare->flags & OBJECT_USED) != 0) {
         // The flare is already lit.
         messageListItem.num = 588;
-        if (message_search(&proto_main_msg_file, &messageListItem)) {
+        if (shouldPresent && message_search(&proto_main_msg_file, &messageListItem)) {
             display_print(messageListItem.text);
         }
     } else {
         // You light the flare.
         messageListItem.num = 587;
-        if (message_search(&proto_main_msg_file, &messageListItem)) {
+        if (shouldPresent && message_search(&proto_main_msg_file, &messageListItem)) {
             display_print(messageListItem.text);
         }
 
@@ -809,7 +816,7 @@ static int obj_use_flare(Object* critter_obj, Object* flare)
 }
 
 // 0x48AFC8
-int obj_use_radio(Object* item)
+int obj_use_radio(Object* critter, Object* item)
 {
     Script* scr;
     int sid;
@@ -818,7 +825,7 @@ int obj_use_radio(Object* item)
         return -1;
     }
 
-    scr_set_objs(sid, obj_dude, item);
+    scr_set_objs(sid, critter, item);
     exec_script_proc(sid, SCRIPT_PROC_USE);
 
     if (scr_ptr(sid, &scr) == -1) {
@@ -829,9 +836,10 @@ int obj_use_radio(Object* item)
 }
 
 // 0x48B01C
-static int obj_use_explosive(Object* explosive)
+static int obj_use_explosive(Object* critter, Object* explosive)
 {
     MessageListItem messageListItem;
+    bool shouldPresent = multiplayer::isPresentedPlayerActor(critter);
 
     int pid = explosive->pid;
     if (pid != PROTO_ID_DYNAMITE_I
@@ -844,7 +852,7 @@ static int obj_use_explosive(Object* explosive)
     if ((explosive->flags & OBJECT_USED) != 0) {
         // The timer is already ticking.
         messageListItem.num = 590;
-        if (message_search(&proto_main_msg_file, &messageListItem)) {
+        if (shouldPresent && message_search(&proto_main_msg_file, &messageListItem)) {
             display_print(messageListItem.text);
         }
     } else {
@@ -852,7 +860,7 @@ static int obj_use_explosive(Object* explosive)
         if (seconds != -1) {
             // You set the timer.
             messageListItem.num = 589;
-            if (message_search(&proto_main_msg_file, &messageListItem)) {
+            if (shouldPresent && message_search(&proto_main_msg_file, &messageListItem)) {
                 display_print(messageListItem.text);
             }
 
@@ -863,7 +871,7 @@ static int obj_use_explosive(Object* explosive)
             }
 
             int delay = 10 * seconds;
-            int roll = skill_result(obj_dude, SKILL_TRAPS, 0, NULL);
+            int roll = skill_result(critter, SKILL_TRAPS, 0, NULL);
 
             int eventType;
             switch (roll) {
@@ -899,7 +907,7 @@ int protinst_use_item(Object* critter, Object* item)
         break;
     case ITEM_TYPE_WEAPON:
     case ITEM_TYPE_MISC:
-        rc = obj_use_book(item);
+        rc = obj_use_book(critter, item);
         if (rc != -1) {
             break;
         }
@@ -909,12 +917,12 @@ int protinst_use_item(Object* critter, Object* item)
             break;
         }
 
-        rc = obj_use_radio(item);
+        rc = obj_use_radio(critter, item);
         if (rc == 0) {
             break;
         }
 
-        rc = obj_use_explosive(item);
+        rc = obj_use_explosive(critter, item);
         if (rc == 0) {
             break;
         }
@@ -929,7 +937,7 @@ int protinst_use_item(Object* critter, Object* item)
     default:
         // That does nothing
         messageListItem.num = 582;
-        if (message_search(&proto_main_msg_file, &messageListItem)) {
+        if (multiplayer::isPresentedPlayerActor(critter) && message_search(&proto_main_msg_file, &messageListItem)) {
             display_print(messageListItem.text);
         }
 
@@ -963,7 +971,7 @@ static int protinst_default_use_item(Object* a1, Object* a2, Object* item)
     switch (item_get_type(item)) {
     case ITEM_TYPE_DRUG:
         if (PID_TYPE(a2->pid) != OBJ_TYPE_CRITTER) {
-            if (a1 == obj_dude) {
+            if (multiplayer::isPresentedPlayerActor(a1)) {
                 // That does nothing
                 messageListItem.num = 582;
                 if (message_search(&proto_main_msg_file, &messageListItem)) {
@@ -987,13 +995,13 @@ static int protinst_default_use_item(Object* a1, Object* a2, Object* item)
 
         rc = item_d_take_drug(a2, item);
 
-        if (a1 == obj_dude && a2 != obj_dude) {
+        if (multiplayer::isPresentedPlayerActor(a1) && a2 != a1) {
             // TODO: Looks like there is bug in this branch, message 580 will never be shown,
             // as we can only be here when target is not dude.
 
             // 580: You use the %s.
             // 581: You use the %s on %s.
-            messageListItem.num = 580 + (a2 != obj_dude);
+            messageListItem.num = 580 + (a2 != a1);
             if (!message_search(&proto_main_msg_file, &messageListItem)) {
                 return -1;
             }
@@ -1002,7 +1010,7 @@ static int protinst_default_use_item(Object* a1, Object* a2, Object* item)
             display_print(formattedText);
         }
 
-        if (a2 == obj_dude) {
+        if (multiplayer::isPresentedPlayerActor(a2)) {
             intface_update_hit_points(true);
         }
 
@@ -1099,7 +1107,7 @@ int protinst_use_item_on(Object* a1, Object* a2, Object* item)
         MessageListItem messageListItem;
         // You cannot do that in combat.
         messageListItem.num = 902;
-        if (a1 == obj_dude) {
+        if (multiplayer::isPresentedPlayerActor(a1)) {
             if (message_search(&proto_main_msg_file, &messageListItem)) {
                 display_print(messageListItem.text);
             }
@@ -1117,7 +1125,7 @@ int protinst_use_item_on(Object* a1, Object* a2, Object* item)
 
     MessageListItem messageListItem;
     messageListItem.num = messageId;
-    if (a1 == obj_dude) {
+    if (multiplayer::isPresentedPlayerActor(a1)) {
         if (message_search(&proto_main_msg_file, &messageListItem)) {
             display_print(messageListItem.text);
         }
@@ -1160,8 +1168,8 @@ int check_scenery_ap_cost(Object* obj, Object* a2)
     if (actionPoints >= 3) {
         obj->data.critter.combat.ap = actionPoints - 3;
 
-        if (obj == obj_dude) {
-            intface_update_move_points(obj_dude->data.critter.combat.ap, combat_free_move);
+        if (multiplayer::isPresentedPlayerActor(obj)) {
+            intface_update_move_points(obj->data.critter.combat.ap, combat_free_move);
         }
 
         return 0;
@@ -1171,7 +1179,7 @@ int check_scenery_ap_cost(Object* obj, Object* a2)
     // You don't have enough action points.
     messageListItem.num = 700;
 
-    if (obj == obj_dude) {
+    if (multiplayer::isPresentedPlayerActor(obj)) {
         if (message_search(&proto_main_msg_file, &messageListItem)) {
             display_print(messageListItem.text);
         }
@@ -1187,7 +1195,8 @@ int obj_use(Object* a1, Object* a2)
     int sid = -1;
     bool scriptOverrides = false;
 
-    if (a1 == obj_dude) {
+    bool isPlayerActor = a1 == obj_dude || multiplayer::isActingPlayerActor(a1);
+    if (isPlayerActor) {
         if (type != OBJ_TYPE_SCENERY) {
             return -1;
         }
@@ -1219,7 +1228,7 @@ int obj_use(Object* a1, Object* a2)
     }
 
     if (!scriptOverrides) {
-        if (a1 == obj_dude) {
+        if (multiplayer::isPresentedPlayerActor(a1)) {
             // You see: %s
             MessageListItem messageListItem;
             messageListItem.num = 480;
@@ -1427,7 +1436,7 @@ int obj_use_container(Object* critter, Object* item)
         const char* sfx = gsnd_build_open_sfx_name(item, SCENERY_SOUND_EFFECT_LOCKED);
         gsound_play_sfx_file(sfx);
 
-        if (critter == obj_dude) {
+        if (multiplayer::isPresentedPlayerActor(critter)) {
             MessageListItem messageListItem;
             // It is locked.
             messageListItem.num = 487;
@@ -1471,7 +1480,7 @@ int obj_use_container(Object* critter, Object* item)
 
     register_end();
 
-    if (critter == obj_dude) {
+    if (multiplayer::isPresentedPlayerActor(critter)) {
         MessageListItem messageListItem;
         messageListItem.num = item->frame != 0
             ? 486 // You search the %s.
@@ -1496,7 +1505,7 @@ int obj_use_skill_on(Object* source, Object* target, int skill)
     bool scriptOverrides = false;
 
     if (obj_lock_is_jammed(target)) {
-        if (source == obj_dude) {
+        if (multiplayer::isPresentedPlayerActor(source)) {
             MessageListItem messageListItem;
             messageListItem.num = 2001;
             if (message_search(&misc_message_file, &messageListItem)) {

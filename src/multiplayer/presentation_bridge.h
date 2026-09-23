@@ -8,6 +8,7 @@ struct Object;
 namespace multiplayer {
 
 Object* localPlayerActorOrStoryActor();
+bool isPresentedPlayerActor(const Object* actor);
 int updatePlayerGenderAppearance(Object* actor);
 
 } // namespace multiplayer

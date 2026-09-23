@@ -5,6 +5,7 @@
 #include "game/perk.h"
 #include "game/scripts.h"
 #include "game/stat.h"
+#include "multiplayer/acting_player_context.h"
 
 namespace fallout {
 
@@ -70,6 +71,7 @@ int reaction_influence(int a1, int a2, int a3)
 // 0x490CBC
 int reaction_get(Object* critter)
 {
+    Object* reactingPlayer = multiplayer::actingPlayerActorOr(obj_dude);
     int sid;
     int v1 = 0;
     int v2 = 0;
@@ -95,7 +97,7 @@ int reaction_get(Object* critter)
         return -1;
     }
 
-    compat_scr_set_local_var(sid, 0, v2 + 5 * stat_level(obj_dude, STAT_CHARISMA) - 25);
+    compat_scr_set_local_var(sid, 0, v2 + 5 * stat_level(reactingPlayer, STAT_CHARISMA) - 25);
 
     if (compat_scr_get_local_var(sid, 0, &v2) == -1) {
         return -1;

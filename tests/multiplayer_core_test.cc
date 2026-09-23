@@ -499,11 +499,13 @@ void testActingPlayerContext()
 
     expect(actingPlayerState() == nullptr && actingPlayerActor() == nullptr, "acting-player context starts empty");
     expect(actingCharacterBuild() == nullptr, "no character build is active outside a scope");
+    expect(actingPlayerActorOr(asGameObject(guestActor)) == asGameObject(guestActor), "mechanical actor lookup uses its fallback outside a scope");
 
     {
         ScopedActingPlayerContext hostContext(host, asGameObject(hostActor));
         expect(actingPlayerState() == &host, "acting-player scope exposes its player state");
         expect(actingPlayerActor() == asGameObject(hostActor), "acting-player scope exposes its actor");
+        expect(actingPlayerActorOr(asGameObject(guestActor)) == asGameObject(hostActor), "mechanical actor lookup prefers the scoped actor");
         expect(actingCharacterBuildFor(asGameObject(hostActor)) == &host.build, "acting actor resolves its character build");
         expect(actingCharacterBuildFor(asGameObject(guestActor)) == nullptr, "another actor cannot use the active character build");
         actingCharacterBuild()->level = 4;

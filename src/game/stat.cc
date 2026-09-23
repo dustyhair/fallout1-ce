@@ -22,6 +22,7 @@
 #include "game/tile.h"
 #include "game/trait.h"
 #include "multiplayer/acting_player_context.h"
+#include "multiplayer/presentation_bridge.h"
 #include "platform_compat.h"
 #include "plib/gnw/input.h"
 #include "plib/gnw/memory.h"
@@ -659,7 +660,7 @@ int stat_pc_add_experience(int xp)
             MessageListItem messageListItem;
             int hp;
 
-            if (playerActor == obj_dude) {
+            if (multiplayer::isPresentedPlayerActor(playerActor)) {
                 // You have gone up a level.
                 messageListItem.num = 600;
                 if (message_search(&stat_message_file, &messageListItem)) {
@@ -678,7 +679,7 @@ int stat_pc_add_experience(int xp)
 
             stat_set_bonus(playerActor, STAT_MAXIMUM_HIT_POINTS, stat_get_bonus(playerActor, STAT_MAXIMUM_HIT_POINTS) + hp);
 
-            if (playerActor == obj_dude) {
+            if (multiplayer::isPresentedPlayerActor(playerActor)) {
                 intface_update_hit_points(false);
             }
         }

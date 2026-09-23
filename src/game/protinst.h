@@ -17,7 +17,7 @@ int obj_remove_from_inven(Object* critter, Object* item);
 int obj_drop(Object* a1, Object* a2);
 int obj_drop_quantity(Object* owner, Object* item, int quantity);
 int obj_destroy(Object* obj);
-int obj_use_radio(Object* item_obj);
+int obj_use_radio(Object* critter, Object* item_obj);
 int protinst_use_item(Object* a1, Object* a2);
 int obj_use_item(Object* a1, Object* a2);
 int protinst_use_item_on(Object* a1, Object* a2, Object* item);

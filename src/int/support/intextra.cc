@@ -37,6 +37,8 @@
 #include "game/trait.h"
 #include "game/worldmap.h"
 #include "int/dialog.h"
+#include "multiplayer/acting_player_context.h"
+#include "multiplayer/presentation_bridge.h"
 #include "plib/color/color.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/input.h"
@@ -173,7 +175,8 @@ static int scripts_tile_is_visible(int tile)
 // 0x44B674
 static int correctFidForRemovedItem(Object* critter, Object* item, int flags)
 {
-    if (critter == obj_dude) {
+    bool isPlayerActor = critter == obj_dude || multiplayer::isActingPlayerActor(critter);
+    if (multiplayer::isPresentedPlayerActor(critter)) {
         intface_update_items(true);
     }
 
@@ -182,7 +185,7 @@ static int correctFidForRemovedItem(Object* critter, Object* item, int flags)
     int newFid = -1;
 
     if ((flags & OBJECT_IN_ANY_HAND) != 0) {
-        if (critter == obj_dude) {
+        if (multiplayer::isPresentedPlayerActor(critter)) {
             if (intface_is_item_right_hand()) {
                 if ((flags & OBJECT_IN_RIGHT_HAND) != 0) {
                     anim = 0;
@@ -202,9 +205,9 @@ static int correctFidForRemovedItem(Object* critter, Object* item, int flags)
             newFid = art_id(FID_TYPE(fid), fid & 0xFFF, FID_ANIM_TYPE(fid), 0, (fid & 0x70000000) >> 28);
         }
     } else {
-        if (critter == obj_dude) {
-            newFid = art_id(FID_TYPE(fid), art_vault_guy_num, FID_ANIM_TYPE(fid), anim, (fid & 0x70000000) >> 28);
-            adjust_ac(obj_dude, item, NULL);
+        if (isPlayerActor) {
+            multiplayer::updatePlayerGenderAppearance(critter);
+            adjust_ac(critter, item, NULL);
         }
     }
 
@@ -697,7 +700,7 @@ static void op_destroy_object(Program* program)
         int quantity = item_count(owner, object);
         item_remove_mult(owner, object, quantity);
 
-        if (owner == obj_dude) {
+        if (multiplayer::isPresentedPlayerActor(owner)) {
             intface_update_items(true);
         }
 
@@ -1008,12 +1011,12 @@ static void op_set_critter_stat(Program* program)
 
     int result = 0;
     if (object != NULL) {
-        if (object == obj_dude) {
+        if (object == obj_dude || multiplayer::isActingPlayerActor(object)) {
             int currentValue = stat_get_base(object, stat);
             stat_set_base(object, stat, currentValue + value);
         } else {
             dbg_error(program, "set_critter_stat", SCRIPT_ERROR_FOLLOWS);
-            debug_printf(" Can't modify anyone except obj_dude!");
+            debug_printf(" Can't modify anyone except the active player!");
             result = -1;
         }
     } else {
@@ -1366,13 +1369,16 @@ static void op_wield_obj_critter(Program* program)
     bool shouldAdjustArmorClass = false;
     Object* oldArmor = NULL;
     Object* newArmor = NULL;
-    if (critter == obj_dude) {
+    bool isPlayerActor = critter == obj_dude || multiplayer::isActingPlayerActor(critter);
+    if (multiplayer::isPresentedPlayerActor(critter)) {
         if (intface_is_item_right_hand() == HAND_LEFT) {
             hand = HAND_LEFT;
         }
+    }
 
+    if (isPlayerActor) {
         if (item_get_type(item) == ITEM_TYPE_ARMOR) {
-            oldArmor = inven_worn(obj_dude);
+            oldArmor = inven_worn(critter);
             shouldAdjustArmorClass = true;
             newArmor = item;
         }
@@ -1380,7 +1386,7 @@ static void op_wield_obj_critter(Program* program)
 
     inven_wield(critter, item, hand);
 
-    if (critter == obj_dude) {
+    if (isPlayerActor) {
         if (shouldAdjustArmorClass) {
             adjust_ac(critter, oldArmor, newArmor);
         }
@@ -1813,7 +1819,7 @@ static void op_critter_heal(Program* program)
 
     int rc = critter_adjust_hits(critter, amount);
 
-    if (critter == obj_dude) {
+    if (multiplayer::isPresentedPlayerActor(critter)) {
         intface_update_hit_points(true);
     }
 
@@ -2534,7 +2540,7 @@ static void op_critter_inven_obj(Program* program)
             programStackPushPointer(program, inven_worn(critter));
             break;
         case INVEN_TYPE_RIGHT_HAND:
-            if (critter == obj_dude) {
+            if (multiplayer::isPresentedPlayerActor(critter)) {
                 if (intface_is_item_right_hand() != HAND_LEFT) {
                     programStackPushPointer(program, inven_right_hand(critter));
                 } else {
@@ -2545,7 +2551,7 @@ static void op_critter_inven_obj(Program* program)
             }
             break;
         case INVEN_TYPE_LEFT_HAND:
-            if (critter == obj_dude) {
+            if (multiplayer::isPresentedPlayerActor(critter)) {
                 if (intface_is_item_right_hand() == HAND_LEFT) {
                     programStackPushPointer(program, inven_left_hand(critter));
                 } else {
@@ -2652,7 +2658,7 @@ static void op_float_msg(Program* program)
         color = colorTable[31744];
         a5 = colorTable[0];
         font = 103;
-        tile_set_center(obj_dude->tile, TILE_SET_CENTER_REFRESH_WINDOW);
+        tile_set_center(multiplayer::localPlayerActorOrStoryActor()->tile, TILE_SET_CENTER_REFRESH_WINDOW);
         break;
     case FLOATING_MESSAGE_TYPE_NORMAL:
     case FLOATING_MESSAGE_TYPE_YELLOW:
@@ -2693,7 +2699,7 @@ static void op_float_msg(Program* program)
     if (text_object_create(obj, string, font, color, a5, &rect) != -1) {
         tile_refresh_rect(&rect, obj->elevation);
 
-        bool playerVoice = obj == obj_dude;
+        bool playerVoice = multiplayer::isPresentedPlayerActor(obj);
         int speakerListId = -1;
         int gender = -1;
         if (PID_TYPE(obj->pid) == OBJ_TYPE_CRITTER) {
@@ -3035,7 +3041,7 @@ static void op_rm_mult_objs_from_inven(Program* program)
             Rect updatedRect;
             obj_connect(item, 1, 0, &updatedRect);
             if (itemWasEquipped) {
-                if (owner == obj_dude) {
+                if (multiplayer::isPresentedPlayerActor(owner)) {
                     intface_update_items(true);
                     intface_update_ac(false);
                 }
@@ -3210,7 +3216,8 @@ static void op_giq_option(Program* program)
     int messageListId = programStackPopInteger(program);
     int iq = programStackPopInteger(program);
 
-    int intelligence = stat_level(obj_dude, STAT_INTELLIGENCE);
+    Object* talker = multiplayer::actingPlayerActorOr(obj_dude);
+    int intelligence = stat_level(talker, STAT_INTELLIGENCE);
     intelligence += perk_level(PERK_SMOOTH_TALKER);
 
     if (iq < 0) {
@@ -3339,7 +3346,7 @@ static void op_critter_injure(Program* program)
     flags &= DAM_CRIP;
     critter->data.critter.combat.results |= flags;
 
-    if (critter == obj_dude) {
+    if (multiplayer::isPresentedPlayerActor(critter)) {
         if ((flags & DAM_CRIP_ARM_ANY) != 0) {
             intface_update_items(true);
         }
@@ -3393,7 +3400,7 @@ static void op_inven_unwield(Program* program)
     obj = scr_find_obj_from_program(program);
     v1 = 1;
 
-    if (obj == obj_dude && !intface_is_item_right_hand()) {
+    if (multiplayer::isPresentedPlayerActor(obj) && !intface_is_item_right_hand()) {
         v1 = 0;
     }
 
@@ -3603,15 +3610,15 @@ static void op_critter_mod_skill(Program* program)
 
     if (critter != NULL && points != 0) {
         if (PID_TYPE(critter->pid) == OBJ_TYPE_CRITTER) {
-            if (critter == obj_dude) {
+            if (critter == obj_dude || multiplayer::isActingPlayerActor(critter)) {
                 if (stat_pc_set(PC_STAT_UNSPENT_SKILL_POINTS, stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS) + points) == 0) {
                     for (int it = 0; it < points; it++) {
-                        skill_inc_point(obj_dude, skill);
+                        skill_inc_point(critter, skill);
                     }
                 }
             } else {
                 dbg_error(program, "critter_mod_skill", SCRIPT_ERROR_FOLLOWS);
-                debug_printf(" Can't modify anyone except obj_dude!");
+                debug_printf(" Can't modify anyone except the active player!");
             }
         }
     } else {
@@ -3789,7 +3796,7 @@ static void op_destroy_mult_objs(Program* program)
 
         item_remove_mult(owner, object, quantityToDestroy);
 
-        if (owner == obj_dude) {
+        if (multiplayer::isPresentedPlayerActor(owner)) {
             intface_update_items(true);
         }
 
@@ -3879,13 +3886,14 @@ static void op_move_obj_inven_to_obj(Program* program)
 
     Object* oldArmor = NULL;
     Object* item2 = NULL;
-    if (object1 == obj_dude) {
+    bool isPlayerActor = object1 == obj_dude || multiplayer::isActingPlayerActor(object1);
+    if (isPlayerActor) {
         oldArmor = inven_worn(object1);
     } else {
         item2 = inven_right_hand(object1);
     }
 
-    if (object1 != obj_dude && item2 != NULL) {
+    if (!isPlayerActor && item2 != NULL) {
         int flags = 0;
         if ((item2->flags & OBJECT_IN_LEFT_HAND) != 0) {
             flags |= OBJECT_IN_LEFT_HAND;
@@ -3900,14 +3908,16 @@ static void op_move_obj_inven_to_obj(Program* program)
 
     item_move_all(object1, object2);
 
-    if (object1 == obj_dude) {
+    if (isPlayerActor) {
         if (oldArmor != NULL) {
-            adjust_ac(obj_dude, oldArmor, NULL);
+            adjust_ac(object1, oldArmor, NULL);
         }
 
-        proto_dude_update_gender();
+        multiplayer::updatePlayerGenderAppearance(object1);
 
-        intface_update_items(true);
+        if (multiplayer::isPresentedPlayerActor(object1)) {
+            intface_update_items(true);
+        }
     }
 }
 

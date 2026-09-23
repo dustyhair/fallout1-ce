@@ -38,6 +38,11 @@ Object* actingPlayerActor()
     return currentActor;
 }
 
+Object* actingPlayerActorOr(Object* fallback)
+{
+    return currentActor != nullptr ? currentActor : fallback;
+}
+
 CharacterBuild* actingCharacterBuildFor(const Object* actor)
 {
     return actor != nullptr && actor == currentActor ? actingCharacterBuild() : nullptr;
