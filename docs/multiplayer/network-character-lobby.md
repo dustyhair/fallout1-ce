@@ -10,7 +10,9 @@ The dedicated lobby enables **Start Game** only after the host has both valid sh
 
 ## Automated engine smoke test
 
-`--multiplayer-smoke-test` replaces movies and menu input with fixed `Smoke Host` and `Smoke Guest` sheets. It still initializes the installed game data, computes the compatibility fingerprint, opens the real TLS connection, exchanges both sheets, and waits for host approval. It then hands the established connection to the gameplay wire layer: the guest sends a move command and validates the host's accepted result and movement event. Both processes close that socket, establish a new pinned TLS connection, authenticate the reconnect credential, and validate an authoritative event replay. Each process prints `MULTIPLAYER_SMOKE_TEST_PASS` and exits with status 0. The mode requires either `--multiplayer-host` or `--multiplayer-join`.
+`--multiplayer-smoke-test` replaces movies and menu input with fixed `Smoke Host` and `Smoke Guest` sheets. It initializes the installed game data, computes the compatibility fingerprint, opens the real TLS connection, exchanges both sheets, and loads `V13Ent.map` before entering the replicated world. An execution probe invokes one real scripted door procedure and one random combat attack on the host. The guest applies the corresponding door and attack effect paths and must record zero script procedures, combat attacks, and random draws. The output reports the per-process counts.
+
+The scenario then hands the established connection to the gameplay wire layer: the guest sends a move command and validates the host's accepted result and movement event. Both processes close that socket, establish a new pinned TLS connection, authenticate the reconnect credential, and validate an authoritative event replay. Each process prints `MULTIPLAYER_SMOKE_TEST_PASS` and exits with status 0. The mode requires either `--multiplayer-host` or `--multiplayer-join`.
 
 This hook makes the two-process path runnable under Xvfb:
 

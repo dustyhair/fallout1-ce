@@ -190,6 +190,8 @@ target_sources(${EXECUTABLE_NAME} PUBLIC
     "src/game/elevator.h"
     "src/game/endgame.cc"
     "src/game/endgame.h"
+    "src/game/engine_execution_probe.cc"
+    "src/game/engine_execution_probe.h"
     "src/game/fontmgr.cc"
     "src/game/fontmgr.h"
     "src/game/game_vars.h"

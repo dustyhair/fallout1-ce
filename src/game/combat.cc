@@ -11,6 +11,7 @@
 #include "game/critter.h"
 #include "game/display.h"
 #include "game/elevator.h"
+#include "game/engine_execution_probe.h"
 #include "game/game.h"
 #include "game/gconfig.h"
 #include "game/gmouse.h"
@@ -2491,6 +2492,8 @@ void combat_ctd_init(Attack* attack, Object* attacker, Object* defender, int hit
 // 0x420CFC
 int combat_attack(Object* attacker, Object* defender, int hitMode, int hitLocation)
 {
+    engineExecutionProbeRecordCombatAttack();
+
     bool aiming;
     int actionPoints;
 

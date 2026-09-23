@@ -3,6 +3,7 @@
 
 #include <optional>
 
+#include "game/engine_execution_probe.h"
 #include "multiplayer/character_lobby.h"
 #include "multiplayer/command_processor.h"
 #include "multiplayer/network_bootstrap.h"
@@ -55,6 +56,7 @@ void networkWorldLeave();
 bool networkWorldActive();
 bool networkWorldInventoryTransferInProgress();
 bool networkWorldItemDropInProgress();
+bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts);
 
 } // namespace multiplayer
 } // namespace fallout

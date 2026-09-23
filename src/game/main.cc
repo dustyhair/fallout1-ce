@@ -128,7 +128,11 @@ int gnw_main(int argc, char** argv)
     }
 
     if (multiplayer::networkRuntimeSmokeTestEnabled()) {
+        roll_set_seed(0xBEEFFEED);
+        main_load_new(mainMap);
         bool passed = multiplayer::networkRuntimeRunSmokeTest();
+        main_unload_new();
+        main_reset_system();
         multiplayer::networkRuntimeStop();
         agentControlStop();
         main_exit_system();

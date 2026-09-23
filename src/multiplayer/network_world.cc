@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <deque>
 #include <tuple>
 #include <unordered_map>
@@ -12,6 +13,7 @@
 #include "game/anim.h"
 #include "game/combat.h"
 #include "game/critter.h"
+#include "game/engine_execution_probe.h"
 #include "game/game.h"
 #include "game/intface.h"
 #include "game/inventry.h"
@@ -1097,6 +1099,143 @@ bool networkWorldApplyPeerAttack(const AttackStartedEvent& attack)
     }
     // Never rerun combat_attack on a replica: it consumes RNG and computes
     // damage. Authoritative actor and critter values arrive in snapshots.
+    return true;
+}
+
+bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts)
+{
+    counts = {};
+    if (!session.isActive()) {
+        std::fprintf(stderr, "Multiplayer authority probe: inactive world.\n");
+        return false;
+    }
+
+    Object* scriptedDoor = nullptr;
+    EntityId scriptedDoorId;
+    for (const auto& entry : worldDoors) {
+        int sid = -1;
+        if (obj_sid(entry.second, &sid) != -1) {
+            scriptedDoor = entry.second;
+            scriptedDoorId = entry.first;
+            break;
+        }
+    }
+    if (scriptedDoor == nullptr) {
+        std::fprintf(stderr, "Multiplayer authority probe: no scripted door.\n");
+        return false;
+    }
+
+    Object* hostActor = networkWorldPlayerActor(kHostPlayerId);
+    Object* target = networkWorldPlayerActor(kGuestPlayerId);
+    EntityId hostActorId;
+    EntityId targetId;
+    if (hostActor == nullptr || target == nullptr) {
+        std::fprintf(stderr, "Multiplayer authority probe: missing player actor.\n");
+        return false;
+    }
+    std::optional<EntityId> registeredHostActor = session.entities().findEntity(hostActor);
+    std::optional<EntityId> registeredTarget = session.entities().findEntity(target);
+    if (!registeredHostActor.has_value() || !registeredTarget.has_value()) {
+        std::fprintf(stderr, "Multiplayer authority probe: player actor is not registered.\n");
+        return false;
+    }
+    hostActorId = *registeredHostActor;
+    targetId = *registeredTarget;
+
+    if (worldMode == NetworkLaunchMode::Host) {
+        engineExecutionProbeBegin();
+        int doorRc = obj_use_door(hostActor, scriptedDoor, 0);
+        EngineExecutionProbeCounts doorCounts = engineExecutionProbeEnd();
+        if (doorRc == -1
+            || doorCounts.scriptProcedures != 1
+            || doorCounts.combatAttacks != 0) {
+            std::fprintf(stderr, "Multiplayer authority probe: host door rc=%d scripts=%u attacks=%u rng=%u.\n",
+                doorRc,
+                doorCounts.scriptProcedures,
+                doorCounts.combatAttacks,
+                doorCounts.randomDraws);
+            return false;
+        }
+
+        bool placed = false;
+        for (int rotation = 0; rotation < ROTATION_COUNT && !placed; rotation++) {
+            int tile = tile_num_in_direction(hostActor->tile, rotation, 1);
+            if (obj_blocking_at(target, tile, hostActor->elevation) == nullptr) {
+                placed = obj_move_to_tile(target, tile, hostActor->elevation, nullptr) == 0;
+            }
+        }
+        if (!placed || obj_dist(hostActor, target) != 1) {
+            std::fprintf(stderr, "Multiplayer authority probe: could not place combat target.\n");
+            return false;
+        }
+        hostActor->data.critter.combat.ap = 10;
+        engineExecutionProbeBegin();
+        int attackRc = combat_attack(hostActor, target, HIT_MODE_PUNCH, HIT_LOCATION_TORSO);
+        EngineExecutionProbeCounts attackCounts = engineExecutionProbeEnd();
+        register_clear(hostActor);
+        register_clear(target);
+        if (attackRc == -1
+            || attackCounts.scriptProcedures != 0
+            || attackCounts.combatAttacks != 1
+            || attackCounts.randomDraws == 0) {
+            std::fprintf(stderr, "Multiplayer authority probe: host attack rc=%d scripts=%u attacks=%u rng=%u.\n",
+                attackRc,
+                attackCounts.scriptProcedures,
+                attackCounts.combatAttacks,
+                attackCounts.randomDraws);
+            return false;
+        }
+        counts.scriptProcedures = doorCounts.scriptProcedures;
+        counts.combatAttacks = attackCounts.combatAttacks;
+        counts.randomDraws = attackCounts.randomDraws;
+        return true;
+    }
+
+    if (worldMode != NetworkLaunchMode::Join) {
+        std::fprintf(stderr, "Multiplayer authority probe: invalid world mode.\n");
+        return false;
+    }
+
+    engineExecutionProbeBegin();
+    bool doorApplied = networkWorldApplyPeerDoorUse(DoorUseStartedEvent {
+        hostActorId,
+        scriptedDoorId,
+        obj_is_open(scriptedDoor) != 0,
+        obj_is_locked(scriptedDoor),
+        scriptedDoor->frame,
+    });
+    EngineExecutionProbeCounts doorCounts = engineExecutionProbeEnd();
+    if (!doorApplied
+        || doorCounts.scriptProcedures != 0
+        || doorCounts.combatAttacks != 0
+        || doorCounts.randomDraws != 0) {
+        std::fprintf(stderr, "Multiplayer authority probe: guest door applied=%d scripts=%u attacks=%u rng=%u.\n",
+            doorApplied ? 1 : 0,
+            doorCounts.scriptProcedures,
+            doorCounts.combatAttacks,
+            doorCounts.randomDraws);
+        return false;
+    }
+
+    engineExecutionProbeBegin();
+    bool attackApplied = networkWorldApplyPeerAttack(AttackStartedEvent {
+        hostActorId,
+        targetId,
+        HIT_MODE_PUNCH,
+        HIT_LOCATION_TORSO,
+    });
+    EngineExecutionProbeCounts attackCounts = engineExecutionProbeEnd();
+    if (!attackApplied
+        || attackCounts.scriptProcedures != 0
+        || attackCounts.combatAttacks != 0
+        || attackCounts.randomDraws != 0) {
+        std::fprintf(stderr, "Multiplayer authority probe: guest attack applied=%d scripts=%u attacks=%u rng=%u.\n",
+            attackApplied ? 1 : 0,
+            attackCounts.scriptProcedures,
+            attackCounts.combatAttacks,
+            attackCounts.randomDraws);
+        return false;
+    }
     return true;
 }
 

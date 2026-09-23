@@ -11,6 +11,7 @@
 #include "game/critter.h"
 #include "game/elevator.h"
 #include "game/endgame.h"
+#include "game/engine_execution_probe.h"
 #include "game/game.h"
 #include "game/gdialog.h"
 #include "game/gmouse.h"
@@ -1138,6 +1139,7 @@ int exec_script_proc(int sid, int action)
 
     script->scr_flags |= SCRIPT_FLAG_0x04;
 
+    engineExecutionProbeRecordScriptProcedure();
     if (programLoaded) {
         scr_build_lookup_table(script);
         runProgram(program);

@@ -5,6 +5,7 @@
 
 #include <random>
 
+#include "game/engine_execution_probe.h"
 #include "game/scripts.h"
 #include "platform_compat.h"
 #include "plib/gnw/debug.h"
@@ -110,6 +111,8 @@ int roll_check_critical(int delta, int criticalSuccessModifier)
 // 0x4914D0
 int roll_random(int min, int max)
 {
+    engineExecutionProbeRecordRandomDraw();
+
     int result;
 
     if (min <= max) {

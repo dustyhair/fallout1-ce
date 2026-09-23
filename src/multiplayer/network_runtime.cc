@@ -1049,6 +1049,16 @@ bool networkRuntimeRunSmokeTest()
                 break;
             }
 
+            EngineExecutionProbeCounts authorityProbeCounts;
+            if (!networkWorldEnter(launchOptions.mode, sheet, *peer)) {
+                setStatus("MULTIPLAYER SMOKE TEST FAILED: ENGINE WORLD ENTRY");
+                break;
+            }
+            if (!networkWorldRunEngineAuthoritySmokeTest(authorityProbeCounts)) {
+                setStatus("MULTIPLAYER SMOKE TEST FAILED: ENGINE AUTHORITY PROBE");
+                break;
+            }
+
             const SessionId sessionId = bootstrap.sessionId();
             std::uint64_t nextSendSequence = lobby.nextSendSequence();
             std::uint64_t nextReceiveSequence = lobby.nextReceiveSequence();
@@ -1298,11 +1308,14 @@ bool networkRuntimeRunSmokeTest()
             }
 
             std::fprintf(stdout,
-                "MULTIPLAYER_SMOKE_TEST_PASS role=%s session=%llu local=%s peer=%s command=move reconnect=tls-replay\n",
+                "MULTIPLAYER_SMOKE_TEST_PASS role=%s session=%llu local=%s peer=%s command=move reconnect=tls-replay scripts=%u attacks=%u rng=%u\n",
                 launchOptions.mode == NetworkLaunchMode::Host ? "host" : "guest",
                 static_cast<unsigned long long>(sessionId.value),
                 sheet.name.c_str(),
-                peer->name.c_str());
+                peer->name.c_str(),
+                authorityProbeCounts.scriptProcedures,
+                authorityProbeCounts.combatAttacks,
+                authorityProbeCounts.randomDraws);
             std::fflush(stdout);
             return peer != nullptr;
         }
