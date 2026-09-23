@@ -1,6 +1,7 @@
 #ifndef FALLOUT_MULTIPLAYER_SNAPSHOT_H_
 #define FALLOUT_MULTIPLAYER_SNAPSHOT_H_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -11,7 +12,7 @@ namespace fallout {
 namespace multiplayer {
 
 constexpr std::uint32_t kSnapshotMagic = 0x46434D53;
-constexpr std::uint16_t kSnapshotVersion = 6;
+constexpr std::uint16_t kSnapshotVersion = 7;
 constexpr std::size_t kSnapshotHeaderSize = 28;
 constexpr std::size_t kMaxSnapshotPayloadSize = 64 * 1024;
 constexpr std::size_t kMaxSnapshotActors = 16;
@@ -19,6 +20,8 @@ constexpr std::size_t kMaxSnapshotCritters = 2048;
 constexpr std::size_t kMaxSnapshotDoors = 1024;
 constexpr std::size_t kMaxSnapshotItems = 4096;
 constexpr std::size_t kMaxSnapshotVariables = 8192;
+constexpr std::size_t kMaxSnapshotTimedEvents = 1024;
+constexpr std::size_t kMaxTimedEventPayloadValues = 6;
 
 struct ActorSnapshot {
     EntityId entityId;
@@ -59,6 +62,14 @@ struct ItemSnapshot {
     ItemDescriptor itemDescriptor;
 };
 
+struct TimedEventSnapshot {
+    std::int32_t time = 0;
+    std::uint8_t eventType = 0;
+    std::uint8_t payloadCount = 0;
+    EntityId ownerId;
+    std::array<std::int32_t, kMaxTimedEventPayloadValues> payload {};
+};
+
 struct WorldSnapshot {
     std::uint16_t version = kSnapshotVersion;
     EventSequence lastIncludedEvent;
@@ -72,6 +83,7 @@ struct WorldSnapshot {
     std::vector<std::int32_t> gameGlobalVariables;
     std::vector<std::int32_t> mapGlobalVariables;
     std::vector<std::int32_t> mapLocalVariables;
+    std::vector<TimedEventSnapshot> timedEvents;
 };
 
 enum class SnapshotError {
@@ -92,6 +104,7 @@ enum class SnapshotError {
     TooManyDoors,
     TooManyItems,
     TooManyVariables,
+    TooManyTimedEvents,
     InvalidEntityId,
     InvalidPlayerId,
     DuplicateEntityId,
@@ -99,6 +112,7 @@ enum class SnapshotError {
     InvalidCritterState,
     InvalidDoorState,
     InvalidItemState,
+    InvalidTimedEventState,
 };
 
 struct SnapshotDecodeResult {
@@ -120,6 +134,7 @@ enum class SnapshotSection {
     Items,
     Globals,
     MapVariables,
+    TimedEvents,
 };
 
 struct SectionedStateDigest {
@@ -130,6 +145,7 @@ struct SectionedStateDigest {
     std::uint64_t items = 0;
     std::uint64_t globals = 0;
     std::uint64_t mapVariables = 0;
+    std::uint64_t timedEvents = 0;
     std::uint64_t overall = 0;
 };
 
@@ -142,6 +158,7 @@ constexpr bool operator==(const SectionedStateDigest& lhs, const SectionedStateD
         && lhs.items == rhs.items
         && lhs.globals == rhs.globals
         && lhs.mapVariables == rhs.mapVariables
+        && lhs.timedEvents == rhs.timedEvents
         && lhs.overall == rhs.overall;
 }
 

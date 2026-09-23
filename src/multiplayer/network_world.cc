@@ -20,6 +20,7 @@
 #include "game/map_defs.h"
 #include "game/object.h"
 #include "game/protinst.h"
+#include "game/queue.h"
 #include "game/scripts.h"
 #include "game/stat.h"
 #include "game/tile.h"
@@ -91,6 +92,59 @@ void applyVariableState(const WorldSnapshot& snapshot)
     if (!snapshot.mapLocalVariables.empty()) {
         std::copy(snapshot.mapLocalVariables.begin(), snapshot.mapLocalVariables.end(), map_local_vars);
     }
+}
+
+bool captureTimedEvents(WorldSnapshot& snapshot)
+{
+    std::vector<QueueEventState> queueEvents;
+    if (!queue_capture_state(queueEvents) || queueEvents.size() > kMaxSnapshotTimedEvents) {
+        return false;
+    }
+    snapshot.timedEvents.reserve(queueEvents.size());
+    for (const QueueEventState& queueEvent : queueEvents) {
+        TimedEventSnapshot event;
+        event.time = queueEvent.time;
+        event.eventType = static_cast<std::uint8_t>(queueEvent.eventType);
+        event.payloadCount = static_cast<std::uint8_t>(queueEvent.payloadCount);
+        for (std::size_t index = 0; index < queueEvent.payload.size(); index++) {
+            event.payload[index] = queueEvent.payload[index];
+        }
+        // Script timed-event processing resolves the script by SID and ignores
+        // the legacy owner pointer. Normalizing it avoids depending on an
+        // unreplicated scenery object's process-local identity.
+        if (queueEvent.owner != nullptr && queueEvent.eventType != EVENT_TYPE_SCRIPT) {
+            std::optional<EntityId> ownerId = session.entities().findEntity(queueEvent.owner);
+            if (!ownerId.has_value()) {
+                return false;
+            }
+            event.ownerId = *ownerId;
+        }
+        snapshot.timedEvents.push_back(event);
+    }
+    return true;
+}
+
+bool applyTimedEvents(const WorldSnapshot& snapshot)
+{
+    std::vector<QueueEventState> queueEvents;
+    queueEvents.reserve(snapshot.timedEvents.size());
+    for (const TimedEventSnapshot& event : snapshot.timedEvents) {
+        QueueEventState queueEvent;
+        queueEvent.time = event.time;
+        queueEvent.eventType = event.eventType;
+        queueEvent.payloadCount = event.payloadCount;
+        for (std::size_t index = 0; index < event.payload.size(); index++) {
+            queueEvent.payload[index] = event.payload[index];
+        }
+        if (isValid(event.ownerId)) {
+            queueEvent.owner = session.entities().findObject(event.ownerId);
+            if (queueEvent.owner == nullptr) {
+                return false;
+            }
+        }
+        queueEvents.push_back(queueEvent);
+    }
+    return queue_replace_state(queueEvents);
 }
 
 bool validateActorAndCritterState(const WorldSnapshot& snapshot)
@@ -1580,7 +1634,8 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
     }
     if (!captureVariables(game_global_vars, num_game_global_vars, captured.gameGlobalVariables)
         || !captureVariables(map_global_vars, num_map_global_vars, captured.mapGlobalVariables)
-        || !captureVariables(map_local_vars, num_map_local_vars, captured.mapLocalVariables)) {
+        || !captureVariables(map_local_vars, num_map_local_vars, captured.mapLocalVariables)
+        || !captureTimedEvents(captured)) {
         return false;
     }
     if (validateSnapshot(captured) != SnapshotError::None) {
@@ -1706,6 +1761,9 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
     }
     applyVariableState(snapshot);
     set_game_time(snapshot.gameTime);
+    if (!applyTimedEvents(snapshot)) {
+        return false;
+    }
     intface_redraw();
     return true;
 }

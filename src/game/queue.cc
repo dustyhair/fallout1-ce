@@ -33,6 +33,80 @@ static int queue_explode_exit(Object* obj, void* data);
 static int queue_do_explosion(Object* obj, bool a2);
 static int queue_premature(Object* obj, void* data);
 
+static std::size_t queue_event_payload_count(int eventType)
+{
+    switch (eventType) {
+    case EVENT_TYPE_DRUG:
+        return 6;
+    case EVENT_TYPE_WITHDRAWAL:
+        return 3;
+    case EVENT_TYPE_SCRIPT:
+    case EVENT_TYPE_RADIATION:
+        return 2;
+    default:
+        return 0;
+    }
+}
+
+static void queue_free_list(QueueListNode* list)
+{
+    while (list != NULL) {
+        QueueListNode* next = list->next;
+        if (list->type >= 0 && list->type < EVENT_TYPE_COUNT) {
+            EventTypeDescription* eventTypeDescription = &(q_func[list->type]);
+            if (eventTypeDescription->freeProc != NULL) {
+                eventTypeDescription->freeProc(list->data);
+            }
+        }
+        mem_free(list);
+        list = next;
+    }
+}
+
+static void* queue_create_event_data(const QueueEventState& state)
+{
+    switch (state.eventType) {
+    case EVENT_TYPE_DRUG: {
+        DrugEffectEvent* event = (DrugEffectEvent*)mem_malloc(sizeof(*event));
+        if (event != NULL) {
+            event->drugPid = 0;
+            for (int index = 0; index < 3; index++) {
+                event->stats[index] = state.payload[index];
+                event->modifiers[index] = state.payload[index + 3];
+            }
+        }
+        return event;
+    }
+    case EVENT_TYPE_WITHDRAWAL: {
+        WithdrawalEvent* event = (WithdrawalEvent*)mem_malloc(sizeof(*event));
+        if (event != NULL) {
+            event->field_0 = state.payload[0];
+            event->pid = state.payload[1];
+            event->perk = state.payload[2];
+        }
+        return event;
+    }
+    case EVENT_TYPE_SCRIPT: {
+        ScriptEvent* event = (ScriptEvent*)mem_malloc(sizeof(*event));
+        if (event != NULL) {
+            event->sid = state.payload[0];
+            event->fixedParam = state.payload[1];
+        }
+        return event;
+    }
+    case EVENT_TYPE_RADIATION: {
+        RadiationEvent* event = (RadiationEvent*)mem_malloc(sizeof(*event));
+        if (event != NULL) {
+            event->radiationLevel = state.payload[0];
+            event->isHealing = state.payload[1];
+        }
+        return event;
+    }
+    default:
+        return NULL;
+    }
+}
+
 // 0x5076FC
 EventTypeDescription q_func[EVENT_TYPE_COUNT] = {
     { item_d_process, mem_free, item_d_load, item_d_save, true, item_d_clear },
@@ -414,6 +488,129 @@ int queue_next_time()
     }
 
     return queue->time;
+}
+
+bool queue_capture_state(std::vector<QueueEventState>& state)
+{
+    state.clear();
+    int previousTime = 0;
+    for (QueueListNode* node = queue; node != NULL; node = node->next) {
+        if (node->time <= 0
+            || node->time < previousTime
+            || node->type < 0
+            || node->type >= EVENT_TYPE_COUNT) {
+            state.clear();
+            return false;
+        }
+        QueueEventState event;
+        event.time = node->time;
+        event.eventType = node->type;
+        event.owner = node->owner;
+        event.payloadCount = queue_event_payload_count(node->type);
+        if (event.payloadCount != 0 && node->data == NULL) {
+            state.clear();
+            return false;
+        }
+        switch (node->type) {
+        case EVENT_TYPE_DRUG: {
+            DrugEffectEvent* data = (DrugEffectEvent*)node->data;
+            for (int index = 0; index < 3; index++) {
+                event.payload[index] = data->stats[index];
+                event.payload[index + 3] = data->modifiers[index];
+            }
+            break;
+        }
+        case EVENT_TYPE_WITHDRAWAL: {
+            WithdrawalEvent* data = (WithdrawalEvent*)node->data;
+            event.payload[0] = data->field_0;
+            event.payload[1] = data->pid;
+            event.payload[2] = data->perk;
+            break;
+        }
+        case EVENT_TYPE_SCRIPT: {
+            ScriptEvent* data = (ScriptEvent*)node->data;
+            event.payload[0] = data->sid;
+            event.payload[1] = data->fixedParam;
+            break;
+        }
+        case EVENT_TYPE_RADIATION: {
+            RadiationEvent* data = (RadiationEvent*)node->data;
+            event.payload[0] = data->radiationLevel;
+            event.payload[1] = data->isHealing;
+            break;
+        }
+        default:
+            if (node->data != NULL) {
+                state.clear();
+                return false;
+            }
+            break;
+        }
+        state.push_back(event);
+        previousTime = node->time;
+    }
+    return true;
+}
+
+bool queue_replace_state(const std::vector<QueueEventState>& state)
+{
+    QueueListNode* replacement = NULL;
+    QueueListNode** next = &replacement;
+    int previousTime = 0;
+    for (const QueueEventState& event : state) {
+        if (event.eventType < 0 || event.eventType >= EVENT_TYPE_COUNT) {
+            queue_free_list(replacement);
+            return false;
+        }
+        std::size_t expectedPayloadCount = queue_event_payload_count(event.eventType);
+        bool ownerRequired = event.eventType != EVENT_TYPE_SCRIPT
+            && event.eventType != EVENT_TYPE_GAME_TIME
+            && event.eventType != EVENT_TYPE_MAP_UPDATE_EVENT;
+        if (event.time <= 0
+            || event.time < previousTime
+            || expectedPayloadCount != event.payloadCount
+            || (ownerRequired && event.owner == NULL)
+            || ((event.eventType == EVENT_TYPE_GAME_TIME || event.eventType == EVENT_TYPE_MAP_UPDATE_EVENT)
+                && event.owner != NULL)) {
+            queue_free_list(replacement);
+            return false;
+        }
+        for (std::size_t index = event.payloadCount; index < event.payload.size(); index++) {
+            if (event.payload[index] != 0) {
+                queue_free_list(replacement);
+                return false;
+            }
+        }
+
+        void* data = queue_create_event_data(event);
+        if (expectedPayloadCount != 0 && data == NULL) {
+            queue_free_list(replacement);
+            return false;
+        }
+        QueueListNode* node = (QueueListNode*)mem_malloc(sizeof(*node));
+        if (node == NULL) {
+            if (data != NULL) {
+                mem_free(data);
+            }
+            queue_free_list(replacement);
+            return false;
+        }
+        node->time = event.time;
+        node->type = event.eventType;
+        node->owner = event.owner;
+        node->data = data;
+        node->next = NULL;
+        if (node->owner != NULL) {
+            node->owner->flags |= OBJECT_USED;
+        }
+        *next = node;
+        next = &(node->next);
+        previousTime = event.time;
+    }
+
+    queue_clear();
+    queue = replacement;
+    return true;
 }
 
 // 0x490B30

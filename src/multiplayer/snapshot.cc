@@ -8,11 +8,12 @@ namespace fallout {
 namespace multiplayer {
 namespace {
 
-constexpr std::size_t kSnapshotPayloadHeaderSize = 40;
+constexpr std::size_t kSnapshotPayloadHeaderSize = 44;
 constexpr std::size_t kActorSnapshotSize = 32;
 constexpr std::size_t kCritterSnapshotSize = 36;
 constexpr std::size_t kDoorSnapshotSize = 12;
 constexpr std::size_t kItemSnapshotSize = 36;
+constexpr std::size_t kTimedEventSnapshotSize = 36;
 constexpr std::size_t kSnapshotProtectedOffset = 20;
 constexpr std::uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
 constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
@@ -162,6 +163,33 @@ void appendVariables(std::vector<std::uint8_t>& bytes, const std::vector<std::in
     }
 }
 
+std::uint8_t expectedTimedEventPayloadCount(std::uint8_t eventType)
+{
+    switch (eventType) {
+    case 0: // Drug.
+        return 6;
+    case 2: // Withdrawal.
+        return 3;
+    case 3: // Script.
+    case 6: // Radiation.
+        return 2;
+    default:
+        return 0;
+    }
+}
+
+void appendTimedEvent(std::vector<std::uint8_t>& bytes, const TimedEventSnapshot& event)
+{
+    appendUint32(bytes, static_cast<std::uint32_t>(event.time));
+    appendUint8(bytes, event.eventType);
+    appendUint8(bytes, event.payloadCount);
+    appendUint16(bytes, 0);
+    appendUint32(bytes, event.ownerId.value);
+    for (std::int32_t value : event.payload) {
+        appendUint32(bytes, static_cast<std::uint32_t>(value));
+    }
+}
+
 std::uint64_t digestBytes(const std::vector<std::uint8_t>& bytes)
 {
     return checksum(bytes.data(), bytes.size());
@@ -199,6 +227,9 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
         || snapshot.mapGlobalVariables.size() > kMaxSnapshotVariables
         || snapshot.mapLocalVariables.size() > kMaxSnapshotVariables) {
         return SnapshotError::TooManyVariables;
+    }
+    if (snapshot.timedEvents.size() > kMaxSnapshotTimedEvents) {
+        return SnapshotError::TooManyTimedEvents;
     }
 
     std::unordered_set<std::uint32_t> entityIds;
@@ -268,6 +299,24 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
         }
     }
 
+    std::int32_t previousEventTime = 0;
+    for (const TimedEventSnapshot& event : snapshot.timedEvents) {
+        if (event.time <= 0
+            || event.time < previousEventTime
+            || event.eventType >= 13
+            || event.payloadCount != expectedTimedEventPayloadCount(event.eventType)
+            || ((event.eventType == 4 || event.eventType == 12) && isValid(event.ownerId))
+            || (event.eventType != 3 && event.eventType != 4 && event.eventType != 12 && !isValid(event.ownerId))) {
+            return SnapshotError::InvalidTimedEventState;
+        }
+        for (std::size_t index = event.payloadCount; index < event.payload.size(); index++) {
+            if (event.payload[index] != 0) {
+                return SnapshotError::InvalidTimedEventState;
+            }
+        }
+        previousEventTime = event.time;
+    }
+
     std::size_t payloadSize = kSnapshotPayloadHeaderSize
         + snapshot.actors.size() * kActorSnapshotSize
         + snapshot.critters.size() * kCritterSnapshotSize
@@ -276,7 +325,8 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
         + (snapshot.gameGlobalVariables.size()
               + snapshot.mapGlobalVariables.size()
               + snapshot.mapLocalVariables.size())
-            * sizeof(std::uint32_t);
+            * sizeof(std::uint32_t)
+        + snapshot.timedEvents.size() * kTimedEventSnapshotSize;
     if (payloadSize > kMaxSnapshotPayloadSize) {
         return SnapshotError::PayloadTooLarge;
     }
@@ -302,7 +352,8 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
         + (canonical.gameGlobalVariables.size()
               + canonical.mapGlobalVariables.size()
               + canonical.mapLocalVariables.size())
-            * sizeof(std::uint32_t));
+            * sizeof(std::uint32_t)
+        + canonical.timedEvents.size() * kTimedEventSnapshotSize);
 
     appendUint8(payload, static_cast<std::uint8_t>(canonical.phase));
     appendUint8(payload, 0);
@@ -316,6 +367,7 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
     appendUint32(payload, static_cast<std::uint32_t>(canonical.gameGlobalVariables.size()));
     appendUint32(payload, static_cast<std::uint32_t>(canonical.mapGlobalVariables.size()));
     appendUint32(payload, static_cast<std::uint32_t>(canonical.mapLocalVariables.size()));
+    appendUint32(payload, static_cast<std::uint32_t>(canonical.timedEvents.size()));
     for (const ActorSnapshot& actor : canonical.actors) {
         appendActor(payload, actor);
     }
@@ -331,6 +383,9 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
     appendVariables(payload, canonical.gameGlobalVariables);
     appendVariables(payload, canonical.mapGlobalVariables);
     appendVariables(payload, canonical.mapLocalVariables);
+    for (const TimedEventSnapshot& event : canonical.timedEvents) {
+        appendTimedEvent(payload, event);
+    }
 
     std::vector<std::uint8_t> protectedBytes;
     protectedBytes.reserve(sizeof(std::uint64_t) + payload.size());
@@ -412,6 +467,7 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
     std::uint32_t gameGlobalCount = readUint32(packet, offset);
     std::uint32_t mapGlobalCount = readUint32(packet, offset);
     std::uint32_t mapLocalCount = readUint32(packet, offset);
+    std::uint32_t timedEventCount = readUint32(packet, offset);
 
     if (actorCount > kMaxSnapshotActors) {
         result.error = SnapshotError::TooManyActors;
@@ -435,6 +491,10 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
         result.error = SnapshotError::TooManyVariables;
         return result;
     }
+    if (timedEventCount > kMaxSnapshotTimedEvents) {
+        result.error = SnapshotError::TooManyTimedEvents;
+        return result;
+    }
 
     std::size_t expectedPayloadSize = kSnapshotPayloadHeaderSize
         + static_cast<std::size_t>(actorCount) * kActorSnapshotSize
@@ -444,7 +504,8 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
         + (static_cast<std::size_t>(gameGlobalCount)
               + static_cast<std::size_t>(mapGlobalCount)
               + static_cast<std::size_t>(mapLocalCount))
-            * sizeof(std::uint32_t);
+            * sizeof(std::uint32_t)
+        + static_cast<std::size_t>(timedEventCount) * kTimedEventSnapshotSize;
     if (payloadSize < expectedPayloadSize) {
         result.error = SnapshotError::TruncatedPayload;
         return result;
@@ -526,6 +587,22 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
     for (std::uint32_t index = 0; index < mapLocalCount; index++) {
         result.snapshot.mapLocalVariables.push_back(static_cast<std::int32_t>(readUint32(packet, offset)));
     }
+    result.snapshot.timedEvents.reserve(timedEventCount);
+    for (std::uint32_t index = 0; index < timedEventCount; index++) {
+        TimedEventSnapshot event;
+        event.time = static_cast<std::int32_t>(readUint32(packet, offset));
+        event.eventType = readUint8(packet, offset);
+        event.payloadCount = readUint8(packet, offset);
+        if (readUint16(packet, offset) != 0) {
+            result.error = SnapshotError::InvalidReservedField;
+            return result;
+        }
+        event.ownerId.value = readUint32(packet, offset);
+        for (std::int32_t& value : event.payload) {
+            value = static_cast<std::int32_t>(readUint32(packet, offset));
+        }
+        result.snapshot.timedEvents.push_back(event);
+    }
 
     result.error = validateSnapshot(result.snapshot);
     if (result.error == SnapshotError::None) {
@@ -592,6 +669,13 @@ SnapshotDigestResult computeSnapshotDigest(const WorldSnapshot& snapshot)
     appendVariables(mapVariableBytes, canonical.mapLocalVariables);
     result.digest.mapVariables = digestBytes(mapVariableBytes);
 
+    std::vector<std::uint8_t> timedEventBytes;
+    appendUint32(timedEventBytes, static_cast<std::uint32_t>(canonical.timedEvents.size()));
+    for (const TimedEventSnapshot& event : canonical.timedEvents) {
+        appendTimedEvent(timedEventBytes, event);
+    }
+    result.digest.timedEvents = digestBytes(timedEventBytes);
+
     std::vector<std::uint8_t> overallBytes;
     appendUint64(overallBytes, result.digest.session);
     appendUint64(overallBytes, result.digest.actors);
@@ -600,6 +684,7 @@ SnapshotDigestResult computeSnapshotDigest(const WorldSnapshot& snapshot)
     appendUint64(overallBytes, result.digest.items);
     appendUint64(overallBytes, result.digest.globals);
     appendUint64(overallBytes, result.digest.mapVariables);
+    appendUint64(overallBytes, result.digest.timedEvents);
     result.digest.overall = digestBytes(overallBytes);
     return result;
 }
@@ -626,6 +711,9 @@ SnapshotSection firstDivergentSection(const SectionedStateDigest& expected, cons
     }
     if (expected.mapVariables != actual.mapVariables) {
         return SnapshotSection::MapVariables;
+    }
+    if (expected.timedEvents != actual.timedEvents) {
+        return SnapshotSection::TimedEvents;
     }
     return SnapshotSection::None;
 }

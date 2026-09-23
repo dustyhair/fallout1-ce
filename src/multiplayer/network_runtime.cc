@@ -28,6 +28,7 @@
 #include "game/object.h"
 #include "game/protinst.h"
 #include "game/proto_types.h"
+#include "game/queue.h"
 #include "game/textobj.h"
 #include "game/tile.h"
 #include "multiplayer/character_build_bridge.h"
@@ -44,6 +45,7 @@
 #include "plib/gnw/input.h"
 #include "plib/gnw/intrface.h"
 #include "plib/gnw/kb.h"
+#include "plib/gnw/memory.h"
 #include "plib/gnw/svga.h"
 #include "plib/gnw/text.h"
 
@@ -70,6 +72,50 @@ EventSequence reconnectLastApplied;
 std::uint64_t nextHostCommandSequence = 1;
 std::chrono::steady_clock::time_point nextAuthoritativeState;
 std::chrono::steady_clock::time_point nextAgentWorldReport;
+
+bool queueEventStatesEqual(const std::vector<QueueEventState>& lhs, const std::vector<QueueEventState>& rhs)
+{
+    if (lhs.size() != rhs.size()) {
+        return false;
+    }
+    for (std::size_t index = 0; index < lhs.size(); index++) {
+        if (lhs[index].time != rhs[index].time
+            || lhs[index].eventType != rhs[index].eventType
+            || lhs[index].owner != rhs[index].owner
+            || lhs[index].payloadCount != rhs[index].payloadCount
+            || lhs[index].payload != rhs[index].payload) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool smokeTestTimedQueueRoundTrip()
+{
+    std::vector<QueueEventState> original;
+    if (!queue_capture_state(original)) {
+        return false;
+    }
+    ScriptEvent* scriptEvent = (ScriptEvent*)mem_malloc(sizeof(*scriptEvent));
+    if (scriptEvent == nullptr) {
+        return false;
+    }
+    scriptEvent->sid = 0x01000042;
+    scriptEvent->fixedParam = -7;
+    if (queue_add(1000000, nullptr, scriptEvent, EVENT_TYPE_SCRIPT) == -1) {
+        mem_free(scriptEvent);
+        return false;
+    }
+
+    std::vector<QueueEventState> expected;
+    std::vector<QueueEventState> actual;
+    bool passed = queue_capture_state(expected)
+        && queue_replace_state(expected)
+        && queue_capture_state(actual)
+        && queueEventStatesEqual(expected, actual);
+    bool restored = queue_replace_state(original);
+    return passed && restored;
+}
 
 struct PendingLocalItemDrop {
     Object* source = nullptr;
@@ -969,6 +1015,10 @@ bool networkRuntimeSmokeTestEnabled()
 bool networkRuntimeRunSmokeTest()
 {
     if (!smokeTestEnabled || launchOptions.mode == NetworkLaunchMode::Disabled) {
+        return false;
+    }
+    if (!smokeTestTimedQueueRoundTrip()) {
+        setStatus("MULTIPLAYER SMOKE TEST FAILED: TIMED QUEUE ROUND TRIP");
         return false;
     }
 

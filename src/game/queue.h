@@ -1,6 +1,10 @@
 #ifndef FALLOUT_GAME_QUEUE_H_
 #define FALLOUT_GAME_QUEUE_H_
 
+#include <array>
+#include <cstddef>
+#include <vector>
+
 #include "game/object_types.h"
 #include "plib/db/db.h"
 
@@ -63,6 +67,16 @@ typedef struct EventTypeDescription {
     QueueEventHandler* field_14;
 } EventTypeDescription;
 
+constexpr std::size_t kQueueEventStatePayloadValues = 6;
+
+struct QueueEventState {
+    int time = 0;
+    int eventType = 0;
+    Object* owner = nullptr;
+    std::size_t payloadCount = 0;
+    std::array<int, kQueueEventStatePayloadValues> payload {};
+};
+
 extern EventTypeDescription q_func[EVENT_TYPE_COUNT];
 
 void queue_init();
@@ -79,6 +93,8 @@ void queue_clear();
 void queue_clear_type(int eventType, QueueEventHandler* fn);
 int queue_next_time();
 void queue_leaving_map();
+bool queue_capture_state(std::vector<QueueEventState>& state);
+bool queue_replace_state(const std::vector<QueueEventState>& state);
 
 } // namespace fallout
 

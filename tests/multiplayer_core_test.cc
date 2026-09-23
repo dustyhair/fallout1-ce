@@ -104,6 +104,17 @@ WorldSnapshot sampleSnapshot()
     snapshot.gameGlobalVariables = { 7, -9 };
     snapshot.mapGlobalVariables = { 11 };
     snapshot.mapLocalVariables = { 100, 101, 102 };
+    TimedEventSnapshot scriptEvent;
+    scriptEvent.time = 302500;
+    scriptEvent.eventType = 3;
+    scriptEvent.payloadCount = 2;
+    scriptEvent.payload[0] = 0x01000042;
+    scriptEvent.payload[1] = -7;
+    TimedEventSnapshot poisonEvent;
+    poisonEvent.time = 302600;
+    poisonEvent.eventType = 5;
+    poisonEvent.ownerId = EntityId { 1 };
+    snapshot.timedEvents = { scriptEvent, poisonEvent };
     return snapshot;
 }
 
@@ -2360,7 +2371,7 @@ void testSnapshotRoundTripAndRecovery()
     WorldSnapshot authoritative = sampleSnapshot();
     std::vector<std::uint8_t> packet;
     expect(encodeSnapshot(authoritative, packet) == SnapshotError::None, "valid snapshot encodes");
-    expect(packet.size() == kSnapshotHeaderSize + 40 + 2 * 32 + 36 + 12 + 2 * 36 + 6 * 4,
+    expect(packet.size() == kSnapshotHeaderSize + 44 + 2 * 32 + 36 + 12 + 2 * 36 + 6 * 4 + 2 * 36,
         "snapshot packet declares a fixed-width payload");
     expect(packet[0] == 'F' && packet[1] == 'C' && packet[2] == 'M' && packet[3] == 'S', "snapshot magic uses network byte order");
 
@@ -2389,6 +2400,13 @@ void testSnapshotRoundTripAndRecovery()
             && decoded.snapshot.mapGlobalVariables == std::vector<std::int32_t>({ 11 })
             && decoded.snapshot.mapLocalVariables == std::vector<std::int32_t>({ 100, 101, 102 }),
         "snapshot keeps game globals and indexed map script variables");
+    expect(decoded.snapshot.timedEvents.size() == 2
+            && decoded.snapshot.timedEvents[0].eventType == 3
+            && decoded.snapshot.timedEvents[0].payload[0] == 0x01000042
+            && decoded.snapshot.timedEvents[0].payload[1] == -7
+            && decoded.snapshot.timedEvents[1].eventType == 5
+            && decoded.snapshot.timedEvents[1].ownerId == EntityId { 1 },
+        "snapshot keeps ordered timed events, owners, and type-specific payloads");
 
     SnapshotDigestResult authoritativeDigest = computeSnapshotDigest(authoritative);
     SnapshotDigestResult decodedDigest = computeSnapshotDigest(decoded.snapshot);
@@ -2439,6 +2457,12 @@ void testSnapshotRoundTripAndRecovery()
     SnapshotDigestResult mapVariableDriftDigest = computeSnapshotDigest(mapVariableDrift);
     expect(firstDivergentSection(authoritativeDigest.digest, mapVariableDriftDigest.digest) == SnapshotSection::MapVariables,
         "map script-variable drift reports the map-variable section");
+
+    WorldSnapshot timedEventDrift = decoded.snapshot;
+    timedEventDrift.timedEvents[0].payload[1]++;
+    SnapshotDigestResult timedEventDriftDigest = computeSnapshotDigest(timedEventDrift);
+    expect(firstDivergentSection(authoritativeDigest.digest, timedEventDriftDigest.digest) == SnapshotSection::TimedEvents,
+        "timed-event drift reports the timed-event section");
 
     SnapshotReplica replica;
     expect(replica.apply(actorDrift) == SnapshotError::None, "replica accepts locally drifted state");
@@ -2521,6 +2545,24 @@ void testSnapshotRoundTripAndRecovery()
     tooManyVariables.mapLocalVariables.assign(kMaxSnapshotVariables + 1, 0);
     expect(validateSnapshot(tooManyVariables) == SnapshotError::TooManyVariables,
         "snapshot bounds each script-visible variable array");
+
+    WorldSnapshot invalidTimedEvent = authoritative;
+    invalidTimedEvent.timedEvents[0].payloadCount = 1;
+    expect(validateSnapshot(invalidTimedEvent) == SnapshotError::InvalidTimedEventState,
+        "snapshot rejects a timed event with the wrong type-specific payload shape");
+    invalidTimedEvent = authoritative;
+    invalidTimedEvent.timedEvents[1].ownerId = {};
+    expect(validateSnapshot(invalidTimedEvent) == SnapshotError::InvalidTimedEventState,
+        "snapshot rejects an owner-dependent timed event without an entity");
+    invalidTimedEvent = authoritative;
+    std::swap(invalidTimedEvent.timedEvents[0].time, invalidTimedEvent.timedEvents[1].time);
+    expect(validateSnapshot(invalidTimedEvent) == SnapshotError::InvalidTimedEventState,
+        "snapshot rejects timed events outside queue order");
+
+    WorldSnapshot tooManyTimedEvents = authoritative;
+    tooManyTimedEvents.timedEvents.assign(kMaxSnapshotTimedEvents + 1, TimedEventSnapshot {});
+    expect(validateSnapshot(tooManyTimedEvents) == SnapshotError::TooManyTimedEvents,
+        "snapshot bounds the timed-event queue");
 }
 
 GameEvent sampleMovementEvent(std::uint64_t sequence)
