@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <deque>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -36,6 +37,12 @@ std::vector<std::pair<EntityId, Object*>> worldDoors;
 std::vector<std::pair<EntityId, Object*>> worldItems;
 std::vector<std::pair<EntityId, Object*>> worldCritters;
 std::unordered_set<EntityId, EntityIdHash> reservedPickupTargets;
+struct PendingPickup {
+    EntityId actorId;
+    CommandSequence commandSequence;
+};
+std::unordered_map<EntityId, PendingPickup, EntityIdHash> pendingPickups;
+std::deque<GameEvent> deferredEvents;
 std::unordered_map<Object*, Object*> activeLootTargets;
 bool inventoryTransferInProgress = false;
 bool itemDropInProgress = false;
@@ -554,6 +561,8 @@ bool registerWorldObjects()
     worldItems.clear();
     worldCritters.clear();
     reservedPickupTargets.clear();
+    pendingPickups.clear();
+    deferredEvents.clear();
     activeLootTargets.clear();
     std::vector<Object*> doors;
     std::vector<Object*> items;
@@ -901,6 +910,49 @@ bool networkWorldApplyPeerPickup(const ItemPickupStartedEvent& pickup)
     // snapshot applies the resulting item ownership after the host completes
     // the action.
     return target->owner == nullptr;
+}
+
+bool networkWorldApplyPeerPickupCompletion(const ItemPickupCompletedEvent& pickup)
+{
+    if (!session.isActive()) {
+        return false;
+    }
+    PlayerCharacterState* player = session.players().findByActor(pickup.actorId);
+    Object* actor = player != nullptr ? session.entities().findObject(player->actorId) : nullptr;
+    Object* target = session.entities().findObject(pickup.targetId);
+    if (player == nullptr
+        || actor == nullptr
+        || target == nullptr
+        || FID_TYPE(target->fid) != OBJ_TYPE_ITEM) {
+        return false;
+    }
+    if (!pickup.succeeded) {
+        return target->owner == nullptr;
+    }
+
+    ItemDescriptor actualDescriptor;
+    if (target->owner == actor) {
+        return item_count(actor, target) == static_cast<int>(pickup.quantity)
+            && describeItem(target, actualDescriptor)
+            && itemDescriptorsEqual(actualDescriptor, pickup.itemDescriptor);
+    }
+    if (target->owner != nullptr
+        || !applyItemDescriptor(target, pickup.itemDescriptor)) {
+        return false;
+    }
+
+    inventoryTransferInProgress = true;
+    int rc = item_add_force(actor, target, 1);
+    if (rc == 0) {
+        rc = obj_disconnect(target, nullptr);
+    }
+    inventoryTransferInProgress = false;
+    if (rc != 0 || !setInventoryQuantity(actor, target, pickup.quantity)) {
+        return false;
+    }
+    inven_refresh_inventory_window();
+    intface_redraw();
+    return true;
 }
 
 bool networkWorldApplyPeerLoot(const LootStartedEvent& loot)
@@ -1295,13 +1347,41 @@ bool networkWorldBeginLocalPickup(Object* target)
 
 void networkWorldFinishPickup(Object* target, bool succeeded)
 {
-    if (!session.isActive() || target == nullptr || succeeded) {
+    if (!session.isActive() || target == nullptr) {
         return;
     }
     std::optional<EntityId> targetId = session.entities().findEntity(target);
-    if (targetId.has_value()) {
-        reservedPickupTargets.erase(*targetId);
+    if (!targetId.has_value()) {
+        return;
     }
+    reservedPickupTargets.erase(*targetId);
+    auto pending = pendingPickups.find(*targetId);
+    if (pending == pendingPickups.end()) {
+        return;
+    }
+
+    ItemPickupCompletedEvent completion;
+    completion.actorId = pending->second.actorId;
+    completion.targetId = *targetId;
+    Object* actor = session.entities().findObject(completion.actorId);
+    int quantity = actor != nullptr ? item_count(actor, target) : 0;
+    completion.succeeded = succeeded
+        && actor != nullptr
+        && target->owner == actor
+        && quantity > 0
+        && describeItem(target, completion.itemDescriptor);
+    if (completion.succeeded) {
+        completion.quantity = static_cast<std::uint32_t>(quantity);
+    } else {
+        completion.itemDescriptor = {};
+    }
+
+    deferredEvents.push_back(GameEvent {
+        {},
+        pending->second.commandSequence,
+        completion,
+    });
+    pendingPickups.erase(pending);
 }
 
 AuthoritativeCommandResult networkWorldProcessCommand(const GameCommand& command)
@@ -1325,9 +1405,25 @@ AuthoritativeCommandResult networkWorldProcessCommand(const GameCommand& command
         if (auto* movement = std::get_if<ActorMovementStartedEvent>(&result.event->payload)) {
             movement->startingTile = startingTile;
             movement->path = std::move(path);
+        } else if (const auto* pickup = std::get_if<ItemPickupStartedEvent>(&result.event->payload);
+            pickup != nullptr && !result.replayed) {
+            pendingPickups[pickup->targetId] = PendingPickup {
+                pickup->actorId,
+                result.event->causedBy,
+            };
         }
     }
     return result;
+}
+
+std::optional<GameEvent> networkWorldTakeDeferredEvent()
+{
+    if (deferredEvents.empty()) {
+        return std::nullopt;
+    }
+    GameEvent event = std::move(deferredEvents.front());
+    deferredEvents.pop_front();
+    return event;
 }
 
 bool networkWorldSynchronizeEnginePhase()
@@ -1602,6 +1698,8 @@ void networkWorldLeave()
     worldItems.clear();
     worldCritters.clear();
     reservedPickupTargets.clear();
+    pendingPickups.clear();
+    deferredEvents.clear();
     activeLootTargets.clear();
     itemDropInProgress = false;
     expectedSplitEntityId = {};

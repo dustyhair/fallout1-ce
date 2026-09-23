@@ -27,6 +27,7 @@ enum class EventType : std::uint8_t {
     InventoryTransferred = 6,
     ItemDropped = 7,
     AttackStarted = 8,
+    ItemPickupCompleted = 9,
 };
 
 constexpr std::size_t kCommandHeaderSize = 28;
@@ -42,6 +43,7 @@ constexpr std::size_t kEventHeaderSize = 20;
 constexpr std::size_t kMovementEventHeaderSize = kEventHeaderSize + 20;
 constexpr std::size_t kTargetEventSize = kEventHeaderSize + 8;
 constexpr std::size_t kDoorStateEventSize = kEventHeaderSize + 16;
+constexpr std::size_t kPickupCompletedEventSize = kEventHeaderSize + 16 + kItemDescriptorSize;
 constexpr std::size_t kFacingEventSize = kEventHeaderSize + 8;
 constexpr std::size_t kInventoryTransferEventSize = kEventHeaderSize + 28 + kItemDescriptorSize;
 constexpr std::size_t kItemDropEventSize = kEventHeaderSize + 32 + kItemDescriptorSize;
@@ -382,6 +384,23 @@ GameplayWireError validateEvent(const GameEvent& event)
             ? GameplayWireError::None
             : GameplayWireError::InvalidAttack;
     }
+    if (const auto* pickup = std::get_if<ItemPickupCompletedEvent>(&event.payload)) {
+        if (!isValid(pickup->actorId)
+            || !isValid(pickup->targetId)
+            || !isValidItemDescriptor(pickup->itemDescriptor)) {
+            return GameplayWireError::InvalidEntityId;
+        }
+        if (pickup->succeeded) {
+            return pickup->quantity != 0
+                    && pickup->quantity <= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())
+                    && hasItemDescriptor(pickup->itemDescriptor)
+                ? GameplayWireError::None
+                : GameplayWireError::InvalidQuantity;
+        }
+        return pickup->quantity == 0 && !hasItemDescriptor(pickup->itemDescriptor)
+            ? GameplayWireError::None
+            : GameplayWireError::InvalidQuantity;
+    }
 
     EntityId actorId;
     EntityId targetId;
@@ -688,6 +707,14 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
         appendEventHeader(event, EventType::ItemPickupStarted, envelope.payload);
         appendUInt32(envelope.payload, pickup->actorId.value);
         appendUInt32(envelope.payload, pickup->targetId.value);
+    } else if (const auto* pickup = std::get_if<ItemPickupCompletedEvent>(&event.payload)) {
+        appendEventHeader(event, EventType::ItemPickupCompleted, envelope.payload);
+        appendUInt32(envelope.payload, pickup->actorId.value);
+        appendUInt32(envelope.payload, pickup->targetId.value);
+        envelope.payload.push_back(pickup->succeeded ? 1 : 0);
+        envelope.payload.insert(envelope.payload.end(), 3, 0);
+        appendUInt32(envelope.payload, pickup->quantity);
+        appendItemDescriptor(envelope.payload, pickup->itemDescriptor);
     } else if (const auto* loot = std::get_if<LootStartedEvent>(&event.payload)) {
         appendEventHeader(event, EventType::LootStarted, envelope.payload);
         appendUInt32(envelope.payload, loot->actorId.value);
@@ -817,6 +844,23 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
         }
         break;
     }
+    case EventType::ItemPickupCompleted:
+        if (envelope.payload.size() != kPickupCompletedEventSize
+            || envelope.payload[28] > 1
+            || envelope.payload[29] != 0
+            || envelope.payload[30] != 0
+            || envelope.payload[31] != 0) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.event.payload = ItemPickupCompletedEvent {
+            EntityId { readUInt32(envelope.payload, 20) },
+            EntityId { readUInt32(envelope.payload, 24) },
+            envelope.payload[28] != 0,
+            readUInt32(envelope.payload, 32),
+            readItemDescriptor(envelope.payload, 36),
+        };
+        break;
     case EventType::InventoryTransferred:
         if (envelope.payload.size() != kInventoryTransferEventSize) {
             result.error = GameplayWireError::InvalidLength;

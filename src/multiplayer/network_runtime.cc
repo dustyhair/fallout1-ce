@@ -785,6 +785,12 @@ void networkRuntimeBackgroundProcess()
             if (!networkWorldSynchronizeEnginePhase()) {
                 debug_printf("Multiplayer session phase could not follow the engine phase.\n");
             }
+            while (std::optional<GameEvent> event = networkWorldTakeDeferredEvent()) {
+                if (!lobby.publishDeferredEvent(std::move(*event))) {
+                    debug_printf("Multiplayer deferred authoritative event could not be published.\n");
+                    break;
+                }
+            }
             if (!pendingRecoveryRequest.has_value()) {
                 pendingRecoveryRequest = lobby.takeRecoveryRequest();
             }
@@ -859,6 +865,8 @@ void networkRuntimeBackgroundProcess()
                 applied = networkWorldApplyPeerDoorUse(*doorUse);
             } else if (const auto* pickup = std::get_if<ItemPickupStartedEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerPickup(*pickup);
+            } else if (const auto* pickup = std::get_if<ItemPickupCompletedEvent>(&event->payload)) {
+                applied = networkWorldApplyPeerPickupCompletion(*pickup);
             } else if (const auto* loot = std::get_if<LootStartedEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerLoot(*loot);
             } else if (const auto* transfer = std::get_if<InventoryTransferredEvent>(&event->payload)) {

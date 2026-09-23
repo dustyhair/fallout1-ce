@@ -85,6 +85,7 @@ public:
         ItemDescriptor itemDescriptor = {});
     bool sendCommandOutcome(AuthoritativeCommandResult outcome);
     bool publishLocalCommandOutcome(AuthoritativeCommandResult outcome);
+    bool publishDeferredEvent(GameEvent event);
     std::optional<GameCommand> takePeerCommand();
     std::optional<CommandResult> takeCommandResult();
     std::optional<GameEvent> takePeerEvent();

@@ -806,6 +806,7 @@ void testGameplayWireFormat()
         GameEvent { EventSequence { 12 }, CommandSequence { 6 }, InventoryTransferredEvent { EntityId { 20 }, EntityId { 42 }, EntityId { 20 }, EntityId { 43 }, 3, 5, EntityId { 44 }, ItemDescriptor { 40, 7, 8, 9 } } },
         GameEvent { EventSequence { 13 }, CommandSequence { 7 }, ItemDroppedEvent { EntityId { 20 }, EntityId { 20 }, EntityId { 43 }, 3, 5, EntityId { 45 }, 12345, 1, ItemDescriptor { 40, 7, 8, 9 } } },
         GameEvent { EventSequence { 14 }, CommandSequence { 8 }, AttackStartedEvent { EntityId { 20 }, EntityId { 42 }, 1, 8 } },
+        GameEvent { EventSequence { 15 }, CommandSequence { 3 }, ItemPickupCompletedEvent { EntityId { 20 }, EntityId { 41 }, true, 1, ItemDescriptor { 40, 7, 8, 9 } } },
     };
     for (std::size_t index = 0; index < events.size(); index++) {
         ProtocolEnvelope envelope = gameplayEnvelope(30 + index);
@@ -845,6 +846,24 @@ void testGameplayWireFormat()
             && !doorEvent->locked
             && doorEvent->frame == 3,
         "door event carries authoritative state instead of a script replay request");
+
+    ProtocolEnvelope pickupCompletedEnvelope = gameplayEnvelope(46);
+    encodeGameEvent(events[8], pickupCompletedEnvelope);
+    GameEventDecodeResult decodedPickupCompleted = decodeGameEvent(pickupCompletedEnvelope);
+    const ItemPickupCompletedEvent* pickupCompleted = decodedPickupCompleted
+        ? std::get_if<ItemPickupCompletedEvent>(&decodedPickupCompleted.event.payload)
+        : nullptr;
+    expect(pickupCompleted != nullptr
+            && pickupCompleted->actorId == EntityId { 20 }
+            && pickupCompleted->targetId == EntityId { 41 }
+            && pickupCompleted->succeeded
+            && pickupCompleted->quantity == 1
+            && pickupCompleted->itemDescriptor.data1 == 9,
+        "pickup completion carries the host-selected inventory result");
+    GameEvent invalidPickupCompletion = events[8];
+    std::get<ItemPickupCompletedEvent>(invalidPickupCompletion.payload).quantity = 0;
+    expect(encodeGameEvent(invalidPickupCompletion, pickupCompletedEnvelope) == GameplayWireError::InvalidQuantity,
+        "a successful pickup completion requires a concrete quantity");
 
     ProtocolEnvelope facingEventEnvelope = gameplayEnvelope(41);
     encodeGameEvent(events[4], facingEventEnvelope);

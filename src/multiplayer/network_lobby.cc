@@ -99,6 +99,7 @@ bool isSupportedLiveEvent(const GameEventPayload& payload)
         || std::holds_alternative<ActorFacingChangedEvent>(payload)
         || std::holds_alternative<DoorUseStartedEvent>(payload)
         || std::holds_alternative<ItemPickupStartedEvent>(payload)
+        || std::holds_alternative<ItemPickupCompletedEvent>(payload)
         || std::holds_alternative<LootStartedEvent>(payload)
         || std::holds_alternative<InventoryTransferredEvent>(payload)
         || std::holds_alternative<ItemDroppedEvent>(payload)
@@ -347,6 +348,17 @@ bool NetworkLobby::publishLocalCommandOutcome(AuthoritativeCommandResult outcome
     }
     outcome.event->sequence.value = _nextEventSequence;
     return sendAuthoritativeEvent(std::move(*outcome.event));
+}
+
+bool NetworkLobby::publishDeferredEvent(GameEvent event)
+{
+    if (_mode != NetworkLaunchMode::Host
+        || (_state != NetworkLobbyState::Ready && _state != NetworkLobbyState::Disconnected)
+        || !_startRequested) {
+        return false;
+    }
+    event.sequence.value = _nextEventSequence;
+    return sendAuthoritativeEvent(std::move(event));
 }
 
 bool NetworkLobby::sendAuthoritativeEvent(GameEvent event)

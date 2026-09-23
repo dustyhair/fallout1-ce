@@ -238,6 +238,14 @@ struct ItemPickupStartedEvent {
     EntityId targetId;
 };
 
+struct ItemPickupCompletedEvent {
+    EntityId actorId;
+    EntityId targetId;
+    bool succeeded = false;
+    std::uint32_t quantity = 0;
+    ItemDescriptor itemDescriptor;
+};
+
 struct LootStartedEvent {
     EntityId actorId;
     EntityId targetId;
@@ -273,7 +281,7 @@ struct AttackStartedEvent {
     std::int32_t hitLocation = 0;
 };
 
-using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, LootStartedEvent, InventoryTransferredEvent, ItemDroppedEvent, AttackStartedEvent>;
+using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, ItemPickupCompletedEvent, LootStartedEvent, InventoryTransferredEvent, ItemDroppedEvent, AttackStartedEvent>;
 
 struct GameEvent {
     EventSequence sequence;
