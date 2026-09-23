@@ -34,6 +34,7 @@ int main(int argc, char** argv)
         && expect(fallout::agentJournalEnabled(), "journal reports that it is enabled");
     fallout::agentJournalWriteText("display", "Vault \"door\"\nopened");
     fallout::agentJournalWriteChat("incoming", 1, "Albert", "Follow me.");
+    fallout::agentJournalWriteAgentCommand(17, "click", "executed", "click injected");
 
     fallout::AgentJournalWorldState state;
     state.map = "VAULT13.MAP";
@@ -66,7 +67,7 @@ int main(int argc, char** argv)
     for (std::string line; std::getline(input, line);) {
         lines.push_back(std::move(line));
     }
-    passed = expect(lines.size() == 7, "journal suppresses duplicate world states") && passed;
+    passed = expect(lines.size() == 8, "journal suppresses duplicate world states") && passed;
     passed = expect(lines.size() > 1
             && lines[1].find("Vault \\\"door\\\"\\nopened") != std::string::npos,
         "journal JSON-escapes display text")
@@ -77,13 +78,19 @@ int main(int argc, char** argv)
         "journal records structured chat direction")
         && passed;
     passed = expect(lines.size() > 3
-            && lines[3].find("\"event\":\"world_state\"") != std::string::npos
-            && lines[3].find("\"tile\":12345") != std::string::npos
-            && lines[3].find("\"visible_critters\":[{\"entity_id\":44") != std::string::npos
-            && lines[3].find("\"disposition\":\"hostile\"") != std::string::npos,
+            && lines[3].find("\"event\":\"agent_command\"") != std::string::npos
+            && lines[3].find("\"command_id\":17") != std::string::npos
+            && lines[3].find("\"status\":\"executed\"") != std::string::npos,
+        "journal records agent command acknowledgements")
+        && passed;
+    passed = expect(lines.size() > 4
+            && lines[4].find("\"event\":\"world_state\"") != std::string::npos
+            && lines[4].find("\"tile\":12345") != std::string::npos
+            && lines[4].find("\"visible_critters\":[{\"entity_id\":44") != std::string::npos
+            && lines[4].find("\"disposition\":\"hostile\"") != std::string::npos,
         "journal records structured actor and enemy state")
         && passed;
-    passed = expect(lines.size() > 6 && lines[6].find("\"event\":\"session_end\"") != std::string::npos,
+    passed = expect(lines.size() > 7 && lines[7].find("\"event\":\"session_end\"") != std::string::npos,
         "journal closes with a session boundary")
         && passed;
     return passed ? 0 : 1;

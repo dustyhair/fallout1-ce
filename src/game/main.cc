@@ -13,6 +13,7 @@
 #include <limits.h>
 #include <stddef.h>
 
+#include "agent_control.h"
 #include "agent_journal.h"
 #include "game/amutex.h"
 #include "game/art.h"
@@ -96,21 +97,32 @@ int gnw_main(int argc, char** argv)
     if (!agentJournalConfigure(argc, argv)) {
         return 1;
     }
+    if (!agentControlConfigure(argc, argv)) {
+        return 1;
+    }
     multiplayer::developerLocalSessionConfigure(argc, argv);
     if (!multiplayer::networkRuntimeConfigure(argc, argv)) {
+        agentControlClose();
         return 1;
     }
 
     if (!autorun_mutex_create()) {
+        agentControlClose();
         return 1;
     }
 
     if (!main_init_system(argc, argv)) {
+        agentControlClose();
+        autorun_mutex_destroy();
         return 1;
     }
 
+    agentControlStart();
+
     if (!multiplayer::networkRuntimeStart()) {
+        agentControlStop();
         main_exit_system();
+        agentControlClose();
         autorun_mutex_destroy();
         return 1;
     }
@@ -118,7 +130,9 @@ int gnw_main(int argc, char** argv)
     if (multiplayer::networkRuntimeSmokeTestEnabled()) {
         bool passed = multiplayer::networkRuntimeRunSmokeTest();
         multiplayer::networkRuntimeStop();
+        agentControlStop();
         main_exit_system();
+        agentControlClose();
         autorun_mutex_destroy();
         return passed ? 0 : 1;
     }
@@ -238,10 +252,12 @@ int gnw_main(int argc, char** argv)
     }
 
     multiplayer::networkRuntimeStop();
+    agentControlStop();
 
     // NOTE: Uninline.
     main_exit_system();
 
+    agentControlClose();
     autorun_mutex_destroy();
 
     return 0;

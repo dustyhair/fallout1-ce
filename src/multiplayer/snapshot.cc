@@ -8,8 +8,9 @@ namespace fallout {
 namespace multiplayer {
 namespace {
 
-constexpr std::size_t kSnapshotPayloadHeaderSize = 20;
-constexpr std::size_t kActorSnapshotSize = 24;
+constexpr std::size_t kSnapshotPayloadHeaderSize = 24;
+constexpr std::size_t kActorSnapshotSize = 32;
+constexpr std::size_t kCritterSnapshotSize = 36;
 constexpr std::size_t kDoorSnapshotSize = 12;
 constexpr std::size_t kItemSnapshotSize = 36;
 constexpr std::size_t kSnapshotProtectedOffset = 20;
@@ -95,6 +96,9 @@ WorldSnapshot canonicalize(const WorldSnapshot& snapshot)
     std::sort(canonical.actors.begin(), canonical.actors.end(), [](const ActorSnapshot& lhs, const ActorSnapshot& rhs) {
         return lhs.entityId.value < rhs.entityId.value;
     });
+    std::sort(canonical.critters.begin(), canonical.critters.end(), [](const CritterSnapshot& lhs, const CritterSnapshot& rhs) {
+        return lhs.entityId.value < rhs.entityId.value;
+    });
     std::sort(canonical.doors.begin(), canonical.doors.end(), [](const DoorSnapshot& lhs, const DoorSnapshot& rhs) {
         return lhs.entityId.value < rhs.entityId.value;
     });
@@ -112,6 +116,8 @@ void appendActor(std::vector<std::uint8_t>& bytes, const ActorSnapshot& actor)
     appendUint32(bytes, static_cast<std::uint32_t>(actor.elevation));
     appendUint32(bytes, static_cast<std::uint32_t>(actor.rotation));
     appendUint32(bytes, static_cast<std::uint32_t>(actor.hitPoints));
+    appendUint32(bytes, static_cast<std::uint32_t>(actor.actionPoints));
+    appendUint32(bytes, static_cast<std::uint32_t>(actor.combatResults));
 }
 
 void appendDoor(std::vector<std::uint8_t>& bytes, const DoorSnapshot& door)
@@ -121,6 +127,19 @@ void appendDoor(std::vector<std::uint8_t>& bytes, const DoorSnapshot& door)
     appendUint8(bytes, door.locked ? 1 : 0);
     appendUint16(bytes, 0);
     appendUint32(bytes, static_cast<std::uint32_t>(door.frame));
+}
+
+void appendCritter(std::vector<std::uint8_t>& bytes, const CritterSnapshot& critter)
+{
+    appendUint32(bytes, critter.entityId.value);
+    appendUint32(bytes, static_cast<std::uint32_t>(critter.pid));
+    appendUint32(bytes, static_cast<std::uint32_t>(critter.tile));
+    appendUint32(bytes, static_cast<std::uint32_t>(critter.elevation));
+    appendUint32(bytes, static_cast<std::uint32_t>(critter.rotation));
+    appendUint32(bytes, static_cast<std::uint32_t>(critter.hitPoints));
+    appendUint32(bytes, static_cast<std::uint32_t>(critter.actionPoints));
+    appendUint32(bytes, static_cast<std::uint32_t>(critter.combatResults));
+    appendUint32(bytes, static_cast<std::uint32_t>(critter.team));
 }
 
 void appendItem(std::vector<std::uint8_t>& bytes, const ItemSnapshot& item)
@@ -157,6 +176,9 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
     if (snapshot.actors.size() > kMaxSnapshotActors) {
         return SnapshotError::TooManyActors;
     }
+    if (snapshot.critters.size() > kMaxSnapshotCritters) {
+        return SnapshotError::TooManyCritters;
+    }
     if (snapshot.doors.size() > kMaxSnapshotDoors) {
         return SnapshotError::TooManyDoors;
     }
@@ -179,8 +201,24 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
         if (actor.tile < 0
             || actor.elevation < 0 || actor.elevation > 2
             || actor.rotation < 0 || actor.rotation > 5
-            || actor.hitPoints < 0) {
+            || actor.hitPoints < 0
+            || actor.actionPoints < 0) {
             return SnapshotError::InvalidActorState;
+        }
+    }
+
+    for (const CritterSnapshot& critter : snapshot.critters) {
+        if (!isValid(critter.entityId)
+            || !entityIds.insert(critter.entityId.value).second) {
+            return !isValid(critter.entityId) ? SnapshotError::InvalidEntityId : SnapshotError::DuplicateEntityId;
+        }
+        if (critter.pid < 0
+            || critter.tile < 0
+            || critter.elevation < 0 || critter.elevation > 2
+            || critter.rotation < 0 || critter.rotation > 5
+            || critter.hitPoints < 0
+            || critter.actionPoints < 0) {
+            return SnapshotError::InvalidCritterState;
         }
     }
 
@@ -217,6 +255,7 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
 
     std::size_t payloadSize = kSnapshotPayloadHeaderSize
         + snapshot.actors.size() * kActorSnapshotSize
+        + snapshot.critters.size() * kCritterSnapshotSize
         + snapshot.doors.size() * kDoorSnapshotSize
         + snapshot.items.size() * kItemSnapshotSize;
     if (payloadSize > kMaxSnapshotPayloadSize) {
@@ -238,6 +277,7 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
     std::vector<std::uint8_t> payload;
     payload.reserve(kSnapshotPayloadHeaderSize
         + canonical.actors.size() * kActorSnapshotSize
+        + canonical.critters.size() * kCritterSnapshotSize
         + canonical.doors.size() * kDoorSnapshotSize
         + canonical.items.size() * kItemSnapshotSize);
 
@@ -246,10 +286,14 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
     appendUint16(payload, 0);
     appendUint32(payload, canonical.phaseRevision);
     appendUint32(payload, static_cast<std::uint32_t>(canonical.actors.size()));
+    appendUint32(payload, static_cast<std::uint32_t>(canonical.critters.size()));
     appendUint32(payload, static_cast<std::uint32_t>(canonical.doors.size()));
     appendUint32(payload, static_cast<std::uint32_t>(canonical.items.size()));
     for (const ActorSnapshot& actor : canonical.actors) {
         appendActor(payload, actor);
+    }
+    for (const CritterSnapshot& critter : canonical.critters) {
+        appendCritter(payload, critter);
     }
     for (const DoorSnapshot& door : canonical.doors) {
         appendDoor(payload, door);
@@ -331,11 +375,16 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
     }
     result.snapshot.phaseRevision = readUint32(packet, offset);
     std::uint32_t actorCount = readUint32(packet, offset);
+    std::uint32_t critterCount = readUint32(packet, offset);
     std::uint32_t doorCount = readUint32(packet, offset);
     std::uint32_t itemCount = readUint32(packet, offset);
 
     if (actorCount > kMaxSnapshotActors) {
         result.error = SnapshotError::TooManyActors;
+        return result;
+    }
+    if (critterCount > kMaxSnapshotCritters) {
+        result.error = SnapshotError::TooManyCritters;
         return result;
     }
     if (doorCount > kMaxSnapshotDoors) {
@@ -349,6 +398,7 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
 
     std::size_t expectedPayloadSize = kSnapshotPayloadHeaderSize
         + static_cast<std::size_t>(actorCount) * kActorSnapshotSize
+        + static_cast<std::size_t>(critterCount) * kCritterSnapshotSize
         + static_cast<std::size_t>(doorCount) * kDoorSnapshotSize
         + static_cast<std::size_t>(itemCount) * kItemSnapshotSize;
     if (payloadSize < expectedPayloadSize) {
@@ -369,7 +419,24 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
         actor.elevation = static_cast<std::int32_t>(readUint32(packet, offset));
         actor.rotation = static_cast<std::int32_t>(readUint32(packet, offset));
         actor.hitPoints = static_cast<std::int32_t>(readUint32(packet, offset));
+        actor.actionPoints = static_cast<std::int32_t>(readUint32(packet, offset));
+        actor.combatResults = static_cast<std::int32_t>(readUint32(packet, offset));
         result.snapshot.actors.push_back(actor);
+    }
+
+    result.snapshot.critters.reserve(critterCount);
+    for (std::uint32_t index = 0; index < critterCount; index++) {
+        CritterSnapshot critter;
+        critter.entityId.value = readUint32(packet, offset);
+        critter.pid = static_cast<std::int32_t>(readUint32(packet, offset));
+        critter.tile = static_cast<std::int32_t>(readUint32(packet, offset));
+        critter.elevation = static_cast<std::int32_t>(readUint32(packet, offset));
+        critter.rotation = static_cast<std::int32_t>(readUint32(packet, offset));
+        critter.hitPoints = static_cast<std::int32_t>(readUint32(packet, offset));
+        critter.actionPoints = static_cast<std::int32_t>(readUint32(packet, offset));
+        critter.combatResults = static_cast<std::int32_t>(readUint32(packet, offset));
+        critter.team = static_cast<std::int32_t>(readUint32(packet, offset));
+        result.snapshot.critters.push_back(critter);
     }
 
     result.snapshot.doors.reserve(doorCount);
@@ -434,6 +501,13 @@ SnapshotDigestResult computeSnapshotDigest(const WorldSnapshot& snapshot)
     }
     result.digest.actors = digestBytes(actorBytes);
 
+    std::vector<std::uint8_t> critterBytes;
+    appendUint32(critterBytes, static_cast<std::uint32_t>(canonical.critters.size()));
+    for (const CritterSnapshot& critter : canonical.critters) {
+        appendCritter(critterBytes, critter);
+    }
+    result.digest.critters = digestBytes(critterBytes);
+
     std::vector<std::uint8_t> doorBytes;
     appendUint32(doorBytes, static_cast<std::uint32_t>(canonical.doors.size()));
     for (const DoorSnapshot& door : canonical.doors) {
@@ -451,6 +525,7 @@ SnapshotDigestResult computeSnapshotDigest(const WorldSnapshot& snapshot)
     std::vector<std::uint8_t> overallBytes;
     appendUint64(overallBytes, result.digest.session);
     appendUint64(overallBytes, result.digest.actors);
+    appendUint64(overallBytes, result.digest.critters);
     appendUint64(overallBytes, result.digest.doors);
     appendUint64(overallBytes, result.digest.items);
     result.digest.overall = digestBytes(overallBytes);
@@ -464,6 +539,9 @@ SnapshotSection firstDivergentSection(const SectionedStateDigest& expected, cons
     }
     if (expected.actors != actual.actors) {
         return SnapshotSection::Actors;
+    }
+    if (expected.critters != actual.critters) {
+        return SnapshotSection::Critters;
     }
     if (expected.doors != actual.doors) {
         return SnapshotSection::Doors;

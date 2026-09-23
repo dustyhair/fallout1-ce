@@ -40,6 +40,7 @@ bool networkRuntimeSubmitLocalMove(int destinationTile, int elevation, bool runn
 bool networkRuntimeHandleLocalDoorUse(Object* target);
 bool networkRuntimeHandleLocalPickup(Object* target);
 bool networkRuntimeHandleLocalLoot(Object* target);
+bool networkRuntimeHandleLocalAttack(Object* target, int hitMode, int hitLocation);
 bool networkRuntimeHandleLocalLootTargetChange(Object* target);
 bool networkRuntimeHandleLocalInventoryTransfer(Object* source,
     Object* destination,

@@ -123,6 +123,10 @@ static bool bk_disabled;
 // actor animations when their window is on an inactive workspace.
 static bool background_processing_when_inactive;
 
+// Optional input injected after the platform mouse state has been sampled and
+// before Fallout evaluates buttons and keys.
+static InputProcess* input_process;
+
 // 0x671F08
 static unsigned int bk_process_time;
 
@@ -159,6 +163,7 @@ int GNW_input_init(int use_msec_timer)
     pause_win_func = default_pause_window;
     screendump_func = default_screendump;
     bk_list = NULL;
+    input_process = NULL;
     screendump_key = KEY_ALT_C;
 
     set_idle_func(idleImpl);
@@ -223,6 +228,10 @@ void process_bk()
 
     if (vcr_update() != 3) {
         mouse_info();
+    }
+
+    if (input_process != NULL) {
+        input_process();
     }
 
     v1 = win_check_all_buttons();
@@ -1232,6 +1241,11 @@ void GNW95_lost_focus()
 void set_background_processing_when_inactive(bool enabled)
 {
     background_processing_when_inactive = enabled;
+}
+
+void set_input_process(InputProcess* process)
+{
+    input_process = process;
 }
 
 static void idleImpl()

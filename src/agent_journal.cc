@@ -230,6 +230,19 @@ void agentJournalWriteDialogueOption(int index, const char* text)
             + ",\"text\":" + jsonString(text));
 }
 
+void agentJournalWriteAgentCommand(std::uint64_t commandId,
+    const char* command,
+    const char* status,
+    const char* message)
+{
+    std::lock_guard<std::mutex> lock(journalMutex);
+    writeRecordLocked("agent_command",
+        ",\"command_id\":" + std::to_string(commandId)
+            + ",\"command\":" + jsonString(command)
+            + ",\"status\":" + jsonString(status)
+            + ",\"message\":" + jsonString(message));
+}
+
 void agentJournalWriteWorldState(const AgentJournalWorldState& state)
 {
     std::ostringstream fields;

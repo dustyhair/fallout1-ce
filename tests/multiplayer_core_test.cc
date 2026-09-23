@@ -86,6 +86,9 @@ WorldSnapshot sampleSnapshot()
         ActorSnapshot { EntityId { 2 }, kGuestPlayerId, 20102, 0, 3, 28 },
         ActorSnapshot { EntityId { 1 }, kHostPlayerId, 20100, 0, 1, 34 },
     };
+    snapshot.critters = {
+        CritterSnapshot { EntityId { 12 }, 0x01000023, 20106, 0, 4, 6, 7, 0, 1 },
+    };
     snapshot.doors = {
         DoorSnapshot { EntityId { 9 }, true, false, 5 },
     };
@@ -636,6 +639,7 @@ void testGameplayWireFormat()
         GameCommand { CommandSequence { 5 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, FaceCommand { 4 } },
         GameCommand { CommandSequence { 6 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, InventoryTransferCommand { EntityId { 42 }, EntityId { 20 }, EntityId { 43 }, 3, 5, ItemDescriptor { 40, 7, 8, 9 } } },
         GameCommand { CommandSequence { 7 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, ItemDropCommand { EntityId { 20 }, EntityId { 43 }, 3, 5, ItemDescriptor { 40, 7, 8, 9 } } },
+        GameCommand { CommandSequence { 8 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, AttackCommand { EntityId { 42 }, 1, 8 } },
     };
 
     for (std::size_t index = 0; index < commands.size(); index++) {
@@ -748,6 +752,22 @@ void testGameplayWireFormat()
     expect(encodeGameCommand(invalidDrop, dropEnvelope) == GameplayWireError::InvalidQuantity,
         "item drop rejects an empty source stack");
 
+    ProtocolEnvelope attackEnvelope = gameplayEnvelope(28);
+    encodeGameCommand(commands[7], attackEnvelope);
+    GameCommandDecodeResult decodedAttack = decodeGameCommand(attackEnvelope);
+    const AttackCommand* attack = decodedAttack
+        ? std::get_if<AttackCommand>(&decodedAttack.command.payload)
+        : nullptr;
+    expect(attack != nullptr
+            && attack->targetId == EntityId { 42 }
+            && attack->hitMode == 1
+            && attack->hitLocation == 8,
+        "attack command round trips its shared target and combat mode");
+    GameCommand invalidAttack = commands[7];
+    std::get<AttackCommand>(invalidAttack.payload).hitLocation = 9;
+    expect(encodeGameCommand(invalidAttack, attackEnvelope) == GameplayWireError::InvalidAttack,
+        "attack command rejects an invalid hit location");
+
     CommandResult accepted;
     accepted.commandSequence.value = 1;
     accepted.status = CommandStatus::Accepted;
@@ -785,6 +805,7 @@ void testGameplayWireFormat()
         GameEvent { EventSequence { 11 }, CommandSequence { 5 }, ActorFacingChangedEvent { EntityId { 20 }, 4 } },
         GameEvent { EventSequence { 12 }, CommandSequence { 6 }, InventoryTransferredEvent { EntityId { 20 }, EntityId { 42 }, EntityId { 20 }, EntityId { 43 }, 3, 5, EntityId { 44 }, ItemDescriptor { 40, 7, 8, 9 } } },
         GameEvent { EventSequence { 13 }, CommandSequence { 7 }, ItemDroppedEvent { EntityId { 20 }, EntityId { 20 }, EntityId { 43 }, 3, 5, EntityId { 45 }, 12345, 1, ItemDescriptor { 40, 7, 8, 9 } } },
+        GameEvent { EventSequence { 14 }, CommandSequence { 8 }, AttackStartedEvent { EntityId { 20 }, EntityId { 42 }, 1, 8 } },
     };
     for (std::size_t index = 0; index < events.size(); index++) {
         ProtocolEnvelope envelope = gameplayEnvelope(30 + index);
@@ -865,6 +886,19 @@ void testGameplayWireFormat()
     fullDropPayload.remainderItemId = {};
     expect(encodeGameEvent(fullDropEvent, dropEventEnvelope) == GameplayWireError::None,
         "whole-stack item drop does not invent a remainder identity");
+
+    ProtocolEnvelope attackEventEnvelope = gameplayEnvelope(44);
+    encodeGameEvent(events[7], attackEventEnvelope);
+    GameEventDecodeResult decodedAttackEvent = decodeGameEvent(attackEventEnvelope);
+    const AttackStartedEvent* attackEvent = decodedAttackEvent
+        ? std::get_if<AttackStartedEvent>(&decodedAttackEvent.event.payload)
+        : nullptr;
+    expect(attackEvent != nullptr
+            && attackEvent->actorId == EntityId { 20 }
+            && attackEvent->targetId == EntityId { 42 }
+            && attackEvent->hitMode == 1
+            && attackEvent->hitLocation == 8,
+        "attack event round trips authoritative actor and target IDs");
 
     ProtocolEnvelope missingSession = gameplayEnvelope(42);
     missingSession.sessionId = {};
@@ -1560,6 +1594,19 @@ void testNetworkCharacterLobby()
     expect(resumedFacing.has_value() && guest.confirmPeerEventApplied(resumedFacing->sequence)
             && guest.lastAppliedEvent() == EventSequence { 10 },
         "guest confirms the replayed event as its new reconnect boundary");
+    WorldSnapshot authoritativeState = sampleSnapshot();
+    authoritativeState.doors.clear();
+    authoritativeState.items.clear();
+    expect(host.sendAuthoritativeState(authoritativeState),
+        "host sends a non-journaled authoritative actor and NPC correction");
+    guest.poll();
+    std::optional<WorldSnapshot> receivedState = guest.takeAuthoritativeState();
+    expect(receivedState.has_value()
+            && receivedState->actors.size() == 2
+            && receivedState->critters.size() == 1
+            && receivedState->critters[0].entityId == EntityId { 12 }
+            && receivedState->critters[0].hitPoints == 6,
+        "guest receives authoritative NPC combat state independently of replay events");
     expect(host.takeTransport() != nullptr && guest.takeTransport() != nullptr,
         "ready lobbies hand the connection to the game session");
 
@@ -1763,6 +1810,16 @@ public:
         return nextStatus;
     }
 
+    CommandExecutionStatus attack(Object* actor, Object* target, const AttackCommand& command) override
+    {
+        attackCalls++;
+        lastActor = actor;
+        lastTarget = target;
+        lastAttack = command;
+        recordContext();
+        return nextStatus;
+    }
+
     InventoryTransferExecution transferInventory(Object* actor,
         Object* source,
         Object* destination,
@@ -1820,6 +1877,7 @@ public:
     int doorCalls = 0;
     int pickupCalls = 0;
     int lootCalls = 0;
+    int attackCalls = 0;
     int transferCalls = 0;
     int dropCalls = 0;
     Object* lastActor = nullptr;
@@ -1832,6 +1890,7 @@ public:
     PlayerId lastActingPlayerId;
     MoveCommand lastMove;
     FaceCommand lastFace;
+    AttackCommand lastAttack;
     std::unordered_set<Object*> reservedPickupTargets;
 };
 
@@ -2033,6 +2092,26 @@ void testAuthoritativeCommandProcessing()
             && dropEvent->elevation == 1,
         "host execution emits authoritative identity and placement for a dropped stack item");
 
+    GameCommand attack;
+    attack.sequence.value = 8;
+    attack.playerId = kGuestPlayerId;
+    attack.actorId = session.playerActorId(kGuestPlayerId);
+    attack.expectedPhase = SessionPhase::Exploration;
+    attack.expectedPhaseRevision = session.phaseRevision();
+    attack.payload = AttackCommand { registeredLootableCritter.entityId, 1, 8 };
+    AuthoritativeCommandResult attacked = processor.process(attack, session, executor);
+    const AttackStartedEvent* attackEvent = attacked.event.has_value()
+        ? std::get_if<AttackStartedEvent>(&attacked.event->payload)
+        : nullptr;
+    expect(attacked.result.status == CommandStatus::Accepted
+            && executor.attackCalls == 1
+            && executor.lastActor == asGameObject(guestActor)
+            && executor.lastTarget == asGameObject(lootableCritter)
+            && executor.lastAttack.hitMode == 1
+            && attackEvent != nullptr
+            && attackEvent->targetId == registeredLootableCritter.entityId,
+        "host resolves and executes a guest attack against the shared NPC identity");
+
     executor.nextStatus = CommandExecutionStatus::InvalidAction;
     move.sequence.value = 3;
     AuthoritativeCommandResult invalid = processor.process(move, session, executor);
@@ -2090,7 +2169,7 @@ void testSnapshotRoundTripAndRecovery()
     WorldSnapshot authoritative = sampleSnapshot();
     std::vector<std::uint8_t> packet;
     expect(encodeSnapshot(authoritative, packet) == SnapshotError::None, "valid snapshot encodes");
-    expect(packet.size() == kSnapshotHeaderSize + 20 + 2 * 24 + 12 + 2 * 36, "snapshot packet declares a fixed-width payload");
+    expect(packet.size() == kSnapshotHeaderSize + 24 + 2 * 32 + 36 + 12 + 2 * 36, "snapshot packet declares a fixed-width payload");
     expect(packet[0] == 'F' && packet[1] == 'C' && packet[2] == 'M' && packet[3] == 'S', "snapshot magic uses network byte order");
 
     SnapshotDecodeResult decoded = decodeSnapshot(packet);
@@ -2099,6 +2178,11 @@ void testSnapshotRoundTripAndRecovery()
     expect(decoded.snapshot.phase == SessionPhase::Exploration && decoded.snapshot.phaseRevision == 7, "snapshot keeps session phase state");
     expect(decoded.snapshot.actors.size() == 2 && decoded.snapshot.actors[0].entityId == EntityId { 1 }, "decoded actors use canonical entity order");
     expect(decoded.snapshot.actors[1].tile == 20102 && decoded.snapshot.actors[1].hitPoints == 28, "snapshot keeps guest actor state");
+    expect(decoded.snapshot.critters.size() == 1
+            && decoded.snapshot.critters[0].entityId == EntityId { 12 }
+            && decoded.snapshot.critters[0].hitPoints == 6
+            && decoded.snapshot.critters[0].actionPoints == 7,
+        "snapshot keeps authoritative NPC combat state");
     expect(decoded.snapshot.doors.size() == 1 && decoded.snapshot.doors[0].open, "snapshot keeps door state");
     expect(decoded.snapshot.items.size() == 2
             && decoded.snapshot.items[0].holderId == EntityId { 1 }
@@ -2121,6 +2205,12 @@ void testSnapshotRoundTripAndRecovery()
     actorDrift.actors[1].tile++;
     SnapshotDigestResult actorDriftDigest = computeSnapshotDigest(actorDrift);
     expect(firstDivergentSection(authoritativeDigest.digest, actorDriftDigest.digest) == SnapshotSection::Actors, "position drift reports the actor section");
+
+    WorldSnapshot critterDrift = decoded.snapshot;
+    critterDrift.critters[0].hitPoints--;
+    SnapshotDigestResult critterDriftDigest = computeSnapshotDigest(critterDrift);
+    expect(firstDivergentSection(authoritativeDigest.digest, critterDriftDigest.digest) == SnapshotSection::Critters,
+        "NPC combat drift reports the critter section");
 
     WorldSnapshot doorDrift = decoded.snapshot;
     doorDrift.doors[0].open = false;

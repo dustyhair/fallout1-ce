@@ -11,6 +11,7 @@ namespace fallout {
 typedef void(IdleFunc)();
 typedef void(FocusFunc)(int);
 typedef void(BackgroundProcess)();
+typedef void(InputProcess)();
 typedef int(PauseWinFunc)();
 typedef int(ScreenDumpFunc)(int width, int height, unsigned char* buffer, unsigned char* palette);
 
@@ -50,6 +51,7 @@ void GNW95_process_message();
 void GNW95_clear_time_stamps();
 void GNW95_lost_focus();
 void set_background_processing_when_inactive(bool enabled);
+void set_input_process(InputProcess* process);
 
 void beginTextInput();
 void endTextInput();

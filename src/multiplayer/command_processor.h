@@ -41,6 +41,10 @@ public:
     virtual CommandExecutionStatus useDoor(Object* actor, Object* target) = 0;
     virtual CommandExecutionStatus pickup(Object* actor, Object* target) = 0;
     virtual CommandExecutionStatus loot(Object* actor, Object* target) = 0;
+    virtual CommandExecutionStatus attack(Object*, Object*, const AttackCommand&)
+    {
+        return CommandExecutionStatus::InvalidAction;
+    }
     virtual InventoryTransferExecution transferInventory(Object* actor,
         Object* source,
         Object* destination,

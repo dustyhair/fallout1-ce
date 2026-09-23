@@ -65,6 +65,7 @@ public:
     bool sendLocalDoorUse(EntityId targetId, std::uint32_t phaseRevision = 1);
     bool sendLocalPickup(EntityId targetId, std::uint32_t phaseRevision = 1);
     bool sendLocalLoot(EntityId targetId, std::uint32_t phaseRevision = 1);
+    bool sendLocalAttack(EntityId targetId, std::int32_t hitMode, std::int32_t hitLocation, std::uint32_t phaseRevision = 1);
     bool sendLocalInventoryTransfer(EntityId sourceId,
         EntityId destinationId,
         EntityId itemId,
@@ -94,6 +95,8 @@ public:
     std::optional<EventSequence> takeRecoveryRequest();
     bool sendRecovery(EventSequence lastApplied, const WorldSnapshot& snapshot);
     std::optional<WorldSnapshot> takePeerSnapshot();
+    bool sendAuthoritativeState(const WorldSnapshot& snapshot);
+    std::optional<WorldSnapshot> takeAuthoritativeState();
     EventSequence latestAuthoritativeEvent() const;
     bool recoveryInProgress() const;
     void abortRecovery();
@@ -156,6 +159,7 @@ private:
     std::deque<GameEvent> _peerEvents;
     std::deque<LobbyChatMessage> _chatMessages;
     std::deque<WorldSnapshot> _peerSnapshots;
+    std::deque<WorldSnapshot> _authoritativeStates;
     bool _recovering = false;
     EventJournal _eventJournal;
     std::unique_ptr<Transport> _transport;

@@ -23,6 +23,7 @@
 #include "multiplayer/local_player_context.h"
 #include "multiplayer/local_session.h"
 #include "multiplayer/presentation_bridge.h"
+#include "plib/gnw/debug.h"
 
 namespace fallout {
 namespace multiplayer {
@@ -33,6 +34,7 @@ Object* peerActor = nullptr;
 CommandProcessor commandProcessor;
 std::vector<std::pair<EntityId, Object*>> worldDoors;
 std::vector<std::pair<EntityId, Object*>> worldItems;
+std::vector<std::pair<EntityId, Object*>> worldCritters;
 std::unordered_set<EntityId, EntityIdHash> reservedPickupTargets;
 std::unordered_map<Object*, Object*> activeLootTargets;
 bool inventoryTransferInProgress = false;
@@ -40,6 +42,83 @@ bool itemDropInProgress = false;
 NetworkLaunchMode worldMode = NetworkLaunchMode::Disabled;
 EntityId expectedSplitEntityId;
 EntityId lastSplitEntityId;
+
+bool validateActorAndCritterState(const WorldSnapshot& snapshot)
+{
+    if (snapshot.actors.size() != 2) {
+        return false;
+    }
+    for (const ActorSnapshot& actorState : snapshot.actors) {
+        Object* actor = session.entities().findObject(actorState.entityId);
+        std::optional<PlayerId> owner = session.entities().ownerOf(actorState.entityId);
+        if (actor == nullptr || !owner.has_value() || *owner != actorState.ownerId) {
+            return false;
+        }
+    }
+    for (const CritterSnapshot& critterState : snapshot.critters) {
+        Object* critter = session.entities().findObject(critterState.entityId);
+        if (critter == nullptr
+            || critter->pid != critterState.pid
+            || FID_TYPE(critter->fid) != OBJ_TYPE_CRITTER) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool applyActorAndCritterState(const WorldSnapshot& snapshot)
+{
+    for (const ActorSnapshot& actorState : snapshot.actors) {
+        Object* actor = session.entities().findObject(actorState.entityId);
+        Rect dirtyRect {};
+        bool dirty = false;
+        if (actor->tile != actorState.tile || actor->elevation != actorState.elevation) {
+            register_clear(actor);
+            if (obj_move_to_tile(actor, actorState.tile, actorState.elevation, &dirtyRect) == -1) {
+                return false;
+            }
+            dirty = true;
+        }
+        if (actor->rotation != actorState.rotation) {
+            if (obj_set_rotation(actor, actorState.rotation, &dirtyRect) == -1) {
+                return false;
+            }
+            dirty = true;
+        }
+        critter_adjust_hits(actor, actorState.hitPoints - critter_get_hits(actor));
+        actor->data.critter.combat.ap = actorState.actionPoints;
+        actor->data.critter.combat.results = actorState.combatResults;
+        if (dirty) {
+            tile_refresh_rect(&dirtyRect, actorState.elevation);
+        }
+    }
+    for (const CritterSnapshot& critterState : snapshot.critters) {
+        Object* critter = session.entities().findObject(critterState.entityId);
+        Rect dirtyRect {};
+        bool dirty = false;
+        if (critter->tile != critterState.tile || critter->elevation != critterState.elevation) {
+            register_clear(critter);
+            if (obj_move_to_tile(critter, critterState.tile, critterState.elevation, &dirtyRect) == -1) {
+                return false;
+            }
+            dirty = true;
+        }
+        if (critter->rotation != critterState.rotation) {
+            if (obj_set_rotation(critter, critterState.rotation, &dirtyRect) == -1) {
+                return false;
+            }
+            dirty = true;
+        }
+        critter_adjust_hits(critter, critterState.hitPoints - critter_get_hits(critter));
+        critter->data.critter.combat.ap = critterState.actionPoints;
+        critter->data.critter.combat.results = critterState.combatResults;
+        critter->data.critter.combat.team = critterState.team;
+        if (dirty) {
+            tile_refresh_rect(&dirtyRect, critterState.elevation);
+        }
+    }
+    return true;
+}
 
 bool describeItem(const Object* item, ItemDescriptor& descriptor)
 {
@@ -320,6 +399,22 @@ public:
         return CommandExecutionStatus::Applied;
     }
 
+    CommandExecutionStatus attack(Object* actor, Object* target, const AttackCommand& command) override
+    {
+        if (actor == nullptr
+            || target == nullptr
+            || actor == target
+            || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER
+            || actor->elevation != target->elevation
+            || command.hitMode < 0 || command.hitMode >= HIT_MODE_COUNT
+            || command.hitLocation < 0 || command.hitLocation >= HIT_LOCATION_COUNT
+            || combat_check_bad_shot(actor, target, command.hitMode, command.hitLocation != HIT_LOCATION_UNCALLED) != COMBAT_BAD_SHOT_OK
+            || combat_attack(actor, target, command.hitMode, command.hitLocation) == -1) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        return CommandExecutionStatus::Applied;
+    }
+
     InventoryTransferExecution transferInventory(Object* actor,
         Object* source,
         Object* destination,
@@ -458,6 +553,7 @@ bool registerWorldObjects()
 {
     worldDoors.clear();
     worldItems.clear();
+    worldCritters.clear();
     reservedPickupTargets.clear();
     activeLootTargets.clear();
     std::vector<Object*> doors;
@@ -483,7 +579,10 @@ bool registerWorldObjects()
     };
     std::sort(doors.begin(), doors.end(), stableObjectOrder);
     std::sort(items.begin(), items.end(), stableObjectOrder);
-    std::sort(critters.begin(), critters.end(), stableObjectOrder);
+    std::sort(critters.begin(), critters.end(), [](const Object* lhs, const Object* rhs) {
+        return std::tie(lhs->id, lhs->pid, lhs->elevation)
+            < std::tie(rhs->id, rhs->pid, rhs->elevation);
+    });
 
     auto registerInventory = [&](auto&& self, Object* owner) -> bool {
         std::vector<Object*> inventoryItems;
@@ -524,10 +623,11 @@ bool registerWorldObjects()
         }
     }
     for (Object* critter : critters) {
-        if (!session.registerWorldObject(critter)
-            || !registerInventory(registerInventory, critter)) {
+        EntityRegistrationResult registration = session.registerWorldObject(critter);
+        if (!registration || !registerInventory(registerInventory, critter)) {
             return false;
         }
+        worldCritters.emplace_back(registration.entityId, critter);
     }
     return true;
 }
@@ -816,6 +916,27 @@ bool networkWorldApplyPeerLoot(const LootStartedEvent& loot)
     }
     ScopedActingPlayerContext actingPlayer(*player, actor);
     return action_loot_container(actor, target) != -1;
+}
+
+bool networkWorldApplyPeerAttack(const AttackStartedEvent& attack)
+{
+    if (!session.isActive()) {
+        return false;
+    }
+    PlayerCharacterState* player = session.players().findByActor(attack.actorId);
+    Object* actor = player != nullptr ? session.entities().findObject(player->actorId) : nullptr;
+    Object* target = session.entities().findObject(attack.targetId);
+    if (player == nullptr
+        || actor == nullptr
+        || target == nullptr
+        || actor == target
+        || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER
+        || attack.hitMode < 0 || attack.hitMode >= HIT_MODE_COUNT
+        || attack.hitLocation < 0 || attack.hitLocation >= HIT_LOCATION_COUNT) {
+        return false;
+    }
+    ScopedActingPlayerContext actingPlayer(*player, actor);
+    return combat_attack(actor, target, attack.hitMode, attack.hitLocation) != -1;
 }
 
 bool networkWorldBeginLocalLoot(Object* target)
@@ -1229,7 +1350,28 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
             actor->tile,
             actor->elevation,
             actor->rotation,
-            critter_get_hits(actor),
+            std::max(critter_get_hits(actor), 0),
+            std::max(actor->data.critter.combat.ap, 0),
+            actor->data.critter.combat.results,
+        });
+    }
+    for (const auto& entry : worldCritters) {
+        Object* critter = entry.second;
+        if (critter == nullptr
+            || session.entities().findObject(entry.first) != critter
+            || critter->tile < 0) {
+            return false;
+        }
+        captured.critters.push_back(CritterSnapshot {
+            entry.first,
+            critter->pid,
+            critter->tile,
+            critter->elevation,
+            critter->rotation,
+            std::max(critter_get_hits(critter), 0),
+            std::max(critter->data.critter.combat.ap, 0),
+            critter->data.critter.combat.results,
+            critter->data.critter.combat.team,
         });
     }
     for (const auto& entry : worldDoors) {
@@ -1287,17 +1429,12 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
         || validateSnapshot(snapshot) != SnapshotError::None
         || snapshot.phase != session.phase()
         || snapshot.phaseRevision != session.phaseRevision()
-        || snapshot.actors.size() != 2
         || snapshot.doors.size() != worldDoors.size()) {
         return false;
     }
 
-    for (const ActorSnapshot& actorState : snapshot.actors) {
-        Object* actor = session.entities().findObject(actorState.entityId);
-        std::optional<PlayerId> owner = session.entities().ownerOf(actorState.entityId);
-        if (actor == nullptr || !owner.has_value() || *owner != actorState.ownerId) {
-            return false;
-        }
+    if (!validateActorAndCritterState(snapshot)) {
+        return false;
     }
     for (const DoorSnapshot& doorState : snapshot.doors) {
         Object* door = session.entities().findObject(doorState.entityId);
@@ -1332,17 +1469,8 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
         }
     }
 
-    for (const ActorSnapshot& actorState : snapshot.actors) {
-        Object* actor = session.entities().findObject(actorState.entityId);
-        register_clear(actor);
-        Rect dirtyRect;
-        if (obj_move_to_tile(actor, actorState.tile, actorState.elevation, &dirtyRect) == -1
-            || obj_set_rotation(actor, actorState.rotation, &dirtyRect) == -1) {
-            return false;
-        }
-        int currentHitPoints = critter_get_hits(actor);
-        critter_adjust_hits(actor, actorState.hitPoints - currentHitPoints);
-        tile_refresh_rect(&dirtyRect, actorState.elevation);
+    if (!applyActorAndCritterState(snapshot)) {
+        return false;
     }
     for (const DoorSnapshot& doorState : snapshot.doors) {
         Object* door = session.entities().findObject(doorState.entityId);
@@ -1413,6 +1541,85 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
     return true;
 }
 
+bool networkWorldCaptureAuthoritativeState(EventSequence lastIncludedEvent, WorldSnapshot& snapshot)
+{
+    static SnapshotError lastValidationError = SnapshotError::None;
+    if (!session.isActive()) {
+        return false;
+    }
+    WorldSnapshot captured;
+    captured.lastIncludedEvent = lastIncludedEvent;
+    captured.phase = session.phase();
+    captured.phaseRevision = session.phaseRevision();
+    for (PlayerId playerId : { kHostPlayerId, kGuestPlayerId }) {
+        EntityId actorId = session.playerActorId(playerId);
+        Object* actor = session.entities().findObject(actorId);
+        if (actor == nullptr || actor->tile < 0) {
+            return false;
+        }
+        captured.actors.push_back(ActorSnapshot {
+            actorId,
+            playerId,
+            actor->tile,
+            actor->elevation,
+            actor->rotation,
+            std::max(critter_get_hits(actor), 0),
+            std::max(actor->data.critter.combat.ap, 0),
+            actor->data.critter.combat.results,
+        });
+    }
+    for (const auto& entry : worldCritters) {
+        Object* critter = entry.second;
+        if (critter == nullptr
+            || session.entities().findObject(entry.first) != critter) {
+            return false;
+        }
+        if (critter->tile < 0) {
+            continue;
+        }
+        captured.critters.push_back(CritterSnapshot {
+            entry.first,
+            critter->pid,
+            critter->tile,
+            critter->elevation,
+            critter->rotation,
+            std::max(critter_get_hits(critter), 0),
+            std::max(critter->data.critter.combat.ap, 0),
+            critter->data.critter.combat.results,
+            critter->data.critter.combat.team,
+        });
+    }
+    SnapshotError validationError = validateSnapshot(captured);
+    if (validationError != SnapshotError::None) {
+        if (validationError != lastValidationError) {
+            debug_printf("Multiplayer authoritative state validation failed: %d.\n", static_cast<int>(validationError));
+            lastValidationError = validationError;
+        }
+        return false;
+    }
+    lastValidationError = SnapshotError::None;
+    snapshot = std::move(captured);
+    return true;
+}
+
+bool networkWorldApplyAuthoritativeState(const WorldSnapshot& snapshot)
+{
+    if (!session.isActive()
+        || validateSnapshot(snapshot) != SnapshotError::None
+        || snapshot.phase != session.phase()
+        || snapshot.phaseRevision != session.phaseRevision()
+        || !snapshot.doors.empty()
+        || !snapshot.items.empty()) {
+        return false;
+    }
+    if (!validateActorAndCritterState(snapshot)
+        || !applyActorAndCritterState(snapshot)) {
+        return false;
+    }
+    intface_redraw();
+    return true;
+}
+
 std::optional<EntityId> networkWorldFindEntity(const Object* object)
 {
     if (!session.isActive() || object == nullptr) {
@@ -1434,6 +1641,7 @@ void networkWorldLeave()
     session.stop();
     worldDoors.clear();
     worldItems.clear();
+    worldCritters.clear();
     reservedPickupTargets.clear();
     activeLootTargets.clear();
     itemDropInProgress = false;

@@ -11,10 +11,11 @@ namespace fallout {
 namespace multiplayer {
 
 constexpr std::uint32_t kSnapshotMagic = 0x46434D53;
-constexpr std::uint16_t kSnapshotVersion = 3;
+constexpr std::uint16_t kSnapshotVersion = 4;
 constexpr std::size_t kSnapshotHeaderSize = 28;
 constexpr std::size_t kMaxSnapshotPayloadSize = 64 * 1024;
 constexpr std::size_t kMaxSnapshotActors = 16;
+constexpr std::size_t kMaxSnapshotCritters = 2048;
 constexpr std::size_t kMaxSnapshotDoors = 1024;
 constexpr std::size_t kMaxSnapshotItems = 4096;
 
@@ -25,6 +26,8 @@ struct ActorSnapshot {
     std::int32_t elevation = -1;
     std::int32_t rotation = -1;
     std::int32_t hitPoints = 0;
+    std::int32_t actionPoints = 0;
+    std::int32_t combatResults = 0;
 };
 
 struct DoorSnapshot {
@@ -32,6 +35,18 @@ struct DoorSnapshot {
     bool open = false;
     bool locked = false;
     std::int32_t frame = 0;
+};
+
+struct CritterSnapshot {
+    EntityId entityId;
+    std::int32_t pid = -1;
+    std::int32_t tile = -1;
+    std::int32_t elevation = -1;
+    std::int32_t rotation = -1;
+    std::int32_t hitPoints = 0;
+    std::int32_t actionPoints = 0;
+    std::int32_t combatResults = 0;
+    std::int32_t team = 0;
 };
 
 struct ItemSnapshot {
@@ -49,6 +64,7 @@ struct WorldSnapshot {
     SessionPhase phase = SessionPhase::Lobby;
     std::uint32_t phaseRevision = 0;
     std::vector<ActorSnapshot> actors;
+    std::vector<CritterSnapshot> critters;
     std::vector<DoorSnapshot> doors;
     std::vector<ItemSnapshot> items;
 };
@@ -66,12 +82,14 @@ enum class SnapshotError {
     InvalidPhase,
     InvalidPhaseRevision,
     TooManyActors,
+    TooManyCritters,
     TooManyDoors,
     TooManyItems,
     InvalidEntityId,
     InvalidPlayerId,
     DuplicateEntityId,
     InvalidActorState,
+    InvalidCritterState,
     InvalidDoorState,
     InvalidItemState,
 };
@@ -90,6 +108,7 @@ enum class SnapshotSection {
     None,
     Session,
     Actors,
+    Critters,
     Doors,
     Items,
 };
@@ -97,6 +116,7 @@ enum class SnapshotSection {
 struct SectionedStateDigest {
     std::uint64_t session = 0;
     std::uint64_t actors = 0;
+    std::uint64_t critters = 0;
     std::uint64_t doors = 0;
     std::uint64_t items = 0;
     std::uint64_t overall = 0;
@@ -106,6 +126,7 @@ constexpr bool operator==(const SectionedStateDigest& lhs, const SectionedStateD
 {
     return lhs.session == rhs.session
         && lhs.actors == rhs.actors
+        && lhs.critters == rhs.critters
         && lhs.doors == rhs.doors
         && lhs.items == rhs.items
         && lhs.overall == rhs.overall;

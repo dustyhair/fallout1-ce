@@ -30,6 +30,7 @@
 #include "game/stat.h"
 #include "game/tile.h"
 #include "game/trait.h"
+#include "multiplayer/network_runtime.h"
 #include "platform_compat.h"
 #include "plib/color/color.h"
 #include "plib/db/db.h"
@@ -4570,6 +4571,9 @@ void combat_attack_this(Object* a1)
     }
 
     if (!aiming) {
+        if (multiplayer::networkRuntimeHandleLocalAttack(a1, hitMode, HIT_LOCATION_UNCALLED)) {
+            return;
+        }
         combat_attack(obj_dude, a1, hitMode, HIT_LOCATION_UNCALLED);
         return;
     }
@@ -4580,6 +4584,9 @@ void combat_attack_this(Object* a1)
 
     int hitLocation;
     if (get_called_shot_location(a1, &hitLocation, hitMode) != -1) {
+        if (multiplayer::networkRuntimeHandleLocalAttack(a1, hitMode, hitLocation)) {
+            return;
+        }
         combat_attack(obj_dude, a1, hitMode, hitLocation);
     }
 }

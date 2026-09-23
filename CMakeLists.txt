@@ -112,6 +112,14 @@ target_sources(${EXECUTABLE_NAME} PRIVATE
 target_include_directories(${EXECUTABLE_NAME} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 
 if (BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
+    add_executable(fallout-agent-control-test
+        "src/agent_control_command.cc"
+        "tests/agent_control_test.cc"
+    )
+    target_include_directories(fallout-agent-control-test PRIVATE src)
+    target_link_libraries(fallout-agent-control-test PRIVATE SDL2::SDL2)
+    add_test(NAME agent-control COMMAND fallout-agent-control-test)
+
     add_executable(fallout-agent-journal-test
         "src/agent_journal.cc"
         "tests/agent_journal_test.cc"
@@ -139,6 +147,10 @@ endif()
 target_include_directories(${EXECUTABLE_NAME} PUBLIC src)
 
 target_sources(${EXECUTABLE_NAME} PUBLIC
+    "src/agent_control.cc"
+    "src/agent_control.h"
+    "src/agent_control_command.cc"
+    "src/agent_control_command.h"
     "src/agent_journal.cc"
     "src/agent_journal.h"
     "src/game/actions.cc"

@@ -101,7 +101,8 @@ bool isSupportedLiveEvent(const GameEventPayload& payload)
         || std::holds_alternative<ItemPickupStartedEvent>(payload)
         || std::holds_alternative<LootStartedEvent>(payload)
         || std::holds_alternative<InventoryTransferredEvent>(payload)
-        || std::holds_alternative<ItemDroppedEvent>(payload);
+        || std::holds_alternative<ItemDroppedEvent>(payload)
+        || std::holds_alternative<AttackStartedEvent>(payload);
 }
 
 } // namespace
@@ -129,6 +130,7 @@ bool NetworkLobby::start(NetworkLaunchMode mode, SessionId sessionId, std::uniqu
     _peerEvents.clear();
     _chatMessages.clear();
     _peerSnapshots.clear();
+    _authoritativeStates.clear();
     _recovering = false;
     _eventJournal.clear();
 
@@ -189,6 +191,16 @@ bool NetworkLobby::sendLocalLoot(EntityId targetId, std::uint32_t phaseRevision)
     return sendLocalAction(
         LootStartedEvent { actorId, targetId },
         LootCommand { targetId },
+        phaseRevision);
+}
+
+bool NetworkLobby::sendLocalAttack(EntityId targetId, std::int32_t hitMode, std::int32_t hitLocation, std::uint32_t phaseRevision)
+{
+    PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
+    EntityId actorId { playerId.value };
+    return sendLocalAction(
+        AttackStartedEvent { actorId, targetId, hitMode, hitLocation },
+        AttackCommand { targetId, hitMode, hitLocation },
         phaseRevision);
 }
 
@@ -517,6 +529,36 @@ std::optional<WorldSnapshot> NetworkLobby::takePeerSnapshot()
     return snapshot;
 }
 
+bool NetworkLobby::sendAuthoritativeState(const WorldSnapshot& snapshot)
+{
+    if (_mode != NetworkLaunchMode::Host
+        || _state != NetworkLobbyState::Ready
+        || !_startRequested
+        || _transport == nullptr) {
+        return false;
+    }
+    std::vector<std::uint8_t> payload;
+    if (encodeSnapshot(snapshot, payload) != SnapshotError::None) {
+        return false;
+    }
+    ProtocolEnvelope envelope;
+    envelope.kind = MessageKind::Combat;
+    envelope.sessionId = _sessionId;
+    envelope.sequence = _nextSendSequence++;
+    envelope.payload = std::move(payload);
+    return sendGameplayEnvelope(std::move(envelope));
+}
+
+std::optional<WorldSnapshot> NetworkLobby::takeAuthoritativeState()
+{
+    if (_authoritativeStates.empty()) {
+        return std::nullopt;
+    }
+    WorldSnapshot snapshot = std::move(_authoritativeStates.front());
+    _authoritativeStates.pop_front();
+    return snapshot;
+}
+
 EventSequence NetworkLobby::latestAuthoritativeEvent() const
 {
     return _eventJournal.latestSequence();
@@ -709,6 +751,7 @@ void NetworkLobby::stop()
     _peerEvents.clear();
     _chatMessages.clear();
     _peerSnapshots.clear();
+    _authoritativeStates.clear();
     _recovering = false;
     _eventJournal.clear();
     _state = NetworkLobbyState::Stopped;
@@ -865,6 +908,24 @@ void NetworkLobby::handlePacket(const Packet& packet)
             return;
         }
         fail(NetworkLobbyError::UnexpectedMessage);
+        return;
+    }
+
+    if (decoded.envelope.kind == MessageKind::Combat) {
+        SnapshotDecodeResult state = decodeSnapshot(decoded.envelope.payload);
+        if (_mode != NetworkLaunchMode::Join
+            || _state != NetworkLobbyState::Ready
+            || !_startRequested
+            || !state
+            || !state.snapshot.doors.empty()
+            || !state.snapshot.items.empty()) {
+            fail(NetworkLobbyError::UnexpectedMessage);
+            return;
+        }
+        if (_authoritativeStates.size() >= 2) {
+            _authoritativeStates.pop_front();
+        }
+        _authoritativeStates.push_back(std::move(state.snapshot));
         return;
     }
 

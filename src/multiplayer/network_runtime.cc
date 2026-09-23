@@ -65,6 +65,8 @@ std::unique_ptr<Transport> reconnectTransport;
 std::chrono::steady_clock::time_point reconnectDeadline;
 std::chrono::steady_clock::time_point nextReconnectAttempt;
 EventSequence reconnectLastApplied;
+std::chrono::steady_clock::time_point nextAuthoritativeState;
+std::chrono::steady_clock::time_point nextAgentWorldReport;
 
 struct PendingLocalItemDrop {
     Object* source = nullptr;
@@ -433,8 +435,14 @@ void reportAgentWorldState()
     }
     if (!networkWorldActive()) {
         agentJournalWriteWorldExit();
+        nextAgentWorldReport = {};
         return;
     }
+    auto now = std::chrono::steady_clock::now();
+    if (nextAgentWorldReport.time_since_epoch().count() != 0 && now < nextAgentWorldReport) {
+        return;
+    }
+    nextAgentWorldReport = now + std::chrono::milliseconds(200);
     bool hostIsLocal = launchOptions.mode == NetworkLaunchMode::Host;
     AgentJournalWorldState state;
     state.map = map_data.name;
@@ -700,6 +708,16 @@ void networkRuntimeBackgroundProcess()
                     break;
                 }
             }
+            auto now = std::chrono::steady_clock::now();
+            if (lobby.state() == NetworkLobbyState::Ready
+                && (nextAuthoritativeState.time_since_epoch().count() == 0 || now >= nextAuthoritativeState)) {
+                WorldSnapshot state;
+                if (networkWorldCaptureAuthoritativeState(lobby.latestAuthoritativeEvent(), state)
+                    && !lobby.sendAuthoritativeState(state)) {
+                    debug_printf("Multiplayer authoritative state could not be sent.\n");
+                }
+                nextAuthoritativeState = now + std::chrono::milliseconds(100);
+            }
         }
         while (std::optional<WorldSnapshot> snapshot = lobby.takePeerSnapshot()) {
             if (!networkWorldApplySnapshot(*snapshot)) {
@@ -744,6 +762,8 @@ void networkRuntimeBackgroundProcess()
                 applied = networkWorldApplyInventoryTransfer(*transfer);
             } else if (const auto* drop = std::get_if<ItemDroppedEvent>(&event->payload)) {
                 applied = networkWorldApplyItemDrop(*drop);
+            } else if (const auto* attack = std::get_if<AttackStartedEvent>(&event->payload)) {
+                applied = networkWorldApplyPeerAttack(*attack);
             }
             if (!applied) {
                 debug_printf("Multiplayer peer event could not be applied.\n");
@@ -754,6 +774,11 @@ void networkRuntimeBackgroundProcess()
                 if (!lobby.confirmPeerEventApplied(event->sequence)) {
                     debug_printf("Multiplayer peer event boundary could not be confirmed.\n");
                 }
+            }
+        }
+        while (std::optional<WorldSnapshot> state = lobby.takeAuthoritativeState()) {
+            if (!networkWorldApplyAuthoritativeState(*state)) {
+                debug_printf("Multiplayer authoritative state could not be applied.\n");
             }
         }
     }
@@ -824,6 +849,8 @@ bool networkRuntimeConfigure(int argc, char** argv)
     reconnectLastApplied = {};
     reconnectTokens.invalidateAll();
     nextReconnectAttempt = {};
+    nextAuthoritativeState = {};
+    nextAgentWorldReport = {};
     runtimeStatus.clear();
     lobbyStarted = false;
     return true;
@@ -1404,6 +1431,8 @@ bool networkRuntimeEnterWorld()
         return false;
     }
     lastSentLocalRotation = -1;
+    nextAuthoritativeState = {};
+    nextAgentWorldReport = {};
     reportLobbyStatus();
     return true;
 }
@@ -1517,6 +1546,28 @@ bool networkRuntimeHandleLocalLoot(Object* target)
     }
     if (!lobby.sendLocalLoot(*targetId, networkWorldPhaseRevision())) {
         debug_printf("Multiplayer loot command could not be sent.\n");
+    }
+    return true;
+}
+
+bool networkRuntimeHandleLocalAttack(Object* target, int hitMode, int hitLocation)
+{
+    if (!networkWorldActive()
+        || target == nullptr
+        || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER) {
+        return false;
+    }
+    std::optional<EntityId> targetId = networkWorldFindEntity(target);
+    if (!targetId.has_value()) {
+        debug_printf("Multiplayer attack target is missing a shared entity ID.\n");
+        return true;
+    }
+    if (launchOptions.mode == NetworkLaunchMode::Host
+        && combat_attack(obj_dude, target, hitMode, hitLocation) == -1) {
+        return true;
+    }
+    if (!lobby.sendLocalAttack(*targetId, hitMode, hitLocation, networkWorldPhaseRevision())) {
+        debug_printf("Multiplayer attack command could not be sent.\n");
     }
     return true;
 }
@@ -1823,6 +1874,8 @@ void networkRuntimeStop()
     lobbyStarted = false;
     pendingRecoveryRequest.reset();
     pendingLocalItemDrop.reset();
+    nextAuthoritativeState = {};
+    nextAgentWorldReport = {};
 }
 
 } // namespace multiplayer

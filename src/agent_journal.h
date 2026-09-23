@@ -55,6 +55,10 @@ void agentJournalWriteChat(const char* direction,
     const char* playerName,
     const char* text);
 void agentJournalWriteDialogueOption(int index, const char* text);
+void agentJournalWriteAgentCommand(std::uint64_t commandId,
+    const char* command,
+    const char* status,
+    const char* message);
 void agentJournalWriteWorldState(const AgentJournalWorldState& state);
 void agentJournalWriteWorldExit();
 void agentJournalClose();

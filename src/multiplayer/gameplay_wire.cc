@@ -15,6 +15,7 @@ enum class CommandType : std::uint8_t {
     Face = 5,
     InventoryTransfer = 6,
     ItemDrop = 7,
+    Attack = 8,
 };
 
 enum class EventType : std::uint8_t {
@@ -25,6 +26,7 @@ enum class EventType : std::uint8_t {
     ActorFacingChanged = 5,
     InventoryTransferred = 6,
     ItemDropped = 7,
+    AttackStarted = 8,
 };
 
 constexpr std::size_t kCommandHeaderSize = 28;
@@ -34,6 +36,7 @@ constexpr std::size_t kFacingCommandSize = kCommandHeaderSize + 8;
 constexpr std::size_t kItemDescriptorSize = 16;
 constexpr std::size_t kInventoryTransferCommandSize = kCommandHeaderSize + 20 + kItemDescriptorSize;
 constexpr std::size_t kItemDropCommandSize = kCommandHeaderSize + 16 + kItemDescriptorSize;
+constexpr std::size_t kAttackCommandSize = kCommandHeaderSize + 12;
 constexpr std::size_t kCommandResultSize = 24;
 constexpr std::size_t kEventHeaderSize = 20;
 constexpr std::size_t kMovementEventHeaderSize = kEventHeaderSize + 20;
@@ -41,6 +44,9 @@ constexpr std::size_t kTargetEventSize = kEventHeaderSize + 8;
 constexpr std::size_t kFacingEventSize = kEventHeaderSize + 8;
 constexpr std::size_t kInventoryTransferEventSize = kEventHeaderSize + 28 + kItemDescriptorSize;
 constexpr std::size_t kItemDropEventSize = kEventHeaderSize + 32 + kItemDescriptorSize;
+constexpr std::size_t kAttackEventSize = kEventHeaderSize + 16;
+constexpr std::int32_t kAttackHitModeCount = 20;
+constexpr std::int32_t kAttackHitLocationCount = 9;
 
 void appendUInt16(std::vector<std::uint8_t>& bytes, std::uint16_t value)
 {
@@ -239,6 +245,15 @@ GameplayWireError validateCommand(const GameCommand& command)
             ? GameplayWireError::None
             : GameplayWireError::InvalidQuantity;
     }
+    if (const auto* attack = std::get_if<AttackCommand>(&command.payload)) {
+        if (!isValid(attack->targetId)) {
+            return GameplayWireError::InvalidEntityId;
+        }
+        return attack->hitMode >= 0 && attack->hitMode < kAttackHitModeCount
+                && attack->hitLocation >= 0 && attack->hitLocation < kAttackHitLocationCount
+            ? GameplayWireError::None
+            : GameplayWireError::InvalidAttack;
+    }
 
     EntityId targetId;
     if (const auto* interact = std::get_if<InteractCommand>(&command.payload)) {
@@ -357,6 +372,15 @@ GameplayWireError validateEvent(const GameEvent& event)
             ? GameplayWireError::None
             : GameplayWireError::InvalidQuantity;
     }
+    if (const auto* attack = std::get_if<AttackStartedEvent>(&event.payload)) {
+        if (!isValid(attack->actorId) || !isValid(attack->targetId)) {
+            return GameplayWireError::InvalidEntityId;
+        }
+        return attack->hitMode >= 0 && attack->hitMode < kAttackHitModeCount
+                && attack->hitLocation >= 0 && attack->hitLocation < kAttackHitLocationCount
+            ? GameplayWireError::None
+            : GameplayWireError::InvalidAttack;
+    }
 
     EntityId actorId;
     EntityId targetId;
@@ -437,14 +461,19 @@ GameplayWireError encodeGameCommand(const GameCommand& command, ProtocolEnvelope
         appendUInt32(envelope.payload, transfer->quantity);
         appendUInt32(envelope.payload, transfer->sourceQuantity);
         appendItemDescriptor(envelope.payload, transfer->itemDescriptor);
-    } else {
-        const auto* drop = std::get_if<ItemDropCommand>(&command.payload);
+    } else if (const auto* drop = std::get_if<ItemDropCommand>(&command.payload)) {
         appendCommandHeader(command, CommandType::ItemDrop, envelope.payload);
         appendUInt32(envelope.payload, drop->sourceId.value);
         appendUInt32(envelope.payload, drop->itemId.value);
         appendUInt32(envelope.payload, drop->quantity);
         appendUInt32(envelope.payload, drop->sourceQuantity);
         appendItemDescriptor(envelope.payload, drop->itemDescriptor);
+    } else {
+        const auto* attack = std::get_if<AttackCommand>(&command.payload);
+        appendCommandHeader(command, CommandType::Attack, envelope.payload);
+        appendUInt32(envelope.payload, attack->targetId.value);
+        appendInt32(envelope.payload, attack->hitMode);
+        appendInt32(envelope.payload, attack->hitLocation);
     }
     return GameplayWireError::None;
 }
@@ -545,6 +574,17 @@ GameCommandDecodeResult decodeGameCommand(const ProtocolEnvelope& envelope)
             readUInt32(envelope.payload, 36),
             readUInt32(envelope.payload, 40),
             readItemDescriptor(envelope.payload, 44),
+        };
+        break;
+    case CommandType::Attack:
+        if (envelope.payload.size() != kAttackCommandSize) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.command.payload = AttackCommand {
+            EntityId { readUInt32(envelope.payload, 28) },
+            readInt32(envelope.payload, 32),
+            readInt32(envelope.payload, 36),
         };
         break;
     default:
@@ -652,8 +692,7 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
         appendUInt32(envelope.payload, transfer->sourceQuantity);
         appendUInt32(envelope.payload, transfer->remainderItemId.value);
         appendItemDescriptor(envelope.payload, transfer->itemDescriptor);
-    } else {
-        const auto* drop = std::get_if<ItemDroppedEvent>(&event.payload);
+    } else if (const auto* drop = std::get_if<ItemDroppedEvent>(&event.payload)) {
         appendEventHeader(event, EventType::ItemDropped, envelope.payload);
         appendUInt32(envelope.payload, drop->actorId.value);
         appendUInt32(envelope.payload, drop->sourceId.value);
@@ -664,6 +703,13 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
         appendInt32(envelope.payload, drop->tile);
         appendInt32(envelope.payload, drop->elevation);
         appendItemDescriptor(envelope.payload, drop->itemDescriptor);
+    } else {
+        const auto* attack = std::get_if<AttackStartedEvent>(&event.payload);
+        appendEventHeader(event, EventType::AttackStarted, envelope.payload);
+        appendUInt32(envelope.payload, attack->actorId.value);
+        appendUInt32(envelope.payload, attack->targetId.value);
+        appendInt32(envelope.payload, attack->hitMode);
+        appendInt32(envelope.payload, attack->hitLocation);
     }
     return GameplayWireError::None;
 }
@@ -779,6 +825,18 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
             readItemDescriptor(envelope.payload, 52),
         };
         break;
+    case EventType::AttackStarted:
+        if (envelope.payload.size() != kAttackEventSize) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.event.payload = AttackStartedEvent {
+            EntityId { readUInt32(envelope.payload, 20) },
+            EntityId { readUInt32(envelope.payload, 24) },
+            readInt32(envelope.payload, 28),
+            readInt32(envelope.payload, 32),
+        };
+        break;
     default:
         result.error = GameplayWireError::UnknownPayloadType;
         return result;
@@ -823,6 +881,8 @@ const char* gameplayWireErrorMessage(GameplayWireError error)
         return "invalid movement payload";
     case GameplayWireError::InvalidRotation:
         return "invalid actor rotation";
+    case GameplayWireError::InvalidAttack:
+        return "invalid attack payload";
     case GameplayWireError::InvalidQuantity:
         return "invalid inventory quantity";
     case GameplayWireError::InvalidStatus:
