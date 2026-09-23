@@ -66,8 +66,25 @@ bool smokeTestEnabled = false;
 enum class SmokeScenario {
     Movement,
     Door,
+    Pickup,
+    Loot,
 };
 SmokeScenario smokeScenario = SmokeScenario::Movement;
+
+const char* smokeScenarioName()
+{
+    switch (smokeScenario) {
+    case SmokeScenario::Movement:
+        return "move";
+    case SmokeScenario::Door:
+        return "door";
+    case SmokeScenario::Pickup:
+        return "pickup";
+    case SmokeScenario::Loot:
+        return "loot";
+    }
+    return "unknown";
+}
 int lastSentLocalRotation = -1;
 std::optional<EventSequence> pendingRecoveryRequest;
 std::unique_ptr<Transport> reconnectTransport;
@@ -994,6 +1011,10 @@ bool networkRuntimeConfigure(int argc, char** argv)
             smokeTestEnabled = true;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=door") == 0) {
             smokeScenario = SmokeScenario::Door;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=pickup") == 0) {
+            smokeScenario = SmokeScenario::Pickup;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=loot") == 0) {
+            smokeScenario = SmokeScenario::Loot;
         }
     }
     if (smokeTestEnabled && launchOptions.mode == NetworkLaunchMode::Disabled) {
@@ -1081,9 +1102,15 @@ bool networkRuntimeRunSmokeTest()
             Object* scenarioActor = networkWorldPlayerActor(kGuestPlayerId);
             int scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
             int scenarioDestinationTile = -1;
-            std::optional<EntityId> scenarioDoorId;
+            std::optional<EntityId> scenarioTargetId;
             if (smokeScenario == SmokeScenario::Door) {
-                scenarioDoorId = networkWorldPrepareDoorSmokeTest();
+                scenarioTargetId = networkWorldPrepareDoorSmokeTest();
+                scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
+            } else if (smokeScenario == SmokeScenario::Pickup) {
+                scenarioTargetId = networkWorldPreparePickupSmokeTest();
+                scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
+            } else if (smokeScenario == SmokeScenario::Loot) {
+                scenarioTargetId = networkWorldPrepareLootSmokeTest();
                 scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
             } else if (scenarioActor != nullptr) {
                 for (int distance = 1; distance <= 4 && scenarioDestinationTile == -1; distance++) {
@@ -1097,16 +1124,31 @@ bool networkRuntimeRunSmokeTest()
                     }
                 }
             }
-            if ((smokeScenario == SmokeScenario::Door && !scenarioDoorId.has_value())
+            if ((smokeScenario != SmokeScenario::Movement && !scenarioTargetId.has_value())
                 || (smokeScenario == SmokeScenario::Movement && scenarioDestinationTile == -1)) {
                 setStatus("MULTIPLAYER SMOKE TEST FAILED: NO EXPLORATION FIXTURE");
                 break;
             }
-            scenarioCommand.payload = smokeScenario == SmokeScenario::Door
-                ? GameCommandPayload { InteractCommand { *scenarioDoorId } }
-                : GameCommandPayload { MoveCommand { scenarioDestinationTile, scenarioActor->elevation, false } };
+            switch (smokeScenario) {
+            case SmokeScenario::Movement:
+                scenarioCommand.payload = MoveCommand { scenarioDestinationTile, scenarioActor->elevation, false };
+                break;
+            case SmokeScenario::Door:
+                scenarioCommand.payload = InteractCommand { *scenarioTargetId };
+                break;
+            case SmokeScenario::Pickup:
+                scenarioCommand.payload = PickupCommand { *scenarioTargetId };
+                break;
+            case SmokeScenario::Loot:
+                scenarioCommand.payload = LootCommand { *scenarioTargetId };
+                break;
+            }
+            EventSequence scenarioFinalEventSequence {
+                smokeScenario == SmokeScenario::Pickup ? 2ULL : 1ULL
+            };
 
             bool gameplayPassed = false;
+            std::vector<GameEvent> authoritativeEvents;
             if (launchOptions.mode == NetworkLaunchMode::Join) {
                 ProtocolEnvelope commandEnvelope;
                 commandEnvelope.sessionId = sessionId;
@@ -1120,9 +1162,10 @@ bool networkRuntimeRunSmokeTest()
                 }
 
                 bool receivedResult = false;
-                bool receivedEvent = false;
+                std::uint64_t receivedEventCount = 0;
                 bool stateConverged = false;
-                while (std::chrono::steady_clock::now() < deadline && (!receivedResult || !receivedEvent || !stateConverged)) {
+                while (std::chrono::steady_clock::now() < deadline
+                    && (!receivedResult || receivedEventCount < scenarioFinalEventSequence.value || !stateConverged)) {
                     transport->poll();
                     while (std::optional<Packet> packet = transport->receive()) {
                         ProtocolDecodeResult decoded = decodeEnvelope(*packet);
@@ -1140,19 +1183,22 @@ bool networkRuntimeRunSmokeTest()
                                 && result.result.eventCount == 1;
                         } else if (decoded.envelope.kind == MessageKind::Event) {
                             GameEventDecodeResult event = decodeGameEvent(decoded.envelope);
-                            if (smokeScenario == SmokeScenario::Door) {
+                            bool eventApplied = false;
+                            EventSequence expectedEventSequence { receivedEventCount + 1 };
+                            if (event
+                                && event.event.sequence == expectedEventSequence
+                                && event.event.causedBy == scenarioCommand.sequence
+                                && smokeScenario == SmokeScenario::Door) {
                                 const auto* door = event ? std::get_if<DoorUseStartedEvent>(&event.event.payload) : nullptr;
-                                receivedEvent = door != nullptr
-                                    && event.event.sequence == EventSequence { 1 }
-                                    && event.event.causedBy == scenarioCommand.sequence
+                                eventApplied = door != nullptr
                                     && door->actorId == scenarioCommand.actorId
-                                    && door->targetId == *scenarioDoorId
+                                    && door->targetId == *scenarioTargetId
                                     && networkWorldApplyPeerDoorUse(*door);
-                            } else {
+                            } else if (event && event.event.sequence == expectedEventSequence
+                                && event.event.causedBy == scenarioCommand.sequence
+                                && smokeScenario == SmokeScenario::Movement) {
                                 const auto* movement = event ? std::get_if<ActorMovementStartedEvent>(&event.event.payload) : nullptr;
-                                receivedEvent = movement != nullptr
-                                    && event.event.sequence == EventSequence { 1 }
-                                    && event.event.causedBy == scenarioCommand.sequence
+                                eventApplied = movement != nullptr
                                     && movement->actorId == scenarioCommand.actorId
                                     && movement->startingTile == scenarioStartingTile
                                     && movement->destinationTile == scenarioDestinationTile
@@ -1160,17 +1206,46 @@ bool networkRuntimeRunSmokeTest()
                                     && !movement->running
                                     && !movement->path.empty()
                                     && networkWorldApplyPeerMove(*movement);
+                            } else if (event && event.event.sequence == expectedEventSequence
+                                && event.event.causedBy == scenarioCommand.sequence
+                                && smokeScenario == SmokeScenario::Pickup) {
+                                if (receivedEventCount == 0) {
+                                    const auto* pickup = std::get_if<ItemPickupStartedEvent>(&event.event.payload);
+                                    eventApplied = pickup != nullptr
+                                        && pickup->actorId == scenarioCommand.actorId
+                                        && pickup->targetId == *scenarioTargetId
+                                        && networkWorldApplyPeerPickup(*pickup);
+                                } else {
+                                    const auto* pickup = std::get_if<ItemPickupCompletedEvent>(&event.event.payload);
+                                    eventApplied = pickup != nullptr
+                                        && pickup->actorId == scenarioCommand.actorId
+                                        && pickup->targetId == *scenarioTargetId
+                                        && pickup->succeeded
+                                        && pickup->quantity > 0
+                                        && networkWorldApplyPeerPickupCompletion(*pickup);
+                                }
+                            } else if (event && event.event.sequence == expectedEventSequence
+                                && event.event.causedBy == scenarioCommand.sequence
+                                && smokeScenario == SmokeScenario::Loot) {
+                                const auto* loot = std::get_if<LootStartedEvent>(&event.event.payload);
+                                eventApplied = loot != nullptr
+                                    && loot->actorId == scenarioCommand.actorId
+                                    && loot->targetId == *scenarioTargetId
+                                    && networkWorldApplyPeerLoot(*loot);
+                            }
+                            if (eventApplied) {
+                                receivedEventCount++;
                             }
                         } else if (decoded.envelope.kind == MessageKind::Combat) {
                             SnapshotDecodeResult state = decodeSnapshot(decoded.envelope.payload);
                             WorldSnapshot localState;
                             anim_stop();
                             bool boundaryMatches = state
-                                && state.snapshot.lastIncludedEvent == EventSequence { 1 };
+                                && state.snapshot.lastIncludedEvent == scenarioFinalEventSequence;
                             bool stateApplied = boundaryMatches
                                 && networkWorldApplyAuthoritativeState(state.snapshot);
                             bool localCaptured = stateApplied
-                                && networkWorldCaptureAuthoritativeState(EventSequence { 1 }, localState);
+                                && networkWorldCaptureAuthoritativeState(scenarioFinalEventSequence, localState);
                             stateConverged = localCaptured;
                             if (localCaptured) {
                                 SnapshotDigestResult expectedDigest = computeSnapshotDigest(state.snapshot);
@@ -1200,15 +1275,18 @@ bool networkRuntimeRunSmokeTest()
                             break;
                         }
                     }
-                    if (!transport->isConnected() && (!receivedResult || !receivedEvent || !stateConverged)) {
+                    if (!transport->isConnected()
+                        && (!receivedResult || receivedEventCount < scenarioFinalEventSequence.value || !stateConverged)) {
                         setStatus("MULTIPLAYER SMOKE TEST FAILED: GAMEPLAY TRANSPORT DISCONNECTED");
                         break;
                     }
-                    if (!receivedResult || !receivedEvent || !stateConverged) {
+                    if (!receivedResult || receivedEventCount < scenarioFinalEventSequence.value || !stateConverged) {
                         std::this_thread::sleep_for(std::chrono::milliseconds(1));
                     }
                 }
-                gameplayPassed = receivedResult && receivedEvent && stateConverged;
+                gameplayPassed = receivedResult
+                    && receivedEventCount == scenarioFinalEventSequence.value
+                    && stateConverged;
             } else {
                 std::optional<GameCommand> receivedCommand;
                 while (std::chrono::steady_clock::now() < deadline && !receivedCommand.has_value()) {
@@ -1225,7 +1303,13 @@ bool networkRuntimeRunSmokeTest()
                         if (command) {
                             if (smokeScenario == SmokeScenario::Door) {
                                 const auto* door = std::get_if<InteractCommand>(&command.command.payload);
-                                payloadMatches = door != nullptr && door->targetId == *scenarioDoorId;
+                                payloadMatches = door != nullptr && door->targetId == *scenarioTargetId;
+                            } else if (smokeScenario == SmokeScenario::Pickup) {
+                                const auto* pickup = std::get_if<PickupCommand>(&command.command.payload);
+                                payloadMatches = pickup != nullptr && pickup->targetId == *scenarioTargetId;
+                            } else if (smokeScenario == SmokeScenario::Loot) {
+                                const auto* loot = std::get_if<LootCommand>(&command.command.payload);
+                                payloadMatches = loot != nullptr && loot->targetId == *scenarioTargetId;
                             } else {
                                 const auto* movement = std::get_if<MoveCommand>(&command.command.payload);
                                 payloadMatches = movement != nullptr
@@ -1255,17 +1339,34 @@ bool networkRuntimeRunSmokeTest()
 
                 if (receivedCommand.has_value()) {
                     AuthoritativeCommandResult outcome = networkWorldProcessCommand(*receivedCommand);
-                    Object* scenarioTarget = scenarioDoorId.has_value()
-                        ? networkWorldFindObject(*scenarioDoorId)
+                    Object* scenarioTarget = scenarioTargetId.has_value()
+                        ? networkWorldFindObject(*scenarioTargetId)
                         : nullptr;
+                    std::optional<GameEvent> pickupCompletion;
                     auto actionDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
                     auto actionComplete = [&]() {
-                        return smokeScenario == SmokeScenario::Door
-                            ? anim_busy(scenarioActor) != -1 && anim_busy(scenarioTarget) != -1
-                            : scenarioActor->tile == scenarioDestinationTile;
+                        switch (smokeScenario) {
+                        case SmokeScenario::Movement:
+                            return scenarioActor->tile == scenarioDestinationTile;
+                        case SmokeScenario::Door:
+                            return anim_busy(scenarioActor) != -1 && anim_busy(scenarioTarget) != -1;
+                        case SmokeScenario::Pickup:
+                            return pickupCompletion.has_value();
+                        case SmokeScenario::Loot:
+                            return true;
+                        }
+                        return false;
                     };
                     while (!actionComplete() && std::chrono::steady_clock::now() < actionDeadline) {
                         object_animate();
+                        if (smokeScenario == SmokeScenario::Pickup) {
+                            while (std::optional<GameEvent> deferred = networkWorldTakeDeferredEvent()) {
+                                if (std::holds_alternative<ItemPickupCompletedEvent>(deferred->payload)) {
+                                    pickupCompletion = std::move(*deferred);
+                                    break;
+                                }
+                            }
+                        }
                         std::this_thread::sleep_for(std::chrono::milliseconds(1));
                     }
                     if (smokeScenario == SmokeScenario::Door && outcome.event.has_value()) {
@@ -1276,6 +1377,13 @@ bool networkRuntimeRunSmokeTest()
                             door->frame = scenarioTarget->frame;
                         }
                     }
+                    if (outcome.event.has_value()) {
+                        authoritativeEvents.push_back(*outcome.event);
+                    }
+                    if (pickupCompletion.has_value()) {
+                        pickupCompletion->sequence = scenarioFinalEventSequence;
+                        authoritativeEvents.push_back(std::move(*pickupCompletion));
+                    }
                     WorldSnapshot state;
                     std::vector<std::uint8_t> statePayload;
                     anim_stop();
@@ -1283,8 +1391,8 @@ bool networkRuntimeRunSmokeTest()
                     bool scenarioCompleted = actionComplete();
                     bool captured = accepted
                         && scenarioCompleted
-                        && outcome.event.has_value()
-                        && networkWorldCaptureAuthoritativeState(EventSequence { 1 }, state);
+                        && authoritativeEvents.size() == scenarioFinalEventSequence.value
+                        && networkWorldCaptureAuthoritativeState(scenarioFinalEventSequence, state);
                     SnapshotError snapshotError = captured
                         ? encodeSnapshot(state, statePayload)
                         : SnapshotError::None;
@@ -1303,25 +1411,29 @@ bool networkRuntimeRunSmokeTest()
                     ProtocolEnvelope resultEnvelope;
                     resultEnvelope.sessionId = sessionId;
                     resultEnvelope.sequence = nextSendSequence++;
-                    ProtocolEnvelope eventEnvelope;
-                    eventEnvelope.sessionId = sessionId;
-                    eventEnvelope.sequence = nextSendSequence++;
+                    std::vector<std::uint8_t> resultPacket;
+                    gameplayPassed = validOutcome
+                        && encodeCommandResult(outcome.result, resultEnvelope) == GameplayWireError::None
+                        && encodeEnvelope(resultEnvelope, resultPacket) == ProtocolError::None
+                        && transport->send(std::move(resultPacket)) == TransportSendResult::Sent;
+                    for (const GameEvent& event : authoritativeEvents) {
+                        ProtocolEnvelope eventEnvelope;
+                        eventEnvelope.sessionId = sessionId;
+                        eventEnvelope.sequence = nextSendSequence++;
+                        std::vector<std::uint8_t> eventPacket;
+                        gameplayPassed = gameplayPassed
+                            && encodeGameEvent(event, eventEnvelope) == GameplayWireError::None
+                            && encodeEnvelope(eventEnvelope, eventPacket) == ProtocolError::None
+                            && transport->send(std::move(eventPacket)) == TransportSendResult::Sent;
+                    }
                     ProtocolEnvelope stateEnvelope;
                     stateEnvelope.kind = MessageKind::Combat;
                     stateEnvelope.sessionId = sessionId;
                     stateEnvelope.sequence = nextSendSequence++;
                     stateEnvelope.payload = std::move(statePayload);
-                    std::vector<std::uint8_t> resultPacket;
-                    std::vector<std::uint8_t> eventPacket;
                     std::vector<std::uint8_t> statePacket;
-                    gameplayPassed = validOutcome
-                        && encodeCommandResult(outcome.result, resultEnvelope) == GameplayWireError::None
-                        && encodeEnvelope(resultEnvelope, resultPacket) == ProtocolError::None
-                        && encodeGameEvent(*outcome.event, eventEnvelope) == GameplayWireError::None
-                        && encodeEnvelope(eventEnvelope, eventPacket) == ProtocolError::None
+                    gameplayPassed = gameplayPassed
                         && encodeEnvelope(stateEnvelope, statePacket) == ProtocolError::None
-                        && transport->send(std::move(resultPacket)) == TransportSendResult::Sent
-                        && transport->send(std::move(eventPacket)) == TransportSendResult::Sent
                         && transport->send(std::move(statePacket)) == TransportSendResult::Sent;
                     if (gameplayPassed) {
                         // Give the non-blocking socket a chance to flush before this test process exits.
@@ -1345,26 +1457,6 @@ bool networkRuntimeRunSmokeTest()
                 break;
             }
 
-            GameEvent replayEvent;
-            replayEvent.sequence = EventSequence { 1 };
-            replayEvent.causedBy = scenarioCommand.sequence;
-            if (smokeScenario == SmokeScenario::Door) {
-                Object* door = networkWorldFindObject(*scenarioDoorId);
-                replayEvent.payload = DoorUseStartedEvent {
-                    scenarioCommand.actorId,
-                    *scenarioDoorId,
-                    obj_is_open(door) != 0,
-                    obj_is_locked(door),
-                    door->frame,
-                };
-            } else {
-                replayEvent.payload = ActorMovementStartedEvent {
-                    scenarioCommand.actorId,
-                    scenarioDestinationTile,
-                    scenarioActor->elevation,
-                    false,
-                };
-            }
             transport->close();
 
             bool reconnectPassed = false;
@@ -1377,8 +1469,9 @@ bool networkRuntimeRunSmokeTest()
                     reconnectPassed = sendReconnectHandshake(*reconnect.transport,
                         ReconnectHello { sessionId, kGuestPlayerId, bootstrap.reconnectToken(), EventSequence {} });
                     bool welcomed = false;
-                    bool replayed = false;
-                    while (reconnectPassed && std::chrono::steady_clock::now() < deadline && (!welcomed || !replayed)) {
+                    std::uint64_t replayedEventCount = 0;
+                    while (reconnectPassed && std::chrono::steady_clock::now() < deadline
+                        && (!welcomed || replayedEventCount < scenarioFinalEventSequence.value)) {
                         reconnect.transport->poll();
                         while (std::optional<Packet> packet = reconnect.transport->receive()) {
                             ProtocolDecodeResult decoded = decodeEnvelope(*packet);
@@ -1393,23 +1486,34 @@ bool networkRuntimeRunSmokeTest()
                                     : nullptr;
                                 welcomed = welcome != nullptr
                                     && welcome->sessionId == sessionId
-                                    && welcome->latestEvent == EventSequence { 1 };
-                            } else if (decoded.envelope.sequence == 2 && decoded.envelope.kind == MessageKind::Event) {
+                                    && welcome->latestEvent == scenarioFinalEventSequence;
+                            } else if (decoded.envelope.sequence == replayedEventCount + 2
+                                && decoded.envelope.kind == MessageKind::Event) {
                                 GameEventDecodeResult event = decodeGameEvent(decoded.envelope);
-                                replayed = event && event.event.sequence == EventSequence { 1 };
+                                if (event
+                                    && event.event.sequence == EventSequence { replayedEventCount + 1 }
+                                    && event.event.causedBy == scenarioCommand.sequence) {
+                                    replayedEventCount++;
+                                } else {
+                                    reconnectPassed = false;
+                                    break;
+                                }
                             } else {
                                 reconnectPassed = false;
                                 break;
                             }
                         }
-                        if (!reconnect.transport->isConnected() && (!welcomed || !replayed)) {
+                        if (!reconnect.transport->isConnected()
+                            && (!welcomed || replayedEventCount < scenarioFinalEventSequence.value)) {
                             reconnectPassed = false;
                         }
-                        if (!welcomed || !replayed) {
+                        if (!welcomed || replayedEventCount < scenarioFinalEventSequence.value) {
                             std::this_thread::sleep_for(std::chrono::milliseconds(1));
                         }
                     }
-                    reconnectPassed = reconnectPassed && welcomed && replayed;
+                    reconnectPassed = reconnectPassed
+                        && welcomed
+                        && replayedEventCount == scenarioFinalEventSequence.value;
                 }
             } else {
                 std::unique_ptr<Transport> resumed;
@@ -1439,13 +1543,15 @@ bool networkRuntimeRunSmokeTest()
                     && reconnectTokensEqual(hello->reconnectToken, bootstrap.reconnectToken())) {
                     ProtocolEnvelope eventEnvelope;
                     eventEnvelope.sessionId = sessionId;
-                    eventEnvelope.sequence = 2;
-                    Packet eventPacket;
                     reconnectPassed = sendReconnectHandshake(*resumed,
-                                            ReconnectWelcome { sessionId, EventSequence { 1 } })
-                        && encodeGameEvent(replayEvent, eventEnvelope) == GameplayWireError::None
-                        && encodeEnvelope(eventEnvelope, eventPacket) == ProtocolError::None
-                        && resumed->send(std::move(eventPacket)) == TransportSendResult::Sent;
+                        ReconnectWelcome { sessionId, scenarioFinalEventSequence });
+                    for (std::size_t index = 0; reconnectPassed && index < authoritativeEvents.size(); index++) {
+                        eventEnvelope.sequence = index + 2;
+                        Packet eventPacket;
+                        reconnectPassed = encodeGameEvent(authoritativeEvents[index], eventEnvelope) == GameplayWireError::None
+                            && encodeEnvelope(eventEnvelope, eventPacket) == ProtocolError::None
+                            && resumed->send(std::move(eventPacket)) == TransportSendResult::Sent;
+                    }
                     for (int attempt = 0; reconnectPassed && attempt < 100; attempt++) {
                         resumed->poll();
                         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -1464,7 +1570,7 @@ bool networkRuntimeRunSmokeTest()
                 static_cast<unsigned long long>(sessionId.value),
                 sheet.name.c_str(),
                 peer->name.c_str(),
-                smokeScenario == SmokeScenario::Door ? "door" : "move",
+                smokeScenarioName(),
                 authorityProbeCounts.scriptProcedures,
                 authorityProbeCounts.combatAttacks,
                 authorityProbeCounts.randomDraws);

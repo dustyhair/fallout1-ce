@@ -58,6 +58,8 @@ bool networkWorldInventoryTransferInProgress();
 bool networkWorldItemDropInProgress();
 bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts);
 std::optional<EntityId> networkWorldPrepareDoorSmokeTest();
+std::optional<EntityId> networkWorldPreparePickupSmokeTest();
+std::optional<EntityId> networkWorldPrepareLootSmokeTest();
 
 } // namespace multiplayer
 } // namespace fallout

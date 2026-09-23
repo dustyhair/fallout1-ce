@@ -16,6 +16,10 @@ The scenario then hands the established connection to the gameplay wire layer. T
 
 Passing `--multiplayer-smoke-scenario=door` selects the scripted-door fixture instead. Both processes place the guest actor beside the same registered scenery door. The host runs the asynchronous door action and script to completion, publishes the final open, lock, and frame state, and checkpoints the result. The guest applies only that final state and must again match every snapshot section without executing the script.
 
+Passing `--multiplayer-smoke-scenario=pickup` selects the pickup fixture. It uses a registered ordinary ground item when the map provides one, or places a Stimpak from the installed game data beside the guest actor. The host runs Fallout's pickup animation and callback, publishes both the start event and the callback-generated completion event, and checkpoints the resulting inventory ownership and quantity at event 2. The guest treats the start as presentation-only, applies the explicit completion effect without rerunning pickup rules, and verifies the same complete state digest. Reconnect replays both ordered events.
+
+Passing `--multiplayer-smoke-scenario=loot` selects a registered map critter, places the guest actor beside it, sends the loot command through the host command processor, applies the authoritative loot-start event, and verifies checkpoint and replay convergence.
+
 This hook makes the two-process path runnable under Xvfb:
 
 ```text

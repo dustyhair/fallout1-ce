@@ -1266,6 +1266,98 @@ std::optional<EntityId> networkWorldPrepareDoorSmokeTest()
     return std::nullopt;
 }
 
+std::optional<EntityId> networkWorldPreparePickupSmokeTest()
+{
+    if (!session.isActive()) {
+        return std::nullopt;
+    }
+    Object* actor = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+    if (actor == nullptr) {
+        return std::nullopt;
+    }
+
+    anim_stop();
+    for (const auto& entry : worldItems) {
+        Object* item = entry.second;
+        if (item == nullptr
+            || item->owner != nullptr
+            || !hexGridTileIsValid(item->tile)
+            || !elevationIsValid(item->elevation)
+            || item_get_type(item) == ITEM_TYPE_CONTAINER) {
+            continue;
+        }
+        for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+            int tile = tile_num_in_direction(item->tile, rotation, 1);
+            if (hexGridTileIsValid(tile)
+                && obj_blocking_at(actor, tile, item->elevation) == nullptr
+                && obj_move_to_tile(actor, tile, item->elevation, nullptr) == 0) {
+                return entry.first;
+            }
+        }
+    }
+
+    Object* item = nullptr;
+    if (obj_pid_new(&item, PROTO_ID_STIMPACK) == -1 || item == nullptr) {
+        return std::nullopt;
+    }
+    // obj_pid_new inserts a new object into Fallout's floating-object list.
+    // Remove that node before connecting the fixture to a map tile, otherwise
+    // the same object would be owned by two object-list nodes after pickup.
+    if (obj_disconnect(item, nullptr) == -1) {
+        obj_erase_object(item, nullptr);
+        return std::nullopt;
+    }
+    for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+        int tile = tile_num_in_direction(actor->tile, rotation, 1);
+        if (!hexGridTileIsValid(tile)
+            || obj_blocking_at(actor, tile, actor->elevation) != nullptr) {
+            continue;
+        }
+        if (obj_connect(item, tile, actor->elevation, nullptr) == 0) {
+            EntityRegistrationResult registration = registerItem(item);
+            if (registration) {
+                return registration.entityId;
+            }
+            obj_disconnect(item, nullptr);
+        }
+        break;
+    }
+    obj_connect(item, actor->tile, actor->elevation, nullptr);
+    obj_erase_object(item, nullptr);
+    return std::nullopt;
+}
+
+std::optional<EntityId> networkWorldPrepareLootSmokeTest()
+{
+    if (!session.isActive()) {
+        return std::nullopt;
+    }
+    Object* actor = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+    if (actor == nullptr) {
+        return std::nullopt;
+    }
+
+    anim_stop();
+    for (const auto& entry : worldCritters) {
+        Object* critter = entry.second;
+        if (critter == nullptr
+            || critter == actor
+            || !hexGridTileIsValid(critter->tile)
+            || !elevationIsValid(critter->elevation)) {
+            continue;
+        }
+        for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+            int tile = tile_num_in_direction(critter->tile, rotation, 1);
+            if (hexGridTileIsValid(tile)
+                && obj_blocking_at(actor, tile, critter->elevation) == nullptr
+                && obj_move_to_tile(actor, tile, critter->elevation, nullptr) == 0) {
+                return entry.first;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
 bool networkWorldBeginLocalLoot(Object* target)
 {
     if (!session.isActive()
