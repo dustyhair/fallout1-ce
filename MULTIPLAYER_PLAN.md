@@ -349,10 +349,10 @@ Optional Laya or LLM controllers sit above this semantic interface. They receive
 Current implementation status:
 
 1. [x] Add semantic movement, facing, door, pickup, and loot command-file verbs.
-2. [x] Expose visible critters, doors, and ground items with stable entity IDs in the machine-readable world state.
+2. [x] Expose visible critters, doors, ground items, player actor IDs, and registered local inventory items with stable entity IDs in the machine-readable world state.
 3. [x] Route semantic verbs through the same multiplayer runtime handlers and command processor used by human input.
-4. [ ] Add semantic inventory, dialogue, and combat verbs as those authoritative command families become safe.
-5. [x] Add deterministic two-process exploration scenarios and structured completion assertions. Installed-data fixtures cover guest movement, scripted-door use, deferred pickup completion, and loot initiation, with full section-digest convergence and authenticated event replay.
+4. [x] Add a semantic direct-inventory gift verb using the authoritative transfer family; dialogue and combat verbs remain pending their authoritative controllers.
+5. [x] Add deterministic two-process exploration scenarios and structured completion assertions. Installed-data fixtures cover guest movement, scripted-door use, deferred pickup completion, loot initiation, and a split cap gift, with full section-digest convergence and authenticated event replay.
 6. [ ] Add an optional Laya or LLM controller above the deterministic semantic interface.
 
 Exit condition: an automated local client can observe the journal, control one player through validated semantic commands, and complete the supported exploration command set without bypassing multiplayer authority.
@@ -362,7 +362,7 @@ Exit condition: an automated local client can observe the journal, control one p
 - Replicate movement, doors, containers, item pickup, skill use, traps, and map-script results.
 - [x] Require the acting player to remain adjacent to the active loot target when starting loot and when applying every inventory transfer; the deterministic loot scenario also proves a remote command is rejected without publishing an event.
 - [x] Define and enforce modal-screen behavior. Dialogue and barter use the `Dialogue` phase; rest, elevators, and world-map travel use `Transition`. The peer main loop keeps rendering and pumping the network while shared-world input, scripts, and map processing are paused. These entry points fail closed until their effects have host-authoritative command families. Informational Pip-Boy, inventory, character, and options screens remain local; loot keeps its validated live path.
-- Add a minimal host-authoritative player-to-player item/caps transfer command for practical co-op testing; the full transactional trade UI remains Phase 6.
+- [x] Add a minimal host-authoritative player-to-player item/caps gift command for practical co-op testing. It permits only direct owned inventory to move to an adjacent peer, rejects remote transfers and attempts to take, and exposes registered inventory IDs through the agent journal; the full transactional trade UI remains Phase 6.
 - Audit script-facing player assumptions used during exploration and classify each as story actor, acting player, or shared party state.
 
 Exit condition: two players can complete a small non-combat quest together on one map with synchronized objects, inventory, scripts, and player-specific skill checks.

@@ -9,6 +9,7 @@ namespace fallout {
 
 struct AgentJournalActorState {
     std::uint32_t playerId = 0;
+    std::uint64_t entityId = 0;
     std::string name;
     bool local = false;
     int tile = -1;
@@ -18,6 +19,14 @@ struct AgentJournalActorState {
     int screenY = -1;
     int hitPoints = 0;
     int actionPoints = 0;
+};
+
+struct AgentJournalInventoryItemState {
+    std::uint64_t entityId = 0;
+    int pid = -1;
+    std::string name;
+    std::uint32_t quantity = 0;
+    bool equipped = false;
 };
 
 struct AgentJournalCritterState {
@@ -56,6 +65,7 @@ struct AgentJournalWorldState {
     bool combat = false;
     AgentJournalActorState host;
     AgentJournalActorState guest;
+    std::vector<AgentJournalInventoryItemState> localInventory;
     std::vector<AgentJournalCritterState> visibleCritters;
     std::vector<AgentJournalInteractableState> visibleInteractables;
 };

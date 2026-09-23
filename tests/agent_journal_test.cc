@@ -41,10 +41,12 @@ int main(int argc, char** argv)
     state.phase = "exploration";
     state.connected = true;
     state.host.playerId = 1;
+    state.host.entityId = 1;
     state.host.name = "Albert";
     state.host.local = true;
     state.host.tile = 12345;
     state.guest.playerId = 2;
+    state.guest.entityId = 2;
     state.guest.name = "Max";
     state.guest.tile = 12346;
     fallout::AgentJournalCritterState enemy;
@@ -55,6 +57,12 @@ int main(int argc, char** argv)
     enemy.screenX = 410;
     enemy.screenY = 220;
     state.visibleCritters.push_back(enemy);
+    fallout::AgentJournalInventoryItemState item;
+    item.entityId = 66;
+    item.pid = 41;
+    item.name = "Bottle caps";
+    item.quantity = 12;
+    state.localInventory.push_back(item);
     fallout::AgentJournalInteractableState door;
     door.entityId = 77;
     door.kind = "door";
@@ -96,6 +104,8 @@ int main(int argc, char** argv)
     passed = expect(lines.size() > 4
             && lines[4].find("\"event\":\"world_state\"") != std::string::npos
             && lines[4].find("\"tile\":12345") != std::string::npos
+            && lines[4].find("\"local_inventory\":[{\"entity_id\":66") != std::string::npos
+            && lines[4].find("\"quantity\":12") != std::string::npos
             && lines[4].find("\"visible_critters\":[{\"entity_id\":44") != std::string::npos
             && lines[4].find("\"disposition\":\"hostile\"") != std::string::npos
             && lines[4].find("\"visible_interactables\":[{\"entity_id\":77") != std::string::npos

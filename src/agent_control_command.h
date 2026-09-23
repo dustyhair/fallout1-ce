@@ -17,6 +17,7 @@ enum class AgentControlCommandType {
     GameDoor,
     GamePickup,
     GameLoot,
+    GameGive,
 };
 
 struct AgentControlCommand {
@@ -29,6 +30,8 @@ struct AgentControlCommand {
     int elevation = -1;
     int rotation = -1;
     std::uint32_t entityId = 0;
+    std::uint32_t destinationEntityId = 0;
+    std::uint32_t quantity = 0;
     bool running = false;
     std::string text;
 };

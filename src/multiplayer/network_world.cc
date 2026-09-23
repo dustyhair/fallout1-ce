@@ -333,6 +333,20 @@ bool lootTargetIsInRange(Object* actor, Object* target)
         && obj_dist(actor, target) == 1;
 }
 
+bool isPlayerActor(Object* actor)
+{
+    std::optional<EntityId> actorId = session.entities().findEntity(actor);
+    return actorId.has_value() && session.players().findByActor(*actorId) != nullptr;
+}
+
+bool isAdjacentPlayerActor(Object* actor, Object* target)
+{
+    if (!lootTargetIsInRange(actor, target)) {
+        return false;
+    }
+    return isPlayerActor(target);
+}
+
 bool applyInventoryTransfer(Object* source,
     Object* destination,
     Object* item,
@@ -515,6 +529,7 @@ public:
     CommandExecutionStatus loot(Object* actor, Object* target) override
     {
         if (isInCombat()
+            || isPlayerActor(target)
             || !lootTargetIsInRange(actor, target)) {
             return CommandExecutionStatus::InvalidAction;
         }
@@ -578,11 +593,18 @@ public:
         Object* sourceTop = topEnvironmentOrSelf(source);
         Object* destinationTop = topEnvironmentOrSelf(destination);
         Object* otherTop = sourceTop == actor ? destinationTop : sourceTop;
+        bool lootTransfer = activeLoot != activeLootTargets.end()
+            && activeLoot->second == otherTop
+            && !isPlayerActor(otherTop)
+            && lootTargetIsInRange(actor, otherTop);
+        bool playerGift = item != nullptr
+            && source == actor
+            && destination == destinationTop
+            && isAdjacentPlayerActor(actor, destination)
+            && (item->flags & (OBJECT_EQUIPPED | OBJECT_USED)) == 0;
         if (isInCombat()
             || (sourceTop != actor && destinationTop != actor)
-            || activeLoot == activeLootTargets.end()
-            || activeLoot->second != otherTop
-            || !lootTargetIsInRange(actor, otherTop)) {
+            || (!lootTransfer && !playerGift)) {
             return execution;
         }
 
@@ -1113,6 +1135,7 @@ bool networkWorldApplyPeerLoot(const LootStartedEvent& loot)
     if (player == nullptr
         || actor == nullptr
         || target == nullptr
+        || isPlayerActor(target)
         || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER
         || !lootTargetIsInRange(actor, target)) {
         return false;
@@ -1492,6 +1515,156 @@ bool networkWorldVerifyLootRangeSmokeTest(EntityId targetId)
     return rejected && restored;
 }
 
+std::optional<EntityId> networkWorldPreparePlayerTransferSmokeTest()
+{
+    if (!session.isActive()) {
+        return std::nullopt;
+    }
+    Object* hostActor = session.entities().findObject(session.playerActorId(kHostPlayerId));
+    Object* guestActor = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+    if (hostActor == nullptr || guestActor == nullptr) {
+        return std::nullopt;
+    }
+
+    anim_stop();
+    bool placed = false;
+    for (int rotation = 0; rotation < ROTATION_COUNT && !placed; rotation++) {
+        int tile = tile_num_in_direction(hostActor->tile, rotation, 1);
+        placed = hexGridTileIsValid(tile)
+            && obj_blocking_at(guestActor, tile, hostActor->elevation) == nullptr
+            && obj_move_to_tile(guestActor, tile, hostActor->elevation, nullptr) == 0;
+    }
+    int existingHostCaps = item_caps_total(hostActor);
+    int existingGuestCaps = item_caps_total(guestActor);
+    if (!placed
+        || (existingHostCaps > 0 && item_caps_adjust(hostActor, -existingHostCaps) != 0)
+        || (existingGuestCaps > 0 && item_caps_adjust(guestActor, -existingGuestCaps) != 0)
+        || item_caps_adjust(guestActor, 7) != 0) {
+        return std::nullopt;
+    }
+
+    Inventory& inventory = guestActor->data.inventory;
+    for (int index = 0; index < inventory.length; index++) {
+        Object* item = inventory.items[index].item;
+        if (item != nullptr && item->pid == PROTO_ID_MONEY && inventory.items[index].quantity == 7) {
+            EntityRegistrationResult registration = registerItem(item);
+            return registration ? std::optional<EntityId>(registration.entityId) : std::nullopt;
+        }
+    }
+    return std::nullopt;
+}
+
+bool networkWorldVerifyPlayerTransferRangeSmokeTest(EntityId itemId)
+{
+    Object* hostActor = session.entities().findObject(session.playerActorId(kHostPlayerId));
+    Object* guestActor = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+    Object* item = session.entities().findObject(itemId);
+    ItemDescriptor descriptor;
+    if (!session.isActive()
+        || hostActor == nullptr
+        || guestActor == nullptr
+        || item == nullptr
+        || item->owner != guestActor
+        || item_count(guestActor, item) != 7
+        || !isAdjacentPlayerActor(guestActor, hostActor)
+        || !describeItem(item, descriptor)) {
+        return false;
+    }
+
+    int adjacentTile = guestActor->tile;
+    int elevation = guestActor->elevation;
+    int remoteTile = -1;
+    for (int distance = 2; distance <= 4 && remoteTile == -1; distance++) {
+        for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+            int candidate = tile_num_in_direction(hostActor->tile, rotation, distance);
+            if (hexGridTileIsValid(candidate)
+                && obj_blocking_at(guestActor, candidate, elevation) == nullptr) {
+                remoteTile = candidate;
+                break;
+            }
+        }
+    }
+    if (remoteTile == -1 || obj_move_to_tile(guestActor, remoteTile, elevation, nullptr) == -1) {
+        return false;
+    }
+
+    GameCommand command;
+    command.sequence = CommandSequence { 1 };
+    command.playerId = kGuestPlayerId;
+    command.actorId = session.playerActorId(kGuestPlayerId);
+    command.expectedPhase = SessionPhase::Exploration;
+    command.expectedPhaseRevision = session.phaseRevision();
+    command.payload = InventoryTransferCommand {
+        session.playerActorId(kGuestPlayerId),
+        session.playerActorId(kHostPlayerId),
+        itemId,
+        3,
+        7,
+        descriptor,
+    };
+    AuthoritativeCommandResult outcome = networkWorldProcessCommand(command);
+    bool rejected = outcome.result.status == CommandStatus::Rejected
+        && outcome.result.rejection == CommandRejection::InvalidAction
+        && !outcome.event.has_value()
+        && item->owner == guestActor
+        && item_count(guestActor, item) == 7
+        && item_caps_total(hostActor) == 0;
+
+    bool restored = obj_move_to_tile(guestActor, adjacentTile, elevation, nullptr) == 0
+        && isAdjacentPlayerActor(guestActor, hostActor);
+    GameCommand playerLoot = command;
+    playerLoot.sequence = CommandSequence { 2 };
+    playerLoot.payload = LootCommand { session.playerActorId(kHostPlayerId) };
+    AuthoritativeCommandResult playerLootOutcome = networkWorldProcessCommand(playerLoot);
+    bool playerLootRejected = playerLootOutcome.result.status == CommandStatus::Rejected
+        && playerLootOutcome.result.rejection == CommandRejection::InvalidAction
+        && !playerLootOutcome.event.has_value()
+        && activeLootTargets.find(guestActor) == activeLootTargets.end();
+
+    command.sequence = CommandSequence { 3 };
+    command.payload = InventoryTransferCommand {
+        session.playerActorId(kGuestPlayerId),
+        session.playerActorId(kHostPlayerId),
+        itemId,
+        7,
+        7,
+        descriptor,
+    };
+    AuthoritativeCommandResult giftOutcome = networkWorldProcessCommand(command);
+    const auto* giftEvent = giftOutcome.event.has_value()
+        ? std::get_if<InventoryTransferredEvent>(&giftOutcome.event->payload)
+        : nullptr;
+    bool gifted = giftOutcome.result.status == CommandStatus::Accepted
+        && giftEvent != nullptr
+        && !isValid(giftEvent->remainderItemId)
+        && item->owner == hostActor
+        && item_count(hostActor, item) == 7;
+
+    command.sequence = CommandSequence { 4 };
+    command.payload = InventoryTransferCommand {
+        session.playerActorId(kHostPlayerId),
+        session.playerActorId(kGuestPlayerId),
+        itemId,
+        3,
+        7,
+        descriptor,
+    };
+    AuthoritativeCommandResult takeOutcome = networkWorldProcessCommand(command);
+    bool takingRejected = takeOutcome.result.status == CommandStatus::Rejected
+        && takeOutcome.result.rejection == CommandRejection::InvalidAction
+        && !takeOutcome.event.has_value()
+        && item->owner == hostActor
+        && item_count(hostActor, item) == 7;
+    bool rolledBack = giftEvent != nullptr
+        && networkWorldApplyInventoryTransfer(*giftEvent, true)
+        && item->owner == guestActor
+        && item_count(guestActor, item) == 7
+        && item_caps_total(hostActor) == 0;
+
+    commandProcessor.reset();
+    return rejected && restored && playerLootRejected && gifted && takingRejected && rolledBack;
+}
+
 bool networkWorldRunSharedModalSmokeTest()
 {
     if (!session.isActive() || session.phase() != SessionPhase::Exploration) {
@@ -1550,6 +1723,7 @@ bool networkWorldBeginLocalLoot(Object* target)
     if (!session.isActive()
         || obj_dude == nullptr
         || target == nullptr
+        || isPlayerActor(target)
         || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER
         || obj_dude->elevation != target->elevation) {
         return false;
@@ -1563,6 +1737,7 @@ bool networkWorldSetLocalLootTarget(Object* target)
     if (!session.isActive()
         || obj_dude == nullptr
         || target == nullptr
+        || isPlayerActor(target)
         || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER
         || obj_dude->elevation != target->elevation) {
         return false;
@@ -1747,6 +1922,7 @@ bool networkWorldApplyInventoryTransfer(const InventoryTransferredEvent& transfe
     }
     if (item->owner == destination) {
         inven_refresh_loot_window();
+        inven_refresh_inventory_window();
         return true;
     }
     if (item_count(source, item) != static_cast<int>(transfer.sourceQuantity)) {
@@ -1762,6 +1938,7 @@ bool networkWorldApplyInventoryTransfer(const InventoryTransferredEvent& transfe
         !reverse);
     if (applied) {
         inven_refresh_loot_window();
+        inven_refresh_inventory_window();
     }
     return applied;
 }

@@ -170,6 +170,16 @@ void executeCommand(const AgentControlCommand& command)
         }
         return;
     }
+    case AgentControlCommandType::GameGive:
+        if (multiplayer::networkRuntimeGiveItemToPlayer(
+                multiplayer::EntityId { command.destinationEntityId },
+                multiplayer::EntityId { command.entityId },
+                command.quantity)) {
+            agentJournalWriteAgentCommand(command.id, commandName, "accepted", "authoritative player gift submitted");
+        } else {
+            agentJournalWriteAgentCommand(command.id, commandName, "rejected", "player gift is unavailable or invalid");
+        }
+        return;
     }
 }
 

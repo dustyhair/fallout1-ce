@@ -101,6 +101,28 @@ bool parseEntityId(std::istringstream& input, AgentControlCommand& command, std:
     return true;
 }
 
+bool parseGive(std::istringstream& input, AgentControlCommand& command, std::string& error)
+{
+    std::uint64_t destination = 0;
+    std::uint64_t item = 0;
+    std::uint64_t quantity = 0;
+    if (!(input >> destination >> item >> quantity)
+        || hasTrailingInput(input)
+        || destination == 0
+        || item == 0
+        || quantity == 0
+        || destination > std::numeric_limits<std::uint32_t>::max()
+        || item > std::numeric_limits<std::uint32_t>::max()
+        || quantity > std::numeric_limits<std::uint32_t>::max()) {
+        error = "expected: game_give <destination actor id> <item id> <positive quantity>";
+        return false;
+    }
+    command.destinationEntityId = static_cast<std::uint32_t>(destination);
+    command.entityId = static_cast<std::uint32_t>(item);
+    command.quantity = static_cast<std::uint32_t>(quantity);
+    return true;
+}
+
 } // namespace
 
 bool agentControlParseCommand(const std::string& line,
@@ -214,6 +236,10 @@ bool agentControlParseCommand(const std::string& line,
         command.type = AgentControlCommandType::GameLoot;
         return parseEntityId(input, command, error);
     }
+    if (verb == "game_give") {
+        command.type = AgentControlCommandType::GameGive;
+        return parseGive(input, command, error);
+    }
 
     error = "unknown command";
     return false;
@@ -242,6 +268,8 @@ const char* agentControlCommandTypeName(AgentControlCommandType type)
         return "game_pickup";
     case AgentControlCommandType::GameLoot:
         return "game_loot";
+    case AgentControlCommandType::GameGive:
+        return "game_give";
     }
     return "unknown";
 }

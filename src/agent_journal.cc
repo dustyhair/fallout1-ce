@@ -93,6 +93,7 @@ std::string actorJson(const AgentJournalActorState& actor)
 {
     std::ostringstream output;
     output << "{\"player_id\":" << actor.playerId
+           << ",\"entity_id\":" << actor.entityId
            << ",\"name\":" << jsonString(actor.name.c_str())
            << ",\"local\":" << booleanValue(actor.local)
            << ",\"tile\":" << actor.tile
@@ -102,6 +103,18 @@ std::string actorJson(const AgentJournalActorState& actor)
            << ",\"screen_y\":" << actor.screenY
            << ",\"hp\":" << actor.hitPoints
            << ",\"ap\":" << actor.actionPoints
+           << '}';
+    return output.str();
+}
+
+std::string inventoryItemJson(const AgentJournalInventoryItemState& item)
+{
+    std::ostringstream output;
+    output << "{\"entity_id\":" << item.entityId
+           << ",\"pid\":" << item.pid
+           << ",\"name\":" << jsonString(item.name.c_str())
+           << ",\"quantity\":" << item.quantity
+           << ",\"equipped\":" << booleanValue(item.equipped)
            << '}';
     return output.str();
 }
@@ -270,7 +283,14 @@ void agentJournalWriteWorldState(const AgentJournalWorldState& state)
            << ",\"combat\":" << booleanValue(state.combat)
            << ",\"host\":" << actorJson(state.host)
            << ",\"guest\":" << actorJson(state.guest)
-           << ",\"visible_critters\":[";
+           << ",\"local_inventory\":[";
+    for (std::size_t index = 0; index < state.localInventory.size(); index++) {
+        if (index != 0) {
+            fields << ',';
+        }
+        fields << inventoryItemJson(state.localInventory[index]);
+    }
+    fields << "],\"visible_critters\":[";
     for (std::size_t index = 0; index < state.visibleCritters.size(); index++) {
         if (index != 0) {
             fields << ',';

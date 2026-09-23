@@ -64,12 +64,20 @@ int main()
             && command.entityId == 77,
         "parses a semantic entity command")
         && passed;
+    passed = expect(parse("49 game_give 1 77 12", command)
+            && command.type == fallout::AgentControlCommandType::GameGive
+            && command.destinationEntityId == 1
+            && command.entityId == 77
+            && command.quantity == 12,
+        "parses a semantic player gift")
+        && passed;
     passed = expect(!parse("0 click 10 10", command), "rejects command id zero") && passed;
-    passed = expect(!parse("49 click -1 10", command), "rejects negative coordinates") && passed;
-    passed = expect(!parse("50 key definitely-not-a-key", command), "rejects an unknown key") && passed;
-    passed = expect(!parse("51 move 10 20 trailing", command), "rejects trailing coordinate input") && passed;
-    passed = expect(!parse("52 game_move 10 3 walk", command), "rejects an invalid elevation") && passed;
-    passed = expect(!parse("53 game_door 0", command), "rejects an invalid entity id") && passed;
+    passed = expect(!parse("50 click -1 10", command), "rejects negative coordinates") && passed;
+    passed = expect(!parse("51 key definitely-not-a-key", command), "rejects an unknown key") && passed;
+    passed = expect(!parse("52 move 10 20 trailing", command), "rejects trailing coordinate input") && passed;
+    passed = expect(!parse("53 game_move 10 3 walk", command), "rejects an invalid elevation") && passed;
+    passed = expect(!parse("54 game_door 0", command), "rejects an invalid entity id") && passed;
+    passed = expect(!parse("55 game_give 1 77 0", command), "rejects a zero gift quantity") && passed;
 
     return passed ? 0 : 1;
 }

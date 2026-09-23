@@ -20,6 +20,8 @@ Passing `--multiplayer-smoke-scenario=pickup` selects the pickup fixture. It use
 
 Passing `--multiplayer-smoke-scenario=loot` selects a registered map critter, places the guest actor beside it, first proves that a remote loot command is rejected without an event, then sends the adjacent command through the host command processor. It applies the authoritative loot-start event and verifies checkpoint and replay convergence.
 
+Passing `--multiplayer-smoke-scenario=transfer` creates the same seven-cap guest stack on both processes. It first proves that an out-of-range gift and a forged attempt to take from the host are rejected without events. The guest then gives three caps to the adjacent host over the real command channel. Both peers must reach the same four/three cap split identities, converge at the checkpoint, and replay the transfer after reconnect.
+
 This hook makes the two-process path runnable under Xvfb:
 
 ```text
@@ -38,3 +40,5 @@ Ground-item pickup uses the same host-authoritative live path as movement and do
 Loot initiation and inventory transfers are also live. Canonically registered critters and recursive item contents give both peers the same IDs. The initiating player alone sees the modal loot UI; guest moves are deferred until the host accepts and journals them, while rejected moves leave local inventory unchanged. Partial transfers preserve the moved object's ID and use a new host-assigned ID for Fallout's copied remainder. Previously unregistered player items receive an ID from the host when first transferred, with prototype and mutable item state reproduced on the other peer.
 
 Player inventory drops are live as well. The host executes drop scripts, assigns IDs to dropped objects and split remainders, and publishes the final ground position. The guest inventory window refreshes as accepted events arrive. Ordinary stack quantities are drained in order through the returned remainder identities, while caps are handled as one authoritative bulk drop.
+
+Minimal direct player gifts are live through the semantic `game_give` command. The host permits only a directly owned, unequipped item moving from the sender to the adjacent peer; reverse “take” requests and remote transfers are rejected. Stack and cap splits reuse the authoritative inventory event and recovery snapshot path. The revisioned two-sided offer/confirmation UI remains a later trade milestone.

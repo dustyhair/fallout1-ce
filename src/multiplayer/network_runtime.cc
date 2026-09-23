@@ -68,6 +68,7 @@ enum class SmokeScenario {
     Door,
     Pickup,
     Loot,
+    PlayerTransfer,
 };
 SmokeScenario smokeScenario = SmokeScenario::Movement;
 
@@ -82,6 +83,8 @@ const char* smokeScenarioName()
         return "pickup";
     case SmokeScenario::Loot:
         return "loot";
+    case SmokeScenario::PlayerTransfer:
+        return "transfer";
     }
     return "unknown";
 }
@@ -383,6 +386,9 @@ AgentJournalActorState actorJournalState(PlayerId playerId, bool local)
     state.name = sheet != nullptr ? sheet->name : playerLabel(playerId);
     Object* actor = networkWorldPlayerActor(playerId);
     if (actor != nullptr) {
+        if (std::optional<EntityId> entityId = networkWorldFindEntity(actor)) {
+            state.entityId = entityId->value;
+        }
         state.tile = actor->tile;
         state.elevation = actor->elevation;
         state.rotation = actor->rotation;
@@ -487,6 +493,37 @@ std::vector<AgentJournalCritterState> visibleCritterJournalStates(Object* localA
     return states;
 }
 
+std::vector<AgentJournalInventoryItemState> localInventoryJournalStates(Object* localActor)
+{
+    std::vector<AgentJournalInventoryItemState> states;
+    if (localActor == nullptr) {
+        return states;
+    }
+    const Inventory& inventory = localActor->data.inventory;
+    for (int index = 0; index < inventory.length; index++) {
+        Object* item = inventory.items[index].item;
+        if (item == nullptr || inventory.items[index].quantity <= 0) {
+            continue;
+        }
+        std::optional<EntityId> entityId = networkWorldFindEntity(item);
+        if (!entityId.has_value()) {
+            continue;
+        }
+        AgentJournalInventoryItemState state;
+        state.entityId = entityId->value;
+        state.pid = item->pid;
+        const char* name = object_name(item);
+        state.name = name != nullptr ? name : "";
+        state.quantity = static_cast<std::uint32_t>(inventory.items[index].quantity);
+        state.equipped = (item->flags & (OBJECT_EQUIPPED | OBJECT_USED)) != 0;
+        states.push_back(std::move(state));
+    }
+    std::sort(states.begin(), states.end(), [](const auto& left, const auto& right) {
+        return left.entityId < right.entityId;
+    });
+    return states;
+}
+
 std::vector<AgentJournalInteractableState> visibleInteractableJournalStates(Object* localActor)
 {
     std::vector<AgentJournalInteractableState> states;
@@ -577,6 +614,7 @@ void reportAgentWorldState()
     Object* guestActor = networkWorldPlayerActor(kGuestPlayerId);
     Object* localActor = hostIsLocal ? hostActor : guestActor;
     if (localActor != nullptr) {
+        state.localInventory = localInventoryJournalStates(localActor);
         state.visibleCritters = visibleCritterJournalStates(localActor, hostActor, guestActor);
         state.visibleInteractables = visibleInteractableJournalStates(localActor);
     }
@@ -1019,6 +1057,8 @@ bool networkRuntimeConfigure(int argc, char** argv)
             smokeScenario = SmokeScenario::Pickup;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=loot") == 0) {
             smokeScenario = SmokeScenario::Loot;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=transfer") == 0) {
+            smokeScenario = SmokeScenario::PlayerTransfer;
         }
     }
     if (smokeTestEnabled && launchOptions.mode == NetworkLaunchMode::Disabled) {
@@ -1107,6 +1147,7 @@ bool networkRuntimeRunSmokeTest()
             scenarioCommand.actorId = EntityId { 2 };
             scenarioCommand.expectedPhase = SessionPhase::Exploration;
             scenarioCommand.expectedPhaseRevision = networkWorldPhaseRevision();
+            bool scenarioCommandReady = true;
             Object* scenarioActor = networkWorldPlayerActor(kGuestPlayerId);
             int scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
             int scenarioDestinationTile = -1;
@@ -1122,6 +1163,13 @@ bool networkRuntimeRunSmokeTest()
                 scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
                 if (scenarioTargetId.has_value()
                     && !networkWorldVerifyLootRangeSmokeTest(*scenarioTargetId)) {
+                    scenarioTargetId.reset();
+                }
+            } else if (smokeScenario == SmokeScenario::PlayerTransfer) {
+                scenarioTargetId = networkWorldPreparePlayerTransferSmokeTest();
+                scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
+                if (scenarioTargetId.has_value()
+                    && !networkWorldVerifyPlayerTransferRangeSmokeTest(*scenarioTargetId)) {
                     scenarioTargetId.reset();
                 }
             } else if (scenarioActor != nullptr) {
@@ -1153,6 +1201,27 @@ bool networkRuntimeRunSmokeTest()
                 break;
             case SmokeScenario::Loot:
                 scenarioCommand.payload = LootCommand { *scenarioTargetId };
+                break;
+            case SmokeScenario::PlayerTransfer: {
+                Object* item = networkWorldFindObject(*scenarioTargetId);
+                ItemDescriptor descriptor;
+                if (item == nullptr || !networkWorldDescribeItem(item, descriptor)) {
+                    setStatus("MULTIPLAYER SMOKE TEST FAILED: INVALID PLAYER TRANSFER FIXTURE");
+                    scenarioCommandReady = false;
+                    break;
+                }
+                scenarioCommand.payload = InventoryTransferCommand {
+                    EntityId { kGuestPlayerId.value },
+                    EntityId { kHostPlayerId.value },
+                    *scenarioTargetId,
+                    3,
+                    7,
+                    descriptor,
+                };
+                break;
+            }
+            }
+            if (!scenarioCommandReady) {
                 break;
             }
             EventSequence scenarioFinalEventSequence {
@@ -1244,6 +1313,22 @@ bool networkRuntimeRunSmokeTest()
                                     && loot->actorId == scenarioCommand.actorId
                                     && loot->targetId == *scenarioTargetId
                                     && networkWorldApplyPeerLoot(*loot);
+                            } else if (event && event.event.sequence == expectedEventSequence
+                                && event.event.causedBy == scenarioCommand.sequence
+                                && smokeScenario == SmokeScenario::PlayerTransfer) {
+                                const auto* transfer = std::get_if<InventoryTransferredEvent>(&event.event.payload);
+                                eventApplied = transfer != nullptr
+                                    && transfer->actorId == scenarioCommand.actorId
+                                    && transfer->sourceId == EntityId { kGuestPlayerId.value }
+                                    && transfer->destinationId == EntityId { kHostPlayerId.value }
+                                    && transfer->itemId == *scenarioTargetId
+                                    && transfer->quantity == 3
+                                    && transfer->sourceQuantity == 7
+                                    && isValid(transfer->remainderItemId)
+                                    && transfer->itemDescriptor.pid == PROTO_ID_MONEY
+                                    && networkWorldApplyInventoryTransfer(*transfer)
+                                    && item_caps_total(networkWorldPlayerActor(kHostPlayerId)) == 3
+                                    && item_caps_total(networkWorldPlayerActor(kGuestPlayerId)) == 4;
                             }
                             if (eventApplied) {
                                 receivedEventCount++;
@@ -1322,6 +1407,15 @@ bool networkRuntimeRunSmokeTest()
                             } else if (smokeScenario == SmokeScenario::Loot) {
                                 const auto* loot = std::get_if<LootCommand>(&command.command.payload);
                                 payloadMatches = loot != nullptr && loot->targetId == *scenarioTargetId;
+                            } else if (smokeScenario == SmokeScenario::PlayerTransfer) {
+                                const auto* transfer = std::get_if<InventoryTransferCommand>(&command.command.payload);
+                                payloadMatches = transfer != nullptr
+                                    && transfer->sourceId == EntityId { kGuestPlayerId.value }
+                                    && transfer->destinationId == EntityId { kHostPlayerId.value }
+                                    && transfer->itemId == *scenarioTargetId
+                                    && transfer->quantity == 3
+                                    && transfer->sourceQuantity == 7
+                                    && transfer->itemDescriptor.pid == PROTO_ID_MONEY;
                             } else {
                                 const auto* movement = std::get_if<MoveCommand>(&command.command.payload);
                                 payloadMatches = movement != nullptr
@@ -1366,6 +1460,9 @@ bool networkRuntimeRunSmokeTest()
                             return pickupCompletion.has_value();
                         case SmokeScenario::Loot:
                             return true;
+                        case SmokeScenario::PlayerTransfer:
+                            return item_caps_total(networkWorldPlayerActor(kHostPlayerId)) == 3
+                                && item_caps_total(networkWorldPlayerActor(kGuestPlayerId)) == 4;
                         }
                         return false;
                     };
@@ -1993,6 +2090,61 @@ bool networkRuntimeHandleLocalAttack(Object* target, int hitMode, int hitLocatio
     (void)hitLocation;
     debug_printf("Multiplayer combat input is blocked until authoritative turn ownership is available.\n");
     return true;
+}
+
+bool networkRuntimeGiveItemToPlayer(EntityId destinationActorId, EntityId itemId, std::uint32_t quantity)
+{
+    if (!networkWorldActive()
+        || networkWorldPhase() != SessionPhase::Exploration
+        || !isValid(destinationActorId)
+        || !isValid(itemId)
+        || quantity == 0) {
+        return false;
+    }
+
+    Object* actor = localPlayerActor();
+    Object* destination = networkWorldFindObject(destinationActorId);
+    Object* item = networkWorldFindObject(itemId);
+    Object* hostActor = networkWorldPlayerActor(kHostPlayerId);
+    Object* guestActor = networkWorldPlayerActor(kGuestPlayerId);
+    std::optional<EntityId> actorId = networkWorldFindEntity(actor);
+    int availableQuantity = actor != nullptr && item != nullptr
+        ? item_count(actor, item)
+        : 0;
+    ItemDescriptor itemDescriptor;
+    if (actor == nullptr
+        || destination == nullptr
+        || destination == actor
+        || (destination != hostActor && destination != guestActor)
+        || actor->elevation != destination->elevation
+        || obj_dist(actor, destination) != 1
+        || item == nullptr
+        || item->owner != actor
+        || !actorId.has_value()
+        || quantity > static_cast<std::uint32_t>(std::max(availableQuantity, 0))
+        || !networkWorldDescribeItem(item, itemDescriptor)
+        || (item->flags & (OBJECT_EQUIPPED | OBJECT_USED)) != 0) {
+        return false;
+    }
+
+    InventoryTransferCommand command {
+        *actorId,
+        destinationActorId,
+        itemId,
+        quantity,
+        static_cast<std::uint32_t>(availableQuantity),
+        itemDescriptor,
+    };
+    return launchOptions.mode == NetworkLaunchMode::Host
+        ? submitHostCommand(command)
+        : lobby.sendLocalInventoryTransfer(command.sourceId,
+              command.destinationId,
+              command.itemId,
+              command.quantity,
+              command.sourceQuantity,
+              networkWorldPhaseRevision(),
+              {},
+              command.itemDescriptor);
 }
 
 bool networkRuntimeRequestSharedModal(SharedModalKind kind, bool open)

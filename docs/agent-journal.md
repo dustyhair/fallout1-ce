@@ -40,9 +40,10 @@ When a multiplayer world is active, prefer the semantic commands below. They ent
 13 game_door 77
 14 game_pickup 88
 15 game_loot 91
+16 game_give 1 88 3
 ```
 
-`game_move` takes a map tile, elevation from 0 through 2, and optional `walk` or `run`. Entity commands take an entity ID reported by the journal. A syntactically accepted command can still be rejected by authority checks for phase, ownership, range, target state, or another gameplay rule. Movement, facing, doors, pickup, and loot initiation are currently supported; inventory, dialogue, and combat verbs remain planned. Live multiplayer combat input remains blocked until authoritative turn ownership is implemented.
+`game_move` takes a map tile, elevation from 0 through 2, and optional `walk` or `run`. Entity commands take an entity ID reported by the journal. `game_give` takes the destination player's actor entity ID, a registered item ID from `local_inventory`, and a positive quantity. It can give ordinary items or caps, but only from the sender's direct inventory to an adjacent player. A syntactically accepted command can still be rejected by authority checks for phase, ownership, range, target state, or another gameplay rule. Movement, facing, doors, pickup, loot initiation, and direct player gifts are currently supported; dialogue and combat verbs remain planned. Live multiplayer combat input remains blocked until authoritative turn ownership is implemented.
 
 An agent can read the existing context and then wait for new records without polling screenshots:
 
@@ -54,7 +55,7 @@ Each record has a monotonic `seq`, a Unix `time_ms`, and an `event`. The journal
 
 - `multiplayer_status` for connection and lobby changes.
 - `chat` with incoming or outgoing direction, player ID, character name, and message.
-- `world_state` when player or visible-world state changes. Player entries include tile, facing, health, action points, and approximate in-game screen coordinates. `visible_critters` reports each on-screen NPC's name, entity ID, tile, screen coordinates, distance, health, and `hostile`, `friendly`, `neutral`, or `dead` disposition. `visible_interactables` reports registered doors and ground items with their entity IDs, locations, and screen coordinates; doors also report open and locked state.
+- `world_state` when player or visible-world state changes. Player entries include their player and actor entity IDs, tile, facing, health, action points, and approximate in-game screen coordinates. `local_inventory` reports network-registered direct inventory items with entity ID, prototype ID, name, quantity, and equipped state. `visible_critters` reports each on-screen NPC's name, entity ID, tile, screen coordinates, distance, health, and `hostile`, `friendly`, `neutral`, or `dead` disposition. `visible_interactables` reports registered doors and ground items with their entity IDs, locations, and screen coordinates; doors also report open and locked state.
 - `world_exit` when the multiplayer world closes.
 - `display` for text sent to Fallout's lower message monitor.
 - `dialogue_reply`, `dialogue_option`, and `dialogue_choice` for NPC conversations.
