@@ -100,6 +100,9 @@ WorldSnapshot sampleSnapshot()
         ItemSnapshot { EntityId { 10 }, EntityId { 1 }, -1, -1, 2, ItemDescriptor { 40, 0, 0, 0 } },
         ItemSnapshot { EntityId { 11 }, {}, 20104, 0, 1, ItemDescriptor { 41, 0, 0, 0 } },
     };
+    snapshot.gameGlobalVariables = { 7, -9 };
+    snapshot.mapGlobalVariables = { 11 };
+    snapshot.mapLocalVariables = { 100, 101, 102 };
     return snapshot;
 }
 
@@ -2356,7 +2359,8 @@ void testSnapshotRoundTripAndRecovery()
     WorldSnapshot authoritative = sampleSnapshot();
     std::vector<std::uint8_t> packet;
     expect(encodeSnapshot(authoritative, packet) == SnapshotError::None, "valid snapshot encodes");
-    expect(packet.size() == kSnapshotHeaderSize + 24 + 2 * 32 + 36 + 12 + 2 * 36, "snapshot packet declares a fixed-width payload");
+    expect(packet.size() == kSnapshotHeaderSize + 36 + 2 * 32 + 36 + 12 + 2 * 36 + 6 * 4,
+        "snapshot packet declares a fixed-width payload");
     expect(packet[0] == 'F' && packet[1] == 'C' && packet[2] == 'M' && packet[3] == 'S', "snapshot magic uses network byte order");
 
     SnapshotDecodeResult decoded = decodeSnapshot(packet);
@@ -2377,6 +2381,10 @@ void testSnapshotRoundTripAndRecovery()
             && decoded.snapshot.items[0].itemDescriptor.pid == 40
             && decoded.snapshot.items[1].tile == 20104,
         "snapshot keeps canonical inventory ownership and ground-item location");
+    expect(decoded.snapshot.gameGlobalVariables == std::vector<std::int32_t>({ 7, -9 })
+            && decoded.snapshot.mapGlobalVariables == std::vector<std::int32_t>({ 11 })
+            && decoded.snapshot.mapLocalVariables == std::vector<std::int32_t>({ 100, 101, 102 }),
+        "snapshot keeps game globals and indexed map script variables");
 
     SnapshotDigestResult authoritativeDigest = computeSnapshotDigest(authoritative);
     SnapshotDigestResult decodedDigest = computeSnapshotDigest(decoded.snapshot);
@@ -2409,6 +2417,18 @@ void testSnapshotRoundTripAndRecovery()
     SnapshotDigestResult itemDriftDigest = computeSnapshotDigest(itemDrift);
     expect(firstDivergentSection(authoritativeDigest.digest, itemDriftDigest.digest) == SnapshotSection::Items,
         "inventory drift reports the item section");
+
+    WorldSnapshot globalDrift = decoded.snapshot;
+    globalDrift.gameGlobalVariables[0]++;
+    SnapshotDigestResult globalDriftDigest = computeSnapshotDigest(globalDrift);
+    expect(firstDivergentSection(authoritativeDigest.digest, globalDriftDigest.digest) == SnapshotSection::Globals,
+        "game-global drift reports the globals section");
+
+    WorldSnapshot mapVariableDrift = decoded.snapshot;
+    mapVariableDrift.mapLocalVariables[1]++;
+    SnapshotDigestResult mapVariableDriftDigest = computeSnapshotDigest(mapVariableDrift);
+    expect(firstDivergentSection(authoritativeDigest.digest, mapVariableDriftDigest.digest) == SnapshotSection::MapVariables,
+        "map script-variable drift reports the map-variable section");
 
     SnapshotReplica replica;
     expect(replica.apply(actorDrift) == SnapshotError::None, "replica accepts locally drifted state");
@@ -2481,6 +2501,11 @@ void testSnapshotRoundTripAndRecovery()
     invalidItem.items[0].itemDescriptor = {};
     expect(validateSnapshot(invalidItem) == SnapshotError::InvalidItemState,
         "snapshot requires enough item description to recreate a missing entity");
+
+    WorldSnapshot tooManyVariables = authoritative;
+    tooManyVariables.mapLocalVariables.assign(kMaxSnapshotVariables + 1, 0);
+    expect(validateSnapshot(tooManyVariables) == SnapshotError::TooManyVariables,
+        "snapshot bounds each script-visible variable array");
 }
 
 GameEvent sampleMovementEvent(std::uint64_t sequence)

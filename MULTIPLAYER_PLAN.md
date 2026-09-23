@@ -1,6 +1,6 @@
 # Two-player co-op plan
 
-Status: Phases 0 and 1 are complete on the `multiplayer-plan` branch. The Phase 2 transport, lobby, event journal, snapshot recovery, authenticated reconnect, complete gameplay-content manifest, and explicit first-contact fingerprint verification are implemented. Same-map movement, facing, doors, pickup, looting, inventory transfer, and item drops are partial Phase 3A work. Authority convergence is now the active milestone: live host and guest exploration inputs use the same command processor, door and completed-pickup events carry authoritative results, replicas no longer rerun pickup or attack gameplay functions, and periodic corrections contain actors, critters, doors, and items. The developer agent interface now exposes visible entity IDs and submits semantic movement, facing, door, pickup, and loot commands through that same authority path. Script/global result coverage, deterministic two-process scenarios, and engine integration scenarios remain open. Combat wire primitives exist, but live multiplayer attacks are intentionally blocked until authoritative phase and turn ownership are implemented.
+Status: Phases 0 and 1 are complete on the `multiplayer-plan` branch. The Phase 2 transport, lobby, event journal, snapshot recovery, authenticated reconnect, complete gameplay-content manifest, and explicit first-contact fingerprint verification are implemented. Same-map movement, facing, doors, pickup, looting, inventory transfer, and item drops are partial Phase 3A work. Authority convergence is now the active milestone: live host and guest exploration inputs use the same command processor, door and completed-pickup events carry authoritative results, replicas no longer rerun pickup or attack gameplay functions, and periodic corrections contain actors, critters, doors, items, game globals, and indexed map/script variables. The developer agent interface now exposes visible entity IDs and submits semantic movement, facing, door, pickup, and loot commands through that same authority path. Timed-queue and remaining script-state coverage, deterministic two-process scenarios, and engine integration scenarios remain open. Combat wire primitives exist, but live multiplayer attacks are intentionally blocked until authoritative phase and turn ownership are implemented.
 
 ## Goal
 
@@ -329,7 +329,7 @@ Current implementation status:
 4. [x] Expand periodic authoritative correction to actors, critters, doors, and items.
 5. [x] Carry authoritative phase revisions in snapshots and apply them on the guest.
 6. [x] Replace snapshot-dependent pickup completion with an explicit authoritative completion effect.
-7. [ ] Add globals, map variables, queues, and script-visible state to sectioned snapshots/digests.
+7. [ ] Add globals, map variables, queues, and script-visible state to sectioned snapshots/digests. Game globals plus indexed map-global and map-local/script variables are covered; timed queues and interpreter state remain.
 8. [ ] Add the script-once and RNG-once engine integration scenarios.
 
 Exit condition: host and guest input share one validation path, the guest executes no rule-bearing mutation or RNG from a replicated event, and sectioned checkpoints show no unexplained divergence.

@@ -8,7 +8,7 @@ namespace fallout {
 namespace multiplayer {
 namespace {
 
-constexpr std::size_t kSnapshotPayloadHeaderSize = 24;
+constexpr std::size_t kSnapshotPayloadHeaderSize = 36;
 constexpr std::size_t kActorSnapshotSize = 32;
 constexpr std::size_t kCritterSnapshotSize = 36;
 constexpr std::size_t kDoorSnapshotSize = 12;
@@ -155,6 +155,13 @@ void appendItem(std::vector<std::uint8_t>& bytes, const ItemSnapshot& item)
     appendUint32(bytes, static_cast<std::uint32_t>(item.itemDescriptor.data1));
 }
 
+void appendVariables(std::vector<std::uint8_t>& bytes, const std::vector<std::int32_t>& variables)
+{
+    for (std::int32_t value : variables) {
+        appendUint32(bytes, static_cast<std::uint32_t>(value));
+    }
+}
+
 std::uint64_t digestBytes(const std::vector<std::uint8_t>& bytes)
 {
     return checksum(bytes.data(), bytes.size());
@@ -184,6 +191,11 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
     }
     if (snapshot.items.size() > kMaxSnapshotItems) {
         return SnapshotError::TooManyItems;
+    }
+    if (snapshot.gameGlobalVariables.size() > kMaxSnapshotVariables
+        || snapshot.mapGlobalVariables.size() > kMaxSnapshotVariables
+        || snapshot.mapLocalVariables.size() > kMaxSnapshotVariables) {
+        return SnapshotError::TooManyVariables;
     }
 
     std::unordered_set<std::uint32_t> entityIds;
@@ -257,7 +269,11 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
         + snapshot.actors.size() * kActorSnapshotSize
         + snapshot.critters.size() * kCritterSnapshotSize
         + snapshot.doors.size() * kDoorSnapshotSize
-        + snapshot.items.size() * kItemSnapshotSize;
+        + snapshot.items.size() * kItemSnapshotSize
+        + (snapshot.gameGlobalVariables.size()
+              + snapshot.mapGlobalVariables.size()
+              + snapshot.mapLocalVariables.size())
+            * sizeof(std::uint32_t);
     if (payloadSize > kMaxSnapshotPayloadSize) {
         return SnapshotError::PayloadTooLarge;
     }
@@ -279,7 +295,11 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
         + canonical.actors.size() * kActorSnapshotSize
         + canonical.critters.size() * kCritterSnapshotSize
         + canonical.doors.size() * kDoorSnapshotSize
-        + canonical.items.size() * kItemSnapshotSize);
+        + canonical.items.size() * kItemSnapshotSize
+        + (canonical.gameGlobalVariables.size()
+              + canonical.mapGlobalVariables.size()
+              + canonical.mapLocalVariables.size())
+            * sizeof(std::uint32_t));
 
     appendUint8(payload, static_cast<std::uint8_t>(canonical.phase));
     appendUint8(payload, 0);
@@ -289,6 +309,9 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
     appendUint32(payload, static_cast<std::uint32_t>(canonical.critters.size()));
     appendUint32(payload, static_cast<std::uint32_t>(canonical.doors.size()));
     appendUint32(payload, static_cast<std::uint32_t>(canonical.items.size()));
+    appendUint32(payload, static_cast<std::uint32_t>(canonical.gameGlobalVariables.size()));
+    appendUint32(payload, static_cast<std::uint32_t>(canonical.mapGlobalVariables.size()));
+    appendUint32(payload, static_cast<std::uint32_t>(canonical.mapLocalVariables.size()));
     for (const ActorSnapshot& actor : canonical.actors) {
         appendActor(payload, actor);
     }
@@ -301,6 +324,9 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
     for (const ItemSnapshot& item : canonical.items) {
         appendItem(payload, item);
     }
+    appendVariables(payload, canonical.gameGlobalVariables);
+    appendVariables(payload, canonical.mapGlobalVariables);
+    appendVariables(payload, canonical.mapLocalVariables);
 
     std::vector<std::uint8_t> protectedBytes;
     protectedBytes.reserve(sizeof(std::uint64_t) + payload.size());
@@ -378,6 +404,9 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
     std::uint32_t critterCount = readUint32(packet, offset);
     std::uint32_t doorCount = readUint32(packet, offset);
     std::uint32_t itemCount = readUint32(packet, offset);
+    std::uint32_t gameGlobalCount = readUint32(packet, offset);
+    std::uint32_t mapGlobalCount = readUint32(packet, offset);
+    std::uint32_t mapLocalCount = readUint32(packet, offset);
 
     if (actorCount > kMaxSnapshotActors) {
         result.error = SnapshotError::TooManyActors;
@@ -395,12 +424,22 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
         result.error = SnapshotError::TooManyItems;
         return result;
     }
+    if (gameGlobalCount > kMaxSnapshotVariables
+        || mapGlobalCount > kMaxSnapshotVariables
+        || mapLocalCount > kMaxSnapshotVariables) {
+        result.error = SnapshotError::TooManyVariables;
+        return result;
+    }
 
     std::size_t expectedPayloadSize = kSnapshotPayloadHeaderSize
         + static_cast<std::size_t>(actorCount) * kActorSnapshotSize
         + static_cast<std::size_t>(critterCount) * kCritterSnapshotSize
         + static_cast<std::size_t>(doorCount) * kDoorSnapshotSize
-        + static_cast<std::size_t>(itemCount) * kItemSnapshotSize;
+        + static_cast<std::size_t>(itemCount) * kItemSnapshotSize
+        + (static_cast<std::size_t>(gameGlobalCount)
+              + static_cast<std::size_t>(mapGlobalCount)
+              + static_cast<std::size_t>(mapLocalCount))
+            * sizeof(std::uint32_t);
     if (payloadSize < expectedPayloadSize) {
         result.error = SnapshotError::TruncatedPayload;
         return result;
@@ -470,6 +509,19 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
         result.snapshot.items.push_back(item);
     }
 
+    result.snapshot.gameGlobalVariables.reserve(gameGlobalCount);
+    for (std::uint32_t index = 0; index < gameGlobalCount; index++) {
+        result.snapshot.gameGlobalVariables.push_back(static_cast<std::int32_t>(readUint32(packet, offset)));
+    }
+    result.snapshot.mapGlobalVariables.reserve(mapGlobalCount);
+    for (std::uint32_t index = 0; index < mapGlobalCount; index++) {
+        result.snapshot.mapGlobalVariables.push_back(static_cast<std::int32_t>(readUint32(packet, offset)));
+    }
+    result.snapshot.mapLocalVariables.reserve(mapLocalCount);
+    for (std::uint32_t index = 0; index < mapLocalCount; index++) {
+        result.snapshot.mapLocalVariables.push_back(static_cast<std::int32_t>(readUint32(packet, offset)));
+    }
+
     result.error = validateSnapshot(result.snapshot);
     if (result.error == SnapshotError::None) {
         result.snapshot = canonicalize(result.snapshot);
@@ -522,12 +574,26 @@ SnapshotDigestResult computeSnapshotDigest(const WorldSnapshot& snapshot)
     }
     result.digest.items = digestBytes(itemBytes);
 
+    std::vector<std::uint8_t> globalBytes;
+    appendUint32(globalBytes, static_cast<std::uint32_t>(canonical.gameGlobalVariables.size()));
+    appendVariables(globalBytes, canonical.gameGlobalVariables);
+    result.digest.globals = digestBytes(globalBytes);
+
+    std::vector<std::uint8_t> mapVariableBytes;
+    appendUint32(mapVariableBytes, static_cast<std::uint32_t>(canonical.mapGlobalVariables.size()));
+    appendVariables(mapVariableBytes, canonical.mapGlobalVariables);
+    appendUint32(mapVariableBytes, static_cast<std::uint32_t>(canonical.mapLocalVariables.size()));
+    appendVariables(mapVariableBytes, canonical.mapLocalVariables);
+    result.digest.mapVariables = digestBytes(mapVariableBytes);
+
     std::vector<std::uint8_t> overallBytes;
     appendUint64(overallBytes, result.digest.session);
     appendUint64(overallBytes, result.digest.actors);
     appendUint64(overallBytes, result.digest.critters);
     appendUint64(overallBytes, result.digest.doors);
     appendUint64(overallBytes, result.digest.items);
+    appendUint64(overallBytes, result.digest.globals);
+    appendUint64(overallBytes, result.digest.mapVariables);
     result.digest.overall = digestBytes(overallBytes);
     return result;
 }
@@ -548,6 +614,12 @@ SnapshotSection firstDivergentSection(const SectionedStateDigest& expected, cons
     }
     if (expected.items != actual.items) {
         return SnapshotSection::Items;
+    }
+    if (expected.globals != actual.globals) {
+        return SnapshotSection::Globals;
+    }
+    if (expected.mapVariables != actual.mapVariables) {
+        return SnapshotSection::MapVariables;
     }
     return SnapshotSection::None;
 }

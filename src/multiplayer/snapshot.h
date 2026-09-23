@@ -11,13 +11,14 @@ namespace fallout {
 namespace multiplayer {
 
 constexpr std::uint32_t kSnapshotMagic = 0x46434D53;
-constexpr std::uint16_t kSnapshotVersion = 4;
+constexpr std::uint16_t kSnapshotVersion = 5;
 constexpr std::size_t kSnapshotHeaderSize = 28;
 constexpr std::size_t kMaxSnapshotPayloadSize = 64 * 1024;
 constexpr std::size_t kMaxSnapshotActors = 16;
 constexpr std::size_t kMaxSnapshotCritters = 2048;
 constexpr std::size_t kMaxSnapshotDoors = 1024;
 constexpr std::size_t kMaxSnapshotItems = 4096;
+constexpr std::size_t kMaxSnapshotVariables = 8192;
 
 struct ActorSnapshot {
     EntityId entityId;
@@ -67,6 +68,9 @@ struct WorldSnapshot {
     std::vector<CritterSnapshot> critters;
     std::vector<DoorSnapshot> doors;
     std::vector<ItemSnapshot> items;
+    std::vector<std::int32_t> gameGlobalVariables;
+    std::vector<std::int32_t> mapGlobalVariables;
+    std::vector<std::int32_t> mapLocalVariables;
 };
 
 enum class SnapshotError {
@@ -85,6 +89,7 @@ enum class SnapshotError {
     TooManyCritters,
     TooManyDoors,
     TooManyItems,
+    TooManyVariables,
     InvalidEntityId,
     InvalidPlayerId,
     DuplicateEntityId,
@@ -111,6 +116,8 @@ enum class SnapshotSection {
     Critters,
     Doors,
     Items,
+    Globals,
+    MapVariables,
 };
 
 struct SectionedStateDigest {
@@ -119,6 +126,8 @@ struct SectionedStateDigest {
     std::uint64_t critters = 0;
     std::uint64_t doors = 0;
     std::uint64_t items = 0;
+    std::uint64_t globals = 0;
+    std::uint64_t mapVariables = 0;
     std::uint64_t overall = 0;
 };
 
@@ -129,6 +138,8 @@ constexpr bool operator==(const SectionedStateDigest& lhs, const SectionedStateD
         && lhs.critters == rhs.critters
         && lhs.doors == rhs.doors
         && lhs.items == rhs.items
+        && lhs.globals == rhs.globals
+        && lhs.mapVariables == rhs.mapVariables
         && lhs.overall == rhs.overall;
 }
 

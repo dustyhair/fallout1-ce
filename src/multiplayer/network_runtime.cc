@@ -187,6 +187,7 @@ std::uint64_t compatibilityDigest()
     hashUInt64(digest, kConnectionHandshakeVersion);
     hashUInt64(digest, kGameplayWireVersion);
     hashUInt64(digest, kNetworkLobbyVersion);
+    hashUInt64(digest, kSnapshotVersion);
     hashString(digest, language);
     hashUInt64(digest, static_cast<std::uint64_t>(gameDifficulty));
     hashUInt64(digest, static_cast<std::uint64_t>(combatDifficulty));

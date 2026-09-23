@@ -12,9 +12,11 @@
 #include "game/anim.h"
 #include "game/combat.h"
 #include "game/critter.h"
+#include "game/game.h"
 #include "game/intface.h"
 #include "game/inventry.h"
 #include "game/item.h"
+#include "game/map.h"
 #include "game/map_defs.h"
 #include "game/object.h"
 #include "game/protinst.h"
@@ -49,6 +51,46 @@ bool itemDropInProgress = false;
 NetworkLaunchMode worldMode = NetworkLaunchMode::Disabled;
 EntityId expectedSplitEntityId;
 EntityId lastSplitEntityId;
+
+bool captureVariables(const int* variables, int count, std::vector<std::int32_t>& captured)
+{
+    if (count < 0
+        || static_cast<std::size_t>(count) > kMaxSnapshotVariables
+        || (count != 0 && variables == nullptr)) {
+        return false;
+    }
+    captured.reserve(static_cast<std::size_t>(count));
+    for (int index = 0; index < count; index++) {
+        captured.push_back(variables[index]);
+    }
+    return true;
+}
+
+bool validateVariableState(const WorldSnapshot& snapshot)
+{
+    return num_game_global_vars >= 0
+        && num_map_global_vars >= 0
+        && num_map_local_vars >= 0
+        && snapshot.gameGlobalVariables.size() == static_cast<std::size_t>(num_game_global_vars)
+        && snapshot.mapGlobalVariables.size() == static_cast<std::size_t>(num_map_global_vars)
+        && snapshot.mapLocalVariables.size() == static_cast<std::size_t>(num_map_local_vars)
+        && (num_game_global_vars == 0 || game_global_vars != nullptr)
+        && (num_map_global_vars == 0 || map_global_vars != nullptr)
+        && (num_map_local_vars == 0 || map_local_vars != nullptr);
+}
+
+void applyVariableState(const WorldSnapshot& snapshot)
+{
+    if (!snapshot.gameGlobalVariables.empty()) {
+        std::copy(snapshot.gameGlobalVariables.begin(), snapshot.gameGlobalVariables.end(), game_global_vars);
+    }
+    if (!snapshot.mapGlobalVariables.empty()) {
+        std::copy(snapshot.mapGlobalVariables.begin(), snapshot.mapGlobalVariables.end(), map_global_vars);
+    }
+    if (!snapshot.mapLocalVariables.empty()) {
+        std::copy(snapshot.mapLocalVariables.begin(), snapshot.mapLocalVariables.end(), map_local_vars);
+    }
+}
 
 bool validateActorAndCritterState(const WorldSnapshot& snapshot)
 {
@@ -1534,6 +1576,11 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
         }
         captured.items.push_back(itemState);
     }
+    if (!captureVariables(game_global_vars, num_game_global_vars, captured.gameGlobalVariables)
+        || !captureVariables(map_global_vars, num_map_global_vars, captured.mapGlobalVariables)
+        || !captureVariables(map_local_vars, num_map_local_vars, captured.mapLocalVariables)) {
+        return false;
+    }
     if (validateSnapshot(captured) != SnapshotError::None) {
         return false;
     }
@@ -1545,7 +1592,8 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
 {
     if (!session.isActive()
         || validateSnapshot(snapshot) != SnapshotError::None
-        || snapshot.doors.size() != worldDoors.size()) {
+        || snapshot.doors.size() != worldDoors.size()
+        || !validateVariableState(snapshot)) {
         return false;
     }
 
@@ -1654,6 +1702,7 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
             tile_refresh_rect(&dirtyRect, itemState.elevation);
         }
     }
+    applyVariableState(snapshot);
     intface_redraw();
     return true;
 }
