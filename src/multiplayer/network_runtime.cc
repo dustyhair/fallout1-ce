@@ -1070,7 +1070,26 @@ bool networkRuntimeRunSmokeTest()
             scenarioCommand.actorId = EntityId { 2 };
             scenarioCommand.expectedPhase = SessionPhase::Exploration;
             scenarioCommand.expectedPhaseRevision = networkWorldPhaseRevision();
-            scenarioCommand.payload = FaceCommand { ROTATION_SW };
+            Object* scenarioActor = networkWorldPlayerActor(kGuestPlayerId);
+            int scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
+            int scenarioDestinationTile = -1;
+            if (scenarioActor != nullptr) {
+                for (int distance = 1; distance <= 4 && scenarioDestinationTile == -1; distance++) {
+                    for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+                        int candidate = tile_num_in_direction(scenarioStartingTile, rotation, distance);
+                        if (hexGridTileIsValid(candidate)
+                            && make_path(scenarioActor, scenarioStartingTile, candidate, nullptr, 1) > 0) {
+                            scenarioDestinationTile = candidate;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (scenarioDestinationTile == -1) {
+                setStatus("MULTIPLAYER SMOKE TEST FAILED: NO MOVEMENT FIXTURE");
+                break;
+            }
+            scenarioCommand.payload = MoveCommand { scenarioDestinationTile, scenarioActor->elevation, false };
 
             bool gameplayPassed = false;
             if (launchOptions.mode == NetworkLaunchMode::Join) {
@@ -1106,13 +1125,17 @@ bool networkRuntimeRunSmokeTest()
                                 && result.result.eventCount == 1;
                         } else if (decoded.envelope.kind == MessageKind::Event) {
                             GameEventDecodeResult event = decodeGameEvent(decoded.envelope);
-                            const auto* facing = event ? std::get_if<ActorFacingChangedEvent>(&event.event.payload) : nullptr;
-                            receivedEvent = facing != nullptr
+                            const auto* movement = event ? std::get_if<ActorMovementStartedEvent>(&event.event.payload) : nullptr;
+                            receivedEvent = movement != nullptr
                                 && event.event.sequence == EventSequence { 1 }
                                 && event.event.causedBy == scenarioCommand.sequence
-                                && facing->actorId == scenarioCommand.actorId
-                                && facing->rotation == ROTATION_SW
-                                && networkWorldApplyPeerFacing(*facing);
+                                && movement->actorId == scenarioCommand.actorId
+                                && movement->startingTile == scenarioStartingTile
+                                && movement->destinationTile == scenarioDestinationTile
+                                && movement->elevation == scenarioActor->elevation
+                                && !movement->running
+                                && !movement->path.empty()
+                                && networkWorldApplyPeerMove(*movement);
                         } else if (decoded.envelope.kind == MessageKind::Combat) {
                             SnapshotDecodeResult state = decodeSnapshot(decoded.envelope.payload);
                             WorldSnapshot localState;
@@ -1173,13 +1196,15 @@ bool networkRuntimeRunSmokeTest()
                             break;
                         }
                         GameCommandDecodeResult command = decodeGameCommand(decoded.envelope);
-                        const auto* facing = command ? std::get_if<FaceCommand>(&command.command.payload) : nullptr;
-                        if (facing == nullptr || command.command.sequence != scenarioCommand.sequence
+                        const auto* movement = command ? std::get_if<MoveCommand>(&command.command.payload) : nullptr;
+                        if (movement == nullptr || command.command.sequence != scenarioCommand.sequence
                             || command.command.playerId != scenarioCommand.playerId
                             || command.command.actorId != scenarioCommand.actorId
                             || command.command.expectedPhase != scenarioCommand.expectedPhase
                             || command.command.expectedPhaseRevision != scenarioCommand.expectedPhaseRevision
-                            || facing->rotation != ROTATION_SW) {
+                            || movement->destinationTile != scenarioDestinationTile
+                            || movement->elevation != scenarioActor->elevation
+                            || movement->running) {
                             setStatus("MULTIPLAYER SMOKE TEST FAILED: INVALID SCENARIO COMMAND");
                             break;
                         }
@@ -1196,11 +1221,19 @@ bool networkRuntimeRunSmokeTest()
 
                 if (receivedCommand.has_value()) {
                     AuthoritativeCommandResult outcome = networkWorldProcessCommand(*receivedCommand);
+                    auto movementDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                    while (scenarioActor->tile != scenarioDestinationTile
+                        && std::chrono::steady_clock::now() < movementDeadline) {
+                        object_animate();
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    }
                     WorldSnapshot state;
                     std::vector<std::uint8_t> statePayload;
                     anim_stop();
                     bool accepted = outcome.result.status == CommandStatus::Accepted;
+                    bool movementCompleted = scenarioActor->tile == scenarioDestinationTile;
                     bool captured = accepted
+                        && movementCompleted
                         && outcome.event.has_value()
                         && networkWorldCaptureAuthoritativeState(EventSequence { 1 }, state);
                     SnapshotError snapshotError = captured
@@ -1209,9 +1242,10 @@ bool networkRuntimeRunSmokeTest()
                     bool validOutcome = captured && snapshotError == SnapshotError::None;
                     if (!validOutcome) {
                         std::fprintf(stderr,
-                            "Multiplayer scenario: accepted=%d event=%d captured=%d snapshot=%d rejection=%d.\n",
+                            "Multiplayer scenario: accepted=%d event=%d movement=%d captured=%d snapshot=%d rejection=%d.\n",
                             accepted ? 1 : 0,
                             outcome.event.has_value() ? 1 : 0,
+                            movementCompleted ? 1 : 0,
                             captured ? 1 : 0,
                             captured ? static_cast<int>(snapshotError) : -1,
                             static_cast<int>(outcome.result.rejection));
@@ -1265,7 +1299,12 @@ bool networkRuntimeRunSmokeTest()
             GameEvent replayEvent;
             replayEvent.sequence = EventSequence { 1 };
             replayEvent.causedBy = scenarioCommand.sequence;
-            replayEvent.payload = ActorFacingChangedEvent { scenarioCommand.actorId, ROTATION_SW };
+            replayEvent.payload = ActorMovementStartedEvent {
+                scenarioCommand.actorId,
+                scenarioDestinationTile,
+                scenarioActor->elevation,
+                false,
+            };
             transport->close();
 
             bool reconnectPassed = false;
@@ -1360,7 +1399,7 @@ bool networkRuntimeRunSmokeTest()
             }
 
             std::fprintf(stdout,
-                "MULTIPLAYER_SMOKE_TEST_PASS role=%s session=%llu local=%s peer=%s command=face checkpoint=state-digest reconnect=tls-replay scripts=%u attacks=%u rng=%u\n",
+                "MULTIPLAYER_SMOKE_TEST_PASS role=%s session=%llu local=%s peer=%s command=move checkpoint=state-digest reconnect=tls-replay scripts=%u attacks=%u rng=%u\n",
                 launchOptions.mode == NetworkLaunchMode::Host ? "host" : "guest",
                 static_cast<unsigned long long>(sessionId.value),
                 sheet.name.c_str(),
