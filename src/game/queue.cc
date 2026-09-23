@@ -13,6 +13,7 @@
 #include "game/protinst.h"
 #include "game/proto.h"
 #include "game/scripts.h"
+#include "multiplayer/network_runtime.h"
 #include "plib/gnw/memory.h"
 
 namespace fallout {
@@ -324,6 +325,10 @@ bool queue_find(Object* owner, int eventType)
 // 0x4909E4
 int queue_process()
 {
+    if (multiplayer::networkRuntimeIsGuestReplica()) {
+        return 0;
+    }
+
     int time = game_time();
     int v1 = 0;
 

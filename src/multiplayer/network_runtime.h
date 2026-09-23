@@ -20,6 +20,7 @@ bool networkRuntimeHost(std::uint16_t port = kDefaultMultiplayerPort);
 bool networkRuntimeJoin(const char* endpoint);
 void networkRuntimeDisconnect();
 NetworkLaunchMode networkRuntimeMode();
+bool networkRuntimeIsGuestReplica();
 bool networkRuntimeConnected();
 bool networkRuntimeFailed();
 const char* networkRuntimeStatus();

@@ -24,6 +24,7 @@
 #include "int/dialog.h"
 #include "int/export.h"
 #include "int/window.h"
+#include "multiplayer/network_runtime.h"
 #include "platform_compat.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/gnw.h"
@@ -561,7 +562,8 @@ static void doBkProcesses()
     }
 
     int v0 = get_bk_time();
-    if (script_engine_running) {
+    bool guestReplica = multiplayer::networkRuntimeIsGuestReplica();
+    if (script_engine_running && !guestReplica) {
         lasttime = v0;
 
         // NOTE: There is a loop at 0x4A3C64, consisting of one iteration, going
@@ -573,7 +575,7 @@ static void doBkProcesses()
 
     updateWindows();
 
-    if (script_engine_running && script_engine_run_critters) {
+    if (script_engine_running && script_engine_run_critters && !guestReplica) {
         if (!dialog_active()) {
             script_chk_critters();
             script_chk_timed_events();
@@ -765,6 +767,11 @@ int scripts_check_state()
 {
     WorldMapContext ctx;
 
+    if (multiplayer::networkRuntimeIsGuestReplica()) {
+        scriptState.requests = 0;
+        return 0;
+    }
+
     if (scriptState.requests == 0) {
         return 0;
     }
@@ -906,6 +913,11 @@ int scripts_check_state()
 // 0x4925C0
 int scripts_check_state_in_combat()
 {
+    if (multiplayer::networkRuntimeIsGuestReplica()) {
+        scriptState.requests = 0;
+        return 0;
+    }
+
     if ((scriptState.requests & SCRIPT_REQUEST_ELEVATOR) != 0) {
         int map = map_data.field_34;
         int elevation = map_elevation;
@@ -1064,6 +1076,9 @@ void script_make_path(char* path)
 // 0x492924
 int exec_script_proc(int sid, int action)
 {
+    if (multiplayer::networkRuntimeIsGuestReplica()) {
+        return 0;
+    }
     if (!script_engine_running) {
         return -1;
     }

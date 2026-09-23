@@ -1317,6 +1317,11 @@ NetworkLaunchMode networkRuntimeMode()
     return launchOptions.mode;
 }
 
+bool networkRuntimeIsGuestReplica()
+{
+    return launchOptions.mode == NetworkLaunchMode::Join && networkWorldActive();
+}
+
 bool networkRuntimeConnected()
 {
     return lobbyStarted

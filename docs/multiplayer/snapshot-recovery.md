@@ -1,8 +1,8 @@
 # Snapshot recovery
 
-Snapshot version 5 contains the state needed to recover the live two-player experiment:
+Snapshot version 6 contains the state needed to recover the live two-player experiment:
 
-- Session phase, phase revision, and last included event sequence.
+- Session phase, phase revision, authoritative world time, and last included event sequence.
 - Player actor identity, owner, tile, elevation, rotation, and hit points.
 - Registered non-player critter identity, prototype, position, rotation, hit points, action points, combat results, and team.
 - Registered door identity, open state, lock state, and animation frame.
@@ -33,4 +33,4 @@ The comparison reports the first section that differs. This is more useful durin
 
 The headless recovery test creates a host snapshot with actors, a critter, a door, an inventory stack, a ground item, and script-visible variables. It checks independent divergence in every section before applying the host state and confirming every section digest matches again.
 
-The item section tracks objects registered for live pickup and looting, including player or script-created items introduced through an authoritative transfer. Map-local variables cover the indexed local storage used by map scripts, but interpreter stacks and program counters are not serialized. Timed queues, other script VM state, full combat state, and dialogue remain outside the recovery snapshot.
+The item section tracks objects registered for live pickup and looting, including player or script-created items introduced through an authoritative transfer. Map-local variables cover the indexed local storage used by map scripts, but interpreter stacks and program counters are not serialized. Timed queues, other script VM state, full combat state, and dialogue remain outside the recovery snapshot. Once a network guest enters the world, its interpreter background loop, direct script dispatcher, queued-event processor, and pending script requests are suppressed; only the host executes them, and snapshots correct the guest's world time and covered results.

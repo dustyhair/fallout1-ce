@@ -8,7 +8,7 @@ namespace fallout {
 namespace multiplayer {
 namespace {
 
-constexpr std::size_t kSnapshotPayloadHeaderSize = 36;
+constexpr std::size_t kSnapshotPayloadHeaderSize = 40;
 constexpr std::size_t kActorSnapshotSize = 32;
 constexpr std::size_t kCritterSnapshotSize = 36;
 constexpr std::size_t kDoorSnapshotSize = 12;
@@ -180,6 +180,9 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
     if (snapshot.phaseRevision == 0) {
         return SnapshotError::InvalidPhaseRevision;
     }
+    if (snapshot.gameTime <= 0) {
+        return SnapshotError::InvalidGameTime;
+    }
     if (snapshot.actors.size() > kMaxSnapshotActors) {
         return SnapshotError::TooManyActors;
     }
@@ -305,6 +308,7 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
     appendUint8(payload, 0);
     appendUint16(payload, 0);
     appendUint32(payload, canonical.phaseRevision);
+    appendUint32(payload, static_cast<std::uint32_t>(canonical.gameTime));
     appendUint32(payload, static_cast<std::uint32_t>(canonical.actors.size()));
     appendUint32(payload, static_cast<std::uint32_t>(canonical.critters.size()));
     appendUint32(payload, static_cast<std::uint32_t>(canonical.doors.size()));
@@ -400,6 +404,7 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
         return result;
     }
     result.snapshot.phaseRevision = readUint32(packet, offset);
+    result.snapshot.gameTime = static_cast<std::int32_t>(readUint32(packet, offset));
     std::uint32_t actorCount = readUint32(packet, offset);
     std::uint32_t critterCount = readUint32(packet, offset);
     std::uint32_t doorCount = readUint32(packet, offset);
@@ -544,6 +549,7 @@ SnapshotDigestResult computeSnapshotDigest(const WorldSnapshot& snapshot)
     appendUint64(sessionBytes, canonical.lastIncludedEvent.value);
     appendUint8(sessionBytes, static_cast<std::uint8_t>(canonical.phase));
     appendUint32(sessionBytes, canonical.phaseRevision);
+    appendUint32(sessionBytes, static_cast<std::uint32_t>(canonical.gameTime));
     result.digest.session = digestBytes(sessionBytes);
 
     std::vector<std::uint8_t> actorBytes;

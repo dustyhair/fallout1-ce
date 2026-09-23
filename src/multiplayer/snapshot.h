@@ -11,7 +11,7 @@ namespace fallout {
 namespace multiplayer {
 
 constexpr std::uint32_t kSnapshotMagic = 0x46434D53;
-constexpr std::uint16_t kSnapshotVersion = 5;
+constexpr std::uint16_t kSnapshotVersion = 6;
 constexpr std::size_t kSnapshotHeaderSize = 28;
 constexpr std::size_t kMaxSnapshotPayloadSize = 64 * 1024;
 constexpr std::size_t kMaxSnapshotActors = 16;
@@ -64,6 +64,7 @@ struct WorldSnapshot {
     EventSequence lastIncludedEvent;
     SessionPhase phase = SessionPhase::Lobby;
     std::uint32_t phaseRevision = 0;
+    std::int32_t gameTime = 1;
     std::vector<ActorSnapshot> actors;
     std::vector<CritterSnapshot> critters;
     std::vector<DoorSnapshot> doors;
@@ -85,6 +86,7 @@ enum class SnapshotError {
     InvalidReservedField,
     InvalidPhase,
     InvalidPhaseRevision,
+    InvalidGameTime,
     TooManyActors,
     TooManyCritters,
     TooManyDoors,

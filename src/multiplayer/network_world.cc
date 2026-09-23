@@ -20,6 +20,7 @@
 #include "game/map_defs.h"
 #include "game/object.h"
 #include "game/protinst.h"
+#include "game/scripts.h"
 #include "game/stat.h"
 #include "game/tile.h"
 #include "multiplayer/acting_player_context.h"
@@ -1498,6 +1499,7 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
     captured.lastIncludedEvent = lastIncludedEvent;
     captured.phase = session.phase();
     captured.phaseRevision = session.phaseRevision();
+    captured.gameTime = game_time();
     for (PlayerId playerId : { kHostPlayerId, kGuestPlayerId }) {
         EntityId actorId = session.playerActorId(playerId);
         Object* actor = session.entities().findObject(actorId);
@@ -1703,6 +1705,7 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
         }
     }
     applyVariableState(snapshot);
+    set_game_time(snapshot.gameTime);
     intface_redraw();
     return true;
 }

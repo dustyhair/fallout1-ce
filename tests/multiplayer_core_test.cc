@@ -86,6 +86,7 @@ WorldSnapshot sampleSnapshot()
     snapshot.lastIncludedEvent.value = 41;
     snapshot.phase = SessionPhase::Exploration;
     snapshot.phaseRevision = 7;
+    snapshot.gameTime = 302400;
     snapshot.actors = {
         ActorSnapshot { EntityId { 2 }, kGuestPlayerId, 20102, 0, 3, 28 },
         ActorSnapshot { EntityId { 1 }, kHostPlayerId, 20100, 0, 1, 34 },
@@ -2359,14 +2360,17 @@ void testSnapshotRoundTripAndRecovery()
     WorldSnapshot authoritative = sampleSnapshot();
     std::vector<std::uint8_t> packet;
     expect(encodeSnapshot(authoritative, packet) == SnapshotError::None, "valid snapshot encodes");
-    expect(packet.size() == kSnapshotHeaderSize + 36 + 2 * 32 + 36 + 12 + 2 * 36 + 6 * 4,
+    expect(packet.size() == kSnapshotHeaderSize + 40 + 2 * 32 + 36 + 12 + 2 * 36 + 6 * 4,
         "snapshot packet declares a fixed-width payload");
     expect(packet[0] == 'F' && packet[1] == 'C' && packet[2] == 'M' && packet[3] == 'S', "snapshot magic uses network byte order");
 
     SnapshotDecodeResult decoded = decodeSnapshot(packet);
     expect(static_cast<bool>(decoded), "encoded snapshot decodes");
     expect(decoded.snapshot.lastIncludedEvent == EventSequence { 41 }, "snapshot keeps the last included event");
-    expect(decoded.snapshot.phase == SessionPhase::Exploration && decoded.snapshot.phaseRevision == 7, "snapshot keeps session phase state");
+    expect(decoded.snapshot.phase == SessionPhase::Exploration
+            && decoded.snapshot.phaseRevision == 7
+            && decoded.snapshot.gameTime == 302400,
+        "snapshot keeps session phase and authoritative world time");
     expect(decoded.snapshot.actors.size() == 2 && decoded.snapshot.actors[0].entityId == EntityId { 1 }, "decoded actors use canonical entity order");
     expect(decoded.snapshot.actors[1].tile == 20102 && decoded.snapshot.actors[1].hitPoints == 28, "snapshot keeps guest actor state");
     expect(decoded.snapshot.critters.size() == 1
@@ -2395,6 +2399,12 @@ void testSnapshotRoundTripAndRecovery()
     sessionDrift.phaseRevision++;
     SnapshotDigestResult sessionDriftDigest = computeSnapshotDigest(sessionDrift);
     expect(firstDivergentSection(authoritativeDigest.digest, sessionDriftDigest.digest) == SnapshotSection::Session, "phase drift reports the session section first");
+
+    WorldSnapshot timeDrift = decoded.snapshot;
+    timeDrift.gameTime++;
+    SnapshotDigestResult timeDriftDigest = computeSnapshotDigest(timeDrift);
+    expect(firstDivergentSection(authoritativeDigest.digest, timeDriftDigest.digest) == SnapshotSection::Session,
+        "world-time drift reports the session section");
 
     WorldSnapshot actorDrift = decoded.snapshot;
     actorDrift.actors[1].tile++;
@@ -2484,6 +2494,11 @@ void testSnapshotRoundTripAndRecovery()
     WorldSnapshot invalidOwner = authoritative;
     invalidOwner.actors[0].ownerId.value = 99;
     expect(validateSnapshot(invalidOwner) == SnapshotError::InvalidPlayerId, "two-player snapshot rejects an unknown actor owner");
+
+    WorldSnapshot invalidGameTime = authoritative;
+    invalidGameTime.gameTime = 0;
+    expect(validateSnapshot(invalidGameTime) == SnapshotError::InvalidGameTime,
+        "snapshot rejects an invalid authoritative world time");
 
     WorldSnapshot invalidItem = authoritative;
     invalidItem.items[0].quantity = 0;
