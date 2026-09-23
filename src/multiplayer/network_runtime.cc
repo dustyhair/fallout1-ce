@@ -7,7 +7,6 @@
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
-#include <fstream>
 #include <limits>
 #include <optional>
 #include <string>
@@ -32,6 +31,7 @@
 #include "game/textobj.h"
 #include "game/tile.h"
 #include "multiplayer/character_build_bridge.h"
+#include "multiplayer/content_manifest.h"
 #include "multiplayer/gameplay_wire.h"
 #include "multiplayer/local_player_context.h"
 #include "multiplayer/network_bootstrap.h"
@@ -83,7 +83,6 @@ std::optional<PendingLocalItemDrop> pendingLocalItemDrop;
 
 constexpr std::uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
 constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
-constexpr std::size_t kArchiveSampleSize = 64 * 1024;
 
 void continuePendingLocalItemDrop(const ItemDroppedEvent& drop)
 {
@@ -146,67 +145,55 @@ void hashUInt64(std::uint64_t& digest, std::uint64_t value)
     hashBytes(digest, bytes.data(), bytes.size());
 }
 
-bool hashArchiveSample(std::uint64_t& digest, const char* path)
-{
-    if (path == nullptr || *path == '\0') {
-        return false;
-    }
-
-    std::ifstream stream(path, std::ios::binary | std::ios::ate);
-    if (!stream) {
-        return false;
-    }
-    std::streamoff size = stream.tellg();
-    if (size < 0) {
-        return false;
-    }
-
-    std::uint64_t archiveSize = static_cast<std::uint64_t>(size);
-    hashUInt64(digest, archiveSize);
-
-    std::array<char, kArchiveSampleSize> buffer;
-    std::streamsize sampleSize = static_cast<std::streamsize>(
-        std::min<std::uint64_t>(archiveSize, buffer.size()));
-    stream.seekg(0);
-    stream.read(buffer.data(), sampleSize);
-    if (stream.gcount() != sampleSize) {
-        return false;
-    }
-    hashBytes(digest, buffer.data(), static_cast<std::size_t>(sampleSize));
-
-    if (archiveSize > buffer.size()) {
-        stream.clear();
-        stream.seekg(size - sampleSize);
-        stream.read(buffer.data(), sampleSize);
-        if (stream.gcount() != sampleSize) {
-            return false;
-        }
-        hashBytes(digest, buffer.data(), static_cast<std::size_t>(sampleSize));
-    }
-    return true;
-}
-
 std::uint64_t compatibilityDigest()
 {
     char* masterDat = nullptr;
     char* critterDat = nullptr;
+    char* masterPatches = nullptr;
+    char* critterPatches = nullptr;
     char* language = nullptr;
+    int gameDifficulty = 0;
+    int combatDifficulty = 0;
+    int violenceLevel = 0;
+    int interruptWalk = 0;
+    int objectHashing = 0;
     if (!config_get_string(&game_config, GAME_CONFIG_SYSTEM_KEY, GAME_CONFIG_MASTER_DAT_KEY, &masterDat)
-        || !config_get_string(&game_config, GAME_CONFIG_SYSTEM_KEY, GAME_CONFIG_CRITTER_DAT_KEY, &critterDat)) {
+        || !config_get_string(&game_config, GAME_CONFIG_SYSTEM_KEY, GAME_CONFIG_CRITTER_DAT_KEY, &critterDat)
+        || !config_get_string(&game_config, GAME_CONFIG_SYSTEM_KEY, GAME_CONFIG_MASTER_PATCHES_KEY, &masterPatches)
+        || !config_get_string(&game_config, GAME_CONFIG_SYSTEM_KEY, GAME_CONFIG_CRITTER_PATCHES_KEY, &critterPatches)
+        || !config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_GAME_DIFFICULTY_KEY, &gameDifficulty)
+        || !config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_COMBAT_DIFFICULTY_KEY, &combatDifficulty)
+        || !config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_VIOLENCE_LEVEL_KEY, &violenceLevel)
+        || !config_get_value(&game_config, GAME_CONFIG_SYSTEM_KEY, GAME_CONFIG_INTERRUPT_WALK_KEY, &interruptWalk)
+        || !config_get_value(&game_config, GAME_CONFIG_SYSTEM_KEY, GAME_CONFIG_HASHING_KEY, &objectHashing)) {
         return 0;
     }
     config_get_string(&game_config, GAME_CONFIG_SYSTEM_KEY, GAME_CONFIG_LANGUAGE_KEY, &language);
 
+    ContentManifestResult manifest = buildContentManifest(
+        masterDat,
+        critterDat,
+        masterPatches,
+        critterPatches);
+    if (!manifest) {
+        debug_printf("Multiplayer content manifest failed: %s.\n",
+            contentManifestErrorMessage(manifest.error));
+        return 0;
+    }
+
     std::uint64_t digest = kFnvOffsetBasis;
-    hashString(digest, "fallout-ce-multiplayer-compatibility-v1");
+    hashString(digest, "fallout-ce-multiplayer-compatibility-v2");
     hashUInt64(digest, kProtocolVersion);
     hashUInt64(digest, kConnectionHandshakeVersion);
     hashUInt64(digest, kGameplayWireVersion);
     hashUInt64(digest, kNetworkLobbyVersion);
     hashString(digest, language);
-    if (!hashArchiveSample(digest, masterDat) || !hashArchiveSample(digest, critterDat)) {
-        return 0;
-    }
+    hashUInt64(digest, static_cast<std::uint64_t>(gameDifficulty));
+    hashUInt64(digest, static_cast<std::uint64_t>(combatDifficulty));
+    hashUInt64(digest, static_cast<std::uint64_t>(violenceLevel));
+    hashUInt64(digest, static_cast<std::uint64_t>(interruptWalk));
+    hashUInt64(digest, static_cast<std::uint64_t>(objectHashing));
+    hashUInt64(digest, manifest.digest);
     return digest != 0 ? digest : 1;
 }
 

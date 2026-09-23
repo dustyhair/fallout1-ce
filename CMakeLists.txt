@@ -40,6 +40,8 @@ add_library(fallout-multiplayer-core STATIC
     "src/multiplayer/character_lobby.h"
     "src/multiplayer/connection_handshake.cc"
     "src/multiplayer/connection_handshake.h"
+    "src/multiplayer/content_manifest.cc"
+    "src/multiplayer/content_manifest.h"
     "src/multiplayer/command_processor.cc"
     "src/multiplayer/command_processor.h"
     "src/multiplayer/entity_registry.cc"

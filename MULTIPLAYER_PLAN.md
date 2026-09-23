@@ -1,6 +1,6 @@
 # Two-player co-op plan
 
-Status: Phases 0 and 1 are complete on the `multiplayer-plan` branch. The Phase 2 transport, lobby, event journal, snapshot recovery, and authenticated reconnect are implemented. Same-map movement, facing, doors, pickup, looting, inventory transfer, and item drops are partial Phase 3A work. Authority convergence is now the active milestone: live host and guest exploration inputs use the same command processor, door and completed-pickup events carry authoritative results, replicas no longer rerun pickup or attack gameplay functions, and periodic corrections contain actors, critters, doors, and items. The developer agent interface now exposes visible entity IDs and submits semantic movement, facing, door, pickup, and loot commands through that same authority path. The full content manifest, first-contact identity verification, script/global result coverage, deterministic two-process scenarios, and engine integration scenarios remain open. Combat wire primitives exist, but live multiplayer attacks are intentionally blocked until authoritative phase and turn ownership are implemented.
+Status: Phases 0 and 1 are complete on the `multiplayer-plan` branch. The Phase 2 transport, lobby, event journal, snapshot recovery, authenticated reconnect, and complete gameplay-content manifest are implemented. Same-map movement, facing, doors, pickup, looting, inventory transfer, and item drops are partial Phase 3A work. Authority convergence is now the active milestone: live host and guest exploration inputs use the same command processor, door and completed-pickup events carry authoritative results, replicas no longer rerun pickup or attack gameplay functions, and periodic corrections contain actors, critters, doors, and items. The developer agent interface now exposes visible entity IDs and submits semantic movement, facing, door, pickup, and loot commands through that same authority path. First-contact identity verification, script/global result coverage, deterministic two-process scenarios, and engine integration scenarios remain open. Combat wire primitives exist, but live multiplayer attacks are intentionally blocked until authoritative phase and turn ownership are implemented.
 
 ## Goal
 
@@ -452,7 +452,7 @@ Do not add a networking dependency, lobby UI, or broad player-state refactor in 
 4. [x] Add a sixth main-menu entry and a [native two-player lobby](docs/multiplayer/lobby-screen.md) for hosting, joining, and character readiness.
 5. [x] Encode commands, results, and events for the existing authoritative processor.
 6. [x] Add event journaling, snapshot recovery, reconnect tokens, pinned-identity reconnect, and reconnect-after-TCP-disconnect.
-7. [ ] Replace the sampled archive digest with the complete scripts/maps/prototypes/messages/gameplay-configuration manifest.
+7. [x] Replace the sampled archive digest with a complete full-archive, scripts/maps/prototypes/messages, and gameplay-configuration manifest.
 8. [ ] Add an explicit first-contact identity mechanism for untrusted direct-IP play; until then document the mode as trusted LAN/TOFU.
 
 ## Testing strategy

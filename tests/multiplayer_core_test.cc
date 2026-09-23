@@ -1,4 +1,7 @@
+#include <chrono>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <initializer_list>
 #include <iostream>
 #include <limits>
@@ -11,6 +14,7 @@
 #include "multiplayer/character_lobby.h"
 #include "multiplayer/command_processor.h"
 #include "multiplayer/connection_handshake.h"
+#include "multiplayer/content_manifest.h"
 #include "multiplayer/entity_registry.h"
 #include "multiplayer/gameplay_wire.h"
 #include "multiplayer/local_session.h"
@@ -619,6 +623,87 @@ void testProtocolRejectsInvalidPackets()
     oversized.payload.resize(kMaxProtocolPayloadSize + 1);
     expect(encodeEnvelope(oversized, packet) == ProtocolError::PayloadTooLarge, "oversized payload is rejected before encoding");
     expect(packet.empty(), "failed encoding leaves no partial packet");
+}
+
+void testContentManifest()
+{
+    std::filesystem::path root = std::filesystem::temp_directory_path()
+        / ("fallout-content-manifest-test-"
+            + std::to_string(std::chrono::high_resolution_clock::now().time_since_epoch().count()));
+    std::filesystem::path patches = root / "data";
+    std::error_code filesystemError;
+    std::filesystem::create_directories(patches / "SCRIPTS", filesystemError);
+    std::filesystem::create_directories(patches / "MAPS", filesystemError);
+    std::filesystem::create_directories(patches / "TEXT" / "ENGLISH" / "GAME", filesystemError);
+    std::filesystem::create_directories(patches / "SOUND", filesystemError);
+    auto writeFile = [](const std::filesystem::path& path, const std::string& contents) {
+        std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+        stream.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+        return static_cast<bool>(stream);
+    };
+
+    bool fixtureCreated = !filesystemError
+        && writeFile(root / "master.dat", "master archive bytes")
+        && writeFile(root / "critter.dat", "critter archive bytes")
+        && writeFile(patches / "SCRIPTS" / "DOOR.INT", "script version one")
+        && writeFile(patches / "MAPS" / "VAULT.MAP", "map version one")
+        && writeFile(patches / "TEXT" / "ENGLISH" / "GAME" / "WORLD.MSG", "message version one")
+        && writeFile(patches / "SOUND" / "LOCAL.ACM", "presentation-only sound");
+    expect(fixtureCreated, "content manifest test fixture is created");
+    if (!fixtureCreated) {
+        std::filesystem::remove_all(root, filesystemError);
+        return;
+    }
+
+    ContentManifestResult first = buildContentManifest(
+        (root / "master.dat").string(),
+        (root / "critter.dat").string(),
+        patches.string(),
+        patches.string());
+    ContentManifestResult identical = buildContentManifest(
+        (root / "master.dat").string(),
+        (root / "critter.dat").string(),
+        patches.string(),
+        patches.string());
+    expect(first && identical && first.digest == identical.digest && first.digest != 0,
+        "content manifest is deterministic for identical archives and patches");
+
+    writeFile(patches / "SOUND" / "LOCAL.ACM", "different presentation sound");
+    ContentManifestResult presentationChanged = buildContentManifest(
+        (root / "master.dat").string(),
+        (root / "critter.dat").string(),
+        patches.string(),
+        patches.string());
+    expect(presentationChanged && presentationChanged.digest == first.digest,
+        "content manifest ignores presentation-only patch files");
+
+    writeFile(patches / "SCRIPTS" / "DOOR.INT", "script version two");
+    ContentManifestResult scriptChanged = buildContentManifest(
+        (root / "master.dat").string(),
+        (root / "critter.dat").string(),
+        patches.string(),
+        patches.string());
+    expect(scriptChanged && scriptChanged.digest != first.digest,
+        "content manifest detects a patched script change");
+
+    writeFile(root / "master.dat", "changed master archive bytes");
+    ContentManifestResult archiveChanged = buildContentManifest(
+        (root / "master.dat").string(),
+        (root / "critter.dat").string(),
+        patches.string(),
+        patches.string());
+    expect(archiveChanged && archiveChanged.digest != scriptChanged.digest,
+        "content manifest hashes every byte of each archive");
+
+    ContentManifestResult missingArchive = buildContentManifest(
+        (root / "missing.dat").string(),
+        (root / "critter.dat").string(),
+        patches.string(),
+        patches.string());
+    expect(missingArchive.error == ContentManifestError::InvalidPath,
+        "content manifest fails closed when an archive is missing");
+
+    std::filesystem::remove_all(root, filesystemError);
 }
 
 ProtocolEnvelope gameplayEnvelope(std::uint64_t sequence)
@@ -2493,6 +2578,7 @@ int main()
     fallout::multiplayer::testLocalPlayerContext();
     fallout::multiplayer::testProtocolRoundTrip();
     fallout::multiplayer::testProtocolRejectsInvalidPackets();
+    fallout::multiplayer::testContentManifest();
     fallout::multiplayer::testGameplayWireFormat();
     fallout::multiplayer::testLoopbackTransport();
     fallout::multiplayer::testTcpTransportAndHandshake();
