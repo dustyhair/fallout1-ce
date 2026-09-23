@@ -31,6 +31,19 @@ To let a local agent operate the game, also give the process a command file:
 
 Coordinates are logical game-screen coordinates, not desktop coordinates. Supported named keys are `escape`, `enter`, `tab`, `space`, `backspace`, the four arrow directions, `home`, `end`, `page_up`, `page_down`, and `delete`; a single printable character is also accepted. `text` injects printable ASCII in order. Each `agent_command` journal record acknowledges an accepted, executed, or rejected command and includes its ID.
 
+When a multiplayer world is active, prefer the semantic commands below. They enter through the same runtime handlers and authoritative command processor as human host or guest input; they do not mutate game objects directly.
+
+```text
+10 game_move 12345 0 walk
+11 game_move 12350 0 run
+12 game_face 4
+13 game_door 77
+14 game_pickup 88
+15 game_loot 91
+```
+
+`game_move` takes a map tile, elevation from 0 through 2, and optional `walk` or `run`. Entity commands take an entity ID reported by the journal. A syntactically accepted command can still be rejected by authority checks for phase, ownership, range, target state, or another gameplay rule. Movement, facing, doors, pickup, and loot initiation are currently supported; inventory, dialogue, and combat verbs remain planned. Live multiplayer combat input remains blocked until authoritative turn ownership is implemented.
+
 An agent can read the existing context and then wait for new records without polling screenshots:
 
 ```sh
@@ -41,14 +54,14 @@ Each record has a monotonic `seq`, a Unix `time_ms`, and an `event`. The journal
 
 - `multiplayer_status` for connection and lobby changes.
 - `chat` with incoming or outgoing direction, player ID, character name, and message.
-- `world_state` when player or visible-critter state changes. Player entries include tile, facing, health, action points, and approximate in-game screen coordinates. `visible_critters` reports each on-screen NPC's name, entity ID, tile, screen coordinates, distance, health, and `hostile`, `friendly`, `neutral`, or `dead` disposition.
+- `world_state` when player or visible-world state changes. Player entries include tile, facing, health, action points, and approximate in-game screen coordinates. `visible_critters` reports each on-screen NPC's name, entity ID, tile, screen coordinates, distance, health, and `hostile`, `friendly`, `neutral`, or `dead` disposition. `visible_interactables` reports registered doors and ground items with their entity IDs, locations, and screen coordinates; doors also report open and locked state.
 - `world_exit` when the multiplayer world closes.
 - `display` for text sent to Fallout's lower message monitor.
 - `dialogue_reply`, `dialogue_option`, and `dialogue_choice` for NPC conversations.
 - `floating_text` for overhead NPC and player speech.
 - `agent_command` for command-file readiness, execution, and errors.
 
-For combat targeting, read a hostile entry from `visible_critters`, enter combat or activate the weapon as normal, and append a `click` using that entry's `screen_x` and `screen_y`. The click passes through Fallout's normal cursor and combat hit-testing; it does not bypass combat rules, range, line of sight, or action-point costs.
+For single-player UI smoke tests, combat targeting can still use a hostile entry's `screen_x` and `screen_y` with `click`. The click passes through Fallout's normal cursor and combat hit-testing; it does not bypass combat rules, range, line of sight, or action-point costs. Raw clicks are not an authoritative multiplayer agent interface.
 
 The agent should treat the journal as its first source of context. It still needs a screenshot when it reaches an unreported modal window or must verify a visual result. This keeps visual capture deliberate instead of continuous.
 

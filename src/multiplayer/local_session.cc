@@ -135,6 +135,23 @@ LocalSessionError LocalSession::transitionTo(SessionPhase phase)
     return LocalSessionError::None;
 }
 
+LocalSessionError LocalSession::applyAuthoritativePhase(SessionPhase phase, std::uint32_t revision)
+{
+    if (!_active) {
+        return LocalSessionError::NotActive;
+    }
+    if (phase < SessionPhase::Lobby || phase > SessionPhase::Ending || revision == 0) {
+        return LocalSessionError::InvalidTransition;
+    }
+    if (revision < _phaseRevision
+        || (revision == _phaseRevision && phase != _phase)) {
+        return LocalSessionError::InvalidTransition;
+    }
+    _phase = phase;
+    _phaseRevision = revision;
+    return LocalSessionError::None;
+}
+
 CharacterLobbyError LocalSession::submitCharacterSheet(const CharacterCreationSheet& sheet)
 {
     if (!_active) {

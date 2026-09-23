@@ -40,6 +40,7 @@ public:
     SessionPhase phase() const;
     std::uint32_t phaseRevision() const;
     LocalSessionError transitionTo(SessionPhase phase);
+    LocalSessionError applyAuthoritativePhase(SessionPhase phase, std::uint32_t revision);
     CharacterLobbyError submitCharacterSheet(const CharacterCreationSheet& sheet);
     LocalSessionError restorePlayerCharacters(const MultiplayerSaveSidecar& sidecar);
     bool characterLobbyReady() const;

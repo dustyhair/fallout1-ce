@@ -12,6 +12,11 @@ enum class AgentControlCommandType {
     RightClick,
     Key,
     Text,
+    GameMove,
+    GameFace,
+    GameDoor,
+    GamePickup,
+    GameLoot,
 };
 
 struct AgentControlCommand {
@@ -20,6 +25,11 @@ struct AgentControlCommand {
     int x = 0;
     int y = 0;
     int keyCode = -1;
+    int tile = -1;
+    int elevation = -1;
+    int rotation = -1;
+    std::uint32_t entityId = 0;
+    bool running = false;
     std::string text;
 };
 

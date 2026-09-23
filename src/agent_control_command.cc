@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <limits>
 #include <sstream>
 
 #include "plib/gnw/kb.h"
@@ -86,6 +87,20 @@ bool parseCoordinates(std::istringstream& input, AgentControlCommand& command, s
     return true;
 }
 
+bool parseEntityId(std::istringstream& input, AgentControlCommand& command, std::string& error)
+{
+    std::uint64_t value = 0;
+    if (!(input >> value)
+        || hasTrailingInput(input)
+        || value == 0
+        || value > std::numeric_limits<std::uint32_t>::max()) {
+        error = "expected one positive 32-bit entity id";
+        return false;
+    }
+    command.entityId = static_cast<std::uint32_t>(value);
+    return true;
+}
+
 } // namespace
 
 bool agentControlParseCommand(const std::string& line,
@@ -157,6 +172,48 @@ bool agentControlParseCommand(const std::string& line,
         }
         return true;
     }
+    if (verb == "game_move") {
+        command.type = AgentControlCommandType::GameMove;
+        std::string gait = "walk";
+        if (!(input >> command.tile >> command.elevation)) {
+            error = "expected: game_move <tile> <elevation> [walk|run]";
+            return false;
+        }
+        if (input >> gait) {
+            if (hasTrailingInput(input)) {
+                error = "game_move has too many arguments";
+                return false;
+            }
+        }
+        if (command.tile < 0 || command.elevation < 0 || command.elevation > 2
+            || (gait != "walk" && gait != "run")) {
+            error = "game_move requires a valid tile, elevation 0-2, and walk or run";
+            return false;
+        }
+        command.running = gait == "run";
+        return true;
+    }
+    if (verb == "game_face") {
+        command.type = AgentControlCommandType::GameFace;
+        if (!(input >> command.rotation) || hasTrailingInput(input)
+            || command.rotation < 0 || command.rotation >= 6) {
+            error = "game_face requires one rotation from 0 through 5";
+            return false;
+        }
+        return true;
+    }
+    if (verb == "game_door") {
+        command.type = AgentControlCommandType::GameDoor;
+        return parseEntityId(input, command, error);
+    }
+    if (verb == "game_pickup") {
+        command.type = AgentControlCommandType::GamePickup;
+        return parseEntityId(input, command, error);
+    }
+    if (verb == "game_loot") {
+        command.type = AgentControlCommandType::GameLoot;
+        return parseEntityId(input, command, error);
+    }
 
     error = "unknown command";
     return false;
@@ -175,6 +232,16 @@ const char* agentControlCommandTypeName(AgentControlCommandType type)
         return "key";
     case AgentControlCommandType::Text:
         return "text";
+    case AgentControlCommandType::GameMove:
+        return "game_move";
+    case AgentControlCommandType::GameFace:
+        return "game_face";
+    case AgentControlCommandType::GameDoor:
+        return "game_door";
+    case AgentControlCommandType::GamePickup:
+        return "game_pickup";
+    case AgentControlCommandType::GameLoot:
+        return "game_loot";
     }
     return "unknown";
 }

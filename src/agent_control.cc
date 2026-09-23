@@ -10,6 +10,8 @@
 
 #include "agent_control_command.h"
 #include "agent_journal.h"
+#include "multiplayer/network_runtime.h"
+#include "multiplayer/network_world.h"
 #include "plib/gnw/input.h"
 #include "plib/gnw/mouse.h"
 #include "plib/gnw/svga.h"
@@ -137,6 +139,37 @@ void executeCommand(const AgentControlCommand& command)
         pendingTextId = command.id;
         agentJournalWriteAgentCommand(command.id, commandName, "accepted", "text injection started");
         return;
+    case AgentControlCommandType::GameMove:
+        if (multiplayer::networkRuntimeSubmitLocalMove(command.tile, command.elevation, command.running)) {
+            agentJournalWriteAgentCommand(command.id, commandName, "accepted", "semantic movement submitted");
+        } else {
+            agentJournalWriteAgentCommand(command.id, commandName, "rejected", "semantic movement is unavailable or invalid");
+        }
+        return;
+    case AgentControlCommandType::GameFace:
+        if (multiplayer::networkRuntimeSubmitLocalFacing(command.rotation)) {
+            agentJournalWriteAgentCommand(command.id, commandName, "accepted", "semantic facing submitted");
+        } else {
+            agentJournalWriteAgentCommand(command.id, commandName, "rejected", "semantic facing is unavailable or invalid");
+        }
+        return;
+    case AgentControlCommandType::GameDoor:
+    case AgentControlCommandType::GamePickup:
+    case AgentControlCommandType::GameLoot: {
+        Object* target = multiplayer::networkWorldFindObject(multiplayer::EntityId { command.entityId });
+        bool submitted = target != nullptr
+            && (command.type == AgentControlCommandType::GameDoor
+                    ? multiplayer::networkRuntimeHandleLocalDoorUse(target)
+                    : command.type == AgentControlCommandType::GamePickup
+                    ? multiplayer::networkRuntimeHandleLocalPickup(target)
+                    : multiplayer::networkRuntimeHandleLocalLoot(target));
+        if (submitted) {
+            agentJournalWriteAgentCommand(command.id, commandName, "accepted", "semantic entity command submitted");
+        } else {
+            agentJournalWriteAgentCommand(command.id, commandName, "rejected", "entity is unavailable or invalid for this action");
+        }
+        return;
+    }
     }
 }
 

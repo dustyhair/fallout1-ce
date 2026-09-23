@@ -1,6 +1,6 @@
 # Two-player co-op plan
 
-Status: Phases 0 and 1 are complete on the `multiplayer-plan` branch. Phase 2 is in progress. Host and guest can connect from the in-game multiplayer lobby or explicit launch modes, exchange validated character sheets, start together, and route movement, facing, and doors through host-authoritative commands and one journaled event stream. [Live gap recovery](docs/multiplayer/network-session-recovery.md) replays retained events or applies an actor-and-door snapshot; reconnect after TCP disconnect is next.
+Status: Phases 0 and 1 are complete on the `multiplayer-plan` branch. The Phase 2 transport, lobby, event journal, snapshot recovery, and authenticated reconnect are implemented. Same-map movement, facing, doors, pickup, looting, inventory transfer, and item drops are partial Phase 3A work. Authority convergence is now the active milestone: live host and guest exploration inputs use the same command processor, door results carry authoritative state, replicas no longer rerun pickup or attack gameplay functions, and periodic corrections contain actors, critters, doors, and items. The developer agent interface now exposes visible entity IDs and submits semantic movement, facing, door, pickup, and loot commands through that same authority path. The full content manifest, first-contact identity verification, script/global result coverage, deterministic two-process scenarios, and engine integration scenarios remain open. Combat wire primitives exist, but live multiplayer attacks are intentionally blocked until authoritative phase and turn ownership are implemented.
 
 ## Goal
 
@@ -307,20 +307,91 @@ Exit condition: both characters retain distinct builds through save and load.
 
 Exit condition: a guest can join, move, interact, disconnect, and reconnect on one map.
 
-### Phase 3: exploration and transitions
+Direct-IP TLS currently uses trust on first use. Treat it as trusted-LAN/explicit-fingerprint functionality until a join code or another out-of-band identity check authenticates the first connection. Encryption and reconnect certificate pinning do not by themselves authenticate first contact.
+
+### Phase 2.25: authority convergence
+
+Complete this milestone before expanding same-map gameplay or enabling combat:
+
+- Route host and guest actions through the same `GameCommand` validation and execution path.
+- Keep semantic presentation cues separate from authoritative effects. A guest may animate a host-selected path, but it must not rerun scripts, random rolls, damage calculation, or rule-bearing inventory actions.
+- Include the concrete resulting state in ordered effects, or follow the cue with a sectioned authoritative state boundary that covers every mutation it can cause.
+- Replicate session phase and phase revision authoritatively. Reject commands for the wrong phase before reaching engine code.
+- Make recovery and periodic correction cover actors, critters, doors, items, player metadata, globals, map variables, queued events, and phase-specific state as each section becomes mutable.
+- Add an engine scenario proving a scripted door and a random combat action execute exactly once on the host.
+- Fail closed when an authoritative effect or snapshot cannot be applied; never continue from a presentation-only approximation.
+
+Current implementation status:
+
+1. [x] Route live host and guest exploration input through the authoritative command processor.
+2. [x] Apply door state on the guest without invoking the door action or script again.
+3. [x] Stop guest pickup and attack events from invoking gameplay mutation functions.
+4. [x] Expand periodic authoritative correction to actors, critters, doors, and items.
+5. [x] Carry authoritative phase revisions in snapshots and apply them on the guest.
+6. [ ] Replace snapshot-dependent pickup completion with an explicit authoritative completion effect.
+7. [ ] Add globals, map variables, queues, and script-visible state to sectioned snapshots/digests.
+8. [ ] Add the script-once and RNG-once engine integration scenarios.
+
+Exit condition: host and guest input share one validation path, the guest executes no rule-bearing mutation or RNG from a replicated event, and sectioned checkpoints show no unexplained divergence.
+
+### Phase 2.5: agent-driven multiplayer testing
+
+The existing coordinate/key command file is a UI smoke-test adapter, not the semantic multiplayer agent interface. Keep it for otherwise-unreported modal screens, but do not count raw input injection toward this phase's exit condition.
+
+- Extend the agent journal with a developer-only local command interface that accepts semantic gameplay commands rather than raw mouse or keyboard input.
+- Route agent commands through the same `GameCommand`, ownership, phase, range, AP, and action validation used by a human multiplayer peer. The agent must not receive privileged mutation paths.
+- Cover movement, facing, interaction, pickup, inventory actions, and dialogue/combat commands as those command families become available.
+- Add deterministic scripted scenarios that can drive the second player without requiring two human testers.
+- Keep screenshots and raw UI input as optional presentation checks; machine-readable state and authoritative events are the primary interface.
+
+Optional Laya or LLM controllers sit above this semantic interface. They receive a compact decision state and return constrained semantic actions; they never mutate Fallout state directly. Deterministic scenarios and human multiplayer must work with the entire model stack disabled. Record routing tier, escalation reason, approximate token use, latency, selected action, validation result, and configured call/token budgets when a model controller is enabled.
+
+Current implementation status:
+
+1. [x] Add semantic movement, facing, door, pickup, and loot command-file verbs.
+2. [x] Expose visible critters, doors, and ground items with stable entity IDs in the machine-readable world state.
+3. [x] Route semantic verbs through the same multiplayer runtime handlers and command processor used by human input.
+4. [ ] Add semantic inventory, dialogue, and combat verbs as those authoritative command families become safe.
+5. [ ] Add deterministic two-process exploration scenarios and structured completion assertions.
+6. [ ] Add an optional Laya or LLM controller above the deterministic semantic interface.
+
+Exit condition: an automated local client can observe the journal, control one player through validated semantic commands, and complete the supported exploration command set without bypassing multiplayer authority.
+
+### Phase 3A: same-map exploration
 
 - Replicate movement, doors, containers, item pickup, skill use, traps, and map-script results.
-- Add range rules and synchronized exits, elevators, rest, and world-map travel.
-- Define pause behavior for modal screens.
+- Add range rules and define pause behavior for modal screens.
+- Add a minimal host-authoritative player-to-player item/caps transfer command for practical co-op testing; the full transactional trade UI remains Phase 6.
+- Audit script-facing player assumptions used during exploration and classify each as story actor, acting player, or shared party state.
 
-Exit condition: two players can complete a small non-combat quest together and change maps.
+Exit condition: two players can complete a small non-combat quest together on one map with synchronized objects, inventory, scripts, and player-specific skill checks.
 
-### Phase 4: sequential combat
+### Phase 3B: transitions and world travel
 
-- Route each player-owned turn to the correct peer.
-- Replicate actions and results from the host.
-- Add timeouts, disconnect behavior, combat entry and exit, and shared XP.
+- Add synchronized exits, elevators, elevation changes, rest, and map transitions.
+- Add world-map travel while preserving one authoritative world clock and encounter state.
+- Require transition readiness or an explicit host timeout policy.
+- Verify entity rebinding, guest inventory persistence, queued events, and state hashes across every transition boundary.
+
+Exit condition: two players can complete a small non-combat quest together, change maps and elevations, travel on the world map, and remain synchronized.
+
+### Phase 4A: combat controller and turn ownership
+
+- Transition into and out of the authoritative Combat phase and replicate the phase revision.
+- Classify every combatant as host-controlled, guest-controlled, or host AI.
+- Give engine input only to the peer that owns the active actor; never pass a player-owned actor to `combat_ai`.
+- Add semantic end-turn, timeout, disconnect/pass, and optional host-takeover policies.
+- Keep the guest combat simulation passive: it renders host-selected results but does not advance AI, scripts, rolls, damage, ammo, or death checks.
+
+Exit condition: initiative advances through host, guest, and AI actors in the same order on both views, and an out-of-turn command cannot mutate state.
+
+### Phase 4B: sequential combat actions and recovery
+
+- Replicate movement, attack, item, reload, stance, and end-turn commands and their complete host-selected results.
+- Add shared XP and progression events.
 - Cover death, knockout, fleeing, elevation changes, and combat triggered by scripts.
+
+Do not enable live attack commands merely because their wire format exists. The runtime must reject them until Phase 4A ownership and complete authoritative combat effects are in place.
 
 Exit condition: a complete encounter survives save, load, and guest reconnection.
 
@@ -342,12 +413,16 @@ Exit condition: the players can complete branching dialogue with a tie, a skill 
 
 Exit condition: a two-player session can be stopped, loaded later, and resumed without duplicating or losing items.
 
-### Phase 7: hardening
+### Phase 7: compatibility campaign and hardening
 
 - Test packet loss, latency, reordered messages, duplicate commands, and malicious lengths.
 - Add diagnostics for protocol events and state checksums.
 - Run long play sessions across map changes, combat, barter, dialogue, saving, and loading.
+- Maintain a representative Fallout compatibility campaign covering major script patterns, companions, scripted combat, inventory-heavy interactions, elevators, encounters, timed events, and ending-critical state.
+- Make multiplayer and its networking dependencies optional at build time without changing the single-player binary path when disabled.
 - Document hosting, ports, firewall behavior, compatibility rules, and known limitations.
+
+Exit condition: the compatibility campaign completes without unresolved authoritative-state divergence, save corruption, item duplication/loss, or single-player regression.
 
 ## First implementation series
 
@@ -376,7 +451,9 @@ Do not add a networking dependency, lobby UI, or broad player-state refactor in 
 3. [x] Send validated lobby character sheets through the network transport.
 4. [x] Add a sixth main-menu entry and a [native two-player lobby](docs/multiplayer/lobby-screen.md) for hosting, joining, and character readiness.
 5. [x] Encode commands, results, and events for the existing authoritative processor.
-6. [ ] Add event journaling, snapshot recovery, and reconnect tokens to the network session.
+6. [x] Add event journaling, snapshot recovery, reconnect tokens, pinned-identity reconnect, and reconnect-after-TCP-disconnect.
+7. [ ] Replace the sampled archive digest with the complete scripts/maps/prototypes/messages/gameplay-configuration manifest.
+8. [ ] Add an explicit first-contact identity mechanism for untrusted direct-IP play; until then document the mode as trusted LAN/TOFU.
 
 ## Testing strategy
 
@@ -385,7 +462,11 @@ Build multiplayer code around a loopback transport first. Split tests into two l
 - Headless core tests run in CTest without opening windows, sockets, or proprietary game data. They cover protocol, sequencing, ownership, transactions, journals, and snapshot primitives.
 - Engine integration scenarios run through a developer mode against an installed Fallout data set. They cover actors, maps, scripts, UI loops, combat, and saves. These can run locally even if public CI cannot ship the data.
 
-Both layers should drive semantic commands rather than synthesizing mouse input.
+Both layers should drive semantic commands rather than synthesizing mouse input. Raw coordinate/key injection is retained only as a UI smoke-test adapter and must not be used to satisfy authoritative gameplay scenarios.
+
+State synchronization is an exit criterion for every phase. Development builds should compare sectioned authoritative state after scenario checkpoints and report the first divergent section instead of only an opaque whole-state checksum.
+
+Add deterministic scenario fixtures with explicit starting actors, entities, inventories, and expected results. Scenarios should include disconnect/reconnect and snapshot recovery where relevant and assert conservation properties such as item and cap totals.
 
 High-value automated cases include:
 
@@ -401,6 +482,10 @@ High-value automated cases include:
 - Content-manifest mismatch at connection time.
 - Session-phase mismatch during combat, dialogue, and map transition.
 - A single-player save/load smoke test with multiplayer disabled.
+- Host and guest inputs producing the same rejection/result through the shared processor.
+- A scripted interaction executing exactly once on the host and zero times on the guest.
+- A combat result consuming RNG once on the host and applying explicit values on the guest.
+- Agent runs with no LLM configured, proving deterministic scenarios do not depend on model availability.
 
 Add a debug state hash for maps, global variables, objects, inventories, combat state, and player metadata. Compare the host hash with the guest's last applied snapshot during development. A mismatch should report the first divergent section rather than one opaque checksum.
 
@@ -416,6 +501,10 @@ Save compatibility remains a risk. A sidecar avoids breaking original saves, but
 
 Content mismatch will look like network corruption if it is not rejected early. Hash scripts, message files, maps, prototypes, and relevant configuration during the handshake.
 
+Script compatibility is a continuing risk because legacy content often assumes `dude_obj` is the only meaningful player. Keep an explicit audit of script and engine call sites that must mean story actor, acting player, or shared party state instead of changing these assumptions opportunistically.
+
+Recovery must fail closed. If event replay or snapshot recovery cannot establish a verified synchronized state after bounded retries, stop accepting guest gameplay commands, preserve the host's authoritative state, expose a synchronization error, and require reconnect or session recovery rather than continuing from guessed state.
+
 ## Rough effort
 
 This is a substantial engine change, not a networking patch. A vertical slice with two characters, one map, one dialogue, and one sequential fight is roughly three to four months for one developer familiar with the code. A usable MVP is likely six to twelve months of full-time work. A robust release with save recovery, broad quest testing, and platform support can take longer.
@@ -430,6 +519,7 @@ Use these as provisional defaults. They keep Phase 0 unblocked and give later ph
 | --- | --- | --- |
 | First host and guest platforms | Linux and Windows desktop | Phase 2 transport selection |
 | Internet connection model | LAN and direct IP only, no relay in the MVP | Phase 2 lobby work |
+| Direct-IP first contact | Trusted LAN/TOFU initially; require a displayed fingerprint or join code before describing Internet play as authenticated | Phase 2 completion |
 | Tied dialogue vote | The talker decides after both votes are visible | Phase 5 |
 | Shared XP | Grant the original full award to both characters | Phase 1 progression tests |
 | Disconnected guest | The actor passes in combat and becomes unavailable for new exploration actions until reconnection | Phase 4 |

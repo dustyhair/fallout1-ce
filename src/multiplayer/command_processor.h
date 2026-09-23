@@ -23,6 +23,13 @@ struct InventoryTransferExecution {
     ItemDescriptor itemDescriptor;
 };
 
+struct DoorUseExecution {
+    CommandExecutionStatus status = CommandExecutionStatus::InvalidAction;
+    bool open = false;
+    bool locked = false;
+    std::int32_t frame = 0;
+};
+
 struct ItemDropExecution {
     CommandExecutionStatus status = CommandExecutionStatus::InvalidAction;
     EntityId itemId;
@@ -38,7 +45,7 @@ public:
 
     virtual CommandExecutionStatus move(Object* actor, const MoveCommand& command) = 0;
     virtual CommandExecutionStatus face(Object* actor, const FaceCommand& command) = 0;
-    virtual CommandExecutionStatus useDoor(Object* actor, Object* target) = 0;
+    virtual DoorUseExecution useDoor(Object* actor, Object* target) = 0;
     virtual CommandExecutionStatus pickup(Object* actor, Object* target) = 0;
     virtual CommandExecutionStatus loot(Object* actor, Object* target) = 0;
     virtual CommandExecutionStatus attack(Object*, Object*, const AttackCommand&)
@@ -59,6 +66,7 @@ public:
 struct AuthoritativeCommandResult {
     CommandResult result;
     std::optional<GameEvent> event;
+    bool replayed = false;
 };
 
 class CommandProcessor {

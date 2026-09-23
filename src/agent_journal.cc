@@ -125,6 +125,24 @@ std::string critterJson(const AgentJournalCritterState& critter)
     return output.str();
 }
 
+std::string interactableJson(const AgentJournalInteractableState& interactable)
+{
+    std::ostringstream output;
+    output << "{\"entity_id\":" << interactable.entityId
+           << ",\"pid\":" << interactable.pid
+           << ",\"kind\":" << jsonString(interactable.kind.c_str())
+           << ",\"name\":" << jsonString(interactable.name.c_str())
+           << ",\"tile\":" << interactable.tile
+           << ",\"elevation\":" << interactable.elevation
+           << ",\"screen_x\":" << interactable.screenX
+           << ",\"screen_y\":" << interactable.screenY
+           << ",\"distance\":" << interactable.distance
+           << ",\"open\":" << booleanValue(interactable.open)
+           << ",\"locked\":" << booleanValue(interactable.locked)
+           << '}';
+    return output.str();
+}
+
 } // namespace
 
 bool agentJournalConfigure(int argc, char** argv)
@@ -258,6 +276,13 @@ void agentJournalWriteWorldState(const AgentJournalWorldState& state)
             fields << ',';
         }
         fields << critterJson(state.visibleCritters[index]);
+    }
+    fields << "],\"visible_interactables\":[";
+    for (std::size_t index = 0; index < state.visibleInteractables.size(); index++) {
+        if (index != 0) {
+            fields << ',';
+        }
+        fields << interactableJson(state.visibleInteractables[index]);
     }
     fields << ']';
     std::string encoded = fields.str();

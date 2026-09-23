@@ -84,6 +84,7 @@ public:
         std::int32_t elevation = -1,
         ItemDescriptor itemDescriptor = {});
     bool sendCommandOutcome(AuthoritativeCommandResult outcome);
+    bool publishLocalCommandOutcome(AuthoritativeCommandResult outcome);
     std::optional<GameCommand> takePeerCommand();
     std::optional<CommandResult> takeCommandResult();
     std::optional<GameEvent> takePeerEvent();

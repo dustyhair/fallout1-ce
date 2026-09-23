@@ -41,6 +41,7 @@ constexpr std::size_t kCommandResultSize = 24;
 constexpr std::size_t kEventHeaderSize = 20;
 constexpr std::size_t kMovementEventHeaderSize = kEventHeaderSize + 20;
 constexpr std::size_t kTargetEventSize = kEventHeaderSize + 8;
+constexpr std::size_t kDoorStateEventSize = kEventHeaderSize + 16;
 constexpr std::size_t kFacingEventSize = kEventHeaderSize + 8;
 constexpr std::size_t kInventoryTransferEventSize = kEventHeaderSize + 28 + kItemDescriptorSize;
 constexpr std::size_t kItemDropEventSize = kEventHeaderSize + 32 + kItemDescriptorSize;
@@ -385,8 +386,13 @@ GameplayWireError validateEvent(const GameEvent& event)
     EntityId actorId;
     EntityId targetId;
     if (const auto* door = std::get_if<DoorUseStartedEvent>(&event.payload)) {
-        actorId = door->actorId;
-        targetId = door->targetId;
+        if (!isValid(door->actorId)
+            || !isValid(door->targetId)
+            || door->frame < 0
+            || door->open != (door->frame != 0)) {
+            return GameplayWireError::InvalidMove;
+        }
+        return GameplayWireError::None;
     } else if (const auto* pickup = std::get_if<ItemPickupStartedEvent>(&event.payload)) {
         actorId = pickup->actorId;
         targetId = pickup->targetId;
@@ -674,6 +680,10 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
         appendEventHeader(event, EventType::DoorUseStarted, envelope.payload);
         appendUInt32(envelope.payload, door->actorId.value);
         appendUInt32(envelope.payload, door->targetId.value);
+        envelope.payload.push_back(door->open ? 1 : 0);
+        envelope.payload.push_back(door->locked ? 1 : 0);
+        appendUInt16(envelope.payload, 0);
+        appendInt32(envelope.payload, door->frame);
     } else if (const auto* pickup = std::get_if<ItemPickupStartedEvent>(&event.payload)) {
         appendEventHeader(event, EventType::ItemPickupStarted, envelope.payload);
         appendUInt32(envelope.payload, pickup->actorId.value);
@@ -774,7 +784,24 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
             readInt32(envelope.payload, 24),
         };
         break;
-    case EventType::DoorUseStarted:
+    case EventType::DoorUseStarted: {
+        if (envelope.payload.size() != kDoorStateEventSize
+            || envelope.payload[30] != 0
+            || envelope.payload[31] != 0
+            || envelope.payload[28] > 1
+            || envelope.payload[29] > 1) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.event.payload = DoorUseStartedEvent {
+            EntityId { readUInt32(envelope.payload, 20) },
+            EntityId { readUInt32(envelope.payload, 24) },
+            envelope.payload[28] != 0,
+            envelope.payload[29] != 0,
+            readInt32(envelope.payload, 32),
+        };
+        break;
+    }
     case EventType::ItemPickupStarted:
     case EventType::LootStarted: {
         if (envelope.payload.size() != kTargetEventSize) {
@@ -783,9 +810,7 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
         }
         EntityId actorId { readUInt32(envelope.payload, 20) };
         EntityId targetId { readUInt32(envelope.payload, 24) };
-        if (type == EventType::DoorUseStarted) {
-            result.event.payload = DoorUseStartedEvent { actorId, targetId };
-        } else if (type == EventType::ItemPickupStarted) {
+        if (type == EventType::ItemPickupStarted) {
             result.event.payload = ItemPickupStartedEvent { actorId, targetId };
         } else {
             result.event.payload = LootStartedEvent { actorId, targetId };

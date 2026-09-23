@@ -55,6 +55,16 @@ int main(int argc, char** argv)
     enemy.screenX = 410;
     enemy.screenY = 220;
     state.visibleCritters.push_back(enemy);
+    fallout::AgentJournalInteractableState door;
+    door.entityId = 77;
+    door.kind = "door";
+    door.name = "Vault door";
+    door.tile = 12348;
+    door.screenX = 440;
+    door.screenY = 220;
+    door.distance = 2;
+    door.locked = true;
+    state.visibleInteractables.push_back(door);
     fallout::agentJournalWriteWorldState(state);
     fallout::agentJournalWriteWorldState(state);
     state.guest.rotation = 2;
@@ -87,8 +97,11 @@ int main(int argc, char** argv)
             && lines[4].find("\"event\":\"world_state\"") != std::string::npos
             && lines[4].find("\"tile\":12345") != std::string::npos
             && lines[4].find("\"visible_critters\":[{\"entity_id\":44") != std::string::npos
-            && lines[4].find("\"disposition\":\"hostile\"") != std::string::npos,
-        "journal records structured actor and enemy state")
+            && lines[4].find("\"disposition\":\"hostile\"") != std::string::npos
+            && lines[4].find("\"visible_interactables\":[{\"entity_id\":77") != std::string::npos
+            && lines[4].find("\"kind\":\"door\"") != std::string::npos
+            && lines[4].find("\"locked\":true") != std::string::npos,
+        "journal records structured actors, enemies, and interactable targets")
         && passed;
     passed = expect(lines.size() > 7 && lines[7].find("\"event\":\"session_end\"") != std::string::npos,
         "journal closes with a session boundary")

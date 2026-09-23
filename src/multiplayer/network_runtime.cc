@@ -12,6 +12,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "agent_journal.h"
 #include "game/actions.h"
@@ -32,6 +33,7 @@
 #include "game/tile.h"
 #include "multiplayer/character_build_bridge.h"
 #include "multiplayer/gameplay_wire.h"
+#include "multiplayer/local_player_context.h"
 #include "multiplayer/network_bootstrap.h"
 #include "multiplayer/network_lobby.h"
 #include "multiplayer/network_world.h"
@@ -65,6 +67,7 @@ std::unique_ptr<Transport> reconnectTransport;
 std::chrono::steady_clock::time_point reconnectDeadline;
 std::chrono::steady_clock::time_point nextReconnectAttempt;
 EventSequence reconnectLastApplied;
+std::uint64_t nextHostCommandSequence = 1;
 std::chrono::steady_clock::time_point nextAuthoritativeState;
 std::chrono::steady_clock::time_point nextAgentWorldReport;
 
@@ -428,6 +431,69 @@ std::vector<AgentJournalCritterState> visibleCritterJournalStates(Object* localA
     return states;
 }
 
+std::vector<AgentJournalInteractableState> visibleInteractableJournalStates(Object* localActor)
+{
+    std::vector<AgentJournalInteractableState> states;
+    auto appendType = [&](int objectType) {
+        Object** objects = nullptr;
+        int objectCount = obj_create_list(-1, map_elevation, objectType, &objects);
+        for (int index = 0; index < objectCount; index++) {
+            Object* object = objects[index];
+            if (object == nullptr
+                || object->owner != nullptr
+                || object->tile < 0
+                || (object->flags & OBJECT_HIDDEN) != 0) {
+                continue;
+            }
+            bool door = obj_is_a_portal(object);
+            if (!door && objectType != OBJ_TYPE_ITEM) {
+                continue;
+            }
+            std::optional<EntityId> entityId = networkWorldFindEntity(object);
+            if (!entityId.has_value()) {
+                continue;
+            }
+            Rect bounds;
+            obj_bound(object, &bounds);
+            if (!isOnScreen(bounds)) {
+                continue;
+            }
+
+            AgentJournalInteractableState state;
+            state.entityId = entityId->value;
+            state.pid = object->pid;
+            state.kind = door ? "door" : "item";
+            const char* name = object_name(object);
+            state.name = name != nullptr ? name : "";
+            state.tile = object->tile;
+            state.elevation = object->elevation;
+            state.screenX = (bounds.ulx + bounds.lrx) / 2;
+            state.screenY = (bounds.uly + bounds.lry) / 2;
+            state.distance = obj_dist(localActor, object);
+            if (door) {
+                state.open = obj_is_open(object) != 0;
+                state.locked = obj_is_locked(object);
+            }
+            states.push_back(std::move(state));
+        }
+        if (objects != nullptr) {
+            obj_delete_list(objects);
+        }
+    };
+    appendType(OBJ_TYPE_SCENERY);
+    appendType(OBJ_TYPE_ITEM);
+    std::sort(states.begin(), states.end(), [](const auto& left, const auto& right) {
+        if (left.entityId != right.entityId) {
+            return left.entityId < right.entityId;
+        }
+        if (left.tile != right.tile) {
+            return left.tile < right.tile;
+        }
+        return left.pid < right.pid;
+    });
+    return states;
+}
+
 void reportAgentWorldState()
 {
     if (!agentJournalEnabled()) {
@@ -456,6 +522,7 @@ void reportAgentWorldState()
     Object* localActor = hostIsLocal ? hostActor : guestActor;
     if (localActor != nullptr) {
         state.visibleCritters = visibleCritterJournalStates(localActor, hostActor, guestActor);
+        state.visibleInteractables = visibleInteractableJournalStates(localActor);
     }
     agentJournalWriteWorldState(state);
 }
@@ -666,6 +733,35 @@ void reportState()
     }
 }
 
+bool submitHostCommand(GameCommandPayload payload)
+{
+    if (launchOptions.mode != NetworkLaunchMode::Host || !networkWorldActive()) {
+        return false;
+    }
+    GameCommand command;
+    command.sequence.value = nextHostCommandSequence++;
+    command.playerId = kHostPlayerId;
+    command.actorId = EntityId { kHostPlayerId.value };
+    command.expectedPhase = std::holds_alternative<AttackCommand>(payload)
+        ? SessionPhase::Combat
+        : SessionPhase::Exploration;
+    command.expectedPhaseRevision = networkWorldPhaseRevision();
+    command.payload = std::move(payload);
+
+    AuthoritativeCommandResult outcome = networkWorldProcessCommand(command);
+    bool accepted = outcome.result.status == CommandStatus::Accepted;
+    if (!accepted) {
+        debug_printf("Multiplayer host command %llu rejected with reason %d.\n",
+            static_cast<unsigned long long>(command.sequence.value),
+            static_cast<int>(outcome.result.rejection));
+    }
+    if (!lobby.publishLocalCommandOutcome(std::move(outcome))) {
+        debug_printf("Multiplayer host command outcome could not be published.\n");
+        return false;
+    }
+    return accepted;
+}
+
 void networkRuntimeBackgroundProcess()
 {
     if (!lobbyStarted) {
@@ -686,6 +782,9 @@ void networkRuntimeBackgroundProcess()
     if (networkWorldActive()) {
         presentPendingGameChatMessages();
         if (launchOptions.mode == NetworkLaunchMode::Host) {
+            if (!networkWorldSynchronizeEnginePhase()) {
+                debug_printf("Multiplayer session phase could not follow the engine phase.\n");
+            }
             if (!pendingRecoveryRequest.has_value()) {
                 pendingRecoveryRequest = lobby.takeRecoveryRequest();
             }
@@ -716,7 +815,7 @@ void networkRuntimeBackgroundProcess()
                     && !lobby.sendAuthoritativeState(state)) {
                     debug_printf("Multiplayer authoritative state could not be sent.\n");
                 }
-                nextAuthoritativeState = now + std::chrono::milliseconds(100);
+                nextAuthoritativeState = now + std::chrono::milliseconds(250);
             }
         }
         while (std::optional<WorldSnapshot> snapshot = lobby.takePeerSnapshot()) {
@@ -732,11 +831,15 @@ void networkRuntimeBackgroundProcess()
                 break;
             }
         }
-        if (obj_dude != nullptr
-            && FID_ANIM_TYPE(obj_dude->fid) == ANIM_STAND
-            && obj_dude->rotation != lastSentLocalRotation
-            && lobby.sendLocalFacing(obj_dude->rotation, networkWorldPhaseRevision())) {
-            lastSentLocalRotation = obj_dude->rotation;
+        Object* localActor = localPlayerActor();
+        if (localActor != nullptr
+            && networkWorldPhase() == SessionPhase::Exploration
+            && FID_ANIM_TYPE(localActor->fid) == ANIM_STAND
+            && localActor->rotation != lastSentLocalRotation
+            && (launchOptions.mode == NetworkLaunchMode::Host
+                    ? submitHostCommand(FaceCommand { localActor->rotation })
+                    : lobby.sendLocalFacing(localActor->rotation, networkWorldPhaseRevision()))) {
+            lastSentLocalRotation = localActor->rotation;
         }
         while (std::optional<CommandResult> result = lobby.takeCommandResult()) {
             if (result->status == CommandStatus::Rejected) {
@@ -847,6 +950,7 @@ bool networkRuntimeConfigure(int argc, char** argv)
     pendingLocalItemDrop.reset();
     discardReconnectTransport();
     reconnectLastApplied = {};
+    nextHostCommandSequence = 1;
     reconnectTokens.invalidateAll();
     nextReconnectAttempt = {};
     nextAuthoritativeState = {};
@@ -1431,6 +1535,7 @@ bool networkRuntimeEnterWorld()
         return false;
     }
     lastSentLocalRotation = -1;
+    nextHostCommandSequence = 1;
     nextAuthoritativeState = {};
     nextAgentWorldReport = {};
     reportLobbyStatus();
@@ -1439,50 +1544,38 @@ bool networkRuntimeEnterWorld()
 
 bool networkRuntimeSubmitLocalMove(int destinationTile, int elevation, bool running)
 {
-    if (!networkWorldActive() || obj_dude == nullptr || elevation != obj_dude->elevation) {
+    Object* actor = localPlayerActor();
+    if (!networkWorldActive() || actor == nullptr || elevation != actor->elevation) {
         return false;
     }
-    if (destinationTile == obj_dude->tile) {
+    if (destinationTile == actor->tile) {
         return true;
     }
 
-    std::array<unsigned char, kMaximumMovementPathLength> path;
-    int pathLength = make_path(obj_dude, obj_dude->tile, destinationTile, path.data(), 1);
-    if (pathLength <= 0) {
-        return false;
-    }
-
-    int startingTile = obj_dude->tile;
-    std::vector<std::uint8_t> rotations(path.begin(), path.begin() + pathLength);
     if (launchOptions.mode == NetworkLaunchMode::Host) {
-        register_clear(obj_dude);
-        if (register_begin(ANIMATION_REQUEST_RESERVED) == -1) {
-            return false;
-        }
-        int rc = register_object_move_along_path(obj_dude,
-            destinationTile,
-            elevation,
-            path.data(),
-            pathLength,
-            running,
-            0);
-        int endRc = register_end();
-        if (rc == -1 || endRc == -1) {
-            return false;
-        }
+        submitHostCommand(MoveCommand { destinationTile, elevation, running });
+        return true;
     }
 
-    bool sent = lobby.sendLocalMove(
-        destinationTile,
-        elevation,
-        running,
-        startingTile,
-        rotations,
-        networkWorldPhaseRevision());
+    bool sent = lobby.sendLocalMove(destinationTile, elevation, running, -1, {}, networkWorldPhaseRevision());
     if (!sent) {
         debug_printf("Multiplayer movement command could not be sent.\n");
     }
     return true;
+}
+
+bool networkRuntimeSubmitLocalFacing(int rotation)
+{
+    if (!networkWorldActive() || rotation < 0 || rotation >= ROTATION_COUNT) {
+        return false;
+    }
+    bool submitted = launchOptions.mode == NetworkLaunchMode::Host
+        ? submitHostCommand(FaceCommand { rotation })
+        : lobby.sendLocalFacing(rotation, networkWorldPhaseRevision());
+    if (submitted) {
+        lastSentLocalRotation = rotation;
+    }
+    return submitted;
 }
 
 bool networkRuntimeHandleLocalDoorUse(Object* target)
@@ -1497,8 +1590,8 @@ bool networkRuntimeHandleLocalDoorUse(Object* target)
         return true;
     }
 
-    if (launchOptions.mode == NetworkLaunchMode::Host
-        && action_use_an_object(obj_dude, target) == -1) {
+    if (launchOptions.mode == NetworkLaunchMode::Host) {
+        submitHostCommand(InteractCommand { *targetId });
         return true;
     }
     if (!lobby.sendLocalDoorUse(*targetId, networkWorldPhaseRevision())) {
@@ -1519,8 +1612,8 @@ bool networkRuntimeHandleLocalPickup(Object* target)
         return true;
     }
 
-    if (launchOptions.mode == NetworkLaunchMode::Host
-        && !networkWorldBeginLocalPickup(target)) {
+    if (launchOptions.mode == NetworkLaunchMode::Host) {
+        submitHostCommand(PickupCommand { *targetId });
         return true;
     }
     if (!lobby.sendLocalPickup(*targetId, networkWorldPhaseRevision())) {
@@ -1540,8 +1633,8 @@ bool networkRuntimeHandleLocalLoot(Object* target)
         debug_printf("Multiplayer loot target is missing a shared entity ID.\n");
         return true;
     }
-    if (launchOptions.mode == NetworkLaunchMode::Host
-        && !networkWorldBeginLocalLoot(target)) {
+    if (launchOptions.mode == NetworkLaunchMode::Host) {
+        submitHostCommand(LootCommand { *targetId });
         return true;
     }
     if (!lobby.sendLocalLoot(*targetId, networkWorldPhaseRevision())) {
@@ -1557,18 +1650,9 @@ bool networkRuntimeHandleLocalAttack(Object* target, int hitMode, int hitLocatio
         || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER) {
         return false;
     }
-    std::optional<EntityId> targetId = networkWorldFindEntity(target);
-    if (!targetId.has_value()) {
-        debug_printf("Multiplayer attack target is missing a shared entity ID.\n");
-        return true;
-    }
-    if (launchOptions.mode == NetworkLaunchMode::Host
-        && combat_attack(obj_dude, target, hitMode, hitLocation) == -1) {
-        return true;
-    }
-    if (!lobby.sendLocalAttack(*targetId, hitMode, hitLocation, networkWorldPhaseRevision())) {
-        debug_printf("Multiplayer attack command could not be sent.\n");
-    }
+    (void)hitMode;
+    (void)hitLocation;
+    debug_printf("Multiplayer combat input is blocked until authoritative turn ownership is available.\n");
     return true;
 }
 
@@ -1583,8 +1667,8 @@ bool networkRuntimeHandleLocalLootTargetChange(Object* target)
         debug_printf("Multiplayer loot target is missing a shared entity ID.\n");
         return true;
     }
-    if (launchOptions.mode == NetworkLaunchMode::Host
-        && !networkWorldSetLocalLootTarget(target)) {
+    if (launchOptions.mode == NetworkLaunchMode::Host) {
+        submitHostCommand(LootCommand { *targetId });
         return true;
     }
     if (!lobby.sendLocalLoot(*targetId, networkWorldPhaseRevision())) {
@@ -1679,8 +1763,17 @@ NetworkInventoryTransferDisposition networkRuntimePrepareLocalInventoryTransfer(
             debug_printf("Multiplayer host could not assign an item entity ID.\n");
             return NetworkInventoryTransferDisposition::Reject;
         }
-        networkWorldResetLastItemSplit();
-        return NetworkInventoryTransferDisposition::ApplyLocally;
+        bool accepted = submitHostCommand(InventoryTransferCommand {
+            *sourceId,
+            *destinationId,
+            *itemId,
+            quantity,
+            availableQuantity,
+            itemDescriptor,
+        });
+        return accepted
+            ? NetworkInventoryTransferDisposition::DeferToHost
+            : NetworkInventoryTransferDisposition::Reject;
     }
     if (launchOptions.mode != NetworkLaunchMode::Join) {
         return NetworkInventoryTransferDisposition::Reject;
@@ -1751,8 +1844,16 @@ NetworkItemDropDisposition networkRuntimePrepareLocalItemDrop(Object* source,
             debug_printf("Multiplayer host could not assign a dropped item entity ID.\n");
             return NetworkItemDropDisposition::Reject;
         }
-        networkWorldResetLastItemSplit();
-        return NetworkItemDropDisposition::ApplyLocally;
+        bool accepted = submitHostCommand(ItemDropCommand {
+            *sourceId,
+            *itemId,
+            quantity,
+            sourceQuantity,
+            itemDescriptor,
+        });
+        return accepted
+            ? NetworkItemDropDisposition::DeferToHost
+            : NetworkItemDropDisposition::Reject;
     }
     if (launchOptions.mode != NetworkLaunchMode::Join) {
         return NetworkItemDropDisposition::Reject;
@@ -1852,6 +1953,7 @@ bool networkRuntimeHandleLocalMoneyDrop(Object* source, Object* item, std::uint3
 void networkRuntimeLeaveWorld()
 {
     lastSentLocalRotation = -1;
+    nextHostCommandSequence = 1;
     pendingRecoveryRequest.reset();
     pendingLocalItemDrop.reset();
     networkWorldLeave();

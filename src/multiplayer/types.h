@@ -228,6 +228,9 @@ constexpr std::int32_t kActorRotationCount = 6;
 struct DoorUseStartedEvent {
     EntityId actorId;
     EntityId targetId;
+    bool open = false;
+    bool locked = false;
+    std::int32_t frame = 0;
 };
 
 struct ItemPickupStartedEvent {

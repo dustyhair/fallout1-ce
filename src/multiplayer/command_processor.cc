@@ -21,7 +21,9 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     if (commandHistory != _players.end()) {
         auto previousResult = commandHistory->second.results.find(command.sequence.value);
         if (previousResult != commandHistory->second.results.end()) {
-            return previousResult->second;
+            AuthoritativeCommandResult replay = previousResult->second;
+            replay.replayed = true;
+            return replay;
         }
         expectedSequence = commandHistory->second.lastSequence + 1;
     }
@@ -36,8 +38,11 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
         return result;
     };
 
+    SessionPhase requiredPhase = std::holds_alternative<AttackCommand>(command.payload)
+        ? SessionPhase::Combat
+        : SessionPhase::Exploration;
     if (!session.isActive()
-        || session.phase() != SessionPhase::Exploration
+        || session.phase() != requiredPhase
         || command.expectedPhase != session.phase()) {
         return rejectAndRemember(CommandRejection::WrongPhase);
     }
@@ -143,8 +148,15 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
             executionStatus = executor.face(actor, *face);
             event.payload = ActorFacingChangedEvent { command.actorId, face->rotation };
         } else if (interact != nullptr) {
-            executionStatus = executor.useDoor(actor, target);
-            event.payload = DoorUseStartedEvent { command.actorId, interact->targetId };
+            DoorUseExecution doorExecution = executor.useDoor(actor, target);
+            executionStatus = doorExecution.status;
+            event.payload = DoorUseStartedEvent {
+                command.actorId,
+                interact->targetId,
+                doorExecution.open,
+                doorExecution.locked,
+                doorExecution.frame,
+            };
         } else if (pickup != nullptr) {
             executionStatus = executor.pickup(actor, target);
             event.payload = ItemPickupStartedEvent { command.actorId, pickup->targetId };

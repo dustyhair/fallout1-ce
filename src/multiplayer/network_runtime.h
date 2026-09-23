@@ -37,6 +37,7 @@ bool networkRuntimeRequestStart();
 bool networkRuntimeStartRequested();
 bool networkRuntimeEnterWorld();
 bool networkRuntimeSubmitLocalMove(int destinationTile, int elevation, bool running);
+bool networkRuntimeSubmitLocalFacing(int rotation);
 bool networkRuntimeHandleLocalDoorUse(Object* target);
 bool networkRuntimeHandleLocalPickup(Object* target);
 bool networkRuntimeHandleLocalLoot(Object* target);

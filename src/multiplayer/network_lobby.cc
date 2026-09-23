@@ -269,7 +269,9 @@ bool NetworkLobby::sendLocalAction(
         command.sequence.value = _nextLocalCommandSequence;
         command.playerId = playerId;
         command.actorId = EntityId { playerId.value };
-        command.expectedPhase = SessionPhase::Exploration;
+        command.expectedPhase = std::holds_alternative<AttackCommand>(commandPayload)
+            ? SessionPhase::Combat
+            : SessionPhase::Exploration;
         command.expectedPhaseRevision = phaseRevision;
         command.payload = std::move(commandPayload);
 
@@ -305,7 +307,7 @@ bool NetworkLobby::sendCommandOutcome(AuthoritativeCommandResult outcome)
         return false;
     }
 
-    if (outcome.event.has_value()) {
+    if (outcome.event.has_value() && !outcome.replayed) {
         outcome.event->sequence.value = _nextEventSequence;
         outcome.result.firstEventSequence = outcome.event->sequence;
         outcome.result.eventCount = 1;
@@ -322,7 +324,29 @@ bool NetworkLobby::sendCommandOutcome(AuthoritativeCommandResult outcome)
             }
         }
     }
-    return !outcome.event.has_value() || sendAuthoritativeEvent(std::move(*outcome.event));
+    return !outcome.event.has_value()
+        || outcome.replayed
+        || sendAuthoritativeEvent(std::move(*outcome.event));
+}
+
+bool NetworkLobby::publishLocalCommandOutcome(AuthoritativeCommandResult outcome)
+{
+    if (_mode != NetworkLaunchMode::Host
+        || (_state != NetworkLobbyState::Ready && _state != NetworkLobbyState::Disconnected)
+        || !_startRequested) {
+        return false;
+    }
+    if (outcome.result.status == CommandStatus::Rejected) {
+        return true;
+    }
+    if (outcome.replayed) {
+        return true;
+    }
+    if (!outcome.event.has_value()) {
+        return outcome.result.eventCount == 0;
+    }
+    outcome.event->sequence.value = _nextEventSequence;
+    return sendAuthoritativeEvent(std::move(*outcome.event));
 }
 
 bool NetworkLobby::sendAuthoritativeEvent(GameEvent event)
@@ -916,9 +940,7 @@ void NetworkLobby::handlePacket(const Packet& packet)
         if (_mode != NetworkLaunchMode::Join
             || _state != NetworkLobbyState::Ready
             || !_startRequested
-            || !state
-            || !state.snapshot.doors.empty()
-            || !state.snapshot.items.empty()) {
+            || !state) {
             fail(NetworkLobbyError::UnexpectedMessage);
             return;
         }

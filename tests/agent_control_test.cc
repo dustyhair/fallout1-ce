@@ -47,10 +47,29 @@ int main()
     passed = expect(parse("45 text Follow me.", command) && command.text == "Follow me.",
         "preserves command text")
         && passed;
+    passed = expect(parse("46 game_move 12345 1 run", command)
+            && command.type == fallout::AgentControlCommandType::GameMove
+            && command.tile == 12345
+            && command.elevation == 1
+            && command.running,
+        "parses a semantic movement command")
+        && passed;
+    passed = expect(parse("47 game_face 5", command)
+            && command.type == fallout::AgentControlCommandType::GameFace
+            && command.rotation == 5,
+        "parses a semantic facing command")
+        && passed;
+    passed = expect(parse("48 game_pickup 77", command)
+            && command.type == fallout::AgentControlCommandType::GamePickup
+            && command.entityId == 77,
+        "parses a semantic entity command")
+        && passed;
     passed = expect(!parse("0 click 10 10", command), "rejects command id zero") && passed;
-    passed = expect(!parse("46 click -1 10", command), "rejects negative coordinates") && passed;
-    passed = expect(!parse("47 key definitely-not-a-key", command), "rejects an unknown key") && passed;
-    passed = expect(!parse("48 move 10 20 trailing", command), "rejects trailing coordinate input") && passed;
+    passed = expect(!parse("49 click -1 10", command), "rejects negative coordinates") && passed;
+    passed = expect(!parse("50 key definitely-not-a-key", command), "rejects an unknown key") && passed;
+    passed = expect(!parse("51 move 10 20 trailing", command), "rejects trailing coordinate input") && passed;
+    passed = expect(!parse("52 game_move 10 3 walk", command), "rejects an invalid elevation") && passed;
+    passed = expect(!parse("53 game_door 0", command), "rejects an invalid entity id") && passed;
 
     return passed ? 0 : 1;
 }

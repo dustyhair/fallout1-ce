@@ -367,16 +367,21 @@ public:
         return CommandExecutionStatus::Applied;
     }
 
-    CommandExecutionStatus useDoor(Object* actor, Object* target) override
+    DoorUseExecution useDoor(Object* actor, Object* target) override
     {
+        DoorUseExecution execution;
         if (isInCombat()
             || target == nullptr
             || actor->elevation != target->elevation
             || !obj_is_a_portal(target)
             || action_use_an_object(actor, target) == -1) {
-            return CommandExecutionStatus::InvalidAction;
+            return execution;
         }
-        return CommandExecutionStatus::Applied;
+        execution.status = CommandExecutionStatus::Applied;
+        execution.open = obj_is_open(target) != 0;
+        execution.locked = obj_is_locked(target);
+        execution.frame = target->frame;
+        return execution;
     }
 
     CommandExecutionStatus pickup(Object* actor, Object* target) override
@@ -401,18 +406,12 @@ public:
 
     CommandExecutionStatus attack(Object* actor, Object* target, const AttackCommand& command) override
     {
-        if (actor == nullptr
-            || target == nullptr
-            || actor == target
-            || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER
-            || actor->elevation != target->elevation
-            || command.hitMode < 0 || command.hitMode >= HIT_MODE_COUNT
-            || command.hitLocation < 0 || command.hitLocation >= HIT_LOCATION_COUNT
-            || combat_check_bad_shot(actor, target, command.hitMode, command.hitLocation != HIT_LOCATION_UNCALLED) != COMBAT_BAD_SHOT_OK
-            || combat_attack(actor, target, command.hitMode, command.hitLocation) == -1) {
-            return CommandExecutionStatus::InvalidAction;
-        }
-        return CommandExecutionStatus::Applied;
+        // Fail closed until the combat controller can prove active-turn
+        // ownership and publish complete authoritative effects.
+        (void)actor;
+        (void)target;
+        (void)command;
+        return CommandExecutionStatus::InvalidAction;
     }
 
     InventoryTransferExecution transferInventory(Object* actor,
@@ -871,8 +870,17 @@ bool networkWorldApplyPeerDoorUse(const DoorUseStartedEvent& doorUse)
         return false;
     }
 
-    ScopedActingPlayerContext actingPlayer(*player, actor);
-    return action_use_an_object(actor, target) != -1;
+    if (doorUse.open != (doorUse.frame != 0)) {
+        return false;
+    }
+
+    Rect dirtyRect;
+    if (obj_set_frame(target, doorUse.frame, &dirtyRect) == -1
+        || (doorUse.locked ? obj_lock(target) : obj_unlock(target)) == -1) {
+        return false;
+    }
+    tile_refresh_rect(&dirtyRect, target->elevation);
+    return true;
 }
 
 bool networkWorldApplyPeerPickup(const ItemPickupStartedEvent& pickup)
@@ -888,8 +896,11 @@ bool networkWorldApplyPeerPickup(const ItemPickupStartedEvent& pickup)
         return false;
     }
 
-    ScopedActingPlayerContext actingPlayer(*player, actor);
-    return beginPickup(actor, target);
+    // The event is a presentation cue. Calling the pickup action here would
+    // rerun scripts and inventory rules on the guest. The authoritative state
+    // snapshot applies the resulting item ownership after the host completes
+    // the action.
+    return target->owner == nullptr;
 }
 
 bool networkWorldApplyPeerLoot(const LootStartedEvent& loot)
@@ -935,8 +946,9 @@ bool networkWorldApplyPeerAttack(const AttackStartedEvent& attack)
         || attack.hitLocation < 0 || attack.hitLocation >= HIT_LOCATION_COUNT) {
         return false;
     }
-    ScopedActingPlayerContext actingPlayer(*player, actor);
-    return combat_attack(actor, target, attack.hitMode, attack.hitLocation) != -1;
+    // Never rerun combat_attack on a replica: it consumes RNG and computes
+    // damage. Authoritative actor and critter values arrive in snapshots.
+    return true;
 }
 
 bool networkWorldBeginLocalLoot(Object* target)
@@ -1318,6 +1330,16 @@ AuthoritativeCommandResult networkWorldProcessCommand(const GameCommand& command
     return result;
 }
 
+bool networkWorldSynchronizeEnginePhase()
+{
+    if (!session.isActive()) {
+        return false;
+    }
+    SessionPhase desired = isInCombat() ? SessionPhase::Combat : SessionPhase::Exploration;
+    return session.phase() == desired
+        || session.transitionTo(desired) == LocalSessionError::None;
+}
+
 SessionPhase networkWorldPhase()
 {
     return session.phase();
@@ -1427,8 +1449,6 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
 {
     if (!session.isActive()
         || validateSnapshot(snapshot) != SnapshotError::None
-        || snapshot.phase != session.phase()
-        || snapshot.phaseRevision != session.phaseRevision()
         || snapshot.doors.size() != worldDoors.size()) {
         return false;
     }
@@ -1469,7 +1489,8 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
         }
     }
 
-    if (!applyActorAndCritterState(snapshot)) {
+    if (session.applyAuthoritativePhase(snapshot.phase, snapshot.phaseRevision) != LocalSessionError::None
+        || !applyActorAndCritterState(snapshot)) {
         return false;
     }
     for (const DoorSnapshot& doorState : snapshot.doors) {
@@ -1543,81 +1564,12 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
 
 bool networkWorldCaptureAuthoritativeState(EventSequence lastIncludedEvent, WorldSnapshot& snapshot)
 {
-    static SnapshotError lastValidationError = SnapshotError::None;
-    if (!session.isActive()) {
-        return false;
-    }
-    WorldSnapshot captured;
-    captured.lastIncludedEvent = lastIncludedEvent;
-    captured.phase = session.phase();
-    captured.phaseRevision = session.phaseRevision();
-    for (PlayerId playerId : { kHostPlayerId, kGuestPlayerId }) {
-        EntityId actorId = session.playerActorId(playerId);
-        Object* actor = session.entities().findObject(actorId);
-        if (actor == nullptr || actor->tile < 0) {
-            return false;
-        }
-        captured.actors.push_back(ActorSnapshot {
-            actorId,
-            playerId,
-            actor->tile,
-            actor->elevation,
-            actor->rotation,
-            std::max(critter_get_hits(actor), 0),
-            std::max(actor->data.critter.combat.ap, 0),
-            actor->data.critter.combat.results,
-        });
-    }
-    for (const auto& entry : worldCritters) {
-        Object* critter = entry.second;
-        if (critter == nullptr
-            || session.entities().findObject(entry.first) != critter) {
-            return false;
-        }
-        if (critter->tile < 0) {
-            continue;
-        }
-        captured.critters.push_back(CritterSnapshot {
-            entry.first,
-            critter->pid,
-            critter->tile,
-            critter->elevation,
-            critter->rotation,
-            std::max(critter_get_hits(critter), 0),
-            std::max(critter->data.critter.combat.ap, 0),
-            critter->data.critter.combat.results,
-            critter->data.critter.combat.team,
-        });
-    }
-    SnapshotError validationError = validateSnapshot(captured);
-    if (validationError != SnapshotError::None) {
-        if (validationError != lastValidationError) {
-            debug_printf("Multiplayer authoritative state validation failed: %d.\n", static_cast<int>(validationError));
-            lastValidationError = validationError;
-        }
-        return false;
-    }
-    lastValidationError = SnapshotError::None;
-    snapshot = std::move(captured);
-    return true;
+    return networkWorldCaptureSnapshot(lastIncludedEvent, snapshot);
 }
 
 bool networkWorldApplyAuthoritativeState(const WorldSnapshot& snapshot)
 {
-    if (!session.isActive()
-        || validateSnapshot(snapshot) != SnapshotError::None
-        || snapshot.phase != session.phase()
-        || snapshot.phaseRevision != session.phaseRevision()
-        || !snapshot.doors.empty()
-        || !snapshot.items.empty()) {
-        return false;
-    }
-    if (!validateActorAndCritterState(snapshot)
-        || !applyActorAndCritterState(snapshot)) {
-        return false;
-    }
-    intface_redraw();
-    return true;
+    return networkWorldApplySnapshot(snapshot);
 }
 
 std::optional<EntityId> networkWorldFindEntity(const Object* object)
@@ -1626,6 +1578,13 @@ std::optional<EntityId> networkWorldFindEntity(const Object* object)
         return std::nullopt;
     }
     return session.entities().findEntity(object);
+}
+
+Object* networkWorldFindObject(EntityId entityId)
+{
+    return session.isActive() && isValid(entityId)
+        ? session.entities().findObject(entityId)
+        : nullptr;
 }
 
 Object* networkWorldPlayerActor(PlayerId playerId)

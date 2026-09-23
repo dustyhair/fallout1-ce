@@ -799,7 +799,7 @@ void testGameplayWireFormat()
 
     std::vector<GameEvent> events = {
         GameEvent { EventSequence { 7 }, CommandSequence { 1 }, ActorMovementStartedEvent { EntityId { 20 }, 12345, 1, true, 12340, { 1, 2, 3 } } },
-        GameEvent { EventSequence { 8 }, CommandSequence { 2 }, DoorUseStartedEvent { EntityId { 20 }, EntityId { 40 } } },
+        GameEvent { EventSequence { 8 }, CommandSequence { 2 }, DoorUseStartedEvent { EntityId { 20 }, EntityId { 40 }, true, false, 3 } },
         GameEvent { EventSequence { 9 }, CommandSequence { 3 }, ItemPickupStartedEvent { EntityId { 20 }, EntityId { 41 } } },
         GameEvent { EventSequence { 10 }, CommandSequence { 4 }, LootStartedEvent { EntityId { 20 }, EntityId { 42 } } },
         GameEvent { EventSequence { 11 }, CommandSequence { 5 }, ActorFacingChangedEvent { EntityId { 20 }, 4 } },
@@ -831,6 +831,20 @@ void testGameplayWireFormat()
             && movementEvent->startingTile == 12340
             && movementEvent->path == std::vector<std::uint8_t>({ 1, 2, 3 }),
         "movement event payload round trips");
+
+    ProtocolEnvelope doorEventEnvelope = gameplayEnvelope(45);
+    encodeGameEvent(events[1], doorEventEnvelope);
+    GameEventDecodeResult decodedDoorEvent = decodeGameEvent(doorEventEnvelope);
+    const DoorUseStartedEvent* doorEvent = decodedDoorEvent
+        ? std::get_if<DoorUseStartedEvent>(&decodedDoorEvent.event.payload)
+        : nullptr;
+    expect(doorEvent != nullptr
+            && doorEvent->actorId == EntityId { 20 }
+            && doorEvent->targetId == EntityId { 40 }
+            && doorEvent->open
+            && !doorEvent->locked
+            && doorEvent->frame == 3,
+        "door event carries authoritative state instead of a script replay request");
 
     ProtocolEnvelope facingEventEnvelope = gameplayEnvelope(41);
     encodeGameEvent(events[4], facingEventEnvelope);
@@ -1595,18 +1609,18 @@ void testNetworkCharacterLobby()
             && guest.lastAppliedEvent() == EventSequence { 10 },
         "guest confirms the replayed event as its new reconnect boundary");
     WorldSnapshot authoritativeState = sampleSnapshot();
-    authoritativeState.doors.clear();
-    authoritativeState.items.clear();
     expect(host.sendAuthoritativeState(authoritativeState),
-        "host sends a non-journaled authoritative actor and NPC correction");
+        "host sends a non-journaled full authoritative correction");
     guest.poll();
     std::optional<WorldSnapshot> receivedState = guest.takeAuthoritativeState();
     expect(receivedState.has_value()
             && receivedState->actors.size() == 2
             && receivedState->critters.size() == 1
             && receivedState->critters[0].entityId == EntityId { 12 }
-            && receivedState->critters[0].hitPoints == 6,
-        "guest receives authoritative NPC combat state independently of replay events");
+            && receivedState->critters[0].hitPoints == 6
+            && receivedState->doors.size() == 1
+            && receivedState->items.size() == 2,
+        "guest receives complete authoritative state independently of replay events");
     expect(host.takeTransport() != nullptr && guest.takeTransport() != nullptr,
         "ready lobbies hand the connection to the game session");
 
@@ -1734,6 +1748,16 @@ void testLocalSessionLifecycle()
     expect(session.phaseRevision() == 3, "accepted transitions advance the phase revision");
     expect(session.transitionTo(SessionPhase::Exploration) == LocalSessionError::None, "repeating the current phase is harmless");
     expect(session.phaseRevision() == 3, "repeating the current phase does not advance its revision");
+    expect(session.applyAuthoritativePhase(SessionPhase::Combat, 7) == LocalSessionError::None
+            && session.phase() == SessionPhase::Combat
+            && session.phaseRevision() == 7,
+        "an authoritative snapshot can advance a guest across missed phase revisions");
+    expect(session.applyAuthoritativePhase(SessionPhase::Exploration, 7) == LocalSessionError::InvalidTransition,
+        "an authoritative phase cannot change without a newer revision");
+    expect(session.applyAuthoritativePhase(SessionPhase::Exploration, 6) == LocalSessionError::InvalidTransition,
+        "an authoritative phase cannot roll a guest back to a stale revision");
+    expect(session.applyAuthoritativePhase(SessionPhase::Exploration, 8) == LocalSessionError::None,
+        "a newer authoritative revision can return the guest to exploration");
 
     Transport* hostTransport = session.transportFor(kHostPlayerId);
     Transport* guestTransport = session.transportFor(kGuestPlayerId);
@@ -1780,13 +1804,13 @@ public:
         return nextStatus;
     }
 
-    CommandExecutionStatus useDoor(Object* actor, Object* target) override
+    DoorUseExecution useDoor(Object* actor, Object* target) override
     {
         doorCalls++;
         lastActor = actor;
         lastTarget = target;
         recordContext();
-        return nextStatus;
+        return DoorUseExecution { nextStatus, true, false, 3 };
     }
 
     CommandExecutionStatus pickup(Object* actor, Object* target) override
@@ -1941,7 +1965,10 @@ void testAuthoritativeCommandProcessing()
     AuthoritativeCommandResult duplicate = processor.process(move, session, executor);
     expect(duplicate.result.status == CommandStatus::Accepted, "duplicate command returns its prior result");
     expect(executor.moveCalls == 1, "duplicate command does not execute twice");
-    expect(duplicate.event.has_value() && duplicate.event->sequence == EventSequence { 1 }, "duplicate command returns the original event");
+    expect(duplicate.replayed
+            && duplicate.event.has_value()
+            && duplicate.event->sequence == EventSequence { 1 },
+        "duplicate command identifies the original event without republishing it");
 
     GameCommand stolen = move;
     stolen.sequence.value = 1;
@@ -1965,7 +1992,12 @@ void testAuthoritativeCommandProcessing()
     expect(executor.lastBuild == &session.players().find(kGuestPlayerId)->build, "guest context exposes the registered character build");
     expect(actingPlayerState() == nullptr, "guest command clears its context after execution");
     const DoorUseStartedEvent* doorEvent = usedDoor.event.has_value() ? std::get_if<DoorUseStartedEvent>(&usedDoor.event->payload) : nullptr;
-    expect(doorEvent != nullptr && doorEvent->targetId == registeredDoor.entityId, "door event records the actor and target IDs");
+    expect(doorEvent != nullptr
+            && doorEvent->targetId == registeredDoor.entityId
+            && doorEvent->open
+            && !doorEvent->locked
+            && doorEvent->frame == 3,
+        "door event records authoritative state without requiring guest script execution");
     expect(usedDoor.event.has_value() && usedDoor.event->sequence == EventSequence { 2 }, "event sequence advances across players");
 
     GameCommand pickup;
@@ -2096,7 +2128,9 @@ void testAuthoritativeCommandProcessing()
     attack.sequence.value = 8;
     attack.playerId = kGuestPlayerId;
     attack.actorId = session.playerActorId(kGuestPlayerId);
-    attack.expectedPhase = SessionPhase::Exploration;
+    expect(session.transitionTo(SessionPhase::Combat) == LocalSessionError::None,
+        "command test enters combat before accepting an attack");
+    attack.expectedPhase = SessionPhase::Combat;
     attack.expectedPhaseRevision = session.phaseRevision();
     attack.payload = AttackCommand { registeredLootableCritter.entityId, 1, 8 };
     AuthoritativeCommandResult attacked = processor.process(attack, session, executor);
@@ -2112,8 +2146,13 @@ void testAuthoritativeCommandProcessing()
             && attackEvent->targetId == registeredLootableCritter.entityId,
         "host resolves and executes a guest attack against the shared NPC identity");
 
+    expect(session.transitionTo(SessionPhase::Exploration) == LocalSessionError::None,
+        "command test returns to exploration after the attack");
+
     executor.nextStatus = CommandExecutionStatus::InvalidAction;
     move.sequence.value = 3;
+    move.expectedPhase = SessionPhase::Exploration;
+    move.expectedPhaseRevision = session.phaseRevision();
     AuthoritativeCommandResult invalid = processor.process(move, session, executor);
     expect(invalid.result.rejection == CommandRejection::InvalidAction, "executor can reject an impossible action");
     expect(!invalid.event.has_value(), "rejected action emits no authoritative event");

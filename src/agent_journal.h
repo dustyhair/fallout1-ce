@@ -35,6 +35,20 @@ struct AgentJournalCritterState {
     int hitPoints = 0;
 };
 
+struct AgentJournalInteractableState {
+    std::uint64_t entityId = 0;
+    int pid = -1;
+    std::string kind;
+    std::string name;
+    int tile = -1;
+    int elevation = 0;
+    int screenX = -1;
+    int screenY = -1;
+    int distance = 0;
+    bool open = false;
+    bool locked = false;
+};
+
 struct AgentJournalWorldState {
     std::string map;
     std::string phase;
@@ -43,6 +57,7 @@ struct AgentJournalWorldState {
     AgentJournalActorState host;
     AgentJournalActorState guest;
     std::vector<AgentJournalCritterState> visibleCritters;
+    std::vector<AgentJournalInteractableState> visibleInteractables;
 };
 
 bool agentJournalConfigure(int argc, char** argv);

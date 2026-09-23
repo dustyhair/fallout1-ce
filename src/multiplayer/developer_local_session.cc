@@ -166,16 +166,21 @@ public:
         return CommandExecutionStatus::Applied;
     }
 
-    CommandExecutionStatus useDoor(Object* actor, Object* target) override
+    DoorUseExecution useDoor(Object* actor, Object* target) override
     {
+        DoorUseExecution execution;
         if (isInCombat()
             || actor->elevation != target->elevation
             || !obj_is_a_portal(target)
             || action_use_an_object(actor, target) == -1) {
-            return CommandExecutionStatus::InvalidAction;
+            return execution;
         }
 
-        return CommandExecutionStatus::Applied;
+        execution.status = CommandExecutionStatus::Applied;
+        execution.open = obj_is_open(target) != 0;
+        execution.locked = obj_is_locked(target);
+        execution.frame = target->frame;
+        return execution;
     }
 
     CommandExecutionStatus pickup(Object* actor, Object* target) override
