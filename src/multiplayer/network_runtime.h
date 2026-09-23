@@ -43,6 +43,9 @@ bool networkRuntimeHandleLocalDoorUse(Object* target);
 bool networkRuntimeHandleLocalPickup(Object* target);
 bool networkRuntimeHandleLocalLoot(Object* target);
 bool networkRuntimeHandleLocalAttack(Object* target, int hitMode, int hitLocation);
+bool networkRuntimeRequestSharedModal(SharedModalKind kind, bool open);
+bool networkRuntimeBlockUnsupportedSharedModal(SharedModalKind kind);
+bool networkRuntimeWorldPaused();
 bool networkRuntimeHandleLocalLootTargetChange(Object* target);
 bool networkRuntimeHandleLocalInventoryTransfer(Object* source,
     Object* destination,

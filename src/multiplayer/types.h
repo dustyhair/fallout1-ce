@@ -116,6 +116,26 @@ enum class SessionPhase : std::uint8_t {
     Ending = 7,
 };
 
+enum class SharedModalKind : std::uint8_t {
+    Dialogue = 1,
+    Barter = 2,
+    Rest = 3,
+    Elevator = 4,
+    WorldMap = 5,
+};
+
+constexpr bool isValid(SharedModalKind kind)
+{
+    return kind >= SharedModalKind::Dialogue && kind <= SharedModalKind::WorldMap;
+}
+
+constexpr SessionPhase sharedModalPhase(SharedModalKind kind)
+{
+    return kind == SharedModalKind::Dialogue || kind == SharedModalKind::Barter
+        ? SessionPhase::Dialogue
+        : SessionPhase::Transition;
+}
+
 struct MoveCommand {
     std::int32_t destinationTile = -1;
     std::int32_t elevation = -1;
@@ -173,7 +193,12 @@ struct AttackCommand {
     std::int32_t hitLocation = 0;
 };
 
-using GameCommandPayload = std::variant<MoveCommand, FaceCommand, InteractCommand, PickupCommand, LootCommand, InventoryTransferCommand, ItemDropCommand, AttackCommand>;
+struct SharedModalCommand {
+    SharedModalKind kind = SharedModalKind::Dialogue;
+    bool open = false;
+};
+
+using GameCommandPayload = std::variant<MoveCommand, FaceCommand, InteractCommand, PickupCommand, LootCommand, InventoryTransferCommand, ItemDropCommand, AttackCommand, SharedModalCommand>;
 
 struct GameCommand {
     CommandSequence sequence;
@@ -281,7 +306,15 @@ struct AttackStartedEvent {
     std::int32_t hitLocation = 0;
 };
 
-using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, ItemPickupCompletedEvent, LootStartedEvent, InventoryTransferredEvent, ItemDroppedEvent, AttackStartedEvent>;
+struct SharedModalStateChangedEvent {
+    EntityId actorId;
+    SharedModalKind kind = SharedModalKind::Dialogue;
+    bool open = false;
+    SessionPhase phase = SessionPhase::Exploration;
+    std::uint32_t phaseRevision = 0;
+};
+
+using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, ItemPickupCompletedEvent, LootStartedEvent, InventoryTransferredEvent, ItemDroppedEvent, AttackStartedEvent, SharedModalStateChangedEvent>;
 
 struct GameEvent {
     EventSequence sequence;

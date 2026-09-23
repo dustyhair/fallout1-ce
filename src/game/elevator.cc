@@ -11,6 +11,7 @@
 #include "game/map.h"
 #include "game/pipboy.h"
 #include "game/scripts.h"
+#include "multiplayer/network_runtime.h"
 #include "plib/gnw/button.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/gnw.h"
@@ -240,6 +241,10 @@ static unsigned char* grphbmp[ELEVATOR_FRM_COUNT];
 // 0x437E8C
 int elevator_select(int elevator, int* mapPtr, int* elevationPtr, int* tilePtr)
 {
+    if (multiplayer::networkRuntimeBlockUnsupportedSharedModal(multiplayer::SharedModalKind::Elevator)) {
+        return -1;
+    }
+
     if (elevator < 0 || elevator >= ELEVATOR_COUNT) {
         return -1;
     }

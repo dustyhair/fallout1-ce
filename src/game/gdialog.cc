@@ -33,6 +33,7 @@
 #include "game/tile.h"
 #include "int/dialog.h"
 #include "int/window.h"
+#include "multiplayer/network_runtime.h"
 #include "platform_compat.h"
 #include "plib/color/color.h"
 #include "plib/gnw/button.h"
@@ -628,6 +629,10 @@ void gdialog_enter(Object* target, int a2)
     gdDialogWentOff = false;
 
     if (isInCombat()) {
+        return;
+    }
+
+    if (multiplayer::networkRuntimeBlockUnsupportedSharedModal(multiplayer::SharedModalKind::Dialogue)) {
         return;
     }
 

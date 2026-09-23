@@ -361,7 +361,7 @@ Exit condition: an automated local client can observe the journal, control one p
 
 - Replicate movement, doors, containers, item pickup, skill use, traps, and map-script results.
 - [x] Require the acting player to remain adjacent to the active loot target when starting loot and when applying every inventory transfer; the deterministic loot scenario also proves a remote command is rejected without publishing an event.
-- Define pause behavior for modal screens.
+- [x] Define and enforce modal-screen behavior. Dialogue and barter use the `Dialogue` phase; rest, elevators, and world-map travel use `Transition`. The peer main loop keeps rendering and pumping the network while shared-world input, scripts, and map processing are paused. These entry points fail closed until their effects have host-authoritative command families. Informational Pip-Boy, inventory, character, and options screens remain local; loot keeps its validated live path.
 - Add a minimal host-authoritative player-to-player item/caps transfer command for practical co-op testing; the full transactional trade UI remains Phase 6.
 - Audit script-facing player assumptions used during exploration and classify each as story actor, acting player, or shared party state.
 

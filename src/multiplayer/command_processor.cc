@@ -38,8 +38,11 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
         return result;
     };
 
+    const SharedModalCommand* modal = std::get_if<SharedModalCommand>(&command.payload);
     SessionPhase requiredPhase = std::holds_alternative<AttackCommand>(command.payload)
         ? SessionPhase::Combat
+        : modal != nullptr && !modal->open
+        ? sharedModalPhase(modal->kind)
         : SessionPhase::Exploration;
     if (!session.isActive()
         || session.phase() != requiredPhase
@@ -166,6 +169,16 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
         } else if (attack != nullptr) {
             executionStatus = executor.attack(actor, target, *attack);
             event.payload = AttackStartedEvent { command.actorId, attack->targetId, attack->hitMode, attack->hitLocation };
+        } else if (modal != nullptr) {
+            SharedModalExecution modalExecution = executor.setSharedModal(actor, *modal);
+            executionStatus = modalExecution.status;
+            event.payload = SharedModalStateChangedEvent {
+                command.actorId,
+                modal->kind,
+                modal->open,
+                modalExecution.phase,
+                modalExecution.phaseRevision,
+            };
         } else if (transfer != nullptr) {
             InventoryTransferExecution transferExecution = executor.transferInventory(actor,
                 source,

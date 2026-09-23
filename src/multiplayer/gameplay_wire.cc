@@ -16,6 +16,7 @@ enum class CommandType : std::uint8_t {
     InventoryTransfer = 6,
     ItemDrop = 7,
     Attack = 8,
+    SharedModal = 9,
 };
 
 enum class EventType : std::uint8_t {
@@ -28,6 +29,7 @@ enum class EventType : std::uint8_t {
     ItemDropped = 7,
     AttackStarted = 8,
     ItemPickupCompleted = 9,
+    SharedModalStateChanged = 10,
 };
 
 constexpr std::size_t kCommandHeaderSize = 28;
@@ -38,6 +40,7 @@ constexpr std::size_t kItemDescriptorSize = 16;
 constexpr std::size_t kInventoryTransferCommandSize = kCommandHeaderSize + 20 + kItemDescriptorSize;
 constexpr std::size_t kItemDropCommandSize = kCommandHeaderSize + 16 + kItemDescriptorSize;
 constexpr std::size_t kAttackCommandSize = kCommandHeaderSize + 12;
+constexpr std::size_t kSharedModalCommandSize = kCommandHeaderSize + 4;
 constexpr std::size_t kCommandResultSize = 24;
 constexpr std::size_t kEventHeaderSize = 20;
 constexpr std::size_t kMovementEventHeaderSize = kEventHeaderSize + 20;
@@ -48,6 +51,7 @@ constexpr std::size_t kFacingEventSize = kEventHeaderSize + 8;
 constexpr std::size_t kInventoryTransferEventSize = kEventHeaderSize + 28 + kItemDescriptorSize;
 constexpr std::size_t kItemDropEventSize = kEventHeaderSize + 32 + kItemDescriptorSize;
 constexpr std::size_t kAttackEventSize = kEventHeaderSize + 16;
+constexpr std::size_t kSharedModalEventSize = kEventHeaderSize + 12;
 constexpr std::int32_t kAttackHitModeCount = 20;
 constexpr std::int32_t kAttackHitLocationCount = 9;
 
@@ -257,6 +261,11 @@ GameplayWireError validateCommand(const GameCommand& command)
             ? GameplayWireError::None
             : GameplayWireError::InvalidAttack;
     }
+    if (const auto* modal = std::get_if<SharedModalCommand>(&command.payload)) {
+        return isValid(modal->kind)
+            ? GameplayWireError::None
+            : GameplayWireError::InvalidModal;
+    }
 
     EntityId targetId;
     if (const auto* interact = std::get_if<InteractCommand>(&command.payload)) {
@@ -401,6 +410,19 @@ GameplayWireError validateEvent(const GameEvent& event)
             ? GameplayWireError::None
             : GameplayWireError::InvalidQuantity;
     }
+    if (const auto* modal = std::get_if<SharedModalStateChangedEvent>(&event.payload)) {
+        if (!isValid(modal->actorId)
+            || !isValid(modal->kind)
+            || modal->phaseRevision == 0) {
+            return GameplayWireError::InvalidModal;
+        }
+        SessionPhase expectedPhase = modal->open
+            ? sharedModalPhase(modal->kind)
+            : SessionPhase::Exploration;
+        return modal->phase == expectedPhase
+            ? GameplayWireError::None
+            : GameplayWireError::InvalidModal;
+    }
 
     EntityId actorId;
     EntityId targetId;
@@ -493,6 +515,11 @@ GameplayWireError encodeGameCommand(const GameCommand& command, ProtocolEnvelope
         appendUInt32(envelope.payload, drop->quantity);
         appendUInt32(envelope.payload, drop->sourceQuantity);
         appendItemDescriptor(envelope.payload, drop->itemDescriptor);
+    } else if (const auto* modal = std::get_if<SharedModalCommand>(&command.payload)) {
+        appendCommandHeader(command, CommandType::SharedModal, envelope.payload);
+        envelope.payload.push_back(static_cast<std::uint8_t>(modal->kind));
+        envelope.payload.push_back(modal->open ? 1 : 0);
+        appendUInt16(envelope.payload, 0);
     } else {
         const auto* attack = std::get_if<AttackCommand>(&command.payload);
         appendCommandHeader(command, CommandType::Attack, envelope.payload);
@@ -610,6 +637,19 @@ GameCommandDecodeResult decodeGameCommand(const ProtocolEnvelope& envelope)
             EntityId { readUInt32(envelope.payload, 28) },
             readInt32(envelope.payload, 32),
             readInt32(envelope.payload, 36),
+        };
+        break;
+    case CommandType::SharedModal:
+        if (envelope.payload.size() != kSharedModalCommandSize
+            || envelope.payload[29] > 1
+            || envelope.payload[30] != 0
+            || envelope.payload[31] != 0) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.command.payload = SharedModalCommand {
+            static_cast<SharedModalKind>(envelope.payload[28]),
+            envelope.payload[29] != 0,
         };
         break;
     default:
@@ -740,6 +780,14 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
         appendInt32(envelope.payload, drop->tile);
         appendInt32(envelope.payload, drop->elevation);
         appendItemDescriptor(envelope.payload, drop->itemDescriptor);
+    } else if (const auto* modal = std::get_if<SharedModalStateChangedEvent>(&event.payload)) {
+        appendEventHeader(event, EventType::SharedModalStateChanged, envelope.payload);
+        appendUInt32(envelope.payload, modal->actorId.value);
+        envelope.payload.push_back(static_cast<std::uint8_t>(modal->kind));
+        envelope.payload.push_back(modal->open ? 1 : 0);
+        envelope.payload.push_back(static_cast<std::uint8_t>(modal->phase));
+        envelope.payload.push_back(0);
+        appendUInt32(envelope.payload, modal->phaseRevision);
     } else {
         const auto* attack = std::get_if<AttackStartedEvent>(&event.payload);
         appendEventHeader(event, EventType::AttackStarted, envelope.payload);
@@ -906,6 +954,21 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
             readInt32(envelope.payload, 32),
         };
         break;
+    case EventType::SharedModalStateChanged:
+        if (envelope.payload.size() != kSharedModalEventSize
+            || envelope.payload[25] > 1
+            || envelope.payload[27] != 0) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.event.payload = SharedModalStateChangedEvent {
+            EntityId { readUInt32(envelope.payload, 20) },
+            static_cast<SharedModalKind>(envelope.payload[24]),
+            envelope.payload[25] != 0,
+            static_cast<SessionPhase>(envelope.payload[26]),
+            readUInt32(envelope.payload, 28),
+        };
+        break;
     default:
         result.error = GameplayWireError::UnknownPayloadType;
         return result;
@@ -952,6 +1015,8 @@ const char* gameplayWireErrorMessage(GameplayWireError error)
         return "invalid actor rotation";
     case GameplayWireError::InvalidAttack:
         return "invalid attack payload";
+    case GameplayWireError::InvalidModal:
+        return "invalid shared modal payload";
     case GameplayWireError::InvalidQuantity:
         return "invalid inventory quantity";
     case GameplayWireError::InvalidStatus:

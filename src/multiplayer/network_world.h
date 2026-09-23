@@ -24,6 +24,7 @@ bool networkWorldApplyPeerDoorUse(const DoorUseStartedEvent& doorUse);
 bool networkWorldApplyPeerPickup(const ItemPickupStartedEvent& pickup);
 bool networkWorldApplyPeerPickupCompletion(const ItemPickupCompletedEvent& pickup);
 bool networkWorldApplyPeerLoot(const LootStartedEvent& loot);
+bool networkWorldApplyPeerSharedModal(const SharedModalStateChangedEvent& modal);
 bool networkWorldApplyPeerAttack(const AttackStartedEvent& attack);
 bool networkWorldApplyInventoryTransfer(const InventoryTransferredEvent& transfer, bool reverse = false);
 bool networkWorldApplyItemDrop(const ItemDroppedEvent& drop);
@@ -45,6 +46,7 @@ std::optional<GameEvent> networkWorldTakeDeferredEvent();
 bool networkWorldSynchronizeEnginePhase();
 SessionPhase networkWorldPhase();
 std::uint32_t networkWorldPhaseRevision();
+bool networkWorldSharedModalActive();
 bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot& snapshot);
 bool networkWorldApplySnapshot(const WorldSnapshot& snapshot);
 bool networkWorldCaptureAuthoritativeState(EventSequence lastIncludedEvent, WorldSnapshot& snapshot);
@@ -61,6 +63,7 @@ std::optional<EntityId> networkWorldPrepareDoorSmokeTest();
 std::optional<EntityId> networkWorldPreparePickupSmokeTest();
 std::optional<EntityId> networkWorldPrepareLootSmokeTest();
 bool networkWorldVerifyLootRangeSmokeTest(EntityId targetId);
+bool networkWorldRunSharedModalSmokeTest();
 
 } // namespace multiplayer
 } // namespace fallout

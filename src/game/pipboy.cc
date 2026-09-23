@@ -24,6 +24,7 @@
 #include "game/stat.h"
 #include "game/wordwrap.h"
 #include "game/worldmap.h"
+#include "multiplayer/network_runtime.h"
 #include "platform_compat.h"
 #include "plib/color/color.h"
 #include "plib/gnw/button.h"
@@ -1813,6 +1814,11 @@ static int ListArchive(int a1)
 // 0x488E94
 static void PipAlarm(int a1)
 {
+    if (multiplayer::networkRuntimeBlockUnsupportedSharedModal(multiplayer::SharedModalKind::Rest)) {
+        gsound_play_sfx_file("iisxxxx1");
+        return;
+    }
+
     if (a1 == 1024) {
         if (critter_can_obj_dude_rest()) {
             NixHotLines();

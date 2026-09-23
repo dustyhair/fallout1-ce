@@ -50,6 +50,11 @@ struct PendingPickup {
 std::unordered_map<EntityId, PendingPickup, EntityIdHash> pendingPickups;
 std::deque<GameEvent> deferredEvents;
 std::unordered_map<Object*, Object*> activeLootTargets;
+struct ActiveSharedModal {
+    EntityId actorId;
+    SharedModalKind kind = SharedModalKind::Dialogue;
+};
+std::optional<ActiveSharedModal> activeSharedModal;
 bool inventoryTransferInProgress = false;
 bool itemDropInProgress = false;
 NetworkLaunchMode worldMode = NetworkLaunchMode::Disabled;
@@ -527,6 +532,38 @@ public:
         return CommandExecutionStatus::InvalidAction;
     }
 
+    SharedModalExecution setSharedModal(Object* actor, const SharedModalCommand& command) override
+    {
+        SharedModalExecution execution;
+        std::optional<EntityId> actorId = session.entities().findEntity(actor);
+        if (!actorId.has_value() || !isValid(command.kind)) {
+            return execution;
+        }
+
+        if (command.open) {
+            if (activeSharedModal.has_value()
+                || session.phase() != SessionPhase::Exploration
+                || session.transitionTo(sharedModalPhase(command.kind)) != LocalSessionError::None) {
+                return execution;
+            }
+            activeSharedModal = ActiveSharedModal { *actorId, command.kind };
+        } else {
+            if (!activeSharedModal.has_value()
+                || activeSharedModal->actorId != *actorId
+                || activeSharedModal->kind != command.kind
+                || session.phase() != sharedModalPhase(command.kind)
+                || session.transitionTo(SessionPhase::Exploration) != LocalSessionError::None) {
+                return execution;
+            }
+            activeSharedModal.reset();
+        }
+
+        execution.status = CommandExecutionStatus::Applied;
+        execution.phase = session.phase();
+        execution.phaseRevision = session.phaseRevision();
+        return execution;
+    }
+
     InventoryTransferExecution transferInventory(Object* actor,
         Object* source,
         Object* destination,
@@ -671,6 +708,7 @@ bool registerWorldObjects()
     pendingPickups.clear();
     deferredEvents.clear();
     activeLootTargets.clear();
+    activeSharedModal.reset();
     std::vector<Object*> doors;
     std::vector<Object*> items;
     std::vector<Object*> critters;
@@ -1090,6 +1128,49 @@ bool networkWorldApplyPeerLoot(const LootStartedEvent& loot)
     return action_loot_container(actor, target) != -1;
 }
 
+bool networkWorldApplyPeerSharedModal(const SharedModalStateChangedEvent& modal)
+{
+    if (!session.isActive()
+        || !isValid(modal.kind)
+        || session.entities().findObject(modal.actorId) == nullptr
+        || modal.phaseRevision == 0) {
+        return false;
+    }
+    SessionPhase expectedPhase = modal.open
+        ? sharedModalPhase(modal.kind)
+        : SessionPhase::Exploration;
+    if (modal.phase != expectedPhase) {
+        return false;
+    }
+    if (modal.open) {
+        if (activeSharedModal.has_value()) {
+            return activeSharedModal->actorId == modal.actorId
+                && activeSharedModal->kind == modal.kind
+                && session.phase() == modal.phase
+                && session.phaseRevision() == modal.phaseRevision;
+        }
+        if (session.phase() != SessionPhase::Exploration) {
+            return false;
+        }
+        activeSharedModal = ActiveSharedModal { modal.actorId, modal.kind };
+    } else {
+        if (activeSharedModal.has_value()
+            && (activeSharedModal->actorId != modal.actorId || activeSharedModal->kind != modal.kind)) {
+            return false;
+        }
+    }
+    if (session.applyAuthoritativePhase(modal.phase, modal.phaseRevision) != LocalSessionError::None) {
+        if (modal.open) {
+            activeSharedModal.reset();
+        }
+        return false;
+    }
+    if (!modal.open) {
+        activeSharedModal.reset();
+    }
+    return true;
+}
+
 bool networkWorldApplyPeerAttack(const AttackStartedEvent& attack)
 {
     if (!session.isActive()) {
@@ -1409,6 +1490,59 @@ bool networkWorldVerifyLootRangeSmokeTest(EntityId targetId)
     bool restored = obj_move_to_tile(actor, adjacentTile, elevation, nullptr) == 0
         && lootTargetIsInRange(actor, target);
     return rejected && restored;
+}
+
+bool networkWorldRunSharedModalSmokeTest()
+{
+    if (!session.isActive() || session.phase() != SessionPhase::Exploration) {
+        return false;
+    }
+    EntityId actorId = session.playerActorId(kGuestPlayerId);
+    GameCommand open;
+    open.sequence = CommandSequence { 1 };
+    open.playerId = kGuestPlayerId;
+    open.actorId = actorId;
+    open.expectedPhase = SessionPhase::Exploration;
+    open.expectedPhaseRevision = session.phaseRevision();
+    open.payload = SharedModalCommand { SharedModalKind::Dialogue, true };
+    AuthoritativeCommandResult opened = networkWorldProcessCommand(open);
+    const auto* openedEvent = opened.event.has_value()
+        ? std::get_if<SharedModalStateChangedEvent>(&opened.event->payload)
+        : nullptr;
+    bool openPassed = opened.result.status == CommandStatus::Accepted
+        && openedEvent != nullptr
+        && openedEvent->open
+        && openedEvent->phase == SessionPhase::Dialogue
+        && openedEvent->phaseRevision == session.phaseRevision()
+        && networkWorldSharedModalActive();
+
+    GameCommand blocked = open;
+    blocked.sequence = CommandSequence { 2 };
+    blocked.expectedPhase = SessionPhase::Dialogue;
+    blocked.expectedPhaseRevision = session.phaseRevision();
+    blocked.payload = MoveCommand { 1, 0, false };
+    AuthoritativeCommandResult blockedResult = networkWorldProcessCommand(blocked);
+    bool blockPassed = blockedResult.result.rejection == CommandRejection::WrongPhase
+        && !blockedResult.event.has_value();
+
+    GameCommand close = open;
+    close.sequence = CommandSequence { 3 };
+    close.expectedPhase = SessionPhase::Dialogue;
+    close.expectedPhaseRevision = session.phaseRevision();
+    close.payload = SharedModalCommand { SharedModalKind::Dialogue, false };
+    AuthoritativeCommandResult closed = networkWorldProcessCommand(close);
+    const auto* closedEvent = closed.event.has_value()
+        ? std::get_if<SharedModalStateChangedEvent>(&closed.event->payload)
+        : nullptr;
+    bool closePassed = closed.result.status == CommandStatus::Accepted
+        && closedEvent != nullptr
+        && !closedEvent->open
+        && closedEvent->phase == SessionPhase::Exploration
+        && closedEvent->phaseRevision == session.phaseRevision()
+        && !networkWorldSharedModalActive();
+
+    commandProcessor.reset();
+    return openPassed && blockPassed && closePassed;
 }
 
 bool networkWorldBeginLocalLoot(Object* target)
@@ -1839,6 +1973,9 @@ bool networkWorldSynchronizeEnginePhase()
     if (!session.isActive()) {
         return false;
     }
+    if (activeSharedModal.has_value()) {
+        return session.phase() == sharedModalPhase(activeSharedModal->kind);
+    }
     SessionPhase desired = isInCombat() ? SessionPhase::Combat : SessionPhase::Exploration;
     return session.phase() == desired
         || session.transitionTo(desired) == LocalSessionError::None;
@@ -1852,6 +1989,13 @@ SessionPhase networkWorldPhase()
 std::uint32_t networkWorldPhaseRevision()
 {
     return session.phaseRevision();
+}
+
+bool networkWorldSharedModalActive()
+{
+    return activeSharedModal.has_value()
+        || session.phase() == SessionPhase::Dialogue
+        || session.phase() == SessionPhase::Transition;
 }
 
 bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot& snapshot)
@@ -2075,6 +2219,10 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
     if (!applyTimedEvents(snapshot)) {
         return false;
     }
+    if (activeSharedModal.has_value()
+        && sharedModalPhase(activeSharedModal->kind) != snapshot.phase) {
+        activeSharedModal.reset();
+    }
     intface_redraw();
     return true;
 }
@@ -2122,6 +2270,7 @@ void networkWorldLeave()
     pendingPickups.clear();
     deferredEvents.clear();
     activeLootTargets.clear();
+    activeSharedModal.reset();
     itemDropInProgress = false;
     expectedSplitEntityId = {};
     lastSplitEntityId = {};

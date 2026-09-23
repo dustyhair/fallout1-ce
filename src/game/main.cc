@@ -396,13 +396,15 @@ static void main_game_loop()
         multiplayer::developerLocalSessionEnsureStarted();
 
         int keyCode = get_input();
-        if (!multiplayer::networkRuntimeHandleGameChatInput(keyCode)) {
+        bool multiplayerPaused = multiplayer::networkRuntimeWorldPaused();
+        if (!multiplayer::networkRuntimeHandleGameChatInput(keyCode) && !multiplayerPaused) {
             game_handle_input(keyCode, false);
         }
 
-        scripts_check_state();
-
-        map_check_state();
+        if (!multiplayerPaused) {
+            scripts_check_state();
+            map_check_state();
+        }
 
         if (main_game_paused != 0) {
             main_game_paused = 0;

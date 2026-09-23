@@ -6,7 +6,7 @@ For every command, the processor checks:
 
 - The player, actor, and command sequence are valid.
 - The command is the next sequence for that player. Repeating one of the 64 most recent commands returns its cached result without executing it again.
-- The session is in exploration and the sender used the current phase revision.
+- The session is in the phase required by the command and the sender used the current phase revision. Ordinary actions and modal opens require exploration; modal closes require that modal's phase.
 - The actor exists and belongs to the sending player.
 - An interaction target exists in the entity registry.
 
@@ -23,3 +23,9 @@ Lootable critters and their recursive inventories are registered in the same can
 Inventory drops use the same authority rule. Guest input stays unchanged until the host runs the drop script and publishes the dropped item ID, any split remainder ID, quantity, and final ground tile. Repeated ordinary-stack drops are serialized through successive remainder IDs; caps use one bounded bulk command so Fallout's special amount selection cannot mutate the guest ahead of the host.
 
 The [snapshot recovery format](snapshot-recovery.md) records the holder or ground position of every registered item so a recovery snapshot repairs pickup, loot, and drop mutations after their journal events have expired.
+
+## Shared modal policy
+
+The command processor owns a single shared-modal controller. Opening dialogue or barter advances the authoritative session to `Dialogue`; opening rest, an elevator, or world-map travel advances it to `Transition`. Only the actor that opened a particular modal can close it. Each change is an ordered event carrying the resulting phase and revision. The engine main loop continues rendering, animation timing, and background network processing while suppressing local gameplay input, script-state checks, and map-state checks on both peers.
+
+Dialogue, barter, rest, elevators, and world-map travel are currently blocked at their engine entry points during a multiplayer world. Their effects still depend on legacy local script or clock execution, so opening them before the corresponding host-authoritative command family exists would permit divergence. Local informational screens stay available, and loot remains live through its separate validated command path. Single-player behavior is unchanged.

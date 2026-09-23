@@ -205,6 +205,17 @@ bool NetworkLobby::sendLocalAttack(EntityId targetId, std::int32_t hitMode, std:
         phaseRevision);
 }
 
+bool NetworkLobby::sendLocalSharedModal(SharedModalKind kind, bool open, std::uint32_t phaseRevision)
+{
+    PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
+    EntityId actorId { playerId.value };
+    SessionPhase phase = open ? sharedModalPhase(kind) : SessionPhase::Exploration;
+    return sendLocalAction(
+        SharedModalStateChangedEvent { actorId, kind, open, phase, phaseRevision },
+        SharedModalCommand { kind, open },
+        phaseRevision);
+}
+
 bool NetworkLobby::sendLocalInventoryTransfer(EntityId sourceId,
     EntityId destinationId,
     EntityId itemId,
@@ -270,8 +281,11 @@ bool NetworkLobby::sendLocalAction(
         command.sequence.value = _nextLocalCommandSequence;
         command.playerId = playerId;
         command.actorId = EntityId { playerId.value };
+        const SharedModalCommand* modal = std::get_if<SharedModalCommand>(&commandPayload);
         command.expectedPhase = std::holds_alternative<AttackCommand>(commandPayload)
             ? SessionPhase::Combat
+            : modal != nullptr && !modal->open
+            ? sharedModalPhase(modal->kind)
             : SessionPhase::Exploration;
         command.expectedPhaseRevision = phaseRevision;
         command.payload = std::move(commandPayload);

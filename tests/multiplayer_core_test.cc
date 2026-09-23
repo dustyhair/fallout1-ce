@@ -740,6 +740,7 @@ void testGameplayWireFormat()
         GameCommand { CommandSequence { 6 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, InventoryTransferCommand { EntityId { 42 }, EntityId { 20 }, EntityId { 43 }, 3, 5, ItemDescriptor { 40, 7, 8, 9 } } },
         GameCommand { CommandSequence { 7 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, ItemDropCommand { EntityId { 20 }, EntityId { 43 }, 3, 5, ItemDescriptor { 40, 7, 8, 9 } } },
         GameCommand { CommandSequence { 8 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, AttackCommand { EntityId { 42 }, 1, 8 } },
+        GameCommand { CommandSequence { 9 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, SharedModalCommand { SharedModalKind::Dialogue, true } },
     };
 
     for (std::size_t index = 0; index < commands.size(); index++) {
@@ -868,6 +869,19 @@ void testGameplayWireFormat()
     expect(encodeGameCommand(invalidAttack, attackEnvelope) == GameplayWireError::InvalidAttack,
         "attack command rejects an invalid hit location");
 
+    ProtocolEnvelope modalEnvelope = gameplayEnvelope(29);
+    encodeGameCommand(commands[8], modalEnvelope);
+    GameCommandDecodeResult decodedModal = decodeGameCommand(modalEnvelope);
+    const SharedModalCommand* modal = decodedModal
+        ? std::get_if<SharedModalCommand>(&decodedModal.command.payload)
+        : nullptr;
+    expect(modal != nullptr && modal->kind == SharedModalKind::Dialogue && modal->open,
+        "shared modal command round trips its kind and requested state");
+    GameCommand invalidModal = commands[8];
+    std::get<SharedModalCommand>(invalidModal.payload).kind = static_cast<SharedModalKind>(99);
+    expect(encodeGameCommand(invalidModal, modalEnvelope) == GameplayWireError::InvalidModal,
+        "shared modal command rejects an unknown kind");
+
     CommandResult accepted;
     accepted.commandSequence.value = 1;
     accepted.status = CommandStatus::Accepted;
@@ -907,6 +921,7 @@ void testGameplayWireFormat()
         GameEvent { EventSequence { 13 }, CommandSequence { 7 }, ItemDroppedEvent { EntityId { 20 }, EntityId { 20 }, EntityId { 43 }, 3, 5, EntityId { 45 }, 12345, 1, ItemDescriptor { 40, 7, 8, 9 } } },
         GameEvent { EventSequence { 14 }, CommandSequence { 8 }, AttackStartedEvent { EntityId { 20 }, EntityId { 42 }, 1, 8 } },
         GameEvent { EventSequence { 15 }, CommandSequence { 3 }, ItemPickupCompletedEvent { EntityId { 20 }, EntityId { 41 }, true, 1, ItemDescriptor { 40, 7, 8, 9 } } },
+        GameEvent { EventSequence { 16 }, CommandSequence { 9 }, SharedModalStateChangedEvent { EntityId { 20 }, SharedModalKind::Dialogue, true, SessionPhase::Dialogue, 4 } },
     };
     for (std::size_t index = 0; index < events.size(); index++) {
         ProtocolEnvelope envelope = gameplayEnvelope(30 + index);
@@ -1032,6 +1047,20 @@ void testGameplayWireFormat()
             && attackEvent->hitMode == 1
             && attackEvent->hitLocation == 8,
         "attack event round trips authoritative actor and target IDs");
+
+    ProtocolEnvelope modalEventEnvelope = gameplayEnvelope(47);
+    encodeGameEvent(events[9], modalEventEnvelope);
+    GameEventDecodeResult decodedModalEvent = decodeGameEvent(modalEventEnvelope);
+    const SharedModalStateChangedEvent* modalEvent = decodedModalEvent
+        ? std::get_if<SharedModalStateChangedEvent>(&decodedModalEvent.event.payload)
+        : nullptr;
+    expect(modalEvent != nullptr
+            && modalEvent->actorId == EntityId { 20 }
+            && modalEvent->kind == SharedModalKind::Dialogue
+            && modalEvent->open
+            && modalEvent->phase == SessionPhase::Dialogue
+            && modalEvent->phaseRevision == 4,
+        "shared modal event round trips the authoritative phase boundary");
 
     ProtocolEnvelope missingSession = gameplayEnvelope(42);
     missingSession.sessionId = {};
@@ -2007,6 +2036,37 @@ public:
         return nextStatus;
     }
 
+    SharedModalExecution setSharedModal(Object* actor, const SharedModalCommand& command) override
+    {
+        modalCalls++;
+        lastActor = actor;
+        lastModal = command;
+        recordContext();
+        if (nextStatus != CommandExecutionStatus::Applied || modalSession == nullptr) {
+            return {};
+        }
+        if (command.open) {
+            if (activeModalActor != nullptr
+                || modalSession->transitionTo(sharedModalPhase(command.kind)) != LocalSessionError::None) {
+                return {};
+            }
+            activeModalActor = actor;
+            activeModalKind = command.kind;
+        } else {
+            if (activeModalActor != actor
+                || activeModalKind != command.kind
+                || modalSession->transitionTo(SessionPhase::Exploration) != LocalSessionError::None) {
+                return {};
+            }
+            activeModalActor = nullptr;
+        }
+        return SharedModalExecution {
+            CommandExecutionStatus::Applied,
+            modalSession->phase(),
+            modalSession->phaseRevision(),
+        };
+    }
+
     InventoryTransferExecution transferInventory(Object* actor,
         Object* source,
         Object* destination,
@@ -2065,6 +2125,7 @@ public:
     int pickupCalls = 0;
     int lootCalls = 0;
     int attackCalls = 0;
+    int modalCalls = 0;
     int transferCalls = 0;
     int dropCalls = 0;
     Object* lastActor = nullptr;
@@ -2078,6 +2139,10 @@ public:
     MoveCommand lastMove;
     FaceCommand lastFace;
     AttackCommand lastAttack;
+    SharedModalCommand lastModal;
+    LocalSession* modalSession = nullptr;
+    Object* activeModalActor = nullptr;
+    SharedModalKind activeModalKind = SharedModalKind::Dialogue;
     std::unordered_set<Object*> reservedPickupTargets;
 };
 
@@ -2104,6 +2169,7 @@ void testAuthoritativeCommandProcessing()
 
     CommandProcessor processor;
     RecordingCommandExecutor executor;
+    executor.modalSession = &session;
 
     GameCommand move;
     move.sequence.value = 1;
@@ -2311,6 +2377,54 @@ void testAuthoritativeCommandProcessing()
 
     expect(session.transitionTo(SessionPhase::Exploration) == LocalSessionError::None,
         "command test returns to exploration after the attack");
+
+    GameCommand openModal;
+    openModal.sequence.value = 9;
+    openModal.playerId = kGuestPlayerId;
+    openModal.actorId = session.playerActorId(kGuestPlayerId);
+    openModal.expectedPhase = SessionPhase::Exploration;
+    openModal.expectedPhaseRevision = session.phaseRevision();
+    openModal.payload = SharedModalCommand { SharedModalKind::Dialogue, true };
+    AuthoritativeCommandResult openedModal = processor.process(openModal, session, executor);
+    const SharedModalStateChangedEvent* openedModalEvent = openedModal.event.has_value()
+        ? std::get_if<SharedModalStateChangedEvent>(&openedModal.event->payload)
+        : nullptr;
+    expect(openedModal.result.status == CommandStatus::Accepted
+            && executor.modalCalls == 1
+            && session.phase() == SessionPhase::Dialogue
+            && openedModalEvent != nullptr
+            && openedModalEvent->open
+            && openedModalEvent->phase == SessionPhase::Dialogue
+            && openedModalEvent->phaseRevision == session.phaseRevision(),
+        "shared modal open publishes the authoritative dialogue phase boundary");
+
+    GameCommand pausedMove = openModal;
+    pausedMove.sequence.value = 10;
+    pausedMove.expectedPhase = SessionPhase::Dialogue;
+    pausedMove.expectedPhaseRevision = session.phaseRevision();
+    pausedMove.payload = MoveCommand { 100, 0, false };
+    AuthoritativeCommandResult pausedMovement = processor.process(pausedMove, session, executor);
+    expect(pausedMovement.result.rejection == CommandRejection::WrongPhase
+            && !pausedMovement.event.has_value(),
+        "ordinary exploration commands are rejected while a shared modal pauses the world");
+
+    GameCommand closeModal = openModal;
+    closeModal.sequence.value = 11;
+    closeModal.expectedPhase = SessionPhase::Dialogue;
+    closeModal.expectedPhaseRevision = session.phaseRevision();
+    closeModal.payload = SharedModalCommand { SharedModalKind::Dialogue, false };
+    AuthoritativeCommandResult closedModal = processor.process(closeModal, session, executor);
+    const SharedModalStateChangedEvent* closedModalEvent = closedModal.event.has_value()
+        ? std::get_if<SharedModalStateChangedEvent>(&closedModal.event->payload)
+        : nullptr;
+    expect(closedModal.result.status == CommandStatus::Accepted
+            && executor.modalCalls == 2
+            && session.phase() == SessionPhase::Exploration
+            && closedModalEvent != nullptr
+            && !closedModalEvent->open
+            && closedModalEvent->phase == SessionPhase::Exploration
+            && closedModalEvent->phaseRevision == session.phaseRevision(),
+        "shared modal close resumes exploration at a new authoritative phase revision");
 
     executor.nextStatus = CommandExecutionStatus::InvalidAction;
     move.sequence.value = 3;

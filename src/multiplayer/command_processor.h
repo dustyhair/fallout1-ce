@@ -39,6 +39,12 @@ struct ItemDropExecution {
     ItemDescriptor itemDescriptor;
 };
 
+struct SharedModalExecution {
+    CommandExecutionStatus status = CommandExecutionStatus::InvalidAction;
+    SessionPhase phase = SessionPhase::Exploration;
+    std::uint32_t phaseRevision = 0;
+};
+
 class CommandExecutor {
 public:
     virtual ~CommandExecutor() = default;
@@ -51,6 +57,10 @@ public:
     virtual CommandExecutionStatus attack(Object*, Object*, const AttackCommand&)
     {
         return CommandExecutionStatus::InvalidAction;
+    }
+    virtual SharedModalExecution setSharedModal(Object*, const SharedModalCommand&)
+    {
+        return {};
     }
     virtual InventoryTransferExecution transferInventory(Object* actor,
         Object* source,

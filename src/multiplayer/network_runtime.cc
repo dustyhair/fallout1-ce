@@ -800,6 +800,8 @@ bool submitHostCommand(GameCommandPayload payload)
     command.actorId = EntityId { kHostPlayerId.value };
     command.expectedPhase = std::holds_alternative<AttackCommand>(payload)
         ? SessionPhase::Combat
+        : std::holds_alternative<SharedModalCommand>(payload)
+        ? networkWorldPhase()
         : SessionPhase::Exploration;
     command.expectedPhaseRevision = networkWorldPhaseRevision();
     command.payload = std::move(payload);
@@ -925,6 +927,8 @@ void networkRuntimeBackgroundProcess()
                 applied = networkWorldApplyPeerPickupCompletion(*pickup);
             } else if (const auto* loot = std::get_if<LootStartedEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerLoot(*loot);
+            } else if (const auto* modal = std::get_if<SharedModalStateChangedEvent>(&event->payload)) {
+                applied = networkWorldApplyPeerSharedModal(*modal);
             } else if (const auto* transfer = std::get_if<InventoryTransferredEvent>(&event->payload)) {
                 applied = networkWorldApplyInventoryTransfer(*transfer);
             } else if (const auto* drop = std::get_if<ItemDroppedEvent>(&event->payload)) {
@@ -1081,6 +1085,10 @@ bool networkRuntimeRunSmokeTest()
             EngineExecutionProbeCounts authorityProbeCounts;
             if (!networkWorldEnter(launchOptions.mode, sheet, *peer)) {
                 setStatus("MULTIPLAYER SMOKE TEST FAILED: ENGINE WORLD ENTRY");
+                break;
+            }
+            if (!networkWorldRunSharedModalSmokeTest()) {
+                setStatus("MULTIPLAYER SMOKE TEST FAILED: SHARED MODAL CONTROLLER");
                 break;
             }
 
@@ -1985,6 +1993,53 @@ bool networkRuntimeHandleLocalAttack(Object* target, int hitMode, int hitLocatio
     (void)hitLocation;
     debug_printf("Multiplayer combat input is blocked until authoritative turn ownership is available.\n");
     return true;
+}
+
+bool networkRuntimeRequestSharedModal(SharedModalKind kind, bool open)
+{
+    if (!networkWorldActive() || !isValid(kind)) {
+        return false;
+    }
+    if ((open && networkWorldPhase() != SessionPhase::Exploration)
+        || (!open && networkWorldPhase() != sharedModalPhase(kind))) {
+        return false;
+    }
+    return launchOptions.mode == NetworkLaunchMode::Host
+        ? submitHostCommand(SharedModalCommand { kind, open })
+        : lobby.sendLocalSharedModal(kind, open, networkWorldPhaseRevision());
+}
+
+bool networkRuntimeBlockUnsupportedSharedModal(SharedModalKind kind)
+{
+    if (!networkWorldActive() || !isValid(kind)) {
+        return false;
+    }
+
+    const char* name = "unknown";
+    switch (kind) {
+    case SharedModalKind::Dialogue:
+        name = "dialogue";
+        break;
+    case SharedModalKind::Barter:
+        name = "barter";
+        break;
+    case SharedModalKind::Rest:
+        name = "rest";
+        break;
+    case SharedModalKind::Elevator:
+        name = "elevator";
+        break;
+    case SharedModalKind::WorldMap:
+        name = "world-map travel";
+        break;
+    }
+    debug_printf("Multiplayer %s is blocked until its effects are host-authoritative.\n", name);
+    return true;
+}
+
+bool networkRuntimeWorldPaused()
+{
+    return networkWorldActive() && networkWorldSharedModalActive();
 }
 
 bool networkRuntimeHandleLocalLootTargetChange(Object* target)

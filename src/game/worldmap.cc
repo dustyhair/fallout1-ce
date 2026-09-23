@@ -36,6 +36,7 @@
 #include "game/stat.h"
 #include "game/tile.h"
 #include "game/worldmap_walkmask.h"
+#include "multiplayer/network_runtime.h"
 #include "platform_compat.h"
 #include "plib/color/color.h"
 #include "plib/db/db.h"
@@ -938,6 +939,10 @@ int load_world_map(DB_FILE* stream)
 // 0x4AA360
 int world_map(WorldMapContext ctx)
 {
+    if (multiplayer::networkRuntimeBlockUnsupportedSharedModal(multiplayer::SharedModalKind::WorldMap)) {
+        return -1;
+    }
+
     const char* title;
     const char* text;
     const char* body[1];
@@ -3099,6 +3104,10 @@ WorldMapContext town_map(WorldMapContext ctx)
 
     new_ctx.state = -1;
     new_ctx.section = 0;
+
+    if (multiplayer::networkRuntimeBlockUnsupportedSharedModal(multiplayer::SharedModalKind::WorldMap)) {
+        return new_ctx;
+    }
 
     if (ctx.town > TOWN_COUNT) {
         return new_ctx;
