@@ -667,15 +667,17 @@ bool registerWorldObjects()
     std::vector<Object*> items;
     std::vector<Object*> critters;
     for (Object* object = obj_find_first(); object != nullptr; object = obj_find_next()) {
-        if (obj_is_a_portal(object)) {
+        if (object == obj_dude || object == peerActor) {
+            continue;
+        }
+        int objectType = FID_TYPE(object->fid);
+        if (objectType == OBJ_TYPE_SCENERY && obj_is_a_portal(object)) {
             doors.push_back(object);
-        } else if (FID_TYPE(object->fid) == OBJ_TYPE_ITEM
+        } else if (objectType == OBJ_TYPE_ITEM
             && object->owner == nullptr
             && object->tile >= 0) {
             items.push_back(object);
-        } else if (FID_TYPE(object->fid) == OBJ_TYPE_CRITTER
-            && object != obj_dude
-            && object != peerActor) {
+        } else if (objectType == OBJ_TYPE_CRITTER) {
             critters.push_back(object);
         }
     }
@@ -1126,17 +1128,19 @@ bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts)
     }
 
     Object* hostActor = networkWorldPlayerActor(kHostPlayerId);
-    Object* target = networkWorldPlayerActor(kGuestPlayerId);
+    Object* target = worldCritters.empty() ? nullptr : worldCritters.front().second;
     EntityId hostActorId;
     EntityId targetId;
     if (hostActor == nullptr || target == nullptr) {
-        std::fprintf(stderr, "Multiplayer authority probe: missing player actor.\n");
+        std::fprintf(stderr, "Multiplayer authority probe: missing host or non-player actor.\n");
         return false;
     }
     std::optional<EntityId> registeredHostActor = session.entities().findEntity(hostActor);
-    std::optional<EntityId> registeredTarget = session.entities().findEntity(target);
+    std::optional<EntityId> registeredTarget = target != nullptr
+        ? session.entities().findEntity(target)
+        : std::nullopt;
     if (!registeredHostActor.has_value() || !registeredTarget.has_value()) {
-        std::fprintf(stderr, "Multiplayer authority probe: player actor is not registered.\n");
+        std::fprintf(stderr, "Multiplayer authority probe: actor is not registered.\n");
         return false;
     }
     hostActorId = *registeredHostActor;
@@ -1146,6 +1150,7 @@ bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts)
         engineExecutionProbeBegin();
         int doorRc = obj_use_door(hostActor, scriptedDoor, 0);
         EngineExecutionProbeCounts doorCounts = engineExecutionProbeEnd();
+        register_clear(scriptedDoor);
         if (doorRc == -1
             || doorCounts.scriptProcedures != 1
             || doorCounts.combatAttacks != 0) {

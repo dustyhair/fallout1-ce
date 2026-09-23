@@ -1054,10 +1054,6 @@ bool networkRuntimeRunSmokeTest()
                 setStatus("MULTIPLAYER SMOKE TEST FAILED: ENGINE WORLD ENTRY");
                 break;
             }
-            if (!networkWorldRunEngineAuthoritySmokeTest(authorityProbeCounts)) {
-                setStatus("MULTIPLAYER SMOKE TEST FAILED: ENGINE AUTHORITY PROBE");
-                break;
-            }
 
             const SessionId sessionId = bootstrap.sessionId();
             std::uint64_t nextSendSequence = lobby.nextSendSequence();
@@ -1068,13 +1064,13 @@ bool networkRuntimeRunSmokeTest()
                 break;
             }
 
-            GameCommand moveCommand;
-            moveCommand.sequence = CommandSequence { 1 };
-            moveCommand.playerId = kGuestPlayerId;
-            moveCommand.actorId = EntityId { 2 };
-            moveCommand.expectedPhase = SessionPhase::Exploration;
-            moveCommand.expectedPhaseRevision = 1;
-            moveCommand.payload = MoveCommand { 12345, 0, true };
+            GameCommand scenarioCommand;
+            scenarioCommand.sequence = CommandSequence { 1 };
+            scenarioCommand.playerId = kGuestPlayerId;
+            scenarioCommand.actorId = EntityId { 2 };
+            scenarioCommand.expectedPhase = SessionPhase::Exploration;
+            scenarioCommand.expectedPhaseRevision = networkWorldPhaseRevision();
+            scenarioCommand.payload = FaceCommand { ROTATION_SW };
 
             bool gameplayPassed = false;
             if (launchOptions.mode == NetworkLaunchMode::Join) {
@@ -1082,16 +1078,17 @@ bool networkRuntimeRunSmokeTest()
                 commandEnvelope.sessionId = sessionId;
                 commandEnvelope.sequence = nextSendSequence++;
                 std::vector<std::uint8_t> commandPacket;
-                if (encodeGameCommand(moveCommand, commandEnvelope) != GameplayWireError::None
+                if (encodeGameCommand(scenarioCommand, commandEnvelope) != GameplayWireError::None
                     || encodeEnvelope(commandEnvelope, commandPacket) != ProtocolError::None
                     || transport->send(std::move(commandPacket)) != TransportSendResult::Sent) {
-                    setStatus("MULTIPLAYER SMOKE TEST FAILED: COULD NOT SEND MOVE COMMAND");
+                    setStatus("MULTIPLAYER SMOKE TEST FAILED: COULD NOT SEND SCENARIO COMMAND");
                     break;
                 }
 
                 bool receivedResult = false;
                 bool receivedEvent = false;
-                while (std::chrono::steady_clock::now() < deadline && (!receivedResult || !receivedEvent)) {
+                bool stateConverged = false;
+                while (std::chrono::steady_clock::now() < deadline && (!receivedResult || !receivedEvent || !stateConverged)) {
                     transport->poll();
                     while (std::optional<Packet> packet = transport->receive()) {
                         ProtocolDecodeResult decoded = decodeEnvelope(*packet);
@@ -1103,34 +1100,67 @@ bool networkRuntimeRunSmokeTest()
                         if (decoded.envelope.kind == MessageKind::CommandResult) {
                             CommandResultDecodeResult result = decodeCommandResult(decoded.envelope);
                             receivedResult = result
-                                && result.result.commandSequence == moveCommand.sequence
+                                && result.result.commandSequence == scenarioCommand.sequence
                                 && result.result.status == CommandStatus::Accepted
                                 && result.result.firstEventSequence == EventSequence { 1 }
                                 && result.result.eventCount == 1;
                         } else if (decoded.envelope.kind == MessageKind::Event) {
                             GameEventDecodeResult event = decodeGameEvent(decoded.envelope);
-                            const auto* movement = event ? std::get_if<ActorMovementStartedEvent>(&event.event.payload) : nullptr;
-                            receivedEvent = movement != nullptr
+                            const auto* facing = event ? std::get_if<ActorFacingChangedEvent>(&event.event.payload) : nullptr;
+                            receivedEvent = facing != nullptr
                                 && event.event.sequence == EventSequence { 1 }
-                                && event.event.causedBy == moveCommand.sequence
-                                && movement->actorId == moveCommand.actorId
-                                && movement->destinationTile == 12345
-                                && movement->elevation == 0
-                                && movement->running;
+                                && event.event.causedBy == scenarioCommand.sequence
+                                && facing->actorId == scenarioCommand.actorId
+                                && facing->rotation == ROTATION_SW
+                                && networkWorldApplyPeerFacing(*facing);
+                        } else if (decoded.envelope.kind == MessageKind::Combat) {
+                            SnapshotDecodeResult state = decodeSnapshot(decoded.envelope.payload);
+                            WorldSnapshot localState;
+                            anim_stop();
+                            bool boundaryMatches = state
+                                && state.snapshot.lastIncludedEvent == EventSequence { 1 };
+                            bool stateApplied = boundaryMatches
+                                && networkWorldApplyAuthoritativeState(state.snapshot);
+                            bool localCaptured = stateApplied
+                                && networkWorldCaptureAuthoritativeState(EventSequence { 1 }, localState);
+                            stateConverged = localCaptured;
+                            if (localCaptured) {
+                                SnapshotDigestResult expectedDigest = computeSnapshotDigest(state.snapshot);
+                                SnapshotDigestResult actualDigest = computeSnapshotDigest(localState);
+                                stateConverged = expectedDigest && actualDigest
+                                    && expectedDigest.digest == actualDigest.digest;
+                            }
+                            if (!stateConverged) {
+                                std::fprintf(stderr,
+                                    "Multiplayer scenario checkpoint: decoded=%d boundary=%d applied=%d captured=%d.\n",
+                                    state ? 1 : 0,
+                                    boundaryMatches ? 1 : 0,
+                                    stateApplied ? 1 : 0,
+                                    localCaptured ? 1 : 0);
+                                if (state && localCaptured) {
+                                    SnapshotDigestResult expectedDigest = computeSnapshotDigest(state.snapshot);
+                                    SnapshotDigestResult actualDigest = computeSnapshotDigest(localState);
+                                    std::fprintf(stderr,
+                                        "Multiplayer scenario divergence: section=%d expected=%llu actual=%llu.\n",
+                                        static_cast<int>(firstDivergentSection(expectedDigest.digest, actualDigest.digest)),
+                                        static_cast<unsigned long long>(expectedDigest.digest.overall),
+                                        static_cast<unsigned long long>(actualDigest.digest.overall));
+                                }
+                            }
                         } else {
                             setStatus("MULTIPLAYER SMOKE TEST FAILED: UNEXPECTED GAMEPLAY MESSAGE");
                             break;
                         }
                     }
-                    if (!transport->isConnected() && (!receivedResult || !receivedEvent)) {
+                    if (!transport->isConnected() && (!receivedResult || !receivedEvent || !stateConverged)) {
                         setStatus("MULTIPLAYER SMOKE TEST FAILED: GAMEPLAY TRANSPORT DISCONNECTED");
                         break;
                     }
-                    if (!receivedResult || !receivedEvent) {
+                    if (!receivedResult || !receivedEvent || !stateConverged) {
                         std::this_thread::sleep_for(std::chrono::milliseconds(1));
                     }
                 }
-                gameplayPassed = receivedResult && receivedEvent;
+                gameplayPassed = receivedResult && receivedEvent && stateConverged;
             } else {
                 std::optional<GameCommand> receivedCommand;
                 while (std::chrono::steady_clock::now() < deadline && !receivedCommand.has_value()) {
@@ -1143,16 +1173,14 @@ bool networkRuntimeRunSmokeTest()
                             break;
                         }
                         GameCommandDecodeResult command = decodeGameCommand(decoded.envelope);
-                        const auto* move = command ? std::get_if<MoveCommand>(&command.command.payload) : nullptr;
-                        if (move == nullptr || command.command.sequence != moveCommand.sequence
-                            || command.command.playerId != moveCommand.playerId
-                            || command.command.actorId != moveCommand.actorId
-                            || command.command.expectedPhase != moveCommand.expectedPhase
-                            || command.command.expectedPhaseRevision != moveCommand.expectedPhaseRevision
-                            || move->destinationTile != 12345
-                            || move->elevation != 0
-                            || !move->running) {
-                            setStatus("MULTIPLAYER SMOKE TEST FAILED: INVALID MOVE COMMAND");
+                        const auto* facing = command ? std::get_if<FaceCommand>(&command.command.payload) : nullptr;
+                        if (facing == nullptr || command.command.sequence != scenarioCommand.sequence
+                            || command.command.playerId != scenarioCommand.playerId
+                            || command.command.actorId != scenarioCommand.actorId
+                            || command.command.expectedPhase != scenarioCommand.expectedPhase
+                            || command.command.expectedPhaseRevision != scenarioCommand.expectedPhaseRevision
+                            || facing->rotation != ROTATION_SW) {
+                            setStatus("MULTIPLAYER SMOKE TEST FAILED: INVALID SCENARIO COMMAND");
                             break;
                         }
                         receivedCommand = command.command;
@@ -1167,17 +1195,27 @@ bool networkRuntimeRunSmokeTest()
                 }
 
                 if (receivedCommand.has_value()) {
-                    CommandResult commandResult;
-                    commandResult.commandSequence = receivedCommand->sequence;
-                    commandResult.status = CommandStatus::Accepted;
-                    commandResult.rejection = CommandRejection::None;
-                    commandResult.firstEventSequence = EventSequence { 1 };
-                    commandResult.eventCount = 1;
-
-                    GameEvent movementEvent;
-                    movementEvent.sequence = EventSequence { 1 };
-                    movementEvent.causedBy = receivedCommand->sequence;
-                    movementEvent.payload = ActorMovementStartedEvent { receivedCommand->actorId, 12345, 0, true };
+                    AuthoritativeCommandResult outcome = networkWorldProcessCommand(*receivedCommand);
+                    WorldSnapshot state;
+                    std::vector<std::uint8_t> statePayload;
+                    anim_stop();
+                    bool accepted = outcome.result.status == CommandStatus::Accepted;
+                    bool captured = accepted
+                        && outcome.event.has_value()
+                        && networkWorldCaptureAuthoritativeState(EventSequence { 1 }, state);
+                    SnapshotError snapshotError = captured
+                        ? encodeSnapshot(state, statePayload)
+                        : SnapshotError::None;
+                    bool validOutcome = captured && snapshotError == SnapshotError::None;
+                    if (!validOutcome) {
+                        std::fprintf(stderr,
+                            "Multiplayer scenario: accepted=%d event=%d captured=%d snapshot=%d rejection=%d.\n",
+                            accepted ? 1 : 0,
+                            outcome.event.has_value() ? 1 : 0,
+                            captured ? 1 : 0,
+                            captured ? static_cast<int>(snapshotError) : -1,
+                            static_cast<int>(outcome.result.rejection));
+                    }
 
                     ProtocolEnvelope resultEnvelope;
                     resultEnvelope.sessionId = sessionId;
@@ -1185,14 +1223,23 @@ bool networkRuntimeRunSmokeTest()
                     ProtocolEnvelope eventEnvelope;
                     eventEnvelope.sessionId = sessionId;
                     eventEnvelope.sequence = nextSendSequence++;
+                    ProtocolEnvelope stateEnvelope;
+                    stateEnvelope.kind = MessageKind::Combat;
+                    stateEnvelope.sessionId = sessionId;
+                    stateEnvelope.sequence = nextSendSequence++;
+                    stateEnvelope.payload = std::move(statePayload);
                     std::vector<std::uint8_t> resultPacket;
                     std::vector<std::uint8_t> eventPacket;
-                    gameplayPassed = encodeCommandResult(commandResult, resultEnvelope) == GameplayWireError::None
+                    std::vector<std::uint8_t> statePacket;
+                    gameplayPassed = validOutcome
+                        && encodeCommandResult(outcome.result, resultEnvelope) == GameplayWireError::None
                         && encodeEnvelope(resultEnvelope, resultPacket) == ProtocolError::None
-                        && encodeGameEvent(movementEvent, eventEnvelope) == GameplayWireError::None
+                        && encodeGameEvent(*outcome.event, eventEnvelope) == GameplayWireError::None
                         && encodeEnvelope(eventEnvelope, eventPacket) == ProtocolError::None
+                        && encodeEnvelope(stateEnvelope, statePacket) == ProtocolError::None
                         && transport->send(std::move(resultPacket)) == TransportSendResult::Sent
-                        && transport->send(std::move(eventPacket)) == TransportSendResult::Sent;
+                        && transport->send(std::move(eventPacket)) == TransportSendResult::Sent
+                        && transport->send(std::move(statePacket)) == TransportSendResult::Sent;
                     if (gameplayPassed) {
                         // Give the non-blocking socket a chance to flush before this test process exits.
                         for (int attempt = 0; attempt < 50 && transport->isConnected(); attempt++) {
@@ -1210,10 +1257,15 @@ bool networkRuntimeRunSmokeTest()
                 break;
             }
 
+            if (!networkWorldRunEngineAuthoritySmokeTest(authorityProbeCounts)) {
+                setStatus("MULTIPLAYER SMOKE TEST FAILED: ENGINE AUTHORITY PROBE");
+                break;
+            }
+
             GameEvent replayEvent;
             replayEvent.sequence = EventSequence { 1 };
-            replayEvent.causedBy = moveCommand.sequence;
-            replayEvent.payload = ActorMovementStartedEvent { moveCommand.actorId, 12345, 0, true };
+            replayEvent.causedBy = scenarioCommand.sequence;
+            replayEvent.payload = ActorFacingChangedEvent { scenarioCommand.actorId, ROTATION_SW };
             transport->close();
 
             bool reconnectPassed = false;
@@ -1308,7 +1360,7 @@ bool networkRuntimeRunSmokeTest()
             }
 
             std::fprintf(stdout,
-                "MULTIPLAYER_SMOKE_TEST_PASS role=%s session=%llu local=%s peer=%s command=move reconnect=tls-replay scripts=%u attacks=%u rng=%u\n",
+                "MULTIPLAYER_SMOKE_TEST_PASS role=%s session=%llu local=%s peer=%s command=face checkpoint=state-digest reconnect=tls-replay scripts=%u attacks=%u rng=%u\n",
                 launchOptions.mode == NetworkLaunchMode::Host ? "host" : "guest",
                 static_cast<unsigned long long>(sessionId.value),
                 sheet.name.c_str(),
