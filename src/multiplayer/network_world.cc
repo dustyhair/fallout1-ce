@@ -1244,6 +1244,28 @@ bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts)
     return true;
 }
 
+std::optional<EntityId> networkWorldPrepareDoorSmokeTest()
+{
+    if (!session.isActive() || worldDoors.empty()) {
+        return std::nullopt;
+    }
+    Object* actor = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+    Object* door = worldDoors.front().second;
+    if (actor == nullptr || door == nullptr) {
+        return std::nullopt;
+    }
+
+    anim_stop();
+    for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+        int tile = tile_num_in_direction(door->tile, rotation, 1);
+        if (obj_blocking_at(actor, tile, door->elevation) == nullptr
+            && obj_move_to_tile(actor, tile, door->elevation, nullptr) == 0) {
+            return worldDoors.front().first;
+        }
+    }
+    return std::nullopt;
+}
+
 bool networkWorldBeginLocalLoot(Object* target)
 {
     if (!session.isActive()

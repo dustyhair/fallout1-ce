@@ -14,6 +14,8 @@ The dedicated lobby enables **Start Game** only after the host has both valid sh
 
 The scenario then hands the established connection to the gameplay wire layer. The guest sends a deterministic movement destination; the host decodes it, runs real pathfinding and movement through the world command processor, and returns the resulting path event after the actor reaches the destination. The host follows it with a complete authoritative checkpoint. The guest applies the path event and checkpoint, recaptures its local world, and requires every section digest to match. Both processes then close that socket, establish a new pinned TLS connection, authenticate the reconnect credential, and validate an authoritative event replay. Each process prints `MULTIPLAYER_SMOKE_TEST_PASS` with `command=move checkpoint=state-digest` and exits with status 0. The mode requires either `--multiplayer-host` or `--multiplayer-join`.
 
+Passing `--multiplayer-smoke-scenario=door` selects the scripted-door fixture instead. Both processes place the guest actor beside the same registered scenery door. The host runs the asynchronous door action and script to completion, publishes the final open, lock, and frame state, and checkpoints the result. The guest applies only that final state and must again match every snapshot section without executing the script.
+
 This hook makes the two-process path runnable under Xvfb:
 
 ```text
