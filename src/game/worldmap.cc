@@ -2470,7 +2470,7 @@ static int CheckEvents()
                     }
                 }
 
-                stat_pc_add_experience(10000);
+                stat_pc_add_party_experience(10000);
                 game_global_vars[GVAR_PLAYER_REPUATION] += 5;
 
                 // NOTE: Looks like min/max macro usage.
@@ -2504,7 +2504,7 @@ static int CheckEvents()
                     }
                 }
 
-                stat_pc_add_experience(10000);
+                stat_pc_add_party_experience(10000);
 
                 game_global_vars[GVAR_PLAYER_REPUATION] += 10;
 

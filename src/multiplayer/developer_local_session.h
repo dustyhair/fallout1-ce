@@ -15,6 +15,7 @@ namespace multiplayer {
 void developerLocalSessionConfigure(int argc, char** argv);
 bool developerLocalSessionIsEnabled();
 bool developerLocalSessionIsActive();
+bool developerLocalSessionAwardPartyExperience(int xp);
 bool developerLocalSessionEnsureStarted();
 MultiplayerSaveError developerLocalSessionCaptureSave(std::uint64_t generation,
     std::uint64_t saveDatDigest,

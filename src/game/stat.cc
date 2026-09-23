@@ -22,6 +22,8 @@
 #include "game/tile.h"
 #include "game/trait.h"
 #include "multiplayer/acting_player_context.h"
+#include "multiplayer/developer_local_session.h"
+#include "multiplayer/network_world.h"
 #include "multiplayer/presentation_bridge.h"
 #include "platform_compat.h"
 #include "plib/gnw/input.h"
@@ -686,6 +688,23 @@ int stat_pc_add_experience(int xp)
     }
 
     return 0;
+}
+
+int stat_pc_add_party_experience(int xp)
+{
+    switch (multiplayer::networkWorldAwardPartyExperience(xp)) {
+    case multiplayer::PartyExperienceResult::NotMultiplayer:
+        if (multiplayer::developerLocalSessionIsActive()) {
+            return multiplayer::developerLocalSessionAwardPartyExperience(xp) ? 0 : -1;
+        }
+        return stat_pc_add_experience(xp);
+    case multiplayer::PartyExperienceResult::Applied:
+    case multiplayer::PartyExperienceResult::ReplicaIgnored:
+        return 0;
+    case multiplayer::PartyExperienceResult::Failed:
+        return -1;
+    }
+    return -1;
 }
 
 } // namespace fallout

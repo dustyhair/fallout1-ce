@@ -527,6 +527,25 @@ bool developerLocalSessionIsActive()
     return enabled && session.isActive();
 }
 
+bool developerLocalSessionAwardPartyExperience(int xp)
+{
+    if (!developerLocalSessionIsActive()) {
+        return false;
+    }
+    for (PlayerId playerId : { kHostPlayerId, kGuestPlayerId }) {
+        PlayerCharacterState* player = session.players().find(playerId);
+        Object* actor = player != nullptr ? session.entities().findObject(player->actorId) : nullptr;
+        if (player == nullptr || actor == nullptr) {
+            return false;
+        }
+        ScopedActingPlayerContext actingPlayer(*player, actor);
+        if (stat_pc_add_experience(xp) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool developerLocalSessionEnsureStarted()
 {
     if (!enabled) {

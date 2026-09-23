@@ -37,6 +37,7 @@ char* stat_pc_description(int pcStat);
 int stat_picture(int stat);
 int stat_result(Object* critter, int stat, int modifier, int* howMuch);
 int stat_pc_add_experience(int xp);
+int stat_pc_add_party_experience(int xp);
 
 } // namespace fallout
 

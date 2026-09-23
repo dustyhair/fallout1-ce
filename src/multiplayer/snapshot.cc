@@ -9,7 +9,14 @@ namespace multiplayer {
 namespace {
 
 constexpr std::size_t kSnapshotPayloadHeaderSize = 44;
-constexpr std::size_t kActorSnapshotSize = 32;
+constexpr std::size_t kCharacterBuildValueCount = SAVEABLE_STAT_COUNT * 2
+    + SKILL_COUNT
+    + PERK_COUNT
+    + NUM_TAGGED_SKILLS
+    + PC_TRAIT_MAX
+    + 4;
+constexpr std::size_t kCharacterBuildSnapshotSize = kCharacterBuildValueCount * sizeof(std::uint32_t);
+constexpr std::size_t kActorSnapshotSize = 32 + kCharacterBuildSnapshotSize;
 constexpr std::size_t kCritterSnapshotSize = 36;
 constexpr std::size_t kDoorSnapshotSize = 12;
 constexpr std::size_t kItemSnapshotSize = 36;
@@ -119,6 +126,84 @@ void appendActor(std::vector<std::uint8_t>& bytes, const ActorSnapshot& actor)
     appendUint32(bytes, static_cast<std::uint32_t>(actor.hitPoints));
     appendUint32(bytes, static_cast<std::uint32_t>(actor.actionPoints));
     appendUint32(bytes, static_cast<std::uint32_t>(actor.combatResults));
+    for (std::int32_t value : actor.build.baseStats) {
+        appendUint32(bytes, static_cast<std::uint32_t>(value));
+    }
+    for (std::int32_t value : actor.build.bonusStats) {
+        appendUint32(bytes, static_cast<std::uint32_t>(value));
+    }
+    for (std::int32_t value : actor.build.skillPoints) {
+        appendUint32(bytes, static_cast<std::uint32_t>(value));
+    }
+    for (std::int32_t value : actor.build.perkRanks) {
+        appendUint32(bytes, static_cast<std::uint32_t>(value));
+    }
+    for (std::int32_t value : actor.build.taggedSkills) {
+        appendUint32(bytes, static_cast<std::uint32_t>(value));
+    }
+    for (std::int32_t value : actor.build.traits) {
+        appendUint32(bytes, static_cast<std::uint32_t>(value));
+    }
+    appendUint32(bytes, actor.build.prototypeFlags);
+    appendUint32(bytes, static_cast<std::uint32_t>(actor.build.unspentSkillPoints));
+    appendUint32(bytes, static_cast<std::uint32_t>(actor.build.level));
+    appendUint32(bytes, static_cast<std::uint32_t>(actor.build.experience));
+}
+
+bool validateCharacterBuild(const CharacterBuild& build)
+{
+    if (build.unspentSkillPoints < 0
+        || build.level < 1
+        || build.level > PC_LEVEL_MAX
+        || build.experience < 0) {
+        return false;
+    }
+    if (std::any_of(build.skillPoints.begin(), build.skillPoints.end(), [](std::int32_t value) { return value < 0; })
+        || std::any_of(build.perkRanks.begin(), build.perkRanks.end(), [](std::int32_t value) { return value < 0; })) {
+        return false;
+    }
+
+    std::unordered_set<std::int32_t> taggedSkills;
+    for (std::int32_t skill : build.taggedSkills) {
+        if (skill < -1 || skill >= SKILL_COUNT
+            || (skill != -1 && !taggedSkills.insert(skill).second)) {
+            return false;
+        }
+    }
+    std::unordered_set<std::int32_t> traits;
+    for (std::int32_t trait : build.traits) {
+        if (trait < -1 || trait >= TRAIT_COUNT
+            || (trait != -1 && !traits.insert(trait).second)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void readCharacterBuild(const std::vector<std::uint8_t>& bytes, std::size_t& offset, CharacterBuild& build)
+{
+    for (std::int32_t& value : build.baseStats) {
+        value = static_cast<std::int32_t>(readUint32(bytes, offset));
+    }
+    for (std::int32_t& value : build.bonusStats) {
+        value = static_cast<std::int32_t>(readUint32(bytes, offset));
+    }
+    for (std::int32_t& value : build.skillPoints) {
+        value = static_cast<std::int32_t>(readUint32(bytes, offset));
+    }
+    for (std::int32_t& value : build.perkRanks) {
+        value = static_cast<std::int32_t>(readUint32(bytes, offset));
+    }
+    for (std::int32_t& value : build.taggedSkills) {
+        value = static_cast<std::int32_t>(readUint32(bytes, offset));
+    }
+    for (std::int32_t& value : build.traits) {
+        value = static_cast<std::int32_t>(readUint32(bytes, offset));
+    }
+    build.prototypeFlags = readUint32(bytes, offset);
+    build.unspentSkillPoints = static_cast<std::int32_t>(readUint32(bytes, offset));
+    build.level = static_cast<std::int32_t>(readUint32(bytes, offset));
+    build.experience = static_cast<std::int32_t>(readUint32(bytes, offset));
 }
 
 void appendDoor(std::vector<std::uint8_t>& bytes, const DoorSnapshot& door)
@@ -233,12 +318,19 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
     }
 
     std::unordered_set<std::uint32_t> entityIds;
+    std::unordered_set<std::uint32_t> playerIds;
     for (const ActorSnapshot& actor : snapshot.actors) {
         if (!isValid(actor.entityId)) {
             return SnapshotError::InvalidEntityId;
         }
         if (!isValid(actor.ownerId)
             || (actor.ownerId != kHostPlayerId && actor.ownerId != kGuestPlayerId)) {
+            return SnapshotError::InvalidPlayerId;
+        }
+        if (!validateCharacterBuild(actor.build)) {
+            return SnapshotError::InvalidPlayerBuild;
+        }
+        if (!playerIds.insert(actor.ownerId.value).second) {
             return SnapshotError::InvalidPlayerId;
         }
         if (!entityIds.insert(actor.entityId.value).second) {
@@ -526,6 +618,7 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
         actor.hitPoints = static_cast<std::int32_t>(readUint32(packet, offset));
         actor.actionPoints = static_cast<std::int32_t>(readUint32(packet, offset));
         actor.combatResults = static_cast<std::int32_t>(readUint32(packet, offset));
+        readCharacterBuild(packet, offset, actor.build);
         result.snapshot.actors.push_back(actor);
     }
 

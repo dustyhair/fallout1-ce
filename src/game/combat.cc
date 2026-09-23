@@ -1886,7 +1886,7 @@ void combat_give_exps(int exp_points)
         return;
     }
 
-    stat_pc_add_experience(exp_points);
+    stat_pc_add_party_experience(exp_points);
 
     format.num = 621; // %s you earn %d exp. points.
     if (!message_search(&proto_main_msg_file, &format)) {

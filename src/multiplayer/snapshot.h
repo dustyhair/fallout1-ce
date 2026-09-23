@@ -6,13 +6,14 @@
 #include <cstdint>
 #include <vector>
 
+#include "multiplayer/player_character_state.h"
 #include "multiplayer/types.h"
 
 namespace fallout {
 namespace multiplayer {
 
 constexpr std::uint32_t kSnapshotMagic = 0x46434D53;
-constexpr std::uint16_t kSnapshotVersion = 7;
+constexpr std::uint16_t kSnapshotVersion = 8;
 constexpr std::size_t kSnapshotHeaderSize = 28;
 constexpr std::size_t kMaxSnapshotPayloadSize = 64 * 1024;
 constexpr std::size_t kMaxSnapshotActors = 16;
@@ -32,6 +33,7 @@ struct ActorSnapshot {
     std::int32_t hitPoints = 0;
     std::int32_t actionPoints = 0;
     std::int32_t combatResults = 0;
+    CharacterBuild build;
 };
 
 struct DoorSnapshot {
@@ -107,6 +109,7 @@ enum class SnapshotError {
     TooManyTimedEvents,
     InvalidEntityId,
     InvalidPlayerId,
+    InvalidPlayerBuild,
     DuplicateEntityId,
     InvalidActorState,
     InvalidCritterState,

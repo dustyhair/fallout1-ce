@@ -1131,6 +1131,10 @@ bool networkRuntimeRunSmokeTest()
                 setStatus("MULTIPLAYER SMOKE TEST FAILED: SHARED MODAL CONTROLLER");
                 break;
             }
+            if (!networkWorldRunPartyExperienceSmokeTest()) {
+                setStatus("MULTIPLAYER SMOKE TEST FAILED: PARTY EXPERIENCE AUTHORITY");
+                break;
+            }
 
             const SessionId sessionId = bootstrap.sessionId();
             std::uint64_t nextSendSequence = lobby.nextSendSequence();
@@ -1674,7 +1678,7 @@ bool networkRuntimeRunSmokeTest()
             }
 
             std::fprintf(stdout,
-                "MULTIPLAYER_SMOKE_TEST_PASS role=%s session=%llu local=%s peer=%s command=%s checkpoint=state-digest reconnect=tls-replay scripts=%u attacks=%u rng=%u\n",
+                "MULTIPLAYER_SMOKE_TEST_PASS role=%s session=%llu local=%s peer=%s command=%s checkpoint=state-digest reconnect=tls-replay xp=party scripts=%u attacks=%u rng=%u\n",
                 launchOptions.mode == NetworkLaunchMode::Host ? "host" : "guest",
                 static_cast<unsigned long long>(sessionId.value),
                 sheet.name.c_str(),

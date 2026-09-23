@@ -91,6 +91,11 @@ WorldSnapshot sampleSnapshot()
         ActorSnapshot { EntityId { 2 }, kGuestPlayerId, 20102, 0, 3, 28 },
         ActorSnapshot { EntityId { 1 }, kHostPlayerId, 20100, 0, 1, 34 },
     };
+    snapshot.actors[0].build.level = 2;
+    snapshot.actors[0].build.experience = 2500;
+    snapshot.actors[0].build.unspentSkillPoints = 7;
+    snapshot.actors[0].build.prototypeFlags = 1 << 3; // PC_FLAG_LEVEL_UP_AVAILABLE.
+    snapshot.actors[1].build.experience = 125;
     snapshot.critters = {
         CritterSnapshot { EntityId { 12 }, 0x01000023, 20106, 0, 4, 6, 7, 0, 1 },
     };
@@ -2487,7 +2492,14 @@ void testSnapshotRoundTripAndRecovery()
     WorldSnapshot authoritative = sampleSnapshot();
     std::vector<std::uint8_t> packet;
     expect(encodeSnapshot(authoritative, packet) == SnapshotError::None, "valid snapshot encodes");
-    expect(packet.size() == kSnapshotHeaderSize + 44 + 2 * 32 + 36 + 12 + 2 * 36 + 6 * 4 + 2 * 36,
+    constexpr std::size_t characterBuildWireSize = (SAVEABLE_STAT_COUNT * 2
+                                                        + SKILL_COUNT
+                                                        + PERK_COUNT
+                                                        + NUM_TAGGED_SKILLS
+                                                        + PC_TRAIT_MAX
+                                                        + 4)
+        * sizeof(std::uint32_t);
+    expect(packet.size() == kSnapshotHeaderSize + 44 + 2 * (32 + characterBuildWireSize) + 36 + 12 + 2 * 36 + 6 * 4 + 2 * 36,
         "snapshot packet declares a fixed-width payload");
     expect(packet[0] == 'F' && packet[1] == 'C' && packet[2] == 'M' && packet[3] == 'S', "snapshot magic uses network byte order");
 
@@ -2500,6 +2512,12 @@ void testSnapshotRoundTripAndRecovery()
         "snapshot keeps session phase and authoritative world time");
     expect(decoded.snapshot.actors.size() == 2 && decoded.snapshot.actors[0].entityId == EntityId { 1 }, "decoded actors use canonical entity order");
     expect(decoded.snapshot.actors[1].tile == 20102 && decoded.snapshot.actors[1].hitPoints == 28, "snapshot keeps guest actor state");
+    expect(decoded.snapshot.actors[0].build.experience == 125
+            && decoded.snapshot.actors[1].build.experience == 2500
+            && decoded.snapshot.actors[1].build.level == 2
+            && decoded.snapshot.actors[1].build.unspentSkillPoints == 7
+            && (decoded.snapshot.actors[1].build.prototypeFlags & (1 << 3)) != 0,
+        "snapshot keeps each player's complete progressing character build");
     expect(decoded.snapshot.critters.size() == 1
             && decoded.snapshot.critters[0].entityId == EntityId { 12 }
             && decoded.snapshot.critters[0].hitPoints == 6
@@ -2544,6 +2562,12 @@ void testSnapshotRoundTripAndRecovery()
     actorDrift.actors[1].tile++;
     SnapshotDigestResult actorDriftDigest = computeSnapshotDigest(actorDrift);
     expect(firstDivergentSection(authoritativeDigest.digest, actorDriftDigest.digest) == SnapshotSection::Actors, "position drift reports the actor section");
+
+    WorldSnapshot buildDrift = decoded.snapshot;
+    buildDrift.actors[1].build.experience++;
+    SnapshotDigestResult buildDriftDigest = computeSnapshotDigest(buildDrift);
+    expect(firstDivergentSection(authoritativeDigest.digest, buildDriftDigest.digest) == SnapshotSection::Actors,
+        "character-build drift reports the owning actor section");
 
     WorldSnapshot critterDrift = decoded.snapshot;
     critterDrift.critters[0].hitPoints--;
@@ -2634,6 +2658,19 @@ void testSnapshotRoundTripAndRecovery()
     WorldSnapshot invalidOwner = authoritative;
     invalidOwner.actors[0].ownerId.value = 99;
     expect(validateSnapshot(invalidOwner) == SnapshotError::InvalidPlayerId, "two-player snapshot rejects an unknown actor owner");
+    invalidOwner = authoritative;
+    invalidOwner.actors[0].ownerId = invalidOwner.actors[1].ownerId;
+    expect(validateSnapshot(invalidOwner) == SnapshotError::InvalidPlayerId,
+        "two-player snapshot rejects duplicate player ownership");
+
+    WorldSnapshot invalidBuild = authoritative;
+    invalidBuild.actors[0].build.level = 0;
+    expect(validateSnapshot(invalidBuild) == SnapshotError::InvalidPlayerBuild,
+        "snapshot rejects an invalid player level");
+    invalidBuild = authoritative;
+    invalidBuild.actors[0].build.taggedSkills = { SKILL_SPEECH, SKILL_SPEECH, -1, -1 };
+    expect(validateSnapshot(invalidBuild) == SnapshotError::InvalidPlayerBuild,
+        "snapshot rejects duplicate tagged skills in a player build");
 
     WorldSnapshot invalidGameTime = authoritative;
     invalidGameTime.gameTime = 0;

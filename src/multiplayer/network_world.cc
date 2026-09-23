@@ -162,7 +162,12 @@ bool validateActorAndCritterState(const WorldSnapshot& snapshot)
     for (const ActorSnapshot& actorState : snapshot.actors) {
         Object* actor = session.entities().findObject(actorState.entityId);
         std::optional<PlayerId> owner = session.entities().ownerOf(actorState.entityId);
-        if (actor == nullptr || !owner.has_value() || *owner != actorState.ownerId) {
+        PlayerCharacterState* player = session.players().find(actorState.ownerId);
+        if (actor == nullptr
+            || !owner.has_value()
+            || *owner != actorState.ownerId
+            || player == nullptr
+            || player->actorId != actorState.entityId) {
             return false;
         }
     }
@@ -181,6 +186,9 @@ bool applyActorAndCritterState(const WorldSnapshot& snapshot)
 {
     for (const ActorSnapshot& actorState : snapshot.actors) {
         Object* actor = session.entities().findObject(actorState.entityId);
+        if (session.players().setBuild(actorState.ownerId, actorState.build) != PlayerStateError::None) {
+            return false;
+        }
         Rect dirtyRect {};
         bool dirty = false;
         if (actor->tile != actorState.tile || actor->elevation != actorState.elevation) {
@@ -2189,7 +2197,8 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
     for (PlayerId playerId : { kHostPlayerId, kGuestPlayerId }) {
         EntityId actorId = session.playerActorId(playerId);
         Object* actor = session.entities().findObject(actorId);
-        if (actor == nullptr || anim_busy(actor) == -1) {
+        PlayerCharacterState* player = session.players().find(playerId);
+        if (actor == nullptr || player == nullptr || anim_busy(actor) == -1) {
             return false;
         }
         captured.actors.push_back(ActorSnapshot {
@@ -2201,6 +2210,7 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
             std::max(critter_get_hits(actor), 0),
             std::max(actor->data.critter.combat.ap, 0),
             actor->data.critter.combat.results,
+            player->build,
         });
     }
     for (const auto& entry : worldCritters) {
@@ -2463,6 +2473,63 @@ bool networkWorldInventoryTransferInProgress()
 bool networkWorldItemDropInProgress()
 {
     return itemDropInProgress;
+}
+
+PartyExperienceResult networkWorldAwardPartyExperience(int xp)
+{
+    if (!session.isActive() || peerActor == nullptr) {
+        return PartyExperienceResult::NotMultiplayer;
+    }
+    if (worldMode == NetworkLaunchMode::Join) {
+        return PartyExperienceResult::ReplicaIgnored;
+    }
+    if (worldMode != NetworkLaunchMode::Host) {
+        return PartyExperienceResult::Failed;
+    }
+
+    std::array<std::pair<PlayerCharacterState*, Object*>, 2> party;
+    std::size_t index = 0;
+    for (PlayerId playerId : { kHostPlayerId, kGuestPlayerId }) {
+        PlayerCharacterState* player = session.players().find(playerId);
+        Object* actor = player != nullptr ? session.entities().findObject(player->actorId) : nullptr;
+        if (player == nullptr || actor == nullptr) {
+            return PartyExperienceResult::Failed;
+        }
+        party[index++] = { player, actor };
+    }
+
+    for (const auto& member : party) {
+        ScopedActingPlayerContext actingPlayer(*member.first, member.second);
+        if (stat_pc_add_experience(xp) != 0) {
+            return PartyExperienceResult::Failed;
+        }
+    }
+    return PartyExperienceResult::Applied;
+}
+
+bool networkWorldRunPartyExperienceSmokeTest()
+{
+    if (!session.isActive()) {
+        return false;
+    }
+    PlayerCharacterState* host = session.players().find(kHostPlayerId);
+    PlayerCharacterState* guest = session.players().find(kGuestPlayerId);
+    if (host == nullptr || guest == nullptr) {
+        return false;
+    }
+
+    int hostExperience = host->build.experience;
+    int guestExperience = guest->build.experience;
+    PartyExperienceResult result = networkWorldAwardPartyExperience(125);
+    if (worldMode == NetworkLaunchMode::Host) {
+        return result == PartyExperienceResult::Applied
+            && host->build.experience == hostExperience + 125
+            && guest->build.experience == guestExperience + 125;
+    }
+    return worldMode == NetworkLaunchMode::Join
+        && result == PartyExperienceResult::ReplicaIgnored
+        && host->build.experience == hostExperience
+        && guest->build.experience == guestExperience;
 }
 
 bool networkWorldActive()

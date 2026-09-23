@@ -30,7 +30,7 @@ or another object argument when they need the acting player.
 | `scripts.cc`, `op_dude_obj`, story script attachment | Story actor | Retained. Existing content expects one stable protagonist. |
 | Save/load, party slot zero, automap, endgame, map start placement | Story actor | Retained. Multiplayer metadata and the guest object are persisted separately. |
 | Camera, HUD, inventory/character screens, messages, selected hand | Local actor | Presentation bridges are used by the main interfaces. This audit also routes exploration item/use feedback and script-driven HUD refreshes through `isPresentedPlayerActor()`. |
-| Stats, skills, perks, traits, character build, XP/level calculations | Acting player | Existing accessors use `ScopedActingPlayerContext`. `actingPlayerActorOr(fallback)` now makes the single-player/story fallback explicit and testable. |
+| Stats, skills, perks, traits, character build, XP/level calculations | Acting player | Existing accessors use `ScopedActingPlayerContext`. `actingPlayerActorOr(fallback)` makes the single-player/story fallback explicit. Complete builds, including prototype flags, now travel in authoritative snapshots. |
 | Books | Acting player plus shared time | Skill gain and reading time use the reader's skill and Intelligence. World time and map-update scripts remain authoritative/shared; palette and text are local presentation. |
 | Radios and scripted item use | Acting player | The actual user is now supplied as the script source instead of always using `obj_dude`. |
 | Explosives and traps | Acting player | The Traps roll uses the player setting the explosive. The resulting timer queue remains shared host state. |
@@ -38,6 +38,7 @@ or another object argument when they need the acting player.
 | Initial NPC reaction and dialogue IQ options | Acting player plus shared NPC state | Charisma, Presence, personality, Intelligence, and Smooth Talker resolve from the scoped talker. The resulting NPC/script local variables remain authoritative shared state. |
 | `set_critter_stat` and `critter_mod_skill` opcodes | Acting player | An explicitly passed scoped guest actor can now mutate its own character build. An arbitrary NPC still cannot use player-only character storage. |
 | Script-driven wield, inventory removal/move, healing, and injury UI | Acting player plus local presentation | Player-specific armor/stat work recognizes the scoped guest; HUD refresh and hand selection use the local actor. |
+| Quest, major world-event, and combat XP | Shared award applied per acting player | The host awards the same base XP to both builds inside separate acting-player scopes, so personal perks and level-up effects are calculated independently. Guest replicas suppress local awards and receive both builds from snapshots. Skill-use and stealing XP remain personal. |
 | Global variables, map variables, script local variables, world clock, random rolls, timed queues | Shared party state | Guest replicas do not execute scripts or timed queue work. Snapshots/checkpoints carry these authoritative sections. |
 | Movement, doors, pickup, loot, and direct gifts | Acting player plus shared world | Commands carry an owned actor, execute in its scoped context on the host, and publish ordered results. Existing installed-data scenarios cover authority and convergence. |
 
@@ -45,12 +46,10 @@ or another object argument when they need the acting player.
 
 These are explicit follow-up work, not reasons to overload `obj_dude`:
 
-- Quest and combat XP policy still needs a party-award operation. The low-level
-  XP function correctly targets the scoped acting build, but the legacy
-  `give_exp_points` script opcode awards only one build today.
-- Process-wide PC flags such as Sneak and "level up available" need ownership
-  before both players can independently use those states. Their remaining
-  story-actor checks are intentionally unchanged.
+- Persistent PC flags are stored per build and now replicate with it, but
+  Sneak's live success result and periodic queue behavior still use legacy
+  process-wide state. Independent multiplayer Sneak activation needs an
+  actor-owned runtime state and semantic command.
 - Dialogue execution and voting remain Phase 5. The talker-dependent stat and
   reaction seams are ready, but shared dialogue is still blocked by the modal
   phase guard.

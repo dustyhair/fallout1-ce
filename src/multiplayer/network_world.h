@@ -15,6 +15,13 @@ struct Object;
 
 namespace multiplayer {
 
+enum class PartyExperienceResult {
+    NotMultiplayer,
+    Applied,
+    ReplicaIgnored,
+    Failed,
+};
+
 bool networkWorldEnter(NetworkLaunchMode mode,
     const CharacterCreationSheet& localSheet,
     const CharacterCreationSheet& peerSheet);
@@ -58,7 +65,9 @@ void networkWorldLeave();
 bool networkWorldActive();
 bool networkWorldInventoryTransferInProgress();
 bool networkWorldItemDropInProgress();
+PartyExperienceResult networkWorldAwardPartyExperience(int xp);
 bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts);
+bool networkWorldRunPartyExperienceSmokeTest();
 std::optional<EntityId> networkWorldPrepareDoorSmokeTest();
 std::optional<EntityId> networkWorldPreparePickupSmokeTest();
 std::optional<EntityId> networkWorldPrepareLootSmokeTest();

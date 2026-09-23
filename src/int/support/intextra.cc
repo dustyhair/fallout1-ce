@@ -225,7 +225,7 @@ static void op_give_exp_points(Program* program)
 {
     int xp = programStackPopInteger(program);
 
-    if (stat_pc_add_experience(xp) != 0) {
+    if (stat_pc_add_party_experience(xp) != 0) {
         int_debug("\nScript Error: %s: op_give_exp_points: stat_pc_set failed");
     }
 }
