@@ -32,6 +32,7 @@
 #include "game/scripts.h"
 #include "game/stat.h"
 #include "game/tile.h"
+#include "game/worldmap.h"
 #include "multiplayer/acting_player_context.h"
 #include "multiplayer/local_player_context.h"
 #include "multiplayer/local_session.h"
@@ -86,6 +87,8 @@ int questSmokeInitialReputation = 0;
 constexpr int kJarvisScriptIndex = 439;
 constexpr int kJarvisCuredLocalVariable = 5;
 constexpr int kAntidotePid = 49;
+constexpr int kChildrenIndependentStairPid = 0x200015C;
+constexpr int kChildrenIndependentStairTile = 18900;
 
 constexpr std::uint32_t kSharedObjectFlagMask = 0xB70FF839;
 
@@ -110,6 +113,17 @@ bool sceneryTransitionType(const Object* object, int& sceneryType)
     return sceneryType == SCENERY_TYPE_STAIRS
         || sceneryType == SCENERY_TYPE_LADDER_UP
         || sceneryType == SCENERY_TYPE_LADDER_DOWN;
+}
+
+bool typedStairCanBeUsedIndependently(const Object* stair, int sourceMap)
+{
+    // A scripted stair with no declared destination may request a cross-map
+    // load after executing world-changing code. Only independently verified
+    // installed routes may run without the other player nearby.
+    return sourceMap == MAP_CHILDRN2
+        && stair->pid == kChildrenIndependentStairPid
+        && stair->tile == kChildrenIndependentStairTile
+        && stair->elevation == 0;
 }
 
 bool exitGridDestination(const Object* exitGrid,
@@ -257,7 +271,7 @@ bool applyTimedEvents(const WorldSnapshot& snapshot)
     return queue_replace_state(queueEvents);
 }
 
-bool validateActorAndCritterState(const WorldSnapshot& snapshot)
+bool validateActorState(const WorldSnapshot& snapshot)
 {
     if (snapshot.actors.size() != 2) {
         return false;
@@ -274,6 +288,11 @@ bool validateActorAndCritterState(const WorldSnapshot& snapshot)
             return false;
         }
     }
+    return true;
+}
+
+bool validateCritterState(const WorldSnapshot& snapshot)
+{
     for (const CritterSnapshot& critterState : snapshot.critters) {
         Object* critter = session.entities().findObject(critterState.entityId);
         if (critter == nullptr
@@ -1031,6 +1050,11 @@ public:
             && !companionReady) {
             return execution;
         }
+        if (sceneryType == SCENERY_TYPE_STAIRS
+            && !companionReady
+            && !typedStairCanBeUsedIndependently(target, sourceMap)) {
+            return execution;
+        }
 
         int oldHostTile = host->tile;
         int oldHostElevation = host->elevation;
@@ -1475,10 +1499,7 @@ bool registerWorldObjects()
 
     Object* host = session.entities().findObject(session.playerActorId(kHostPlayerId));
     Object* guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
-    if (host == nullptr
-        || guest == nullptr
-        || !registerInventory(registerInventory, host)
-        || !registerInventory(registerInventory, guest)) {
+    if (host == nullptr || guest == nullptr) {
         return false;
     }
 
@@ -1504,6 +1525,20 @@ bool registerWorldObjects()
         }
         worldScenery.emplace_back(registration.entityId, object);
     }
+    for (Object* critter : critters) {
+        EntityRegistrationResult registration = session.registerWorldObject(critter);
+        if (!registration) {
+            return false;
+        }
+        worldCritters.emplace_back(registration.entityId, critter);
+    }
+    // Register fixed map entities before inventories. Map-enter scripts run
+    // only on the host and can create/remove items, but must not shift the IDs
+    // of matching exits, doors, scenery, and installed critters on replicas.
+    if (!registerInventory(registerInventory, host)
+        || !registerInventory(registerInventory, guest)) {
+        return false;
+    }
     for (Object* item : items) {
         EntityRegistrationResult registration = session.registerWorldObject(item);
         if (!registration) {
@@ -1515,11 +1550,9 @@ bool registerWorldObjects()
         }
     }
     for (Object* critter : critters) {
-        EntityRegistrationResult registration = session.registerWorldObject(critter);
-        if (!registration || !registerInventory(registerInventory, critter)) {
+        if (!registerInventory(registerInventory, critter)) {
             return false;
         }
-        worldCritters.emplace_back(registration.entityId, critter);
     }
     return true;
 }
@@ -3086,7 +3119,7 @@ bool networkWorldVerifyExitGridSmokeTest(const ExitGridSmokeFixture& fixture)
         && map_elevation == fixture.destinationElevation;
 }
 
-std::optional<SceneryTransitionSmokeFixture> networkWorldPrepareSceneryTransitionSmokeTest()
+std::optional<SceneryTransitionSmokeFixture> networkWorldPrepareSceneryTransitionSmokeTest(bool typedStairs, int targetTile, bool hostReady)
 {
     if (!session.isActive()) {
         return std::nullopt;
@@ -3102,9 +3135,12 @@ std::optional<SceneryTransitionSmokeFixture> networkWorldPrepareSceneryTransitio
         Object* transition = entry.second;
         int sceneryType = -1;
         if (!sceneryTransitionType(transition, sceneryType)
-            || (sceneryType != SCENERY_TYPE_LADDER_UP
-                && sceneryType != SCENERY_TYPE_LADDER_DOWN)
-            || transition->sid == -1) {
+            || (typedStairs
+                ? sceneryType != SCENERY_TYPE_STAIRS
+                : sceneryType != SCENERY_TYPE_LADDER_UP
+                    && sceneryType != SCENERY_TYPE_LADDER_DOWN)
+            || transition->sid == -1
+            || (targetTile >= 0 && (transition->tile != targetTile || transition->elevation != 0))) {
             continue;
         }
         bool guestPlaced = false;
@@ -3114,24 +3150,95 @@ std::optional<SceneryTransitionSmokeFixture> networkWorldPrepareSceneryTransitio
                 && obj_blocking_at(guest, tile, transition->elevation) == nullptr
                 && obj_move_to_tile(guest, tile, transition->elevation, nullptr) == 0;
         }
-        bool hostRemote = false;
-        for (int distance = 5; distance <= 8 && !hostRemote; distance++) {
-            for (int rotation = 0; rotation < ROTATION_COUNT && !hostRemote; rotation++) {
-                int tile = tile_num_in_direction(transition->tile, rotation, distance);
-                hostRemote = hexGridTileIsValid(tile)
-                    && obj_blocking_at(host, tile, transition->elevation) == nullptr
-                    && obj_move_to_tile(host, tile, transition->elevation, nullptr) == 0;
+        auto placeHost = [&](int firstDistance, int lastDistance) {
+            for (int distance = firstDistance; distance <= lastDistance; distance++) {
+                for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+                    int tile = tile_num_in_direction(transition->tile, rotation, distance);
+                    if (hexGridTileIsValid(tile)
+                        && obj_blocking_at(host, tile, transition->elevation) == nullptr
+                        && obj_move_to_tile(host, tile, transition->elevation, nullptr) == 0) {
+                        return true;
+                    }
+                }
             }
-        }
+            return false;
+        };
+        bool hostPlaced = placeHost(5, 8);
         if (!guestPlaced
-            || !hostRemote
+            || !hostPlaced
             || obj_set_rotation(host, ROTATION_SE, nullptr) == -1
             || obj_set_rotation(guest, ROTATION_SE, nullptr) == -1) {
             continue;
         }
+        if (typedStairs && hostReady && worldMode == NetworkLaunchMode::Host) {
+            WorldSnapshot beforeRejection;
+            if (!networkWorldCaptureSnapshot(EventSequence {}, beforeRejection)) {
+                return std::nullopt;
+            }
+            GameCommand readinessProbe;
+            readinessProbe.sequence = CommandSequence { 1 };
+            readinessProbe.playerId = kGuestPlayerId;
+            readinessProbe.actorId = session.playerActorId(kGuestPlayerId);
+            readinessProbe.expectedPhase = SessionPhase::Exploration;
+            readinessProbe.expectedPhaseRevision = session.phaseRevision();
+            readinessProbe.payload = SceneryTransitionCommand { entry.first };
+            AuthoritativeCommandResult rejection = networkWorldProcessCommand(readinessProbe);
+            WorldSnapshot afterRejection;
+            bool afterCaptured = networkWorldCaptureSnapshot(EventSequence {}, afterRejection);
+            SnapshotDigestResult beforeDigest = computeSnapshotDigest(beforeRejection);
+            SnapshotDigestResult afterDigest = afterCaptured
+                ? computeSnapshotDigest(afterRejection)
+                : SnapshotDigestResult {};
+            bool worldUnchanged = beforeDigest && afterDigest
+                && beforeDigest.digest.overall == afterDigest.digest.overall;
+            if (!worldUnchanged) {
+                std::fprintf(stderr, "Denied typed stair changed section=%d captured=%d.\n",
+                    afterCaptured
+                        ? static_cast<int>(firstDivergentSection(beforeDigest.digest, afterDigest.digest))
+                        : -1,
+                    afterCaptured ? 1 : 0);
+            }
+            bool rejected = rejection.result.status == CommandStatus::Rejected
+                && rejection.result.rejection == CommandRejection::InvalidAction
+                && !rejection.event.has_value()
+                && map_data.field_34 == MAP_CHILDRN2
+                && worldUnchanged;
+            commandProcessor.reset();
+            if (!rejected) {
+                return std::nullopt;
+            }
+        }
+        if (hostReady && !placeHost(2, 4)) {
+            return std::nullopt;
+        }
+        int destinationMap = typedStairs && hostReady ? MAP_CHILDRN1 : map_data.field_34;
+        int guestCaps = 0;
+        if (typedStairs && hostReady) {
+            int existingCaps = item_caps_total(guest);
+            if ((existingCaps > 0 && item_caps_adjust(guest, -existingCaps) != 0)
+                || item_caps_adjust(guest, 11) != 0) {
+                return std::nullopt;
+            }
+            guestCaps = 11;
+            bool registered = false;
+            for (int index = 0; index < guest->data.inventory.length; index++) {
+                Object* item = guest->data.inventory.items[index].item;
+                if (item != nullptr && item->pid == PROTO_ID_MONEY
+                    && guest->data.inventory.items[index].quantity == guestCaps) {
+                    registered = static_cast<bool>(registerItem(item));
+                    break;
+                }
+            }
+            if (!registered) {
+                return std::nullopt;
+            }
+        }
         return SceneryTransitionSmokeFixture {
             entry.first,
+            destinationMap,
             map_data.field_34,
+            typedStairs ? 1 : -1,
+            guestCaps,
             host->tile,
             host->elevation,
             host->rotation,
@@ -3149,6 +3256,22 @@ bool networkWorldVerifySceneryTransitionSmokeTest(const SceneryTransitionSmokeFi
     Object* host = session.entities().findObject(fixture.hostActorId);
     Object* guest = session.entities().findObject(fixture.guestActorId);
     Object* localActor = localPlayerActor();
+    bool crossMap = fixture.map != fixture.sourceMap;
+    bool capsRegistered = !crossMap;
+    if (crossMap && guest != nullptr) {
+        for (int index = 0; index < guest->data.inventory.length; index++) {
+            Object* item = guest->data.inventory.items[index].item;
+            std::optional<EntityId> itemId = item != nullptr
+                ? session.entities().findEntity(item)
+                : std::nullopt;
+            if (item != nullptr && item->pid == PROTO_ID_MONEY
+                && guest->data.inventory.items[index].quantity == fixture.guestCaps
+                && itemId.has_value()) {
+                capsRegistered = true;
+                break;
+            }
+        }
+    }
     bool verified = session.isActive()
         && session.playerActorId(kHostPlayerId) == fixture.hostActorId
         && session.playerActorId(kGuestPlayerId) == fixture.guestActorId
@@ -3157,9 +3280,13 @@ bool networkWorldVerifySceneryTransitionSmokeTest(const SceneryTransitionSmokeFi
         && localActor != nullptr
         && map_data.field_34 == fixture.map
         && session.phase() == SessionPhase::Exploration
-        && host->tile == fixture.hostTile
-        && host->elevation == fixture.hostElevation
-        && host->rotation == fixture.hostRotation
+        && (crossMap || (host->tile == fixture.hostTile
+                && host->elevation == fixture.hostElevation
+                && host->rotation == fixture.hostRotation))
+        && (!crossMap || (host->elevation == fixture.destinationElevation
+                && guest->elevation == fixture.destinationElevation
+                && capsRegistered
+                && item_caps_total(guest) == fixture.guestCaps))
         && (guest->tile != fixture.guestStartingTile
             || guest->elevation != fixture.guestStartingElevation)
         && (host->tile != guest->tile || host->elevation != guest->elevation)
@@ -4087,6 +4214,13 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
 bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
 {
     SnapshotError snapshotError = validateSnapshot(snapshot);
+    if (session.isActive()
+        && snapshotError == SnapshotError::None
+        && networkWorldReplicaSessionActive()
+        && snapshot.mapLocalVariables.size() > static_cast<std::size_t>(num_map_local_vars)
+        && !map_ensure_local_vars(static_cast<int>(snapshot.mapLocalVariables.size()))) {
+        return false;
+    }
     bool variablesValid = validateVariableState(snapshot);
     if (!session.isActive()
         || snapshotError != SnapshotError::None
@@ -4094,19 +4228,22 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
         || snapshot.scenery.size() != worldScenery.size()
         || !variablesValid) {
         std::fprintf(stderr,
-            "Multiplayer snapshot preflight failed: active=%d error=%d doors=%zu/%zu scenery=%zu/%zu variables=%d.\n",
+            "Multiplayer snapshot preflight failed: active=%d error=%d doors=%zu/%zu scenery=%zu/%zu variables=%d globals=%zu/%d map_globals=%zu/%d map_locals=%zu/%d.\n",
             session.isActive() ? 1 : 0,
             static_cast<int>(snapshotError),
             snapshot.doors.size(),
             worldDoors.size(),
             snapshot.scenery.size(),
             worldScenery.size(),
-            variablesValid ? 1 : 0);
+            variablesValid ? 1 : 0,
+            snapshot.gameGlobalVariables.size(), num_game_global_vars,
+            snapshot.mapGlobalVariables.size(), num_map_global_vars,
+            snapshot.mapLocalVariables.size(), num_map_local_vars);
         return false;
     }
 
-    if (!validateActorAndCritterState(snapshot)) {
-        std::fprintf(stderr, "Multiplayer snapshot actor or critter identity preflight failed.\n");
+    if (!validateActorState(snapshot)) {
+        std::fprintf(stderr, "Multiplayer snapshot actor identity preflight failed.\n");
         return false;
     }
     for (const DoorSnapshot& doorState : snapshot.doors) {
@@ -4129,7 +4266,7 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
     // shifting the sequential IDs assigned to otherwise identical static map
     // items. Rebind every local item against the authoritative holder/location
     // and descriptor before applying state instead of trusting that local load
-    // order. Non-item entity identities have already passed validation above.
+    // order. Doors and scenery have already passed identity validation above.
     std::vector<Object*> localItems;
     localItems.reserve(worldItems.size());
     for (const auto& entry : worldItems) {
@@ -4139,12 +4276,59 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
         session.entities().unregisterEntity(entry.first);
     }
     worldItems.clear();
+    // Map-enter scripts can create or remove items only on the authority,
+    // shifting the sequential IDs of otherwise identical installed critters.
+    // Match each local critter to its authoritative PID and source placement
+    // before rebinding inventory holders. A genuinely missing critter still
+    // fails closed; the snapshot does not yet describe how to create one.
+    if (snapshot.critters.size() != worldCritters.size()) {
+        std::fprintf(stderr, "Multiplayer snapshot critter count preflight failed.\n");
+        return false;
+    }
+    if (!validateCritterState(snapshot)) {
+        std::vector<Object*> localCritters;
+        localCritters.reserve(worldCritters.size());
+        for (const auto& entry : worldCritters) {
+            localCritters.push_back(entry.second);
+            session.entities().unregisterEntity(entry.first);
+        }
+        worldCritters.clear();
+        std::unordered_set<Object*> reboundCritters;
+        for (const CritterSnapshot& critterState : snapshot.critters) {
+            Object* matched = nullptr;
+            for (Object* candidate : localCritters) {
+                if (candidate != nullptr
+                    && reboundCritters.find(candidate) == reboundCritters.end()
+                    && candidate->pid == critterState.pid
+                    && candidate->tile == critterState.tile
+                    && candidate->elevation == critterState.elevation) {
+                    matched = candidate;
+                    break;
+                }
+            }
+            if (matched == nullptr
+                || session.entities().restoreObject(critterState.entityId, matched) != EntityRegistryError::None) {
+                std::fprintf(stderr,
+                    "Multiplayer snapshot could not rebind critter pid=%d tile=%d elevation=%d.\n",
+                    critterState.pid, critterState.tile, critterState.elevation);
+                return false;
+            }
+            reboundCritters.insert(matched);
+            worldCritters.emplace_back(critterState.entityId, matched);
+        }
+        if (reboundCritters.size() != localCritters.size() || !validateCritterState(snapshot)) {
+            std::fprintf(stderr, "Multiplayer snapshot critter identity preflight failed.\n");
+            return false;
+        }
+    }
     std::unordered_set<Object*> reboundItems;
     for (const ItemSnapshot& itemState : snapshot.items) {
         Object* desiredHolder = isValid(itemState.holderId)
             ? session.entities().findObject(itemState.holderId)
             : nullptr;
         if (isValid(itemState.holderId) && desiredHolder == nullptr) {
+            std::fprintf(stderr, "Multiplayer snapshot item holder missing: item=%u holder=%u.\n",
+                itemState.entityId.value, itemState.holderId.value);
             return false;
         }
 
@@ -4184,6 +4368,8 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
         }
         if (matched == nullptr
             || session.entities().restoreObject(itemState.entityId, matched) != EntityRegistryError::None) {
+            std::fprintf(stderr, "Multiplayer snapshot item rebind failed: item=%u pid=%d created=%d.\n",
+                itemState.entityId.value, itemState.itemDescriptor.pid, created ? 1 : 0);
             if (created && matched != nullptr) {
                 obj_erase_object(matched, nullptr);
             }
@@ -4464,6 +4650,11 @@ bool networkWorldRunPartyExperienceSmokeTest()
 bool networkWorldActive()
 {
     return session.isActive() && peerActor != nullptr;
+}
+
+bool networkWorldReplicaSessionActive()
+{
+    return session.isActive() && worldMode == NetworkLaunchMode::Join;
 }
 
 } // namespace multiplayer

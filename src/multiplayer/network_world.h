@@ -81,6 +81,7 @@ Object* networkWorldFindObject(EntityId entityId);
 Object* networkWorldPlayerActor(PlayerId playerId);
 void networkWorldLeave();
 bool networkWorldActive();
+bool networkWorldReplicaSessionActive();
 bool networkWorldInventoryTransferInProgress();
 bool networkWorldItemDropInProgress();
 PartyExperienceResult networkWorldAwardPartyExperience(int xp);
@@ -133,6 +134,9 @@ bool networkWorldVerifyExitGridSmokeTest(const ExitGridSmokeFixture& fixture);
 struct SceneryTransitionSmokeFixture {
     EntityId transitionId;
     std::int32_t map = -1;
+    std::int32_t sourceMap = -1;
+    std::int32_t destinationElevation = -1;
+    std::int32_t guestCaps = 0;
     std::int32_t hostTile = -1;
     std::int32_t hostElevation = -1;
     std::int32_t hostRotation = 0;
@@ -141,7 +145,7 @@ struct SceneryTransitionSmokeFixture {
     EntityId hostActorId;
     EntityId guestActorId;
 };
-std::optional<SceneryTransitionSmokeFixture> networkWorldPrepareSceneryTransitionSmokeTest();
+std::optional<SceneryTransitionSmokeFixture> networkWorldPrepareSceneryTransitionSmokeTest(bool typedStairs = false, int targetTile = -1, bool hostReady = false);
 bool networkWorldVerifySceneryTransitionSmokeTest(const SceneryTransitionSmokeFixture& fixture);
 bool networkWorldVerifyLootRangeSmokeTest(EntityId targetId);
 std::optional<EntityId> networkWorldPreparePlayerTransferSmokeTest();

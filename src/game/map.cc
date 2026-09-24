@@ -577,6 +577,26 @@ int map_malloc_local_var(int a1)
     return oldMapLocalVarsLength;
 }
 
+bool map_ensure_local_vars(int count)
+{
+    if (count < num_map_local_vars || count < 0) {
+        return false;
+    }
+    if (count == num_map_local_vars) {
+        return true;
+    }
+
+    int* vars = static_cast<int*>(mem_realloc(map_local_vars, sizeof(*vars) * count));
+    if (vars == nullptr) {
+        return false;
+    }
+    memset(vars + num_map_local_vars, 0, sizeof(*vars) * (count - num_map_local_vars));
+    map_local_vars = vars;
+    num_map_local_vars = count;
+    map_local_pointers.resize(count);
+    return true;
+}
+
 // 0x473F14
 void map_set_entrance_hex(int tile, int elevation, int rotation)
 {

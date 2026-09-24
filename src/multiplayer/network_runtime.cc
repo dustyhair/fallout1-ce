@@ -82,6 +82,8 @@ enum class SmokeScenario {
     MapTransition,
     ExitGrid,
     Stairs,
+    TypedStairsIndependent,
+    TypedStairsCrossMap,
     Rest,
 };
 SmokeScenario smokeScenario = SmokeScenario::Movement;
@@ -116,11 +118,32 @@ const char* smokeScenarioName()
         return "exit-grid";
     case SmokeScenario::Stairs:
         return "stairs";
+    case SmokeScenario::TypedStairsIndependent:
+        return "typed-stairs-independent";
+    case SmokeScenario::TypedStairsCrossMap:
+        return "typed-stairs-cross-map";
     case SmokeScenario::Rest:
         return "rest";
     }
     return "unknown";
 }
+
+bool isSceneryTransitionSmokeScenario()
+{
+    return smokeScenario == SmokeScenario::Stairs
+        || smokeScenario == SmokeScenario::TypedStairsIndependent
+        || smokeScenario == SmokeScenario::TypedStairsCrossMap;
+}
+
+bool isAuthorityProbedSmokeScenario()
+{
+    return smokeScenario == SmokeScenario::Quest
+        || isSceneryTransitionSmokeScenario()
+        || smokeScenario == SmokeScenario::Rest
+        || smokeScenario == SmokeScenario::MapTransition
+        || smokeScenario == SmokeScenario::ExitGrid;
+}
+
 int lastSentLocalRotation = -1;
 std::optional<EventSequence> pendingRecoveryRequest;
 std::unique_ptr<Transport> reconnectTransport;
@@ -1169,6 +1192,10 @@ bool networkRuntimeConfigure(int argc, char** argv)
             smokeScenario = SmokeScenario::ExitGrid;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=stairs") == 0) {
             smokeScenario = SmokeScenario::Stairs;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=typed-stairs-independent") == 0) {
+            smokeScenario = SmokeScenario::TypedStairsIndependent;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=typed-stairs-cross-map") == 0) {
+            smokeScenario = SmokeScenario::TypedStairsCrossMap;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=rest") == 0) {
             smokeScenario = SmokeScenario::Rest;
         } else if (argv[index] != nullptr
@@ -1214,6 +1241,10 @@ bool networkRuntimeSmokeTestEnabled()
 
 const char* networkRuntimeSmokeTestMap()
 {
+    if (smokeScenario == SmokeScenario::TypedStairsIndependent
+        || smokeScenario == SmokeScenario::TypedStairsCrossMap) {
+        return "ChilDrn2.map";
+    }
     if (smokeScenario == SmokeScenario::Quest || smokeScenario == SmokeScenario::Rest) {
         return "ShadyW.map";
     }
@@ -1381,8 +1412,13 @@ bool networkRuntimeRunSmokeTest()
                     scenarioTargetId = exitGridFixture->exitId;
                 }
                 scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
-            } else if (smokeScenario == SmokeScenario::Stairs) {
-                sceneryTransitionFixture = networkWorldPrepareSceneryTransitionSmokeTest();
+            } else if (isSceneryTransitionSmokeScenario()) {
+                sceneryTransitionFixture = smokeScenario == SmokeScenario::Stairs
+                    ? networkWorldPrepareSceneryTransitionSmokeTest()
+                    : networkWorldPrepareSceneryTransitionSmokeTest(
+                        true,
+                        smokeScenario == SmokeScenario::TypedStairsIndependent ? 18900 : 18894,
+                        smokeScenario == SmokeScenario::TypedStairsCrossMap);
                 if (sceneryTransitionFixture.has_value()) {
                     scenarioTargetId = sceneryTransitionFixture->transitionId;
                 }
@@ -1403,13 +1439,13 @@ bool networkRuntimeRunSmokeTest()
                     && smokeScenario != SmokeScenario::Elevation
                     && smokeScenario != SmokeScenario::MapTransition
                     && smokeScenario != SmokeScenario::ExitGrid
-                    && smokeScenario != SmokeScenario::Stairs
+                    && !isSceneryTransitionSmokeScenario()
                     && smokeScenario != SmokeScenario::Rest
                     && !scenarioTargetId.has_value())
                 || (smokeScenario == SmokeScenario::Elevation && !elevatorFixture.has_value())
                 || (smokeScenario == SmokeScenario::MapTransition && !mapTransitionFixture.has_value())
                 || (smokeScenario == SmokeScenario::ExitGrid && !exitGridFixture.has_value())
-                || (smokeScenario == SmokeScenario::Stairs && !sceneryTransitionFixture.has_value())
+                || (isSceneryTransitionSmokeScenario() && !sceneryTransitionFixture.has_value())
                 || (smokeScenario == SmokeScenario::Movement && scenarioDestinationTile == -1)) {
                 setStatus("MULTIPLAYER SMOKE TEST FAILED: NO EXPLORATION FIXTURE");
                 break;
@@ -1467,6 +1503,8 @@ bool networkRuntimeRunSmokeTest()
                 scenarioCommand.payload = ExitGridCommand { exitGridFixture->exitId };
                 break;
             case SmokeScenario::Stairs:
+            case SmokeScenario::TypedStairsIndependent:
+            case SmokeScenario::TypedStairsCrossMap:
                 scenarioCommand.payload = SceneryTransitionCommand { sceneryTransitionFixture->transitionId };
                 break;
             case SmokeScenario::Rest:
@@ -1482,7 +1520,7 @@ bool networkRuntimeRunSmokeTest()
 
             bool gameplayPassed = false;
             std::vector<GameEvent> authoritativeEvents;
-            if (smokeScenario == SmokeScenario::Quest || smokeScenario == SmokeScenario::Stairs || smokeScenario == SmokeScenario::Rest) {
+            if (isAuthorityProbedSmokeScenario()) {
                 engineExecutionProbeBegin();
             }
             if (smokeScenario == SmokeScenario::Rest && launchOptions.mode == NetworkLaunchMode::Host) {
@@ -1701,7 +1739,7 @@ bool networkRuntimeRunSmokeTest()
                                     && networkWorldApplyPeerExitGrid(*exitGrid);
                             } else if (event && event.event.sequence == expectedEventSequence
                                 && event.event.causedBy == scenarioCommand.sequence
-                                && smokeScenario == SmokeScenario::Stairs) {
+                                && isSceneryTransitionSmokeScenario()) {
                                 const auto* transition = std::get_if<SceneryTransitionedEvent>(&event.event.payload);
                                 eventApplied = transition != nullptr
                                     && transition->actorId == scenarioCommand.actorId
@@ -1737,7 +1775,7 @@ bool networkRuntimeRunSmokeTest()
                                     stateConverged = networkWorldVerifyMapTransitionSmokeTest(*mapTransitionFixture);
                                 } else if (stateConverged && smokeScenario == SmokeScenario::ExitGrid) {
                                     stateConverged = networkWorldVerifyExitGridSmokeTest(*exitGridFixture);
-                                } else if (stateConverged && smokeScenario == SmokeScenario::Stairs) {
+                                } else if (stateConverged && isSceneryTransitionSmokeScenario()) {
                                     stateConverged = networkWorldVerifySceneryTransitionSmokeTest(*sceneryTransitionFixture);
                                 } else if (stateConverged && smokeScenario == SmokeScenario::Rest) {
                                     stateConverged = restCompletionGameTime >= restStartingGameTime + smokeRestMinutes * 600
@@ -1847,7 +1885,7 @@ bool networkRuntimeRunSmokeTest()
                                 const auto* exitGrid = std::get_if<ExitGridCommand>(&command.command.payload);
                                 payloadMatches = exitGrid != nullptr
                                     && exitGrid->exitId == exitGridFixture->exitId;
-                            } else if (smokeScenario == SmokeScenario::Stairs) {
+                            } else if (isSceneryTransitionSmokeScenario()) {
                                 const auto* transition = std::get_if<SceneryTransitionCommand>(&command.command.payload);
                                 payloadMatches = transition != nullptr
                                     && transition->transitionId == sceneryTransitionFixture->transitionId;
@@ -1917,6 +1955,8 @@ bool networkRuntimeRunSmokeTest()
                         case SmokeScenario::ExitGrid:
                             return networkWorldVerifyExitGridSmokeTest(*exitGridFixture);
                         case SmokeScenario::Stairs:
+                        case SmokeScenario::TypedStairsIndependent:
+                        case SmokeScenario::TypedStairsCrossMap:
                             return networkWorldVerifySceneryTransitionSmokeTest(*sceneryTransitionFixture);
                         case SmokeScenario::Rest:
                             return game_time() >= restStartingGameTime + smokeRestMinutes * 600
@@ -1979,7 +2019,7 @@ bool networkRuntimeRunSmokeTest()
                         || networkWorldVerifyMapTransitionSmokeTest(*mapTransitionFixture);
                     bool exitGridCompleted = smokeScenario != SmokeScenario::ExitGrid
                         || networkWorldVerifyExitGridSmokeTest(*exitGridFixture);
-                    bool sceneryTransitionCompleted = smokeScenario != SmokeScenario::Stairs
+                    bool sceneryTransitionCompleted = !isSceneryTransitionSmokeScenario()
                         || networkWorldVerifySceneryTransitionSmokeTest(*sceneryTransitionFixture);
                     bool restCompleted = smokeScenario != SmokeScenario::Rest
                         || (restCompletionGameTime >= restStartingGameTime + smokeRestMinutes * 600
@@ -2068,10 +2108,11 @@ bool networkRuntimeRunSmokeTest()
 
             EngineExecutionProbeCounts scenarioProbeCounts;
             bool scenarioAuthorityPassed = true;
-            if (smokeScenario == SmokeScenario::Quest || smokeScenario == SmokeScenario::Stairs || smokeScenario == SmokeScenario::Rest) {
+            if (isAuthorityProbedSmokeScenario()) {
                 scenarioProbeCounts = engineExecutionProbeEnd();
                 scenarioAuthorityPassed = launchOptions.mode == NetworkLaunchMode::Host
-                    ? (smokeScenario == SmokeScenario::Rest || scenarioProbeCounts.scriptProcedures > 0)
+                    ? ((smokeScenario != SmokeScenario::Quest && !isSceneryTransitionSmokeScenario())
+                            || scenarioProbeCounts.scriptProcedures > 0)
                         && scenarioProbeCounts.combatAttacks == 0
                     : scenarioProbeCounts.scriptProcedures == 0
                         && scenarioProbeCounts.combatAttacks == 0
@@ -2087,11 +2128,9 @@ bool networkRuntimeRunSmokeTest()
                 break;
             }
 
-            if (smokeScenario == SmokeScenario::Quest || smokeScenario == SmokeScenario::Stairs || smokeScenario == SmokeScenario::Rest) {
+            if (isAuthorityProbedSmokeScenario()) {
                 authorityProbeCounts = scenarioProbeCounts;
-            } else if (smokeScenario == SmokeScenario::Elevation
-                || smokeScenario == SmokeScenario::MapTransition
-                || smokeScenario == SmokeScenario::ExitGrid) {
+            } else if (smokeScenario == SmokeScenario::Elevation) {
                 // The transition event itself is applied under the execution probe
                 // above. The standard door/attack probe assumes both actors remain
                 // on the entrance elevation, which is deliberately false here.
@@ -2284,7 +2323,10 @@ NetworkLaunchMode networkRuntimeMode()
 
 bool networkRuntimeIsGuestReplica()
 {
-    return launchOptions.mode == NetworkLaunchMode::Join && networkWorldActive();
+    // Peer actor rebinding temporarily clears peerActor while the destination
+    // map loads. Script/queue authority must remain disabled through that gap.
+    return launchOptions.mode == NetworkLaunchMode::Join
+        && networkWorldReplicaSessionActive();
 }
 
 bool networkRuntimeConnected()
