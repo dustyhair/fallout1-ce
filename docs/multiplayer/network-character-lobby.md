@@ -22,6 +22,8 @@ Passing `--multiplayer-smoke-scenario=loot` selects a registered map critter, pl
 
 Passing `--multiplayer-smoke-scenario=transfer` creates the same seven-cap guest stack on both processes. It first proves that an out-of-range gift and a forged attempt to take from the host are rejected without events. The guest then gives three caps to the adjacent host over the real command channel. Both peers must reach the same four/three cap split identities, converge at the checkpoint, and replay the transfer after reconnect.
 
+Passing `--multiplayer-smoke-scenario=skill` places the guest beside the same registered door and submits Traps through the real skill command. The host runs the asynchronous skill action under the guest character context; the guest applies only the ordered presentation boundary. Both processes then require the same complete authoritative state digest and replay the skill event after reconnect.
+
 This hook makes the two-process path runnable under Xvfb:
 
 ```text

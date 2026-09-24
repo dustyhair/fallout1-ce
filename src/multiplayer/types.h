@@ -158,6 +158,38 @@ struct LootCommand {
     EntityId targetId;
 };
 
+// These values intentionally match Fallout's Skill enum. Only targeted,
+// exploration-safe skills belong in the multiplayer command surface.
+enum class ExplorationSkill : std::int32_t {
+    FirstAid = 6,
+    Doctor = 7,
+    Lockpick = 9,
+    Steal = 10,
+    Traps = 11,
+    Science = 12,
+    Repair = 13,
+};
+
+constexpr bool isValid(ExplorationSkill skill)
+{
+    switch (skill) {
+    case ExplorationSkill::FirstAid:
+    case ExplorationSkill::Doctor:
+    case ExplorationSkill::Lockpick:
+    case ExplorationSkill::Steal:
+    case ExplorationSkill::Traps:
+    case ExplorationSkill::Science:
+    case ExplorationSkill::Repair:
+        return true;
+    }
+    return false;
+}
+
+struct UseSkillCommand {
+    EntityId targetId;
+    ExplorationSkill skill = ExplorationSkill::FirstAid;
+};
+
 struct ItemDescriptor {
     std::int32_t pid = -1;
     std::int32_t extendedFlags = 0;
@@ -198,7 +230,7 @@ struct SharedModalCommand {
     bool open = false;
 };
 
-using GameCommandPayload = std::variant<MoveCommand, FaceCommand, InteractCommand, PickupCommand, LootCommand, InventoryTransferCommand, ItemDropCommand, AttackCommand, SharedModalCommand>;
+using GameCommandPayload = std::variant<MoveCommand, FaceCommand, InteractCommand, PickupCommand, LootCommand, UseSkillCommand, InventoryTransferCommand, ItemDropCommand, AttackCommand, SharedModalCommand>;
 
 struct GameCommand {
     CommandSequence sequence;
@@ -276,6 +308,12 @@ struct LootStartedEvent {
     EntityId targetId;
 };
 
+struct SkillUseStartedEvent {
+    EntityId actorId;
+    EntityId targetId;
+    ExplorationSkill skill = ExplorationSkill::FirstAid;
+};
+
 struct InventoryTransferredEvent {
     EntityId actorId;
     EntityId sourceId;
@@ -314,7 +352,7 @@ struct SharedModalStateChangedEvent {
     std::uint32_t phaseRevision = 0;
 };
 
-using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, ItemPickupCompletedEvent, LootStartedEvent, InventoryTransferredEvent, ItemDroppedEvent, AttackStartedEvent, SharedModalStateChangedEvent>;
+using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, ItemPickupCompletedEvent, LootStartedEvent, SkillUseStartedEvent, InventoryTransferredEvent, ItemDroppedEvent, AttackStartedEvent, SharedModalStateChangedEvent>;
 
 struct GameEvent {
     EventSequence sequence;

@@ -545,6 +545,20 @@ public:
         return CommandExecutionStatus::Applied;
     }
 
+    CommandExecutionStatus useSkill(Object* actor, Object* target, const UseSkillCommand& command) override
+    {
+        if (isInCombat()
+            || actor == nullptr
+            || target == nullptr
+            || actor->elevation != target->elevation
+            || target->tile < 0
+            || !isValid(command.skill)
+            || action_use_skill_on(actor, target, static_cast<int>(command.skill)) == -1) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        return CommandExecutionStatus::Applied;
+    }
+
     CommandExecutionStatus attack(Object* actor, Object* target, const AttackCommand& command) override
     {
         // Fail closed until the combat controller can prove active-turn
@@ -1224,6 +1238,28 @@ bool networkWorldApplyPeerAttack(const AttackStartedEvent& attack)
     return true;
 }
 
+bool networkWorldApplyPeerSkillUse(const SkillUseStartedEvent& skillUse)
+{
+    if (!session.isActive() || isInCombat() || !isValid(skillUse.skill)) {
+        return false;
+    }
+    PlayerCharacterState* player = session.players().findByActor(skillUse.actorId);
+    Object* actor = player != nullptr ? session.entities().findObject(player->actorId) : nullptr;
+    Object* target = session.entities().findObject(skillUse.targetId);
+    if (player == nullptr
+        || actor == nullptr
+        || target == nullptr
+        || actor->elevation != target->elevation
+        || target->tile < 0) {
+        return false;
+    }
+
+    // This is presentation-only on a replica. Calling action_use_skill_on or
+    // obj_use_skill_on would rerun path callbacks, scripts, rolls, XP, and
+    // target mutations. The next authoritative state carries those results.
+    return true;
+}
+
 bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts)
 {
     counts = {};
@@ -1472,6 +1508,34 @@ std::optional<EntityId> networkWorldPrepareLootSmokeTest()
                 && obj_blocking_at(actor, tile, critter->elevation) == nullptr
                 && obj_move_to_tile(actor, tile, critter->elevation, nullptr) == 0
                 && lootTargetIsInRange(actor, critter)) {
+                return entry.first;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<EntityId> networkWorldPrepareSkillSmokeTest()
+{
+    if (!session.isActive() || worldDoors.empty()) {
+        return std::nullopt;
+    }
+    Object* actor = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+    if (actor == nullptr) {
+        return std::nullopt;
+    }
+
+    anim_stop();
+    for (const auto& entry : worldDoors) {
+        Object* door = entry.second;
+        if (door == nullptr || !hexGridTileIsValid(door->tile) || !elevationIsValid(door->elevation)) {
+            continue;
+        }
+        for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+            int tile = tile_num_in_direction(door->tile, rotation, 1);
+            if (hexGridTileIsValid(tile)
+                && obj_blocking_at(actor, tile, door->elevation) == nullptr
+                && obj_move_to_tile(actor, tile, door->elevation, nullptr) == 0) {
                 return entry.first;
             }
         }

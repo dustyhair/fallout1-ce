@@ -1344,7 +1344,7 @@ int action_use_skill_on(Object* a1, Object* a2, int skill)
             register_begin(ANIMATION_REQUEST_UNRESERVED);
         }
 
-        if (a2 != obj_dude) {
+        if (a2 != a1) {
             if (obj_dist(a1, a2) >= 5) {
                 register_object_run_to_object(a1, a2, -1, 0);
             } else {

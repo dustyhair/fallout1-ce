@@ -748,6 +748,7 @@ void testGameplayWireFormat()
         GameCommand { CommandSequence { 7 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, ItemDropCommand { EntityId { 20 }, EntityId { 43 }, 3, 5, ItemDescriptor { 40, 7, 8, 9 } } },
         GameCommand { CommandSequence { 8 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, AttackCommand { EntityId { 42 }, 1, 8 } },
         GameCommand { CommandSequence { 9 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, SharedModalCommand { SharedModalKind::Dialogue, true } },
+        GameCommand { CommandSequence { 10 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, UseSkillCommand { EntityId { 40 }, ExplorationSkill::Traps } },
     };
 
     for (std::size_t index = 0; index < commands.size(); index++) {
@@ -889,6 +890,22 @@ void testGameplayWireFormat()
     expect(encodeGameCommand(invalidModal, modalEnvelope) == GameplayWireError::InvalidModal,
         "shared modal command rejects an unknown kind");
 
+    ProtocolEnvelope skillEnvelope = gameplayEnvelope(29);
+    expect(encodeGameCommand(commands[9], skillEnvelope) == GameplayWireError::None,
+        "targeted skill command encodes");
+    GameCommandDecodeResult decodedSkill = decodeGameCommand(skillEnvelope);
+    const UseSkillCommand* skill = decodedSkill
+        ? std::get_if<UseSkillCommand>(&decodedSkill.command.payload)
+        : nullptr;
+    expect(skill != nullptr
+            && skill->targetId == EntityId { 40 }
+            && skill->skill == ExplorationSkill::Traps,
+        "targeted skill command round trips its target and skill");
+    GameCommand invalidSkill = commands[9];
+    std::get<UseSkillCommand>(invalidSkill.payload).skill = static_cast<ExplorationSkill>(99);
+    expect(encodeGameCommand(invalidSkill, skillEnvelope) == GameplayWireError::InvalidSkill,
+        "targeted skill command rejects an unsupported skill");
+
     CommandResult accepted;
     accepted.commandSequence.value = 1;
     accepted.status = CommandStatus::Accepted;
@@ -929,6 +946,7 @@ void testGameplayWireFormat()
         GameEvent { EventSequence { 14 }, CommandSequence { 8 }, AttackStartedEvent { EntityId { 20 }, EntityId { 42 }, 1, 8 } },
         GameEvent { EventSequence { 15 }, CommandSequence { 3 }, ItemPickupCompletedEvent { EntityId { 20 }, EntityId { 41 }, true, 1, ItemDescriptor { 40, 7, 8, 9 } } },
         GameEvent { EventSequence { 16 }, CommandSequence { 9 }, SharedModalStateChangedEvent { EntityId { 20 }, SharedModalKind::Dialogue, true, SessionPhase::Dialogue, 4 } },
+        GameEvent { EventSequence { 17 }, CommandSequence { 10 }, SkillUseStartedEvent { EntityId { 20 }, EntityId { 40 }, ExplorationSkill::Traps } },
     };
     for (std::size_t index = 0; index < events.size(); index++) {
         ProtocolEnvelope envelope = gameplayEnvelope(30 + index);
@@ -1068,6 +1086,18 @@ void testGameplayWireFormat()
             && modalEvent->phase == SessionPhase::Dialogue
             && modalEvent->phaseRevision == 4,
         "shared modal event round trips the authoritative phase boundary");
+
+    ProtocolEnvelope skillEventEnvelope = gameplayEnvelope(48);
+    encodeGameEvent(events[10], skillEventEnvelope);
+    GameEventDecodeResult decodedSkillEvent = decodeGameEvent(skillEventEnvelope);
+    const SkillUseStartedEvent* skillEvent = decodedSkillEvent
+        ? std::get_if<SkillUseStartedEvent>(&decodedSkillEvent.event.payload)
+        : nullptr;
+    expect(skillEvent != nullptr
+            && skillEvent->actorId == EntityId { 20 }
+            && skillEvent->targetId == EntityId { 40 }
+            && skillEvent->skill == ExplorationSkill::Traps,
+        "skill-use event round trips without requesting replica-side rules");
 
     ProtocolEnvelope missingSession = gameplayEnvelope(42);
     missingSession.sessionId = {};
@@ -1738,11 +1768,24 @@ void testNetworkCharacterLobby()
             && liveDrop->tile == 12345
             && guest.confirmPeerEventApplied(liveDropEvent->sequence),
         "guest accepts and confirms the authoritative ground drop");
+    expect(host.sendLocalSkillUse(EntityId { 77 }, ExplorationSkill::Traps),
+        "host publishes a targeted exploration skill cue");
+    guest.poll();
+    std::optional<GameEvent> liveSkillEvent = guest.takePeerEvent();
+    const auto* liveSkill = liveSkillEvent.has_value()
+        ? std::get_if<SkillUseStartedEvent>(&liveSkillEvent->payload)
+        : nullptr;
+    expect(liveSkill != nullptr
+            && liveSkill->actorId == EntityId { kHostPlayerId.value }
+            && liveSkill->targetId == EntityId { 77 }
+            && liveSkill->skill == ExplorationSkill::Traps
+            && guest.confirmPeerEventApplied(liveSkillEvent->sequence),
+        "guest accepts and confirms the host skill-use boundary");
     EventReplay completeReplay = host.replayAfter(EventSequence {});
     expect(completeReplay.status == EventReplayStatus::Available
-            && completeReplay.events.size() == 9
+            && completeReplay.events.size() == 10
             && completeReplay.events.front().sequence == EventSequence { 1 }
-            && completeReplay.events.back().sequence == EventSequence { 9 },
+            && completeReplay.events.back().sequence == EventSequence { 10 },
         "host journals every authoritative live event in session order");
     expect(guest.requestRecovery(EventSequence { 6 }), "guest requests recovery from its last retained event");
     host.poll();
@@ -1755,6 +1798,7 @@ void testNetworkCharacterLobby()
     std::optional<GameEvent> replayedLoot = guest.takePeerEvent();
     std::optional<GameEvent> replayedTransfer = guest.takePeerEvent();
     std::optional<GameEvent> replayedDrop = guest.takePeerEvent();
+    std::optional<GameEvent> replayedSkill = guest.takePeerEvent();
     expect(replayedLoot.has_value()
             && replayedLoot->sequence == EventSequence { 7 }
             && std::holds_alternative<LootStartedEvent>(replayedLoot->payload)
@@ -1764,11 +1808,14 @@ void testNetworkCharacterLobby()
             && replayedDrop.has_value()
             && replayedDrop->sequence == EventSequence { 9 }
             && std::holds_alternative<ItemDroppedEvent>(replayedDrop->payload)
+            && replayedSkill.has_value()
+            && replayedSkill->sequence == EventSequence { 10 }
+            && std::holds_alternative<SkillUseStartedEvent>(replayedSkill->payload)
             && !guest.recoveryInProgress(),
-        "guest receives ordered loot and drop replay and observes recovery completion");
+        "guest receives ordered loot, drop, and skill replay and observes recovery completion");
 
     EventSequence guestResumePoint = guest.lastAppliedEvent();
-    expect(guestResumePoint == EventSequence { 9 } && guest.disconnectForReconnect(),
+    expect(guestResumePoint == EventSequence { 10 } && guest.disconnectForReconnect(),
         "guest records its last applied event and drops the old connection");
     host.poll();
     expect(host.state() == NetworkLobbyState::Disconnected
@@ -1777,7 +1824,7 @@ void testNetworkCharacterLobby()
     expect(!guest.sendLocalMove(12347, 0, false),
         "disconnected guest input is blocked");
     expect(host.sendLocalFacing(2)
-            && host.latestAuthoritativeEvent() == EventSequence { 10 },
+            && host.latestAuthoritativeEvent() == EventSequence { 11 },
         "host continues the authoritative journal while the guest is absent");
 
     LoopbackTransportPair resumedPair = createLoopbackTransportPair();
@@ -1800,12 +1847,12 @@ void testNetworkCharacterLobby()
         ? std::get_if<ActorFacingChangedEvent>(&resumedFacing->payload)
         : nullptr;
     expect(resumedFacingPayload != nullptr
-            && resumedFacing->sequence == EventSequence { 10 }
+            && resumedFacing->sequence == EventSequence { 11 }
             && resumedFacingPayload->rotation == 2
             && !guest.recoveryInProgress(),
         "guest applies events created while disconnected and completes reconnect recovery");
     expect(resumedFacing.has_value() && guest.confirmPeerEventApplied(resumedFacing->sequence)
-            && guest.lastAppliedEvent() == EventSequence { 10 },
+            && guest.lastAppliedEvent() == EventSequence { 11 },
         "guest confirms the replayed event as its new reconnect boundary");
     WorldSnapshot authoritativeState = sampleSnapshot();
     expect(host.sendAuthoritativeState(authoritativeState),
@@ -2033,6 +2080,16 @@ public:
         return nextStatus;
     }
 
+    CommandExecutionStatus useSkill(Object* actor, Object* target, const UseSkillCommand& command) override
+    {
+        skillCalls++;
+        lastActor = actor;
+        lastTarget = target;
+        lastSkill = command;
+        recordContext();
+        return nextStatus;
+    }
+
     CommandExecutionStatus attack(Object* actor, Object* target, const AttackCommand& command) override
     {
         attackCalls++;
@@ -2131,6 +2188,7 @@ public:
     int doorCalls = 0;
     int pickupCalls = 0;
     int lootCalls = 0;
+    int skillCalls = 0;
     int attackCalls = 0;
     int modalCalls = 0;
     int transferCalls = 0;
@@ -2146,6 +2204,7 @@ public:
     MoveCommand lastMove;
     FaceCommand lastFace;
     AttackCommand lastAttack;
+    UseSkillCommand lastSkill;
     SharedModalCommand lastModal;
     LocalSession* modalSession = nullptr;
     Object* activeModalActor = nullptr;
@@ -2235,6 +2294,36 @@ void testAuthoritativeCommandProcessing()
             && doorEvent->frame == 3,
         "door event records authoritative state without requiring guest script execution");
     expect(usedDoor.event.has_value() && usedDoor.event->sequence == EventSequence { 2 }, "event sequence advances across players");
+
+    CommandProcessor skillProcessor;
+    GameCommand useSkill;
+    useSkill.sequence.value = 1;
+    useSkill.playerId = kGuestPlayerId;
+    useSkill.actorId = session.playerActorId(kGuestPlayerId);
+    useSkill.expectedPhase = SessionPhase::Exploration;
+    useSkill.expectedPhaseRevision = session.phaseRevision();
+    useSkill.payload = UseSkillCommand { registeredDoor.entityId, ExplorationSkill::Traps };
+    AuthoritativeCommandResult usedSkill = skillProcessor.process(useSkill, session, executor);
+    const SkillUseStartedEvent* skillEvent = usedSkill.event.has_value()
+        ? std::get_if<SkillUseStartedEvent>(&usedSkill.event->payload)
+        : nullptr;
+    expect(usedSkill.result.status == CommandStatus::Accepted
+            && executor.skillCalls == 1
+            && executor.lastActor == asGameObject(guestActor)
+            && executor.lastTarget == asGameObject(door)
+            && executor.lastSkill.skill == ExplorationSkill::Traps
+            && executor.lastActingPlayerId == kGuestPlayerId
+            && skillEvent != nullptr
+            && skillEvent->targetId == registeredDoor.entityId
+            && skillEvent->skill == ExplorationSkill::Traps,
+        "targeted skill executes once under the acting player's build and emits a replica-safe cue");
+    useSkill.sequence.value = 2;
+    std::get<UseSkillCommand>(useSkill.payload).skill = static_cast<ExplorationSkill>(99);
+    AuthoritativeCommandResult invalidSkillUse = skillProcessor.process(useSkill, session, executor);
+    expect(invalidSkillUse.result.rejection == CommandRejection::Malformed
+            && executor.skillCalls == 1
+            && !invalidSkillUse.event.has_value(),
+        "command processor rejects unsupported skills before engine execution");
 
     GameCommand pickup;
     pickup.sequence.value = 2;

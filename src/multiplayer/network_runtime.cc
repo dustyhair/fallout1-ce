@@ -69,6 +69,7 @@ enum class SmokeScenario {
     Pickup,
     Loot,
     PlayerTransfer,
+    Skill,
 };
 SmokeScenario smokeScenario = SmokeScenario::Movement;
 
@@ -85,6 +86,8 @@ const char* smokeScenarioName()
         return "loot";
     case SmokeScenario::PlayerTransfer:
         return "transfer";
+    case SmokeScenario::Skill:
+        return "skill";
     }
     return "unknown";
 }
@@ -965,6 +968,8 @@ void networkRuntimeBackgroundProcess()
                 applied = networkWorldApplyPeerPickupCompletion(*pickup);
             } else if (const auto* loot = std::get_if<LootStartedEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerLoot(*loot);
+            } else if (const auto* skill = std::get_if<SkillUseStartedEvent>(&event->payload)) {
+                applied = networkWorldApplyPeerSkillUse(*skill);
             } else if (const auto* modal = std::get_if<SharedModalStateChangedEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerSharedModal(*modal);
             } else if (const auto* transfer = std::get_if<InventoryTransferredEvent>(&event->payload)) {
@@ -1059,6 +1064,8 @@ bool networkRuntimeConfigure(int argc, char** argv)
             smokeScenario = SmokeScenario::Loot;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=transfer") == 0) {
             smokeScenario = SmokeScenario::PlayerTransfer;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=skill") == 0) {
+            smokeScenario = SmokeScenario::Skill;
         }
     }
     if (smokeTestEnabled && launchOptions.mode == NetworkLaunchMode::Disabled) {
@@ -1176,6 +1183,9 @@ bool networkRuntimeRunSmokeTest()
                     && !networkWorldVerifyPlayerTransferRangeSmokeTest(*scenarioTargetId)) {
                     scenarioTargetId.reset();
                 }
+            } else if (smokeScenario == SmokeScenario::Skill) {
+                scenarioTargetId = networkWorldPrepareSkillSmokeTest();
+                scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
             } else if (scenarioActor != nullptr) {
                 for (int distance = 1; distance <= 4 && scenarioDestinationTile == -1; distance++) {
                     for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
@@ -1224,6 +1234,9 @@ bool networkRuntimeRunSmokeTest()
                 };
                 break;
             }
+            case SmokeScenario::Skill:
+                scenarioCommand.payload = UseSkillCommand { *scenarioTargetId, ExplorationSkill::Traps };
+                break;
             }
             if (!scenarioCommandReady) {
                 break;
@@ -1333,6 +1346,15 @@ bool networkRuntimeRunSmokeTest()
                                     && networkWorldApplyInventoryTransfer(*transfer)
                                     && item_caps_total(networkWorldPlayerActor(kHostPlayerId)) == 3
                                     && item_caps_total(networkWorldPlayerActor(kGuestPlayerId)) == 4;
+                            } else if (event && event.event.sequence == expectedEventSequence
+                                && event.event.causedBy == scenarioCommand.sequence
+                                && smokeScenario == SmokeScenario::Skill) {
+                                const auto* skill = std::get_if<SkillUseStartedEvent>(&event.event.payload);
+                                eventApplied = skill != nullptr
+                                    && skill->actorId == scenarioCommand.actorId
+                                    && skill->targetId == *scenarioTargetId
+                                    && skill->skill == ExplorationSkill::Traps
+                                    && networkWorldApplyPeerSkillUse(*skill);
                             }
                             if (eventApplied) {
                                 receivedEventCount++;
@@ -1420,6 +1442,11 @@ bool networkRuntimeRunSmokeTest()
                                     && transfer->quantity == 3
                                     && transfer->sourceQuantity == 7
                                     && transfer->itemDescriptor.pid == PROTO_ID_MONEY;
+                            } else if (smokeScenario == SmokeScenario::Skill) {
+                                const auto* skill = std::get_if<UseSkillCommand>(&command.command.payload);
+                                payloadMatches = skill != nullptr
+                                    && skill->targetId == *scenarioTargetId
+                                    && skill->skill == ExplorationSkill::Traps;
                             } else {
                                 const auto* movement = std::get_if<MoveCommand>(&command.command.payload);
                                 payloadMatches = movement != nullptr
@@ -1467,6 +1494,8 @@ bool networkRuntimeRunSmokeTest()
                         case SmokeScenario::PlayerTransfer:
                             return item_caps_total(networkWorldPlayerActor(kHostPlayerId)) == 3
                                 && item_caps_total(networkWorldPlayerActor(kGuestPlayerId)) == 4;
+                        case SmokeScenario::Skill:
+                            return anim_busy(scenarioActor) != -1;
                         }
                         return false;
                     };
@@ -2079,6 +2108,30 @@ bool networkRuntimeHandleLocalLoot(Object* target)
     }
     if (!lobby.sendLocalLoot(*targetId, networkWorldPhaseRevision())) {
         debug_printf("Multiplayer loot command could not be sent.\n");
+    }
+    return true;
+}
+
+bool networkRuntimeHandleLocalSkillUse(Object* target, int skill)
+{
+    ExplorationSkill explorationSkill = static_cast<ExplorationSkill>(skill);
+    if (!networkWorldActive()) {
+        return false;
+    }
+    if (target == nullptr || !isValid(explorationSkill)) {
+        return true;
+    }
+    std::optional<EntityId> targetId = networkWorldFindEntity(target);
+    if (!targetId.has_value()) {
+        debug_printf("Multiplayer skill target is missing a shared entity ID.\n");
+        return true;
+    }
+    if (launchOptions.mode == NetworkLaunchMode::Host) {
+        submitHostCommand(UseSkillCommand { *targetId, explorationSkill });
+        return true;
+    }
+    if (!lobby.sendLocalSkillUse(*targetId, explorationSkill, networkWorldPhaseRevision())) {
+        debug_printf("Multiplayer skill command could not be sent.\n");
     }
     return true;
 }

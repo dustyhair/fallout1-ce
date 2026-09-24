@@ -77,6 +77,7 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     const InteractCommand* interact = std::get_if<InteractCommand>(&command.payload);
     const PickupCommand* pickup = std::get_if<PickupCommand>(&command.payload);
     const LootCommand* loot = std::get_if<LootCommand>(&command.payload);
+    const UseSkillCommand* skill = std::get_if<UseSkillCommand>(&command.payload);
     const InventoryTransferCommand* transfer = std::get_if<InventoryTransferCommand>(&command.payload);
     const ItemDropCommand* drop = std::get_if<ItemDropCommand>(&command.payload);
     const AttackCommand* attack = std::get_if<AttackCommand>(&command.payload);
@@ -91,6 +92,12 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
         hasTarget = true;
     } else if (loot != nullptr) {
         targetId = loot->targetId;
+        hasTarget = true;
+    } else if (skill != nullptr) {
+        if (!isValid(skill->skill)) {
+            return rejectAndRemember(CommandRejection::Malformed);
+        }
+        targetId = skill->targetId;
         hasTarget = true;
     } else if (attack != nullptr) {
         targetId = attack->targetId;
@@ -166,6 +173,9 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
         } else if (loot != nullptr) {
             executionStatus = executor.loot(actor, target);
             event.payload = LootStartedEvent { command.actorId, loot->targetId };
+        } else if (skill != nullptr) {
+            executionStatus = executor.useSkill(actor, target, *skill);
+            event.payload = SkillUseStartedEvent { command.actorId, skill->targetId, skill->skill };
         } else if (attack != nullptr) {
             executionStatus = executor.attack(actor, target, *attack);
             event.payload = AttackStartedEvent { command.actorId, attack->targetId, attack->hitMode, attack->hitLocation };

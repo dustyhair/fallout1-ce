@@ -42,6 +42,7 @@ bool networkRuntimeSubmitLocalFacing(int rotation);
 bool networkRuntimeHandleLocalDoorUse(Object* target);
 bool networkRuntimeHandleLocalPickup(Object* target);
 bool networkRuntimeHandleLocalLoot(Object* target);
+bool networkRuntimeHandleLocalSkillUse(Object* target, int skill);
 bool networkRuntimeHandleLocalAttack(Object* target, int hitMode, int hitLocation);
 bool networkRuntimeGiveItemToPlayer(EntityId destinationActorId, EntityId itemId, std::uint32_t quantity);
 bool networkRuntimeRequestSharedModal(SharedModalKind kind, bool open);

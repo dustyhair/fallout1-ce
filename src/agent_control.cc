@@ -170,6 +170,17 @@ void executeCommand(const AgentControlCommand& command)
         }
         return;
     }
+    case AgentControlCommandType::GameSkill: {
+        Object* target = multiplayer::networkWorldFindObject(multiplayer::EntityId { command.entityId });
+        bool submitted = target != nullptr
+            && multiplayer::networkRuntimeHandleLocalSkillUse(target, command.skill);
+        if (submitted) {
+            agentJournalWriteAgentCommand(command.id, commandName, "accepted", "semantic skill use submitted");
+        } else {
+            agentJournalWriteAgentCommand(command.id, commandName, "rejected", "skill or target is unavailable for this action");
+        }
+        return;
+    }
     case AgentControlCommandType::GameGive:
         if (multiplayer::networkRuntimeGiveItemToPlayer(
                 multiplayer::EntityId { command.destinationEntityId },

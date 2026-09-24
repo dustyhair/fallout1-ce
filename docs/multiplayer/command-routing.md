@@ -1,6 +1,6 @@
 # Authoritative command routing
 
-The command processor handles movement, door use, ground-item pickup, looting, loot-window inventory transfers, direct player gifts, and player item drops. The developer session uses the interaction subset in process, while the live network host validates every guest action. Its input and output contain only multiplayer value types and entity IDs.
+The command processor handles movement, door use, ground-item pickup, looting, targeted exploration skills, loot-window inventory transfers, direct player gifts, and player item drops. The developer session uses the interaction subset in process, while the live network host validates every guest action. Its input and output contain only multiplayer value types and entity IDs.
 
 For every command, the processor checks:
 
@@ -23,6 +23,8 @@ Lootable critters and their recursive inventories are registered in the same can
 Inventory drops use the same authority rule. Guest input stays unchanged until the host runs the drop script and publishes the dropped item ID, any split remainder ID, quantity, and final ground tile. Repeated ordinary-stack drops are serialized through successive remainder IDs; caps use one bounded bulk command so Fallout's special amount selection cannot mutate the guest ahead of the host.
 
 The same inventory command supports a deliberately narrow player-gift path before the full trade UI exists. The source must be the acting player's direct inventory, the destination must be the other player actor, both actors must be adjacent on the same elevation, and the item must already have a shared identity and cannot be equipped or active. The receiver cannot use this path to take an item, and player actors cannot be opened as loot targets to bypass that direction rule. Ordinary stacks and caps can be split; the host assigns the remainder identity and publishes the same transfer event used by loot. The `game_give` semantic command exposes this path for co-op testing.
+
+Targeted exploration skills use the same registered target lookup and acting-player context. Only the seven targetable skills are accepted. The host runs the normal asynchronous action, including movement, scripts, rolls, progression, and mutations. The peer skill event is only an ordered presentation boundary; it cannot invoke any of those rule-bearing paths. Actors, critters, ground items, and doors are currently targetable. Other scenery fails closed until canonical registration and concrete snapshot state are added for it.
 
 The [snapshot recovery format](snapshot-recovery.md) records the holder or ground position of every registered item so a recovery snapshot repairs pickup, loot, gift, and drop mutations after their journal events have expired.
 

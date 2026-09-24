@@ -54,6 +54,10 @@ public:
     virtual DoorUseExecution useDoor(Object* actor, Object* target) = 0;
     virtual CommandExecutionStatus pickup(Object* actor, Object* target) = 0;
     virtual CommandExecutionStatus loot(Object* actor, Object* target) = 0;
+    virtual CommandExecutionStatus useSkill(Object*, Object*, const UseSkillCommand&)
+    {
+        return CommandExecutionStatus::InvalidAction;
+    }
     virtual CommandExecutionStatus attack(Object*, Object*, const AttackCommand&)
     {
         return CommandExecutionStatus::InvalidAction;

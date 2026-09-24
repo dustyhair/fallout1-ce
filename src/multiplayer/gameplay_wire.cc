@@ -17,6 +17,7 @@ enum class CommandType : std::uint8_t {
     ItemDrop = 7,
     Attack = 8,
     SharedModal = 9,
+    UseSkill = 10,
 };
 
 enum class EventType : std::uint8_t {
@@ -30,6 +31,7 @@ enum class EventType : std::uint8_t {
     AttackStarted = 8,
     ItemPickupCompleted = 9,
     SharedModalStateChanged = 10,
+    SkillUseStarted = 11,
 };
 
 constexpr std::size_t kCommandHeaderSize = 28;
@@ -41,6 +43,7 @@ constexpr std::size_t kInventoryTransferCommandSize = kCommandHeaderSize + 20 + 
 constexpr std::size_t kItemDropCommandSize = kCommandHeaderSize + 16 + kItemDescriptorSize;
 constexpr std::size_t kAttackCommandSize = kCommandHeaderSize + 12;
 constexpr std::size_t kSharedModalCommandSize = kCommandHeaderSize + 4;
+constexpr std::size_t kSkillCommandSize = kCommandHeaderSize + 8;
 constexpr std::size_t kCommandResultSize = 24;
 constexpr std::size_t kEventHeaderSize = 20;
 constexpr std::size_t kMovementEventHeaderSize = kEventHeaderSize + 20;
@@ -52,6 +55,7 @@ constexpr std::size_t kInventoryTransferEventSize = kEventHeaderSize + 28 + kIte
 constexpr std::size_t kItemDropEventSize = kEventHeaderSize + 32 + kItemDescriptorSize;
 constexpr std::size_t kAttackEventSize = kEventHeaderSize + 16;
 constexpr std::size_t kSharedModalEventSize = kEventHeaderSize + 12;
+constexpr std::size_t kSkillEventSize = kEventHeaderSize + 12;
 constexpr std::int32_t kAttackHitModeCount = 20;
 constexpr std::int32_t kAttackHitLocationCount = 9;
 
@@ -266,6 +270,14 @@ GameplayWireError validateCommand(const GameCommand& command)
             ? GameplayWireError::None
             : GameplayWireError::InvalidModal;
     }
+    if (const auto* skill = std::get_if<UseSkillCommand>(&command.payload)) {
+        if (!isValid(skill->targetId)) {
+            return GameplayWireError::InvalidEntityId;
+        }
+        return isValid(skill->skill)
+            ? GameplayWireError::None
+            : GameplayWireError::InvalidSkill;
+    }
 
     EntityId targetId;
     if (const auto* interact = std::get_if<InteractCommand>(&command.payload)) {
@@ -423,6 +435,14 @@ GameplayWireError validateEvent(const GameEvent& event)
             ? GameplayWireError::None
             : GameplayWireError::InvalidModal;
     }
+    if (const auto* skill = std::get_if<SkillUseStartedEvent>(&event.payload)) {
+        if (!isValid(skill->actorId) || !isValid(skill->targetId)) {
+            return GameplayWireError::InvalidEntityId;
+        }
+        return isValid(skill->skill)
+            ? GameplayWireError::None
+            : GameplayWireError::InvalidSkill;
+    }
 
     EntityId actorId;
     EntityId targetId;
@@ -520,6 +540,10 @@ GameplayWireError encodeGameCommand(const GameCommand& command, ProtocolEnvelope
         envelope.payload.push_back(static_cast<std::uint8_t>(modal->kind));
         envelope.payload.push_back(modal->open ? 1 : 0);
         appendUInt16(envelope.payload, 0);
+    } else if (const auto* skill = std::get_if<UseSkillCommand>(&command.payload)) {
+        appendCommandHeader(command, CommandType::UseSkill, envelope.payload);
+        appendUInt32(envelope.payload, skill->targetId.value);
+        appendInt32(envelope.payload, static_cast<std::int32_t>(skill->skill));
     } else {
         const auto* attack = std::get_if<AttackCommand>(&command.payload);
         appendCommandHeader(command, CommandType::Attack, envelope.payload);
@@ -650,6 +674,16 @@ GameCommandDecodeResult decodeGameCommand(const ProtocolEnvelope& envelope)
         result.command.payload = SharedModalCommand {
             static_cast<SharedModalKind>(envelope.payload[28]),
             envelope.payload[29] != 0,
+        };
+        break;
+    case CommandType::UseSkill:
+        if (envelope.payload.size() != kSkillCommandSize) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.command.payload = UseSkillCommand {
+            EntityId { readUInt32(envelope.payload, 28) },
+            static_cast<ExplorationSkill>(readInt32(envelope.payload, 32)),
         };
         break;
     default:
@@ -788,6 +822,11 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
         envelope.payload.push_back(static_cast<std::uint8_t>(modal->phase));
         envelope.payload.push_back(0);
         appendUInt32(envelope.payload, modal->phaseRevision);
+    } else if (const auto* skill = std::get_if<SkillUseStartedEvent>(&event.payload)) {
+        appendEventHeader(event, EventType::SkillUseStarted, envelope.payload);
+        appendUInt32(envelope.payload, skill->actorId.value);
+        appendUInt32(envelope.payload, skill->targetId.value);
+        appendInt32(envelope.payload, static_cast<std::int32_t>(skill->skill));
     } else {
         const auto* attack = std::get_if<AttackStartedEvent>(&event.payload);
         appendEventHeader(event, EventType::AttackStarted, envelope.payload);
@@ -969,6 +1008,17 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
             readUInt32(envelope.payload, 28),
         };
         break;
+    case EventType::SkillUseStarted:
+        if (envelope.payload.size() != kSkillEventSize) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.event.payload = SkillUseStartedEvent {
+            EntityId { readUInt32(envelope.payload, 20) },
+            EntityId { readUInt32(envelope.payload, 24) },
+            static_cast<ExplorationSkill>(readInt32(envelope.payload, 28)),
+        };
+        break;
     default:
         result.error = GameplayWireError::UnknownPayloadType;
         return result;
@@ -1013,6 +1063,8 @@ const char* gameplayWireErrorMessage(GameplayWireError error)
         return "invalid movement payload";
     case GameplayWireError::InvalidRotation:
         return "invalid actor rotation";
+    case GameplayWireError::InvalidSkill:
+        return "invalid exploration skill";
     case GameplayWireError::InvalidAttack:
         return "invalid attack payload";
     case GameplayWireError::InvalidModal:

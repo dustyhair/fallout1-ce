@@ -5,6 +5,7 @@
 #include <limits>
 #include <sstream>
 
+#include "game/skill_defs.h"
 #include "plib/gnw/kb.h"
 
 namespace fallout {
@@ -123,6 +124,42 @@ bool parseGive(std::istringstream& input, AgentControlCommand& command, std::str
     return true;
 }
 
+bool parseSkill(std::istringstream& input, AgentControlCommand& command, std::string& error)
+{
+    std::string name;
+    std::uint64_t target = 0;
+    if (!(input >> name >> target)
+        || hasTrailingInput(input)
+        || target == 0
+        || target > std::numeric_limits<std::uint32_t>::max()) {
+        error = "expected: game_skill <first_aid|doctor|lockpick|steal|traps|science|repair> <entity id>";
+        return false;
+    }
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    if (name == "first_aid" || name == "firstaid") {
+        command.skill = SKILL_FIRST_AID;
+    } else if (name == "doctor") {
+        command.skill = SKILL_DOCTOR;
+    } else if (name == "lockpick") {
+        command.skill = SKILL_LOCKPICK;
+    } else if (name == "steal") {
+        command.skill = SKILL_STEAL;
+    } else if (name == "traps") {
+        command.skill = SKILL_TRAPS;
+    } else if (name == "science") {
+        command.skill = SKILL_SCIENCE;
+    } else if (name == "repair") {
+        command.skill = SKILL_REPAIR;
+    } else {
+        error = "unknown targeted exploration skill";
+        return false;
+    }
+    command.entityId = static_cast<std::uint32_t>(target);
+    return true;
+}
+
 } // namespace
 
 bool agentControlParseCommand(const std::string& line,
@@ -236,6 +273,10 @@ bool agentControlParseCommand(const std::string& line,
         command.type = AgentControlCommandType::GameLoot;
         return parseEntityId(input, command, error);
     }
+    if (verb == "game_skill") {
+        command.type = AgentControlCommandType::GameSkill;
+        return parseSkill(input, command, error);
+    }
     if (verb == "game_give") {
         command.type = AgentControlCommandType::GameGive;
         return parseGive(input, command, error);
@@ -268,6 +309,8 @@ const char* agentControlCommandTypeName(AgentControlCommandType type)
         return "game_pickup";
     case AgentControlCommandType::GameLoot:
         return "game_loot";
+    case AgentControlCommandType::GameSkill:
+        return "game_skill";
     case AgentControlCommandType::GameGive:
         return "game_give";
     }

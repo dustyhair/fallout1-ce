@@ -101,9 +101,11 @@ bool isSupportedLiveEvent(const GameEventPayload& payload)
         || std::holds_alternative<ItemPickupStartedEvent>(payload)
         || std::holds_alternative<ItemPickupCompletedEvent>(payload)
         || std::holds_alternative<LootStartedEvent>(payload)
+        || std::holds_alternative<SkillUseStartedEvent>(payload)
         || std::holds_alternative<InventoryTransferredEvent>(payload)
         || std::holds_alternative<ItemDroppedEvent>(payload)
-        || std::holds_alternative<AttackStartedEvent>(payload);
+        || std::holds_alternative<AttackStartedEvent>(payload)
+        || std::holds_alternative<SharedModalStateChangedEvent>(payload);
 }
 
 } // namespace
@@ -192,6 +194,16 @@ bool NetworkLobby::sendLocalLoot(EntityId targetId, std::uint32_t phaseRevision)
     return sendLocalAction(
         LootStartedEvent { actorId, targetId },
         LootCommand { targetId },
+        phaseRevision);
+}
+
+bool NetworkLobby::sendLocalSkillUse(EntityId targetId, ExplorationSkill skill, std::uint32_t phaseRevision)
+{
+    PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
+    EntityId actorId { playerId.value };
+    return sendLocalAction(
+        SkillUseStartedEvent { actorId, targetId, skill },
+        UseSkillCommand { targetId, skill },
         phaseRevision);
 }
 
