@@ -41,6 +41,8 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     const SharedModalCommand* modal = std::get_if<SharedModalCommand>(&command.payload);
     SessionPhase requiredPhase = std::holds_alternative<AttackCommand>(command.payload)
         ? SessionPhase::Combat
+        : modal != nullptr && modal->kind == SharedModalKind::WorldMap && !modal->open
+        ? session.phase()
         : modal != nullptr && !modal->open
         ? sharedModalPhase(modal->kind)
         : SessionPhase::Exploration;
@@ -271,7 +273,7 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
             SharedModalExecution modalExecution = executor.setSharedModal(actor, *modal);
             executionStatus = modalExecution.status;
             event.payload = SharedModalStateChangedEvent {
-                command.actorId,
+                isValid(modalExecution.actorId) ? modalExecution.actorId : command.actorId,
                 modal->kind,
                 modal->open,
                 modalExecution.phase,

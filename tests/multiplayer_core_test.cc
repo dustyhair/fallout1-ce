@@ -920,6 +920,11 @@ void testGameplayWireFormat()
     std::get<SharedModalCommand>(invalidModal.payload).kind = static_cast<SharedModalKind>(99);
     expect(encodeGameCommand(invalidModal, modalEnvelope) == GameplayWireError::InvalidModal,
         "shared modal command rejects an unknown kind");
+    GameCommand travelProposal = commands[8];
+    travelProposal.payload = SharedModalCommand { SharedModalKind::WorldMap, true };
+    expect(encodeGameCommand(travelProposal, modalEnvelope) == GameplayWireError::None
+            && std::get<SharedModalCommand>(decodeGameCommand(modalEnvelope).command.payload).kind == SharedModalKind::WorldMap,
+        "world-map consent uses an authenticated semantic command");
 
     ProtocolEnvelope skillEnvelope = gameplayEnvelope(29);
     expect(encodeGameCommand(commands[9], skillEnvelope) == GameplayWireError::None,
@@ -1223,6 +1228,14 @@ void testGameplayWireFormat()
             && modalEvent->phase == SessionPhase::Dialogue
             && modalEvent->phaseRevision == 4,
         "shared modal event round trips the authoritative phase boundary");
+    GameEvent travelProposalEvent {
+        EventSequence { 30 },
+        CommandSequence { 9 },
+        SharedModalStateChangedEvent { EntityId { 20 }, SharedModalKind::WorldMap, true, SessionPhase::Exploration, 3 },
+    };
+    expect(encodeGameEvent(travelProposalEvent, modalEventEnvelope) == GameplayWireError::None
+            && std::get<SharedModalStateChangedEvent>(decodeGameEvent(modalEventEnvelope).event.payload).phase == SessionPhase::Exploration,
+        "world-map proposal event preserves exploration until unanimous consent");
 
     ProtocolEnvelope elevatorEventEnvelope = gameplayEnvelope(48);
     encodeGameEvent(events[12], elevatorEventEnvelope);

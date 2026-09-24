@@ -478,7 +478,10 @@ GameplayWireError validateEvent(const GameEvent& event)
         SessionPhase expectedPhase = modal->open
             ? sharedModalPhase(modal->kind)
             : SessionPhase::Exploration;
-        return modal->phase == expectedPhase
+        return (modal->phase == expectedPhase
+                   || (modal->kind == SharedModalKind::WorldMap
+                       && modal->open
+                       && modal->phase == SessionPhase::Exploration))
             ? GameplayWireError::None
             : GameplayWireError::InvalidModal;
     }

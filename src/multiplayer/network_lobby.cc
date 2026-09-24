@@ -284,7 +284,7 @@ bool NetworkLobby::sendLocalAttack(EntityId targetId, std::int32_t hitMode, std:
         phaseRevision);
 }
 
-bool NetworkLobby::sendLocalSharedModal(SharedModalKind kind, bool open, std::uint32_t phaseRevision)
+bool NetworkLobby::sendLocalSharedModal(SharedModalKind kind, bool open, SessionPhase currentPhase, std::uint32_t phaseRevision)
 {
     PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
     EntityId actorId { playerId.value };
@@ -292,7 +292,8 @@ bool NetworkLobby::sendLocalSharedModal(SharedModalKind kind, bool open, std::ui
     return sendLocalAction(
         SharedModalStateChangedEvent { actorId, kind, open, phase, phaseRevision },
         SharedModalCommand { kind, open },
-        phaseRevision);
+        phaseRevision,
+        kind == SharedModalKind::WorldMap && !open ? currentPhase : SessionPhase::Lobby);
 }
 
 bool NetworkLobby::sendLocalInventoryTransfer(EntityId sourceId,
@@ -343,7 +344,8 @@ bool NetworkLobby::sendLocalFacing(int rotation, std::uint32_t phaseRevision)
 bool NetworkLobby::sendLocalAction(
     GameEventPayload eventPayload,
     GameCommandPayload commandPayload,
-    std::uint32_t phaseRevision)
+    std::uint32_t phaseRevision,
+    SessionPhase phaseOverride)
 {
     bool connected = _state == NetworkLobbyState::Ready && _transport != nullptr;
     bool hostContinuing = _mode == NetworkLaunchMode::Host && _state == NetworkLobbyState::Disconnected;
@@ -361,7 +363,9 @@ bool NetworkLobby::sendLocalAction(
         command.playerId = playerId;
         command.actorId = EntityId { playerId.value };
         const SharedModalCommand* modal = std::get_if<SharedModalCommand>(&commandPayload);
-        command.expectedPhase = std::holds_alternative<AttackCommand>(commandPayload)
+        command.expectedPhase = phaseOverride != SessionPhase::Lobby
+            ? phaseOverride
+            : std::holds_alternative<AttackCommand>(commandPayload)
             ? SessionPhase::Combat
             : modal != nullptr && !modal->open
             ? sharedModalPhase(modal->kind)

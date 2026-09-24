@@ -962,6 +962,9 @@ void networkRuntimeBackgroundProcess()
         pendingLocalRestRequest.reset();
         deferredPeerRestCommand.reset();
         networkWorldClearRestProposal();
+        if (launchOptions.mode == NetworkLaunchMode::Host) {
+            networkWorldCancelPendingWorldMapProposal();
+        }
     }
     if (networkWorldActive()) {
         presentPendingGameChatMessages();
@@ -2980,16 +2983,16 @@ bool networkRuntimeGiveItemToPlayer(EntityId destinationActorId, EntityId itemId
 
 bool networkRuntimeRequestSharedModal(SharedModalKind kind, bool open)
 {
-    if (!networkWorldActive() || !isValid(kind) || kind == SharedModalKind::WorldMap) {
+    if (!networkWorldActive() || !isValid(kind)) {
         return false;
     }
     if ((open && networkWorldPhase() != SessionPhase::Exploration)
-        || (!open && networkWorldPhase() != sharedModalPhase(kind))) {
+        || (!open && kind != SharedModalKind::WorldMap && networkWorldPhase() != sharedModalPhase(kind))) {
         return false;
     }
     return launchOptions.mode == NetworkLaunchMode::Host
         ? submitHostCommand(SharedModalCommand { kind, open })
-        : lobby.sendLocalSharedModal(kind, open, networkWorldPhaseRevision());
+        : lobby.sendLocalSharedModal(kind, open, networkWorldPhase(), networkWorldPhaseRevision());
 }
 
 bool networkRuntimeBlockUnsupportedSharedModal(SharedModalKind kind)

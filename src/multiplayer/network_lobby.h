@@ -72,7 +72,7 @@ public:
     bool sendLocalSceneryTransition(EntityId transitionId, std::uint32_t phaseRevision = 1);
     bool sendLocalRest(std::int32_t minutes, std::uint32_t phaseRevision = 1);
     bool sendLocalAttack(EntityId targetId, std::int32_t hitMode, std::int32_t hitLocation, std::uint32_t phaseRevision = 1);
-    bool sendLocalSharedModal(SharedModalKind kind, bool open, std::uint32_t phaseRevision = 1);
+    bool sendLocalSharedModal(SharedModalKind kind, bool open, SessionPhase currentPhase, std::uint32_t phaseRevision = 1);
     bool sendLocalInventoryTransfer(EntityId sourceId,
         EntityId destinationId,
         EntityId itemId,
@@ -135,7 +135,7 @@ private:
         Chat = 5,
     };
 
-    bool sendLocalAction(GameEventPayload eventPayload, GameCommandPayload commandPayload, std::uint32_t phaseRevision);
+    bool sendLocalAction(GameEventPayload eventPayload, GameCommandPayload commandPayload, std::uint32_t phaseRevision, SessionPhase phaseOverride = SessionPhase::Lobby);
     bool sendAuthoritativeEvent(GameEvent event);
     bool sendRecoveryMessage(std::uint8_t type, const std::vector<std::uint8_t>& body = {});
     bool sendGameplayEnvelope(ProtocolEnvelope envelope);

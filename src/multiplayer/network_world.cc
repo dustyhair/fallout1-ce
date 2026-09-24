@@ -65,6 +65,15 @@ struct ActiveSharedModal {
     SharedModalKind kind = SharedModalKind::Dialogue;
 };
 std::optional<ActiveSharedModal> activeSharedModal;
+struct PendingWorldMapProposal {
+    EntityId proposerActorId;
+    int map = -1;
+    std::uint32_t phaseRevision = 0;
+    CommandSequence proposalSequence;
+    std::chrono::steady_clock::time_point expiresAt;
+    std::unordered_set<PlayerId, PlayerIdHash> readyPlayers;
+};
+std::optional<PendingWorldMapProposal> pendingWorldMapProposal;
 bool inventoryTransferInProgress = false;
 bool itemDropInProgress = false;
 bool itemUseInProgress = false;
@@ -109,6 +118,7 @@ bool allConnectedPlayersNear(int tile, int elevation, int radius)
     return true;
 }
 constexpr auto kRestProposalLifetime = std::chrono::seconds(90);
+constexpr auto kWorldMapProposalLifetime = std::chrono::seconds(90);
 NetworkLaunchMode worldMode = NetworkLaunchMode::Disabled;
 EntityId expectedSplitEntityId;
 EntityId lastSplitEntityId;
@@ -653,6 +663,7 @@ bool loadSharedMap(int map)
     deferredEvents.clear();
     activeLootTargets.clear();
     activeSharedModal.reset();
+    pendingWorldMapProposal.reset();
     peerActor = nullptr;
 
     if (map_load_idx(map) == -1) {
@@ -1329,10 +1340,76 @@ public:
     {
         SharedModalExecution execution;
         std::optional<EntityId> actorId = session.entities().findEntity(actor);
-        // World-map travel needs unanimous consent and a separate proposer
-        // controller. A generic modal-open command would bypass both.
-        if (!actorId.has_value() || !isValid(command.kind)
-            || command.kind == SharedModalKind::WorldMap) {
+        if (!actorId.has_value() || !isValid(command.kind)) {
+            return execution;
+        }
+
+        execution.actorId = *actorId;
+        if (command.kind == SharedModalKind::WorldMap) {
+            PlayerCharacterState* player = session.players().findByActor(*actorId);
+            if (player == nullptr || isInCombat()) {
+                return execution;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (command.open) {
+                if (activeSharedModal.has_value()
+                    || session.phase() != SessionPhase::Exploration) {
+                    return execution;
+                }
+                if (pendingWorldMapProposal.has_value()
+                    && (pendingWorldMapProposal->expiresAt <= now
+                        || pendingWorldMapProposal->map != map_data.field_34
+                        || pendingWorldMapProposal->phaseRevision != session.phaseRevision())) {
+                    pendingWorldMapProposal.reset();
+                }
+                if (!pendingWorldMapProposal.has_value()) {
+                    pendingWorldMapProposal = PendingWorldMapProposal {
+                        *actorId,
+                        map_data.field_34,
+                        session.phaseRevision(),
+                        {},
+                        now + kWorldMapProposalLifetime,
+                        { player->id },
+                    };
+                } else {
+                    if (pendingWorldMapProposal->proposerActorId == *actorId
+                        || !pendingWorldMapProposal->readyPlayers.insert(player->id).second) {
+                        return execution;
+                    }
+                    execution.actorId = pendingWorldMapProposal->proposerActorId;
+                    if (allConnectedPlayersReady(pendingWorldMapProposal->readyPlayers)) {
+                        if (session.transitionTo(SessionPhase::Transition) != LocalSessionError::None) {
+                            return execution;
+                        }
+                        activeSharedModal = ActiveSharedModal {
+                            pendingWorldMapProposal->proposerActorId,
+                            SharedModalKind::WorldMap,
+                        };
+                        pendingWorldMapProposal.reset();
+                    }
+                }
+            } else if (pendingWorldMapProposal.has_value()
+                && session.phase() == SessionPhase::Exploration) {
+                if (pendingWorldMapProposal->expiresAt <= now
+                    || pendingWorldMapProposal->map != map_data.field_34
+                    || pendingWorldMapProposal->phaseRevision != session.phaseRevision()) {
+                    pendingWorldMapProposal.reset();
+                    return execution;
+                }
+                execution.actorId = pendingWorldMapProposal->proposerActorId;
+                pendingWorldMapProposal.reset();
+            } else if (activeSharedModal.has_value()
+                && activeSharedModal->kind == SharedModalKind::WorldMap
+                && activeSharedModal->actorId == *actorId
+                && session.phase() == SessionPhase::Transition
+                && session.transitionTo(SessionPhase::Exploration) == LocalSessionError::None) {
+                activeSharedModal.reset();
+            } else {
+                return execution;
+            }
+            execution.status = CommandExecutionStatus::Applied;
+            execution.phase = session.phase();
+            execution.phaseRevision = session.phaseRevision();
             return execution;
         }
 
@@ -1514,6 +1591,7 @@ bool registerWorldObjects()
     deferredEvents.clear();
     activeLootTargets.clear();
     activeSharedModal.reset();
+    pendingWorldMapProposal.reset();
     std::vector<Object*> doors;
     std::vector<Object*> scenery;
     std::vector<Object*> exitGrids;
@@ -1982,6 +2060,69 @@ bool networkWorldApplyPeerSharedModal(const SharedModalStateChangedEvent& modal)
         || !isValid(modal.kind)
         || session.entities().findObject(modal.actorId) == nullptr
         || modal.phaseRevision == 0) {
+        return false;
+    }
+    if (modal.kind == SharedModalKind::WorldMap) {
+        if (modal.open && modal.phase == SessionPhase::Exploration) {
+            if (pendingWorldMapProposal.has_value()
+                && pendingWorldMapProposal->proposerActorId == modal.actorId
+                && pendingWorldMapProposal->phaseRevision == modal.phaseRevision
+                && session.phase() == SessionPhase::Exploration) {
+                return true;
+            }
+            if (session.phase() != SessionPhase::Exploration
+                || modal.phaseRevision != session.phaseRevision()
+                || pendingWorldMapProposal.has_value()) {
+                return false;
+            }
+            pendingWorldMapProposal = PendingWorldMapProposal {
+                modal.actorId,
+                map_data.field_34,
+                modal.phaseRevision,
+                {},
+                std::chrono::steady_clock::now() + kWorldMapProposalLifetime,
+                {},
+            };
+            return true;
+        }
+        if (modal.open && modal.phase == SessionPhase::Transition) {
+            if (activeSharedModal.has_value()
+                && activeSharedModal->kind == modal.kind
+                && activeSharedModal->actorId == modal.actorId
+                && session.phase() == modal.phase
+                && session.phaseRevision() == modal.phaseRevision) {
+                return true;
+            }
+            if (session.phase() != SessionPhase::Exploration
+                || !pendingWorldMapProposal.has_value()
+                || pendingWorldMapProposal->proposerActorId != modal.actorId
+                || session.applyAuthoritativePhase(modal.phase, modal.phaseRevision) != LocalSessionError::None) {
+                return false;
+            }
+            pendingWorldMapProposal.reset();
+            activeSharedModal = ActiveSharedModal { modal.actorId, modal.kind };
+            return true;
+        }
+        if (!modal.open && modal.phase == SessionPhase::Exploration) {
+            if (pendingWorldMapProposal.has_value()) {
+                if (pendingWorldMapProposal->proposerActorId != modal.actorId
+                    || modal.phaseRevision != session.phaseRevision()) {
+                    return false;
+                }
+                pendingWorldMapProposal.reset();
+                return true;
+            }
+            if (activeSharedModal.has_value()
+                && activeSharedModal->actorId == modal.actorId
+                && activeSharedModal->kind == modal.kind
+                && session.applyAuthoritativePhase(modal.phase, modal.phaseRevision) == LocalSessionError::None) {
+                activeSharedModal.reset();
+                return true;
+            }
+            return !activeSharedModal.has_value()
+                && session.phase() == SessionPhase::Exploration
+                && session.phaseRevision() == modal.phaseRevision;
+        }
         return false;
     }
     SessionPhase expectedPhase = modal.open
@@ -3602,10 +3743,46 @@ bool networkWorldRunSharedModalSmokeTest()
     GameCommand unapprovedTravel = open;
     unapprovedTravel.payload = SharedModalCommand { SharedModalKind::WorldMap, true };
     AuthoritativeCommandResult travelResult = networkWorldProcessCommand(unapprovedTravel);
-    bool travelBlocked = travelResult.result.rejection == CommandRejection::InvalidAction
-        && !travelResult.event.has_value()
+    const auto* proposedTravel = travelResult.event.has_value()
+        ? std::get_if<SharedModalStateChangedEvent>(&travelResult.event->payload)
+        : nullptr;
+    bool travelWaitsForConsent = travelResult.result.status == CommandStatus::Accepted
+        && proposedTravel != nullptr
+        && proposedTravel->actorId == actorId
+        && proposedTravel->phase == SessionPhase::Exploration
+        && proposedTravel->open
         && session.phase() == SessionPhase::Exploration;
+    GameCommand approval = unapprovedTravel;
+    approval.playerId = kHostPlayerId;
+    approval.actorId = session.playerActorId(kHostPlayerId);
+    AuthoritativeCommandResult approvedTravel = networkWorldProcessCommand(approval);
+    const auto* travelReady = approvedTravel.event.has_value()
+        ? std::get_if<SharedModalStateChangedEvent>(&approvedTravel.event->payload)
+        : nullptr;
+    bool proposerRetainsControl = approvedTravel.result.status == CommandStatus::Accepted
+        && travelReady != nullptr
+        && travelReady->actorId == actorId
+        && travelReady->phase == SessionPhase::Transition
+        && networkWorldSharedModalActive();
+    GameCommand unauthorizedClose = approval;
+    unauthorizedClose.sequence = CommandSequence { 2 };
+    unauthorizedClose.expectedPhase = SessionPhase::Transition;
+    unauthorizedClose.expectedPhaseRevision = session.phaseRevision();
+    unauthorizedClose.payload = SharedModalCommand { SharedModalKind::WorldMap, false };
+    AuthoritativeCommandResult unauthorizedResult = networkWorldProcessCommand(unauthorizedClose);
+    bool onlyProposerCanClose = unauthorizedResult.result.rejection == CommandRejection::InvalidAction
+        && !unauthorizedResult.event.has_value();
+    GameCommand cancelTravel = unapprovedTravel;
+    cancelTravel.sequence = CommandSequence { 2 };
+    cancelTravel.expectedPhase = SessionPhase::Transition;
+    cancelTravel.expectedPhaseRevision = session.phaseRevision();
+    cancelTravel.payload = SharedModalCommand { SharedModalKind::WorldMap, false };
+    AuthoritativeCommandResult canceledTravel = networkWorldProcessCommand(cancelTravel);
+    bool proposerCanCancel = canceledTravel.result.status == CommandStatus::Accepted
+        && session.phase() == SessionPhase::Exploration
+        && !networkWorldSharedModalActive();
     commandProcessor.reset();
+    open.expectedPhaseRevision = session.phaseRevision();
     open.payload = SharedModalCommand { SharedModalKind::Dialogue, true };
     AuthoritativeCommandResult opened = networkWorldProcessCommand(open);
     const auto* openedEvent = opened.event.has_value()
@@ -3644,7 +3821,8 @@ bool networkWorldRunSharedModalSmokeTest()
         && !networkWorldSharedModalActive();
 
     commandProcessor.reset();
-    return travelBlocked && openPassed && blockPassed && closePassed;
+    return travelWaitsForConsent && proposerRetainsControl && onlyProposerCanClose
+        && proposerCanCancel && openPassed && blockPassed && closePassed;
 }
 
 bool networkWorldBeginLocalLoot(Object* target)
@@ -4069,6 +4247,14 @@ AuthoritativeCommandResult networkWorldProcessCommand(const GameCommand& command
     }
 
     AuthoritativeCommandResult result = commandProcessor.process(command, session, commandExecutor);
+    if (result.result.status == CommandStatus::Accepted
+        && !result.replayed
+        && std::holds_alternative<SharedModalCommand>(command.payload)
+        && std::get<SharedModalCommand>(command.payload).kind == SharedModalKind::WorldMap
+        && pendingWorldMapProposal.has_value()
+        && pendingWorldMapProposal->proposalSequence.value == 0) {
+        pendingWorldMapProposal->proposalSequence = command.sequence;
+    }
     if (result.event.has_value()) {
         if (auto* movement = std::get_if<ActorMovementStartedEvent>(&result.event->payload)) {
             movement->startingTile = startingTile;
@@ -4094,10 +4280,40 @@ std::optional<GameEvent> networkWorldTakeDeferredEvent()
     return event;
 }
 
+void networkWorldCancelPendingWorldMapProposal()
+{
+    if (!pendingWorldMapProposal.has_value()) {
+        return;
+    }
+    if (worldMode == NetworkLaunchMode::Host
+        && session.phase() == SessionPhase::Exploration
+        && pendingWorldMapProposal->proposalSequence.value != 0) {
+        deferredEvents.push_back(GameEvent {
+            {},
+            pendingWorldMapProposal->proposalSequence,
+            SharedModalStateChangedEvent {
+                pendingWorldMapProposal->proposerActorId,
+                SharedModalKind::WorldMap,
+                false,
+                SessionPhase::Exploration,
+                session.phaseRevision(),
+            },
+        });
+    }
+    pendingWorldMapProposal.reset();
+}
+
 bool networkWorldSynchronizeEnginePhase()
 {
     if (!session.isActive()) {
         return false;
+    }
+    if (pendingWorldMapProposal.has_value()
+        && (pendingWorldMapProposal->expiresAt <= std::chrono::steady_clock::now()
+            || pendingWorldMapProposal->map != map_data.field_34
+            || pendingWorldMapProposal->phaseRevision != session.phaseRevision()
+            || isInCombat())) {
+        networkWorldCancelPendingWorldMapProposal();
     }
     if (activeSharedModal.has_value()) {
         return session.phase() == sharedModalPhase(activeSharedModal->kind);
@@ -4611,6 +4827,12 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
         && sharedModalPhase(activeSharedModal->kind) != snapshot.phase) {
         activeSharedModal.reset();
     }
+    if (pendingWorldMapProposal.has_value()
+        && (snapshot.phase != SessionPhase::Exploration
+            || pendingWorldMapProposal->phaseRevision != snapshot.phaseRevision
+            || pendingWorldMapProposal->map != map_data.field_34)) {
+        pendingWorldMapProposal.reset();
+    }
     intface_redraw();
     return true;
 }
@@ -4661,6 +4883,7 @@ void networkWorldLeave()
     deferredEvents.clear();
     activeLootTargets.clear();
     activeSharedModal.reset();
+    pendingWorldMapProposal.reset();
     itemDropInProgress = false;
     itemUseInProgress = false;
     scriptedSceneryTransitionInProgress = false;

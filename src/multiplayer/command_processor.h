@@ -43,6 +43,7 @@ struct SharedModalExecution {
     CommandExecutionStatus status = CommandExecutionStatus::InvalidAction;
     SessionPhase phase = SessionPhase::Exploration;
     std::uint32_t phaseRevision = 0;
+    EntityId actorId;
 };
 
 struct ElevatorExecution {
