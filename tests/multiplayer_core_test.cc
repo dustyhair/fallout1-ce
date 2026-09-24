@@ -996,6 +996,20 @@ void testGameplayWireFormat()
     std::get<RestCommand>(invalidRest.payload).minutes = 17;
     expect(encodeGameCommand(invalidRest, restEnvelope) == GameplayWireError::InvalidMove,
         "rest command rejects unsupported durations");
+    for (std::int32_t choice : { kRestUntilMorning, kRestUntilNoon,
+             kRestUntilEvening, kRestUntilMidnight, kRestUntilHealed }) {
+        std::get<RestCommand>(invalidRest.payload).minutes = choice;
+        expect(encodeGameCommand(invalidRest, restEnvelope) == GameplayWireError::None
+                && decodeGameCommand(restEnvelope)
+                && std::get<RestCommand>(decodeGameCommand(restEnvelope).command.payload).minutes == choice,
+            "until-rest choice round trips without resolving it on the client");
+    }
+    expect(restMinutesUntilHour(kRestUntilMorning, 600) == 1440
+            && restMinutesUntilHour(kRestUntilMorning, 601) == 1439
+            && restMinutesUntilHour(kRestUntilMidnight, 2359) == 1
+            && restMinutesUntilHour(kRestUntilNoon, 1130) == 30
+            && restMinutesUntilHour(kRestUntilHealed, 1200) == 0,
+        "until-time choices handle exact hour, rollover, and invalid targets");
 
     CommandResult accepted;
     accepted.commandSequence.value = 1;
@@ -1274,6 +1288,17 @@ void testGameplayWireFormat()
             && completedRest->gameTime == 231456
             && completedRest->phaseRevision == 11,
         "completed rest event round trips final world time and phase");
+    GameEvent interruptedRest = events[16];
+    auto& interruptedPayload = std::get<RestStateChangedEvent>(interruptedRest.payload);
+    interruptedPayload.minutes = kRestUntilHealed;
+    interruptedPayload.interrupted = true;
+    expect(encodeGameEvent(interruptedRest, restEventEnvelope) == GameplayWireError::None
+            && decodeGameEvent(restEventEnvelope)
+            && std::get<RestStateChangedEvent>(decodeGameEvent(restEventEnvelope).event.payload).interrupted,
+        "interrupted until-healed completion round trips its stop reason");
+    interruptedPayload.completed = false;
+    expect(encodeGameEvent(interruptedRest, restEventEnvelope) == GameplayWireError::InvalidMove,
+        "rest proposal cannot claim an interruption before rest begins");
 
     ProtocolEnvelope skillEventEnvelope = gameplayEnvelope(48);
     encodeGameEvent(events[10], skillEventEnvelope);

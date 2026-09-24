@@ -208,15 +208,50 @@ struct SceneryTransitionCommand {
     EntityId transitionId;
 };
 
-// Zero withdraws consent. The first slice supports Pip-Boy's fixed durations.
+// Positive values are fixed minutes; zero withdraws consent. Negative values
+// preserve the Pip-Boy choice until the host resolves it at unanimous consent.
+constexpr std::int32_t kRestUntilMorning = -1;
+constexpr std::int32_t kRestUntilNoon = -2;
+constexpr std::int32_t kRestUntilEvening = -3;
+constexpr std::int32_t kRestUntilMidnight = -4;
+constexpr std::int32_t kRestUntilHealed = -5;
 struct RestCommand {
     std::int32_t minutes = 0;
 };
 
 constexpr bool isValidRestMinutes(std::int32_t minutes)
 {
-    return minutes == 0 || minutes == 10 || minutes == 30
+    return (minutes >= kRestUntilHealed && minutes <= 0)
+        || minutes == 10 || minutes == 30
         || (minutes >= 60 && minutes <= 360 && minutes % 60 == 0);
+}
+
+// Returns 1..1440 minutes. Selecting the current hour means the next day.
+constexpr int restMinutesUntilHour(std::int32_t choice, int gameHour)
+{
+    int target = choice == kRestUntilMorning ? 6
+        : choice == kRestUntilNoon ? 12
+        : choice == kRestUntilEvening ? 18
+        : choice == kRestUntilMidnight ? 0
+        : -1;
+    int currentHour = gameHour / 100;
+    int currentMinute = gameHour % 100;
+    if (target < 0 || currentHour < 0 || currentHour >= 24
+        || currentMinute < 0 || currentMinute >= 60) {
+        return 0;
+    }
+    int minutes = (target * 60 - currentHour * 60 - currentMinute + 1440) % 1440;
+    return minutes == 0 ? 1440 : minutes;
+}
+
+constexpr const char* restChoiceName(std::int32_t choice)
+{
+    return choice == kRestUntilMorning ? "until_morning"
+        : choice == kRestUntilNoon ? "until_noon"
+        : choice == kRestUntilEvening ? "until_evening"
+        : choice == kRestUntilMidnight ? "until_midnight"
+        : choice == kRestUntilHealed ? "until_healed"
+        : "fixed";
 }
 
 struct ItemDescriptor {
@@ -394,6 +429,7 @@ struct RestStateChangedEvent {
     bool completed = false;
     std::int32_t gameTime = 0;
     std::uint32_t phaseRevision = 0;
+    bool interrupted = false;
 };
 
 struct InventoryTransferredEvent {

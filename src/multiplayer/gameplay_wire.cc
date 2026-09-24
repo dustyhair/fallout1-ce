@@ -71,7 +71,7 @@ constexpr std::size_t kSkillEventSize = kEventHeaderSize + 12;
 constexpr std::size_t kItemUseEventSize = kEventHeaderSize + 12;
 constexpr std::size_t kElevatorEventSize = kEventHeaderSize + 40;
 constexpr std::size_t kExitGridEventBaseSize = kEventHeaderSize + 20;
-constexpr std::size_t kRestEventSize = kEventHeaderSize + 20;
+constexpr std::size_t kRestEventSize = kEventHeaderSize + 24;
 constexpr std::size_t kTransitionPlacementSize = 20;
 constexpr std::int32_t kAttackHitModeCount = 20;
 constexpr std::int32_t kAttackHitLocationCount = 9;
@@ -590,6 +590,7 @@ GameplayWireError validateEvent(const GameEvent& event)
         return isValid(rest->actorId)
                 && isValidRestMinutes(rest->minutes)
                 && (!rest->completed || rest->minutes != 0)
+                && (!rest->interrupted || rest->completed)
                 && rest->gameTime > 0
                 && rest->phaseRevision > 0
             ? GameplayWireError::None
@@ -1093,6 +1094,7 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
         appendUInt32(envelope.payload, rest->completed ? 1 : 0);
         appendInt32(envelope.payload, rest->gameTime);
         appendUInt32(envelope.payload, rest->phaseRevision);
+        appendUInt32(envelope.payload, rest->interrupted ? 1 : 0);
     } else {
         const auto* attack = std::get_if<AttackStartedEvent>(&event.payload);
         appendEventHeader(event, EventType::AttackStarted, envelope.payload);
@@ -1382,7 +1384,8 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
     }
     case EventType::RestStateChanged:
         if (envelope.payload.size() != kRestEventSize
-            || readUInt32(envelope.payload, 28) > 1) {
+            || readUInt32(envelope.payload, 28) > 1
+            || readUInt32(envelope.payload, 40) > 1) {
             result.error = GameplayWireError::InvalidLength;
             return result;
         }
@@ -1392,6 +1395,7 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
             readUInt32(envelope.payload, 28) != 0,
             readInt32(envelope.payload, 32),
             readUInt32(envelope.payload, 36),
+            readUInt32(envelope.payload, 40) != 0,
         };
         break;
     default:

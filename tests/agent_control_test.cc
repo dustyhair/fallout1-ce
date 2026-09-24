@@ -109,6 +109,12 @@ int main()
             && command.restMinutes == 0,
         "parses rest consent withdrawal")
         && passed;
+    passed = expect(parse("56 game_rest until_morning", command)
+            && command.restMinutes == -1,
+        "parses next-morning rest choice") && passed;
+    passed = expect(parse("56 game_rest until_healed", command)
+            && command.restMinutes == -5,
+        "parses until-healed rest choice") && passed;
     passed = expect(!parse("0 click 10 10", command), "rejects command id zero") && passed;
     passed = expect(!parse("52 click -1 10", command), "rejects negative coordinates") && passed;
     passed = expect(!parse("53 key definitely-not-a-key", command), "rejects an unknown key") && passed;

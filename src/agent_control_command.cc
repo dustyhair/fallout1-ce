@@ -6,6 +6,7 @@
 #include <sstream>
 
 #include "game/skill_defs.h"
+#include "multiplayer/types.h"
 #include "plib/gnw/kb.h"
 
 namespace fallout {
@@ -331,11 +332,21 @@ bool agentControlParseCommand(const std::string& line,
         command.type = AgentControlCommandType::GameRest;
         std::string duration;
         if (!(input >> duration) || hasTrailingInput(input)) {
-            error = "expected: game_rest <10|30|60|120|180|240|300|360|cancel>";
+            error = "expected: game_rest <minutes|until_morning|until_noon|until_evening|until_midnight|until_healed|cancel>";
             return false;
         }
         if (duration == "cancel") {
             command.restMinutes = 0;
+            return true;
+        }
+        if (duration == "until_morning" || duration == "until_noon"
+            || duration == "until_evening" || duration == "until_midnight"
+            || duration == "until_healed") {
+            command.restMinutes = duration == "until_morning" ? multiplayer::kRestUntilMorning
+                : duration == "until_noon" ? multiplayer::kRestUntilNoon
+                : duration == "until_evening" ? multiplayer::kRestUntilEvening
+                : duration == "until_midnight" ? multiplayer::kRestUntilMidnight
+                : multiplayer::kRestUntilHealed;
             return true;
         }
         std::istringstream value(duration);
@@ -343,7 +354,7 @@ bool agentControlParseCommand(const std::string& line,
             || !(command.restMinutes == 10 || command.restMinutes == 30
                 || (command.restMinutes >= 60 && command.restMinutes <= 360
                     && command.restMinutes % 60 == 0))) {
-            error = "game_rest requires a supported fixed duration in minutes or cancel";
+            error = "game_rest requires a supported duration, until-choice, or cancel";
             return false;
         }
         return true;

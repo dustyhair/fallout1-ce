@@ -15,6 +15,7 @@
 #include "game/anim.h"
 #include "game/combat.h"
 #include "game/critter.h"
+#include "game/display.h"
 #include "game/engine_execution_probe.h"
 #include "game/elevator.h"
 #include "game/game.h"
@@ -656,20 +657,49 @@ bool loadSharedMap(int map)
 
 // Advance through each due queue boundary on the host only. The replica gets
 // the resulting world clock and all rule effects from the authoritative state.
-void advanceSharedRest(int minutes)
+bool sharedPlayersHealed()
+{
+    for (PlayerId playerId : session.players().playerIds()) {
+        Object* player = session.entities().findObject(session.playerActorId(playerId));
+        if (player == nullptr || critter_get_hits(player) < stat_level(player, STAT_MAXIMUM_HIT_POINTS)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// True means rest stopped before its requested goal, including an interrupting
+// queue event or a safety bound. The final clock and all effects still publish.
+bool advanceSharedRest(int minutes, bool untilHealed)
 {
     constexpr int kTicksPerMinute = GAME_TIME_TICKS_PER_HOUR / 60;
     int endTime = game_time() + minutes * kTicksPerMinute;
     int nextHealingTime = game_time() + 3 * GAME_TIME_TICKS_PER_HOUR;
-    constexpr int kMaximumRestQueueBoundaries = 65536;
+    // Installed maps can schedule a one-second repeating event. A full day
+    // therefore needs more than 86,400 boundaries even without other events.
+    constexpr int kMaximumRestQueueBoundaries = 3000000;
     int boundaries = 0;
-    while (game_time() < endTime && boundaries++ < kMaximumRestQueueBoundaries) {
+    int stagnantBoundaries = 0;
+    bool interrupted = false;
+    while (game_time() < endTime
+        && (!untilHealed || !sharedPlayersHealed())
+        && boundaries++ < kMaximumRestQueueBoundaries) {
         int nextTime = endTime;
         int nextEventTime = queue_next_time();
         if (nextEventTime > 0 && nextEventTime < nextTime) {
             nextTime = std::max(game_time(), nextEventTime);
         }
         nextTime = std::min(nextTime, nextHealingTime);
+        stagnantBoundaries = nextTime == game_time() ? stagnantBoundaries + 1 : 0;
+        if (stagnantBoundaries > 128) {
+            std::vector<QueueEventState> events;
+            queue_capture_state(events);
+            std::fprintf(stderr,
+                "Multiplayer rest interrupted by a non-advancing queue at time=%d next=%d type=%d.\n",
+                game_time(), nextEventTime, events.empty() ? -1 : events.front().eventType);
+            interrupted = true;
+            break;
+        }
         set_game_time(nextTime);
         if (nextEventTime > 0 && nextEventTime <= game_time()) {
             int queueResult = queue_process();
@@ -677,6 +707,7 @@ void advanceSharedRest(int minutes)
                 std::fprintf(stderr,
                     "Multiplayer rest interrupted by queue at time=%d result=%d quit=%d.\n",
                     game_time(), queueResult, game_user_wants_to_quit);
+                interrupted = true;
                 break;
             }
         }
@@ -693,7 +724,9 @@ void advanceSharedRest(int minutes)
     }
     if (boundaries >= kMaximumRestQueueBoundaries) {
         std::fprintf(stderr, "Multiplayer rest stopped at the queue boundary limit, time=%d.\n", game_time());
+        interrupted = true;
     }
+    return interrupted || (untilHealed && !sharedPlayersHealed());
 }
 
 class NetworkCommandExecutor : public CommandExecutor {
@@ -1199,14 +1232,21 @@ public:
                 pendingRestProposal.reset();
             }
         } else {
-            if (game_time() <= 0
+            int requestedMinutes = command.minutes > 0 ? command.minutes
+                : command.minutes == kRestUntilHealed ? 30 * 24 * 60
+                : restMinutesUntilHour(command.minutes, game_time_hour());
+            if (requestedMinutes <= 0
+                || game_time() <= 0
                 || game_time() > std::numeric_limits<int>::max()
-                        - command.minutes * (GAME_TIME_TICKS_PER_HOUR / 60)) {
+                        - requestedMinutes * (GAME_TIME_TICKS_PER_HOUR / 60)) {
                 return execution;
             }
             for (PlayerId participantId : session.players().playerIds()) {
                 Object* participant = session.entities().findObject(session.playerActorId(participantId));
-                if (participant == nullptr || !critter_can_actor_rest(participant)) {
+                if (participant == nullptr || !critter_can_actor_rest(participant)
+                    || (command.minutes == kRestUntilHealed
+                        && critter_get_hits(participant) < stat_level(participant, STAT_MAXIMUM_HIT_POINTS)
+                        && stat_level(participant, STAT_HEALING_RATE) <= 0)) {
                     return execution;
                 }
             }
@@ -1228,7 +1268,13 @@ public:
                     return execution;
                 }
                 pendingRestProposal.reset();
-                advanceSharedRest(command.minutes);
+                // This duration was resolved from the current host clock for
+                // this approval, not stored with the older proposal.
+                execution.interrupted = advanceSharedRest(requestedMinutes,
+                    command.minutes == kRestUntilHealed);
+                if (execution.interrupted) {
+                    display_print("Shared rest was interrupted.");
+                }
                 if (session.transitionTo(SessionPhase::Exploration) != LocalSessionError::None) {
                     return execution;
                 }
@@ -2183,6 +2229,9 @@ bool networkWorldApplyPeerRest(const RestStateChangedEvent& rest)
         }
         pendingRestProposal.reset();
         set_game_time(rest.gameTime);
+        if (rest.interrupted) {
+            display_print("Shared rest was interrupted.");
+        }
         return session.applyAuthoritativePhase(SessionPhase::Exploration, rest.phaseRevision) == LocalSessionError::None;
     }
     if (rest.phaseRevision != session.phaseRevision()

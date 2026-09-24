@@ -262,6 +262,7 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
                 restExecution.completed,
                 restExecution.gameTime,
                 restExecution.phaseRevision,
+                restExecution.interrupted,
             };
         } else if (attack != nullptr) {
             executionStatus = executor.attack(actor, target, *attack);

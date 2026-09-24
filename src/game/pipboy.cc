@@ -1857,6 +1857,11 @@ static void PipAlarm(int a1)
                 : option == PIPBOY_REST_DURATION_THIRTY_MINUTES      ? 30
                 : option >= PIPBOY_REST_DURATION_ONE_HOUR
                     && option <= PIPBOY_REST_DURATION_SIX_HOURS      ? (option - 1) * 60
+                : option == PIPBOY_REST_DURATION_UNTIL_MORNING ? multiplayer::kRestUntilMorning
+                : option == PIPBOY_REST_DURATION_UNTIL_NOON ? multiplayer::kRestUntilNoon
+                : option == PIPBOY_REST_DURATION_UNTIL_EVENING ? multiplayer::kRestUntilEvening
+                : option == PIPBOY_REST_DURATION_UNTIL_MIDNIGHT ? multiplayer::kRestUntilMidnight
+                : option == PIPBOY_REST_DURATION_UNTIL_HEALED ? multiplayer::kRestUntilHealed
                                                                    : 0;
             int requestMinutes = minutes != 0
                     && minutes == multiplayer::networkRuntimePendingRestMinutes()
@@ -1947,7 +1952,7 @@ static void DrawAlarmText(int a1)
     pip_print(text, PIPBOY_TEXT_ALIGNMENT_CENTER | PIPBOY_TEXT_STYLE_UNDERLINE, colorTable[992]);
 
     int proposedMinutes = multiplayer::networkRuntimePendingRestMinutes();
-    if (proposedMinutes > 0) {
+    if (proposedMinutes != 0) {
         std::string proposer = multiplayer::networkRuntimePendingRestProposerName();
         char proposalText[96];
         if (multiplayer::networkRuntimeLocalRestProposal()) {
@@ -1960,7 +1965,7 @@ static void DrawAlarmText(int a1)
     }
     if (multiplayer::networkRuntimeSharedRestEnabled()) {
         cursor_line = 3;
-        pip_print("Co-op: fixed-duration rest only", 0, colorTable[992]);
+        pip_print("Co-op: both players must choose the same rest option", 0, colorTable[992]);
     }
 
     if (bottom_line >= 5) {
@@ -1979,6 +1984,11 @@ static void DrawAlarmText(int a1)
         int optionMinutes = option == 1 ? 10
             : option == 2             ? 30
             : option >= 3 && option <= 8 ? (option - 2) * 60
+            : option == 9 ? multiplayer::kRestUntilMorning
+            : option == 10 ? multiplayer::kRestUntilNoon
+            : option == 11 ? multiplayer::kRestUntilEvening
+            : option == 12 ? multiplayer::kRestUntilMidnight
+            : option == 13 ? multiplayer::kRestUntilHealed
                                         : 0;
         int color = option == a1 || (optionMinutes != 0 && optionMinutes == proposedMinutes)
             ? colorTable[32747]

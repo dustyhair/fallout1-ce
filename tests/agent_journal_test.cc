@@ -80,6 +80,7 @@ int main(int argc, char** argv)
     state.pendingRestProposerName = "Max";
     fallout::agentJournalWriteWorldState(state);
     state.guest.rotation = 2;
+    state.pendingRestMinutes = -5;
     fallout::agentJournalWriteWorldState(state);
     fallout::agentJournalWriteWorldExit();
     fallout::agentJournalClose();
@@ -119,10 +120,14 @@ int main(int argc, char** argv)
         && passed;
     passed = expect(lines.size() > 5
             && lines[5].find("\"pending_rest\":{\"minutes\":30") != std::string::npos
+            && lines[5].find("\"choice\":\"fixed\"") != std::string::npos
             && lines[5].find("\"proposer_player_id\":2") != std::string::npos
             && lines[5].find("\"proposer_name\":\"Max\"") != std::string::npos,
         "journal attributes a pending rest proposal to its player")
         && passed;
+    passed = expect(lines.size() > 6
+            && lines[6].find("\"minutes\":-5,\"choice\":\"until_healed\"") != std::string::npos,
+        "journal names an until-healed proposal") && passed;
     passed = expect(lines.size() > 8 && lines[8].find("\"event\":\"session_end\"") != std::string::npos,
         "journal closes with a session boundary")
         && passed;

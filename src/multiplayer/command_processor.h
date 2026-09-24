@@ -71,6 +71,7 @@ struct RestExecution {
     bool completed = false;
     std::int32_t gameTime = 0;
     std::uint32_t phaseRevision = 0;
+    bool interrupted = false;
 };
 
 class CommandExecutor {

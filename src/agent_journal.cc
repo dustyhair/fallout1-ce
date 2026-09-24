@@ -8,6 +8,8 @@
 #include <sstream>
 #include <utility>
 
+#include "multiplayer/types.h"
+
 namespace fallout {
 namespace {
 
@@ -282,8 +284,9 @@ void agentJournalWriteWorldState(const AgentJournalWorldState& state)
            << ",\"connected\":" << booleanValue(state.connected)
            << ",\"combat\":" << booleanValue(state.combat)
            << ",\"pending_rest\":";
-    if (state.pendingRestMinutes > 0) {
+    if (state.pendingRestMinutes != 0) {
         fields << "{\"minutes\":" << state.pendingRestMinutes
+               << ",\"choice\":" << jsonString(multiplayer::restChoiceName(state.pendingRestMinutes))
                << ",\"proposer_player_id\":" << state.pendingRestProposerId
                << ",\"proposer_name\":" << jsonString(state.pendingRestProposerName.c_str())
                << '}';

@@ -29,11 +29,13 @@
 #include "game/map.h"
 #include "game/object.h"
 #include "game/pipboy.h"
+#include "game/perk_defs.h"
 #include "game/protinst.h"
 #include "game/proto.h"
 #include "game/proto_types.h"
 #include "game/queue.h"
 #include "game/scripts.h"
+#include "game/stat.h"
 #include "game/textobj.h"
 #include "game/tile.h"
 #include "multiplayer/character_build_bridge.h"
@@ -88,6 +90,7 @@ enum class SmokeScenario {
 };
 SmokeScenario smokeScenario = SmokeScenario::Movement;
 int smokeRestMinutes = 10;
+bool smokeRestInterrupt = false;
 
 const char* smokeScenarioName()
 {
@@ -1165,6 +1168,7 @@ bool networkRuntimeConfigure(int argc, char** argv)
     smokeTestEnabled = false;
     smokeScenario = SmokeScenario::Movement;
     smokeRestMinutes = 10;
+    smokeRestInterrupt = false;
     for (int index = 1; index < argc; index++) {
         if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-test") == 0) {
             smokeTestEnabled = true;
@@ -1198,6 +1202,8 @@ bool networkRuntimeConfigure(int argc, char** argv)
             smokeScenario = SmokeScenario::TypedStairsCrossMap;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=rest") == 0) {
             smokeScenario = SmokeScenario::Rest;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-rest-interrupt") == 0) {
+            smokeRestInterrupt = true;
         } else if (argv[index] != nullptr
             && std::strncmp(argv[index], "--multiplayer-smoke-rest-minutes=", 33) == 0) {
             char* end = nullptr;
@@ -1210,10 +1216,28 @@ bool networkRuntimeConfigure(int argc, char** argv)
                 return false;
             }
             smokeRestMinutes = static_cast<int>(minutes);
+        } else if (argv[index] != nullptr
+            && std::strncmp(argv[index], "--multiplayer-smoke-rest-choice=", 32) == 0) {
+            const char* choice = argv[index] + 32;
+            smokeRestMinutes = std::strcmp(choice, "until_morning") == 0 ? kRestUntilMorning
+                : std::strcmp(choice, "until_noon") == 0 ? kRestUntilNoon
+                : std::strcmp(choice, "until_evening") == 0 ? kRestUntilEvening
+                : std::strcmp(choice, "until_midnight") == 0 ? kRestUntilMidnight
+                : std::strcmp(choice, "until_healed") == 0 ? kRestUntilHealed
+                : 0;
+            if (smokeRestMinutes == 0) {
+                std::fprintf(stderr, "Invalid --multiplayer-smoke-rest-choice value.\n");
+                return false;
+            }
         }
     }
     if (smokeTestEnabled && launchOptions.mode == NetworkLaunchMode::Disabled) {
         std::fprintf(stderr, "--multiplayer-smoke-test requires --multiplayer-host or --multiplayer-join.\n");
+        return false;
+    }
+    if (smokeRestInterrupt && (smokeScenario != SmokeScenario::Rest
+            || smokeRestMinutes != kRestUntilMorning)) {
+        std::fprintf(stderr, "The rest interruption fixture requires rest until_morning.\n");
         return false;
     }
     pendingLocalSheet.reset();
@@ -1277,7 +1301,8 @@ bool networkRuntimeRunSmokeTest()
     sheet.taggedSkills = { SKILL_SMALL_GUNS, SKILL_FIRST_AID, SKILL_SPEECH };
 
     bool submitted = false;
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(25);
+    auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::seconds(smokeRestInterrupt ? 60 : 25);
     while (std::chrono::steady_clock::now() < deadline) {
         networkRuntimeBackgroundProcess();
         if (lobbyStarted && !submitted && lobby.state() == NetworkLobbyState::Waiting) {
@@ -1337,10 +1362,38 @@ bool networkRuntimeRunSmokeTest()
             std::optional<ExitGridSmokeFixture> exitGridFixture;
             std::optional<SceneryTransitionSmokeFixture> sceneryTransitionFixture;
             int restStartingGameTime = game_time();
+            if (smokeScenario == SmokeScenario::Rest && smokeRestInterrupt
+                && launchOptions.mode == NetworkLaunchMode::Host) {
+                // Fallout's withdrawal handler returns nonzero for the story
+                // actor. Ending a nonexistent addiction is otherwise inert.
+                auto* withdrawal = static_cast<WithdrawalEvent*>(mem_malloc(sizeof(WithdrawalEvent)));
+                if (withdrawal == nullptr) {
+                    setStatus("MULTIPLAYER SMOKE TEST FAILED: REST INTERRUPT FIXTURE");
+                    break;
+                }
+                *withdrawal = WithdrawalEvent { 0, 0, PERK_BUFFOUT_ADDICTION };
+                if (queue_add(600, networkWorldPlayerActor(kHostPlayerId), withdrawal,
+                        EVENT_TYPE_WITHDRAWAL) == -1) {
+                    mem_free(withdrawal);
+                    setStatus("MULTIPLAYER SMOKE TEST FAILED: REST INTERRUPT QUEUE");
+                    break;
+                }
+            }
+            int restExpectedMinutes = smokeRestMinutes > 0 ? smokeRestMinutes
+                : smokeRestMinutes == kRestUntilHealed ? 180
+                : restMinutesUntilHour(smokeRestMinutes, game_time_hour());
             int restCompletionGameTime = 0;
+            bool restCompletionInterrupted = false;
+            auto restTimeReached = [&](int finalTime) {
+                return smokeRestInterrupt
+                    ? finalTime > restStartingGameTime
+                        && finalTime < restStartingGameTime + restExpectedMinutes * 600
+                    : finalTime >= restStartingGameTime + restExpectedMinutes * 600;
+            };
             int restHostInitialHits = 0;
             int restGuestInitialHits = 0;
-            if (smokeScenario == SmokeScenario::Rest && smokeRestMinutes >= 180) {
+            if (smokeScenario == SmokeScenario::Rest
+                && (restExpectedMinutes >= 180 || smokeRestMinutes == kRestUntilHealed)) {
                 Object* restHost = networkWorldPlayerActor(kHostPlayerId);
                 Object* restGuest = networkWorldPlayerActor(kGuestPlayerId);
                 if (restHost == nullptr || restGuest == nullptr
@@ -1355,15 +1408,23 @@ bool networkRuntimeRunSmokeTest()
                 restGuestInitialHits = critter_get_hits(restGuest);
             }
             auto restHealed = [&]() {
-                if (smokeRestMinutes < 180) {
+                if (restExpectedMinutes < 180 && smokeRestMinutes != kRestUntilHealed) {
                     return true;
                 }
                 Object* restHost = networkWorldPlayerActor(kHostPlayerId);
                 Object* restGuest = networkWorldPlayerActor(kGuestPlayerId);
+                if (smokeRestInterrupt) {
+                    return restHost != nullptr && restGuest != nullptr
+                        && critter_get_hits(restHost) == restHostInitialHits
+                        && critter_get_hits(restGuest) == restGuestInitialHits;
+                }
                 return restHost != nullptr
                     && restGuest != nullptr
                     && critter_get_hits(restHost) > restHostInitialHits
-                    && critter_get_hits(restGuest) > restGuestInitialHits;
+                    && critter_get_hits(restGuest) > restGuestInitialHits
+                    && (smokeRestMinutes != kRestUntilHealed
+                        || (critter_get_hits(restHost) >= stat_level(restHost, STAT_MAXIMUM_HIT_POINTS)
+                            && critter_get_hits(restGuest) >= stat_level(restGuest, STAT_MAXIMUM_HIT_POINTS)));
             };
             if (smokeScenario == SmokeScenario::Door) {
                 scenarioTargetId = networkWorldPrepareDoorSmokeTest();
@@ -1599,11 +1660,13 @@ bool networkRuntimeRunSmokeTest()
                                         && rest->actorId == scenarioCommand.actorId
                                         && rest->minutes == smokeRestMinutes
                                         && rest->completed
+                                        && rest->interrupted == smokeRestInterrupt
                                         && networkWorldApplyPeerRest(*rest)
                                         && networkWorldPendingRestMinutes() == 0
                                         && game_time() == rest->gameTime;
                                     if (eventApplied) {
                                         restCompletionGameTime = rest->gameTime;
+                                        restCompletionInterrupted = rest->interrupted;
                                     }
                                 }
                             } else if (event
@@ -1778,7 +1841,8 @@ bool networkRuntimeRunSmokeTest()
                                 } else if (stateConverged && isSceneryTransitionSmokeScenario()) {
                                     stateConverged = networkWorldVerifySceneryTransitionSmokeTest(*sceneryTransitionFixture);
                                 } else if (stateConverged && smokeScenario == SmokeScenario::Rest) {
-                                    stateConverged = restCompletionGameTime >= restStartingGameTime + smokeRestMinutes * 600
+                                    stateConverged = restTimeReached(restCompletionGameTime)
+                                        && restCompletionInterrupted == smokeRestInterrupt
                                         && game_time() == restCompletionGameTime
                                         && networkWorldPendingRestMinutes() == 0
                                         && networkWorldPhase() == SessionPhase::Exploration
@@ -1959,7 +2023,7 @@ bool networkRuntimeRunSmokeTest()
                         case SmokeScenario::TypedStairsCrossMap:
                             return networkWorldVerifySceneryTransitionSmokeTest(*sceneryTransitionFixture);
                         case SmokeScenario::Rest:
-                            return game_time() >= restStartingGameTime + smokeRestMinutes * 600
+                            return restTimeReached(game_time())
                                 && networkWorldPendingRestMinutes() == 0
                                 && networkWorldPhase() == SessionPhase::Exploration
                                 && restHealed();
@@ -1998,6 +2062,7 @@ bool networkRuntimeRunSmokeTest()
                             const auto* rest = std::get_if<RestStateChangedEvent>(&outcome.event->payload);
                             if (rest != nullptr && rest->completed) {
                                 restCompletionGameTime = rest->gameTime;
+                                restCompletionInterrupted = rest->interrupted;
                             }
                         }
                         authoritativeEvents.push_back(*outcome.event);
@@ -2022,7 +2087,8 @@ bool networkRuntimeRunSmokeTest()
                     bool sceneryTransitionCompleted = !isSceneryTransitionSmokeScenario()
                         || networkWorldVerifySceneryTransitionSmokeTest(*sceneryTransitionFixture);
                     bool restCompleted = smokeScenario != SmokeScenario::Rest
-                        || (restCompletionGameTime >= restStartingGameTime + smokeRestMinutes * 600
+                        || (restTimeReached(restCompletionGameTime)
+                            && restCompletionInterrupted == smokeRestInterrupt
                             && game_time() == restCompletionGameTime
                             && networkWorldPendingRestMinutes() == 0
                             && networkWorldPhase() == SessionPhase::Exploration
@@ -2058,7 +2124,7 @@ bool networkRuntimeRunSmokeTest()
                                 "Multiplayer rest: time=%d start=%d expected_delta=%d event_time=%d pending=%d phase=%d host_hp=%d/%d guest_hp=%d/%d.\n",
                                 game_time(),
                                 restStartingGameTime,
-                                smokeRestMinutes * 600,
+                                restExpectedMinutes * 600,
                                 restCompletionGameTime,
                                 networkWorldPendingRestMinutes(),
                                 static_cast<int>(networkWorldPhase()),
