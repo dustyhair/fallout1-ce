@@ -45,6 +45,18 @@ struct SharedModalExecution {
     std::uint32_t phaseRevision = 0;
 };
 
+struct ElevatorExecution {
+    CommandExecutionStatus status = CommandExecutionStatus::InvalidAction;
+    std::int32_t map = -1;
+    std::int32_t hostTile = -1;
+    std::int32_t hostElevation = -1;
+    std::int32_t hostRotation = 0;
+    std::int32_t guestTile = -1;
+    std::int32_t guestElevation = -1;
+    std::int32_t guestRotation = 0;
+    std::uint32_t phaseRevision = 0;
+};
+
 class CommandExecutor {
 public:
     virtual ~CommandExecutor() = default;
@@ -61,6 +73,10 @@ public:
     virtual CommandExecutionStatus useItemOn(Object*, Object*, Object*, const UseItemOnCommand&)
     {
         return CommandExecutionStatus::InvalidAction;
+    }
+    virtual ElevatorExecution useElevator(Object*, const ElevatorCommand&)
+    {
+        return {};
     }
     virtual CommandExecutionStatus attack(Object*, Object*, const AttackCommand&)
     {

@@ -1,6 +1,6 @@
 # Authoritative command routing
 
-The command processor handles movement, door use, ground-item pickup, looting, targeted exploration skills, directly owned item-on-target use, loot-window inventory transfers, direct player gifts, and player item drops. The developer session uses the interaction subset in process, while the live network host validates every guest action. Its input and output contain only multiplayer value types and entity IDs.
+The command processor handles movement, door use, ground-item pickup, looting, targeted exploration skills, directly owned item-on-target use, same-map elevators, loot-window inventory transfers, direct player gifts, and player item drops. The developer session uses the interaction subset in process, while the live network host validates every guest action. Its input and output contain only multiplayer value types and entity IDs.
 
 For every command, the processor checks:
 
@@ -8,7 +8,7 @@ For every command, the processor checks:
 - The command is the next sequence for that player. Repeating one of the 64 most recent commands returns its cached result without executing it again.
 - The session is in the phase required by the command and the sender used the current phase revision. Ordinary actions and modal opens require exploration; modal closes require that modal's phase.
 - The actor exists and belongs to the sending player.
-- An interaction target exists in the entity registry.
+- Any entity-targeted interaction resolves its target through the entity registry.
 
 Only then does the engine adapter run Fallout pathfinding, schedule the interaction, or apply the inventory mutation. An accepted command receives one session-wide event sequence. Rejected commands have a specific reason and emit no event. Guest inventory moves remain deferred until their authoritative event arrives, so rejection does not require an identity-sensitive rollback.
 
@@ -28,10 +28,12 @@ Targeted exploration skills use the same registered target lookup and acting-pla
 
 Item-on-target use likewise accepts only a registered item directly owned by the acting player and a registered target on the same elevation. The host schedules the normal Fallout action under the acting-player context. Its event carries only actor, item, and target identities; the guest does not execute the target script. The following checkpoint supplies all mutations and removes a consumed registered item. The `game_use_item` semantic command exposes exactly this path to agents.
 
+Same-map elevator travel does not trust a client-selected scenery object because Fallout implements many elevators as spatial scripts rather than typed scenery. The command instead names one of Fallout's installed elevator tables and a destination level. The host requires that table to contain the acting player's current map/elevation, requires that actor within four hexes of its source tile, resolves the destination from the same table, and rejects cross-map results. A second player on that source elevation and within four hexes rides along automatically; otherwise only the acting player moves. The host advances the session through `Transition` back to `Exploration` and publishes exact tile, elevation, and rotation for both actors plus the new phase revision. Each process presents its local player's elevation while retaining the remote actor off-floor. `game_elevator` exposes this same command path to agents.
+
 The [snapshot recovery format](snapshot-recovery.md) records the holder or ground position of every registered item so a recovery snapshot repairs pickup, loot, gift, and drop mutations after their journal events have expired.
 
 ## Shared modal policy
 
 The command processor owns a single shared-modal controller. Opening dialogue or barter advances the authoritative session to `Dialogue`; opening rest, an elevator, or world-map travel advances it to `Transition`. Only the actor that opened a particular modal can close it. Each change is an ordered event carrying the resulting phase and revision. The engine main loop continues rendering, animation timing, and background network processing while suppressing local gameplay input, script-state checks, and map-state checks on both peers.
 
-Dialogue, barter, rest, elevators, and world-map travel are currently blocked at their engine entry points during a multiplayer world. Their effects still depend on legacy local script or clock execution, so opening them before the corresponding host-authoritative command family exists would permit divergence. Local informational screens stay available, and loot remains live through its separate validated command path. Single-player behavior is unchanged.
+Dialogue, barter, rest, the legacy elevator UI, and world-map travel are currently blocked at their engine entry points during a multiplayer world. Same-map elevation travel is available through the validated semantic elevator command above; cross-map elevator destinations remain blocked. The other effects still depend on legacy local script or clock execution, so opening them before the corresponding host-authoritative command family exists would permit divergence. Local informational screens stay available, and loot remains live through its separate validated command path. Single-player behavior is unchanged.

@@ -195,6 +195,11 @@ struct UseItemOnCommand {
     EntityId targetId;
 };
 
+struct ElevatorCommand {
+    std::int32_t elevatorType = -1;
+    std::int32_t destinationLevel = -1;
+};
+
 struct ItemDescriptor {
     std::int32_t pid = -1;
     std::int32_t extendedFlags = 0;
@@ -235,7 +240,7 @@ struct SharedModalCommand {
     bool open = false;
 };
 
-using GameCommandPayload = std::variant<MoveCommand, FaceCommand, InteractCommand, PickupCommand, LootCommand, UseSkillCommand, UseItemOnCommand, InventoryTransferCommand, ItemDropCommand, AttackCommand, SharedModalCommand>;
+using GameCommandPayload = std::variant<MoveCommand, FaceCommand, InteractCommand, PickupCommand, LootCommand, UseSkillCommand, UseItemOnCommand, ElevatorCommand, InventoryTransferCommand, ItemDropCommand, AttackCommand, SharedModalCommand>;
 
 struct GameCommand {
     CommandSequence sequence;
@@ -325,6 +330,19 @@ struct ItemUseStartedEvent {
     EntityId targetId;
 };
 
+struct ElevatorTransitionedEvent {
+    EntityId actorId;
+    std::int32_t elevatorType = -1;
+    std::int32_t map = -1;
+    std::int32_t hostTile = -1;
+    std::int32_t hostElevation = -1;
+    std::int32_t hostRotation = 0;
+    std::int32_t guestTile = -1;
+    std::int32_t guestElevation = -1;
+    std::int32_t guestRotation = 0;
+    std::uint32_t phaseRevision = 0;
+};
+
 struct InventoryTransferredEvent {
     EntityId actorId;
     EntityId sourceId;
@@ -363,7 +381,7 @@ struct SharedModalStateChangedEvent {
     std::uint32_t phaseRevision = 0;
 };
 
-using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, ItemPickupCompletedEvent, LootStartedEvent, SkillUseStartedEvent, ItemUseStartedEvent, InventoryTransferredEvent, ItemDroppedEvent, AttackStartedEvent, SharedModalStateChangedEvent>;
+using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, ItemPickupCompletedEvent, LootStartedEvent, SkillUseStartedEvent, ItemUseStartedEvent, ElevatorTransitionedEvent, InventoryTransferredEvent, ItemDroppedEvent, AttackStartedEvent, SharedModalStateChangedEvent>;
 
 struct GameEvent {
     EventSequence sequence;

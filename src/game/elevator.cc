@@ -196,6 +196,47 @@ static const char keytable[ELEVATOR_COUNT][ELEVATOR_LEVEL_MAX] = {
     { '4', '5', '6', '\0' },
 };
 
+int elevator_get_level_count(int elevator)
+{
+    return elevator >= 0 && elevator < ELEVATOR_COUNT ? btncnt[elevator] : 0;
+}
+
+bool elevator_get_destination(int elevator, int level, int* mapPtr, int* elevationPtr, int* tilePtr)
+{
+    if (elevator < 0
+        || elevator >= ELEVATOR_COUNT
+        || level < 0
+        || level >= btncnt[elevator]
+        || mapPtr == nullptr
+        || elevationPtr == nullptr
+        || tilePtr == nullptr) {
+        return false;
+    }
+    const ElevatorDescription& destination = retvals[elevator][level];
+    if (destination.map <= 0 || destination.elevation < 0 || destination.tile < 0) {
+        return false;
+    }
+    *mapPtr = destination.map;
+    *elevationPtr = destination.elevation;
+    *tilePtr = destination.tile;
+    return true;
+}
+
+bool elevator_get_source(int elevator, int map, int elevation, int* tilePtr)
+{
+    if (elevator < 0 || elevator >= ELEVATOR_COUNT || map < 0 || elevation < 0 || tilePtr == nullptr) {
+        return false;
+    }
+    for (int level = 0; level < btncnt[elevator]; level++) {
+        const ElevatorDescription& candidate = retvals[elevator][level];
+        if (candidate.map == map && candidate.elevation == elevation && candidate.tile >= 0) {
+            *tilePtr = candidate.tile;
+            return true;
+        }
+    }
+    return false;
+}
+
 // 0x504F3C
 static const char* sfxtable[ELEVATOR_LEVEL_MAX - 1][ELEVATOR_LEVEL_MAX] = {
     {

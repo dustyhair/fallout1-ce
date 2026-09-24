@@ -103,6 +103,7 @@ bool isSupportedLiveEvent(const GameEventPayload& payload)
         || std::holds_alternative<LootStartedEvent>(payload)
         || std::holds_alternative<SkillUseStartedEvent>(payload)
         || std::holds_alternative<ItemUseStartedEvent>(payload)
+        || std::holds_alternative<ElevatorTransitionedEvent>(payload)
         || std::holds_alternative<InventoryTransferredEvent>(payload)
         || std::holds_alternative<ItemDroppedEvent>(payload)
         || std::holds_alternative<AttackStartedEvent>(payload)
@@ -215,6 +216,16 @@ bool NetworkLobby::sendLocalItemUse(EntityId itemId, EntityId targetId, std::uin
     return sendLocalAction(
         ItemUseStartedEvent { actorId, itemId, targetId },
         UseItemOnCommand { itemId, targetId },
+        phaseRevision);
+}
+
+bool NetworkLobby::sendLocalElevator(std::int32_t elevatorType, std::int32_t destinationLevel, std::uint32_t phaseRevision)
+{
+    PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
+    EntityId actorId { playerId.value };
+    return sendLocalAction(
+        ElevatorTransitionedEvent { actorId, elevatorType, 0, 0, 0, 0, 1, 0, 0, phaseRevision },
+        ElevatorCommand { elevatorType, destinationLevel },
         phaseRevision);
 }
 

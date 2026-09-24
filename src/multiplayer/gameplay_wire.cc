@@ -19,6 +19,7 @@ enum class CommandType : std::uint8_t {
     SharedModal = 9,
     UseSkill = 10,
     UseItemOn = 11,
+    Elevator = 12,
 };
 
 enum class EventType : std::uint8_t {
@@ -34,6 +35,7 @@ enum class EventType : std::uint8_t {
     SharedModalStateChanged = 10,
     SkillUseStarted = 11,
     ItemUseStarted = 12,
+    ElevatorTransitioned = 13,
 };
 
 constexpr std::size_t kCommandHeaderSize = 28;
@@ -47,6 +49,7 @@ constexpr std::size_t kAttackCommandSize = kCommandHeaderSize + 12;
 constexpr std::size_t kSharedModalCommandSize = kCommandHeaderSize + 4;
 constexpr std::size_t kSkillCommandSize = kCommandHeaderSize + 8;
 constexpr std::size_t kItemUseCommandSize = kCommandHeaderSize + 8;
+constexpr std::size_t kElevatorCommandSize = kCommandHeaderSize + 8;
 constexpr std::size_t kCommandResultSize = 24;
 constexpr std::size_t kEventHeaderSize = 20;
 constexpr std::size_t kMovementEventHeaderSize = kEventHeaderSize + 20;
@@ -60,6 +63,7 @@ constexpr std::size_t kAttackEventSize = kEventHeaderSize + 16;
 constexpr std::size_t kSharedModalEventSize = kEventHeaderSize + 12;
 constexpr std::size_t kSkillEventSize = kEventHeaderSize + 12;
 constexpr std::size_t kItemUseEventSize = kEventHeaderSize + 12;
+constexpr std::size_t kElevatorEventSize = kEventHeaderSize + 40;
 constexpr std::int32_t kAttackHitModeCount = 20;
 constexpr std::int32_t kAttackHitLocationCount = 9;
 
@@ -289,6 +293,14 @@ GameplayWireError validateCommand(const GameCommand& command)
             ? GameplayWireError::None
             : GameplayWireError::InvalidEntityId;
     }
+    if (const auto* elevator = std::get_if<ElevatorCommand>(&command.payload)) {
+        return elevator->elevatorType >= 0
+                && elevator->elevatorType < 12
+                && elevator->destinationLevel >= 0
+                && elevator->destinationLevel < 4
+            ? GameplayWireError::None
+            : GameplayWireError::InvalidMove;
+    }
 
     EntityId targetId;
     if (const auto* interact = std::get_if<InteractCommand>(&command.payload)) {
@@ -463,6 +475,27 @@ GameplayWireError validateEvent(const GameEvent& event)
             ? GameplayWireError::None
             : GameplayWireError::InvalidEntityId;
     }
+    if (const auto* elevator = std::get_if<ElevatorTransitionedEvent>(&event.payload)) {
+        return isValid(elevator->actorId)
+                && elevator->elevatorType >= 0
+                && elevator->elevatorType < 12
+                && elevator->map >= 0
+                && elevator->hostTile >= 0
+                && elevator->hostElevation >= 0
+                && elevator->hostElevation <= 2
+                && elevator->hostRotation >= 0
+                && elevator->hostRotation < kActorRotationCount
+                && elevator->guestTile >= 0
+                && elevator->guestElevation >= 0
+                && elevator->guestElevation <= 2
+                && elevator->guestRotation >= 0
+                && elevator->guestRotation < kActorRotationCount
+                && (elevator->hostElevation != elevator->guestElevation
+                    || elevator->hostTile != elevator->guestTile)
+                && elevator->phaseRevision != 0
+            ? GameplayWireError::None
+            : GameplayWireError::InvalidMove;
+    }
 
     EntityId actorId;
     EntityId targetId;
@@ -568,6 +601,10 @@ GameplayWireError encodeGameCommand(const GameCommand& command, ProtocolEnvelope
         appendCommandHeader(command, CommandType::UseItemOn, envelope.payload);
         appendUInt32(envelope.payload, itemUse->itemId.value);
         appendUInt32(envelope.payload, itemUse->targetId.value);
+    } else if (const auto* elevator = std::get_if<ElevatorCommand>(&command.payload)) {
+        appendCommandHeader(command, CommandType::Elevator, envelope.payload);
+        appendInt32(envelope.payload, elevator->elevatorType);
+        appendInt32(envelope.payload, elevator->destinationLevel);
     } else {
         const auto* attack = std::get_if<AttackCommand>(&command.payload);
         appendCommandHeader(command, CommandType::Attack, envelope.payload);
@@ -720,6 +757,16 @@ GameCommandDecodeResult decodeGameCommand(const ProtocolEnvelope& envelope)
             EntityId { readUInt32(envelope.payload, 32) },
         };
         break;
+    case CommandType::Elevator:
+        if (envelope.payload.size() != kElevatorCommandSize) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.command.payload = ElevatorCommand {
+            readInt32(envelope.payload, 28),
+            readInt32(envelope.payload, 32),
+        };
+        break;
     default:
         result.error = GameplayWireError::UnknownPayloadType;
         return result;
@@ -866,6 +913,18 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
         appendUInt32(envelope.payload, itemUse->actorId.value);
         appendUInt32(envelope.payload, itemUse->itemId.value);
         appendUInt32(envelope.payload, itemUse->targetId.value);
+    } else if (const auto* elevator = std::get_if<ElevatorTransitionedEvent>(&event.payload)) {
+        appendEventHeader(event, EventType::ElevatorTransitioned, envelope.payload);
+        appendUInt32(envelope.payload, elevator->actorId.value);
+        appendInt32(envelope.payload, elevator->elevatorType);
+        appendInt32(envelope.payload, elevator->map);
+        appendInt32(envelope.payload, elevator->hostTile);
+        appendInt32(envelope.payload, elevator->hostElevation);
+        appendInt32(envelope.payload, elevator->hostRotation);
+        appendInt32(envelope.payload, elevator->guestTile);
+        appendInt32(envelope.payload, elevator->guestElevation);
+        appendInt32(envelope.payload, elevator->guestRotation);
+        appendUInt32(envelope.payload, elevator->phaseRevision);
     } else {
         const auto* attack = std::get_if<AttackStartedEvent>(&event.payload);
         appendEventHeader(event, EventType::AttackStarted, envelope.payload);
@@ -1067,6 +1126,24 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
             EntityId { readUInt32(envelope.payload, 20) },
             EntityId { readUInt32(envelope.payload, 24) },
             EntityId { readUInt32(envelope.payload, 28) },
+        };
+        break;
+    case EventType::ElevatorTransitioned:
+        if (envelope.payload.size() != kElevatorEventSize) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.event.payload = ElevatorTransitionedEvent {
+            EntityId { readUInt32(envelope.payload, 20) },
+            readInt32(envelope.payload, 24),
+            readInt32(envelope.payload, 28),
+            readInt32(envelope.payload, 32),
+            readInt32(envelope.payload, 36),
+            readInt32(envelope.payload, 40),
+            readInt32(envelope.payload, 44),
+            readInt32(envelope.payload, 48),
+            readInt32(envelope.payload, 52),
+            readUInt32(envelope.payload, 56),
         };
         break;
     default:

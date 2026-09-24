@@ -33,6 +33,7 @@ bool networkWorldApplyPeerPickupCompletion(const ItemPickupCompletedEvent& picku
 bool networkWorldApplyPeerLoot(const LootStartedEvent& loot);
 bool networkWorldApplyPeerSkillUse(const SkillUseStartedEvent& skillUse);
 bool networkWorldApplyPeerItemUse(const ItemUseStartedEvent& itemUse);
+bool networkWorldApplyPeerElevator(const ElevatorTransitionedEvent& elevator);
 bool networkWorldApplyPeerSharedModal(const SharedModalStateChangedEvent& modal);
 bool networkWorldApplyPeerAttack(const AttackStartedEvent& attack);
 bool networkWorldApplyInventoryTransfer(const InventoryTransferredEvent& transfer, bool reverse = false);
@@ -86,6 +87,15 @@ struct QuestSmokeFixture {
 };
 std::optional<QuestSmokeFixture> networkWorldPrepareQuestSmokeTest();
 bool networkWorldVerifyQuestSmokeTest(const QuestSmokeFixture& fixture);
+struct ElevatorSmokeFixture {
+    std::int32_t elevatorType = -1;
+    std::int32_t destinationLevel = -1;
+    std::int32_t sourceElevation = -1;
+    std::int32_t hostTile = -1;
+    std::int32_t destinationElevation = -1;
+};
+std::optional<ElevatorSmokeFixture> networkWorldPrepareElevatorSmokeTest();
+bool networkWorldVerifyElevatorSmokeTest(const ElevatorSmokeFixture& fixture);
 bool networkWorldVerifyLootRangeSmokeTest(EntityId targetId);
 std::optional<EntityId> networkWorldPreparePlayerTransferSmokeTest();
 bool networkWorldVerifyPlayerTransferRangeSmokeTest(EntityId itemId);

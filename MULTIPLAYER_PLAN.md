@@ -1,6 +1,6 @@
 # Two-player co-op plan
 
-Status: Phases 0, 1, 2, 2.5, and 3A are complete on the `multiplayer-plan` branch. The transport, lobby, event journal, snapshot recovery, authenticated reconnect, complete gameplay-content manifest, and explicit first-contact fingerprint verification are implemented. Authority convergence is complete for same-map exploration: live host and guest inputs share the host command processor, replicas do not rerun rule-bearing pickup, skill, item-use, attack, script, or timed-queue work, and periodic corrections cover actors, both progressing character builds, critters, doors, non-door scenery, items and containers, world time, game globals, indexed map/script variables, and timed queues. Installed-data two-process scenarios cover guest pathfinding and movement through completion, asynchronous scripted-door use and its final state, the deferred pickup callback and inventory mutation, loot initiation, a split cap gift, targeted door and scenery skills, concrete container/scenery state, host-authoritative party XP, and curing Jarvis through the real quest script. Each applies a full authoritative checkpoint and compares every section digest; authority probes prove rules execute only in the host process. Phase 3B transitions and world travel are next. Combat wire primitives exist, but live multiplayer attacks are intentionally blocked until authoritative phase and turn ownership are implemented.
+Status: Phases 0, 1, 2, 2.5, and 3A are complete on the `multiplayer-plan` branch, and Phase 3B is in progress. The transport, lobby, event journal, snapshot recovery, authenticated reconnect, complete gameplay-content manifest, and explicit first-contact fingerprint verification are implemented. Authority convergence is complete for same-map exploration: live host and guest inputs share the host command processor, replicas do not rerun rule-bearing pickup, skill, item-use, attack, script, or timed-queue work, and periodic corrections cover actors, both progressing character builds, critters, doors, non-door scenery, items and containers, world time, game globals, indexed map/script variables, and timed queues. Installed-data two-process scenarios cover guest pathfinding and movement through completion, asynchronous scripted-door use and its final state, the deferred pickup callback and inventory mutation, loot initiation, a split cap gift, targeted door and scenery skills, concrete container/scenery state, host-authoritative party XP, curing Jarvis through the real quest script, and a synchronized Vault 13 elevation transition. Each applies a full authoritative checkpoint and compares every section digest; authority probes prove rules execute only in the host process. Same-map elevators are the first completed Phase 3B slice; exits, cross-map transitions, rest, and world-map travel remain. Combat wire primitives exist, but live multiplayer attacks are intentionally blocked until authoritative phase and turn ownership are implemented.
 
 ## Goal
 
@@ -45,7 +45,7 @@ Periodic snapshots repair missed or incorrectly applied state. They are also the
 ### Session limits for the first release
 
 - Exactly two players.
-- Both player characters stay on the same map and elevation.
+- Both player characters stay on the same loaded map, but may occupy different elevations on that map.
 - No public matchmaking, relay service, or account system.
 - No host migration. If the host leaves, the session ends after writing a recovery save.
 - No PvP.
@@ -137,7 +137,7 @@ For the first version:
 
 - Keep both characters within a generous distance on the same map.
 - Give each client a local camera that follows its own character.
-- Require both players at exits, elevators, and world-map transitions.
+- Let either player use a same-map elevator independently; automatically carry the other player only when both are close to that elevator. Require both players at shared-map exits and world-map transitions.
 - Pause both players when either opens a modal interface that changes shared state.
 - Let harmless local panels, such as the character sheet, remain client-side when practical.
 
@@ -351,8 +351,8 @@ Current implementation status:
 1. [x] Add semantic movement, facing, door, pickup, and loot command-file verbs.
 2. [x] Expose visible critters, doors, non-door scenery, containers, ground items, player actor IDs, and registered local inventory items with stable entity IDs in the machine-readable world state.
 3. [x] Route semantic verbs through the same multiplayer runtime handlers and command processor used by human input.
-4. [x] Add semantic direct-inventory gift and item-on-target verbs using the same authoritative paths as human input; dialogue and combat verbs remain pending their authoritative controllers.
-5. [x] Add deterministic two-process exploration scenarios and structured completion assertions. Installed-data fixtures cover guest movement, scripted-door use, deferred pickup completion, loot initiation, a split cap gift, targeted skills, item-on-target quest completion, non-door scenery state, and container state, with full section-digest convergence and authenticated event replay.
+4. [x] Add semantic direct-inventory gift, item-on-target, and same-map elevator verbs using the same authoritative paths as human input; dialogue and combat verbs remain pending their authoritative controllers.
+5. [x] Add deterministic two-process exploration scenarios and structured completion assertions. Installed-data fixtures cover guest movement, scripted-door use, deferred pickup completion, loot initiation, a split cap gift, targeted skills, item-on-target quest completion, non-door scenery state, container state, and same-map elevation travel, with full section-digest convergence and authenticated event replay.
 6. [ ] Add an optional Laya or LLM controller above the deterministic semantic interface.
 
 Exit condition: an automated local client can observe the journal, control one player through validated semantic commands, and complete the supported exploration command set without bypassing multiplayer authority.
@@ -375,9 +375,11 @@ Exit condition: two players can complete a small non-combat quest together on on
 
 ### Phase 3B: transitions and world travel
 
-- Add synchronized exits, elevators, elevation changes, rest, and map transitions.
+- [x] Add the first synchronized elevation boundary: a semantic elevator command identifies Fallout's installed elevator table and desired level; the host requires the acting player within four hexes of that elevator's source, rejects cross-map destinations, and automatically carries the other player only when that player is also within four hexes on the source elevation. It advances through `Transition` and publishes each player's exact independent tile, elevation, rotation, and the phase revision. The Vault 13 two-process scenario leaves the host downstairs while the guest travels upstairs and proves local-floor presentation, full snapshot convergence, and authenticated replay.
+- [ ] Add synchronized exits and cross-map elevator/map transitions, including deterministic map-load completion and player/entity rebinding.
+- [ ] Add synchronized rest with an authoritative time advance and queued-event processing boundary.
 - Add world-map travel while preserving one authoritative world clock and encounter state.
-- Require transition readiness or an explicit host timeout policy.
+- [ ] Require both-player readiness for exits, rest, and world-map transitions, with an explicit host timeout policy where appropriate. Same-map elevators remain independently usable, with proximity-based shared rides.
 - Verify entity rebinding, guest inventory persistence, queued events, and state hashes across every transition boundary.
 
 Exit condition: two players can complete a small non-combat quest together, change maps and elevations, travel on the world map, and remain synchronized.

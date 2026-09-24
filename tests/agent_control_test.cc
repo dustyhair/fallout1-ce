@@ -83,6 +83,12 @@ int main()
             && command.entityId == 77,
         "parses a semantic item-on-target command")
         && passed;
+    passed = expect(parse("52 game_elevator 8 2", command)
+            && command.type == fallout::AgentControlCommandType::GameElevator
+            && command.elevatorType == 8
+            && command.elevatorLevel == 1,
+        "parses an authoritative elevator type and one-based level")
+        && passed;
     passed = expect(!parse("0 click 10 10", command), "rejects command id zero") && passed;
     passed = expect(!parse("52 click -1 10", command), "rejects negative coordinates") && passed;
     passed = expect(!parse("53 key definitely-not-a-key", command), "rejects an unknown key") && passed;
@@ -92,6 +98,8 @@ int main()
     passed = expect(!parse("57 game_give 1 77 0", command), "rejects a zero gift quantity") && passed;
     passed = expect(!parse("58 game_skill gambling 77", command), "rejects an unsupported targeted skill") && passed;
     passed = expect(!parse("59 game_use_item 77 77", command), "rejects using an item on itself") && passed;
+    passed = expect(!parse("60 game_elevator 12 1", command), "rejects an unknown elevator type") && passed;
+    passed = expect(!parse("61 game_elevator 8 5", command), "rejects an unavailable elevator level") && passed;
 
     return passed ? 0 : 1;
 }

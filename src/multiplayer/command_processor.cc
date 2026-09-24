@@ -79,6 +79,7 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     const LootCommand* loot = std::get_if<LootCommand>(&command.payload);
     const UseSkillCommand* skill = std::get_if<UseSkillCommand>(&command.payload);
     const UseItemOnCommand* itemUse = std::get_if<UseItemOnCommand>(&command.payload);
+    const ElevatorCommand* elevator = std::get_if<ElevatorCommand>(&command.payload);
     const InventoryTransferCommand* transfer = std::get_if<InventoryTransferCommand>(&command.payload);
     const ItemDropCommand* drop = std::get_if<ItemDropCommand>(&command.payload);
     const AttackCommand* attack = std::get_if<AttackCommand>(&command.payload);
@@ -103,6 +104,13 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     } else if (itemUse != nullptr) {
         targetId = itemUse->targetId;
         hasTarget = true;
+    } else if (elevator != nullptr) {
+        if (elevator->elevatorType < 0
+            || elevator->elevatorType >= 12
+            || elevator->destinationLevel < 0
+            || elevator->destinationLevel > 3) {
+            return rejectAndRemember(CommandRejection::Malformed);
+        }
     } else if (attack != nullptr) {
         targetId = attack->targetId;
         hasTarget = true;
@@ -191,6 +199,21 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
         } else if (itemUse != nullptr) {
             executionStatus = executor.useItemOn(actor, item, target, *itemUse);
             event.payload = ItemUseStartedEvent { command.actorId, itemUse->itemId, itemUse->targetId };
+        } else if (elevator != nullptr) {
+            ElevatorExecution elevatorExecution = executor.useElevator(actor, *elevator);
+            executionStatus = elevatorExecution.status;
+            event.payload = ElevatorTransitionedEvent {
+                command.actorId,
+                elevator->elevatorType,
+                elevatorExecution.map,
+                elevatorExecution.hostTile,
+                elevatorExecution.hostElevation,
+                elevatorExecution.hostRotation,
+                elevatorExecution.guestTile,
+                elevatorExecution.guestElevation,
+                elevatorExecution.guestRotation,
+                elevatorExecution.phaseRevision,
+            };
         } else if (attack != nullptr) {
             executionStatus = executor.attack(actor, target, *attack);
             event.payload = AttackStartedEvent { command.actorId, attack->targetId, attack->hitMode, attack->hitLocation };

@@ -143,6 +143,21 @@ bool parseItemUse(std::istringstream& input, AgentControlCommand& command, std::
     return true;
 }
 
+bool parseElevator(std::istringstream& input, AgentControlCommand& command, std::string& error)
+{
+    if (!(input >> command.elevatorType >> command.elevatorLevel)
+        || hasTrailingInput(input)
+        || command.elevatorType < 0
+        || command.elevatorType >= 12
+        || command.elevatorLevel < 1
+        || command.elevatorLevel > 4) {
+        error = "expected: game_elevator <type 0-11> <level 1-4>";
+        return false;
+    }
+    command.elevatorLevel--;
+    return true;
+}
+
 bool parseSkill(std::istringstream& input, AgentControlCommand& command, std::string& error)
 {
     std::string name;
@@ -300,6 +315,10 @@ bool agentControlParseCommand(const std::string& line,
         command.type = AgentControlCommandType::GameUseItem;
         return parseItemUse(input, command, error);
     }
+    if (verb == "game_elevator") {
+        command.type = AgentControlCommandType::GameElevator;
+        return parseElevator(input, command, error);
+    }
     if (verb == "game_give") {
         command.type = AgentControlCommandType::GameGive;
         return parseGive(input, command, error);
@@ -336,6 +355,8 @@ const char* agentControlCommandTypeName(AgentControlCommandType type)
         return "game_skill";
     case AgentControlCommandType::GameUseItem:
         return "game_use_item";
+    case AgentControlCommandType::GameElevator:
+        return "game_elevator";
     case AgentControlCommandType::GameGive:
         return "game_give";
     }

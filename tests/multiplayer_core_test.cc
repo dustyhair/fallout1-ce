@@ -753,6 +753,7 @@ void testGameplayWireFormat()
         GameCommand { CommandSequence { 9 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, SharedModalCommand { SharedModalKind::Dialogue, true } },
         GameCommand { CommandSequence { 10 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, UseSkillCommand { EntityId { 40 }, ExplorationSkill::Traps } },
         GameCommand { CommandSequence { 11 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, UseItemOnCommand { EntityId { 43 }, EntityId { 40 } } },
+        GameCommand { CommandSequence { 12 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, ElevatorCommand { 8, 1 } },
     };
 
     for (std::size_t index = 0; index < commands.size(); index++) {
@@ -926,6 +927,20 @@ void testGameplayWireFormat()
     expect(encodeGameCommand(invalidItemUse, itemUseEnvelope) == GameplayWireError::InvalidEntityId,
         "item-on-target command rejects an item used on itself");
 
+    ProtocolEnvelope elevatorEnvelope = gameplayEnvelope(31);
+    expect(encodeGameCommand(commands[11], elevatorEnvelope) == GameplayWireError::None,
+        "elevator command encodes");
+    GameCommandDecodeResult decodedElevator = decodeGameCommand(elevatorEnvelope);
+    const ElevatorCommand* elevator = decodedElevator
+        ? std::get_if<ElevatorCommand>(&decodedElevator.command.payload)
+        : nullptr;
+    expect(elevator != nullptr && elevator->elevatorType == 8 && elevator->destinationLevel == 1,
+        "elevator command round trips its installed-data type and destination level");
+    GameCommand invalidElevator = commands[11];
+    std::get<ElevatorCommand>(invalidElevator.payload).elevatorType = 12;
+    expect(encodeGameCommand(invalidElevator, elevatorEnvelope) == GameplayWireError::InvalidMove,
+        "elevator command rejects an unknown elevator table");
+
     CommandResult accepted;
     accepted.commandSequence.value = 1;
     accepted.status = CommandStatus::Accepted;
@@ -968,6 +983,7 @@ void testGameplayWireFormat()
         GameEvent { EventSequence { 16 }, CommandSequence { 9 }, SharedModalStateChangedEvent { EntityId { 20 }, SharedModalKind::Dialogue, true, SessionPhase::Dialogue, 4 } },
         GameEvent { EventSequence { 17 }, CommandSequence { 10 }, SkillUseStartedEvent { EntityId { 20 }, EntityId { 40 }, ExplorationSkill::Traps } },
         GameEvent { EventSequence { 18 }, CommandSequence { 11 }, ItemUseStartedEvent { EntityId { 20 }, EntityId { 43 }, EntityId { 40 } } },
+        GameEvent { EventSequence { 19 }, CommandSequence { 12 }, ElevatorTransitionedEvent { EntityId { 20 }, 8, 6, 14105, 0, 3, 22504, 1, 2, 5 } },
     };
     for (std::size_t index = 0; index < events.size(); index++) {
         ProtocolEnvelope envelope = gameplayEnvelope(30 + index);
@@ -1107,6 +1123,25 @@ void testGameplayWireFormat()
             && modalEvent->phase == SessionPhase::Dialogue
             && modalEvent->phaseRevision == 4,
         "shared modal event round trips the authoritative phase boundary");
+
+    ProtocolEnvelope elevatorEventEnvelope = gameplayEnvelope(48);
+    encodeGameEvent(events[12], elevatorEventEnvelope);
+    GameEventDecodeResult decodedElevatorEvent = decodeGameEvent(elevatorEventEnvelope);
+    const ElevatorTransitionedEvent* elevatorEvent = decodedElevatorEvent
+        ? std::get_if<ElevatorTransitionedEvent>(&decodedElevatorEvent.event.payload)
+        : nullptr;
+    expect(elevatorEvent != nullptr
+            && elevatorEvent->actorId == EntityId { 20 }
+            && elevatorEvent->elevatorType == 8
+            && elevatorEvent->map == 6
+            && elevatorEvent->hostTile == 14105
+            && elevatorEvent->hostElevation == 0
+            && elevatorEvent->hostRotation == 3
+            && elevatorEvent->guestTile == 22504
+            && elevatorEvent->guestElevation == 1
+            && elevatorEvent->guestRotation == 2
+            && elevatorEvent->phaseRevision == 5,
+        "elevator event round trips each actor's independent authoritative placement state");
 
     ProtocolEnvelope skillEventEnvelope = gameplayEnvelope(48);
     encodeGameEvent(events[10], skillEventEnvelope);
@@ -2134,6 +2169,15 @@ public:
         return nextStatus;
     }
 
+    ElevatorExecution useElevator(Object* actor, const ElevatorCommand& command) override
+    {
+        elevatorCalls++;
+        lastActor = actor;
+        lastElevator = command;
+        recordContext();
+        return ElevatorExecution { nextStatus, 6, 14105, 0, 3, 22504, 1, 2, 5 };
+    }
+
     CommandExecutionStatus attack(Object* actor, Object* target, const AttackCommand& command) override
     {
         attackCalls++;
@@ -2234,6 +2278,7 @@ public:
     int lootCalls = 0;
     int skillCalls = 0;
     int itemUseCalls = 0;
+    int elevatorCalls = 0;
     int attackCalls = 0;
     int modalCalls = 0;
     int transferCalls = 0;
@@ -2251,6 +2296,7 @@ public:
     AttackCommand lastAttack;
     UseSkillCommand lastSkill;
     UseItemOnCommand lastItemUse;
+    ElevatorCommand lastElevator;
     SharedModalCommand lastModal;
     LocalSession* modalSession = nullptr;
     Object* activeModalActor = nullptr;
@@ -2400,6 +2446,41 @@ void testAuthoritativeCommandProcessing()
             && executor.itemUseCalls == 1
             && !invalidItemUse.event.has_value(),
         "command processor rejects an item used on itself before engine execution");
+
+    CommandProcessor elevatorProcessor;
+    GameCommand useElevator;
+    useElevator.sequence.value = 1;
+    useElevator.playerId = kGuestPlayerId;
+    useElevator.actorId = session.playerActorId(kGuestPlayerId);
+    useElevator.expectedPhase = SessionPhase::Exploration;
+    useElevator.expectedPhaseRevision = session.phaseRevision();
+    useElevator.payload = ElevatorCommand { 8, 1 };
+    AuthoritativeCommandResult usedElevator = elevatorProcessor.process(useElevator, session, executor);
+    const ElevatorTransitionedEvent* elevatorEvent = usedElevator.event.has_value()
+        ? std::get_if<ElevatorTransitionedEvent>(&usedElevator.event->payload)
+        : nullptr;
+    expect(usedElevator.result.status == CommandStatus::Accepted
+            && executor.elevatorCalls == 1
+            && executor.lastActor == asGameObject(guestActor)
+            && executor.lastElevator.elevatorType == 8
+            && executor.lastElevator.destinationLevel == 1
+            && elevatorEvent != nullptr
+            && elevatorEvent->actorId == session.playerActorId(kGuestPlayerId)
+            && elevatorEvent->elevatorType == 8
+            && elevatorEvent->map == 6
+            && elevatorEvent->hostTile == 14105
+            && elevatorEvent->hostElevation == 0
+            && elevatorEvent->guestTile == 22504
+            && elevatorEvent->guestElevation == 1
+            && elevatorEvent->phaseRevision == 5,
+        "host executes a validated elevator command and emits independent exact player placement state");
+    useElevator.sequence.value = 2;
+    std::get<ElevatorCommand>(useElevator.payload).elevatorType = 12;
+    AuthoritativeCommandResult invalidElevator = elevatorProcessor.process(useElevator, session, executor);
+    expect(invalidElevator.result.rejection == CommandRejection::Malformed
+            && executor.elevatorCalls == 1
+            && !invalidElevator.event.has_value(),
+        "command processor rejects an unknown elevator table before engine execution");
 
     GameCommand pickup;
     pickup.sequence.value = 2;

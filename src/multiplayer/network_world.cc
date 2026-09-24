@@ -14,6 +14,7 @@
 #include "game/combat.h"
 #include "game/critter.h"
 #include "game/engine_execution_probe.h"
+#include "game/elevator.h"
 #include "game/game.h"
 #include "game/game_vars.h"
 #include "game/intface.h"
@@ -621,6 +622,88 @@ public:
         return rc != -1
             ? CommandExecutionStatus::Applied
             : CommandExecutionStatus::InvalidAction;
+    }
+
+    ElevatorExecution useElevator(Object* actor, const ElevatorCommand& command) override
+    {
+        ElevatorExecution execution;
+        Object* host = session.entities().findObject(session.playerActorId(kHostPlayerId));
+        Object* guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+        Object* companion = actor == host ? guest : host;
+        int sourceTile = -1;
+        if (isInCombat()
+            || actor == nullptr
+            || host == nullptr
+            || guest == nullptr
+            || (actor != host && actor != guest)
+            || session.phase() != SessionPhase::Exploration
+            || companion == nullptr
+            || !elevator_get_source(command.elevatorType, map_data.field_34, actor->elevation, &sourceTile)
+            || tile_dist(actor->tile, sourceTile) > 4) {
+            return execution;
+        }
+        bool companionJoins = companion->elevation == actor->elevation
+            && tile_dist(companion->tile, sourceTile) <= 4;
+
+        int destinationMap = -1;
+        int destinationElevation = -1;
+        int destinationTile = -1;
+        if (!elevator_get_destination(command.elevatorType,
+                command.destinationLevel,
+                &destinationMap,
+                &destinationElevation,
+                &destinationTile)
+            || destinationMap != map_data.field_34
+            || !elevationIsValid(destinationElevation)
+            || !hexGridTileIsValid(destinationTile)
+            || destinationElevation == actor->elevation) {
+            return execution;
+        }
+
+        int oldHostTile = host->tile;
+        int oldHostElevation = host->elevation;
+        int oldHostRotation = host->rotation;
+        int oldGuestTile = guest->tile;
+        int oldGuestElevation = guest->elevation;
+        int oldGuestRotation = guest->rotation;
+        int oldMapElevation = map_elevation;
+        register_clear(actor);
+        if (companionJoins) {
+            register_clear(companion);
+        }
+        bool placed = obj_attempt_placement(actor, destinationTile, destinationElevation, 0) != -1
+            && (!companionJoins
+                || obj_attempt_placement(companion, destinationTile, destinationElevation, 2) != -1)
+            && (host->elevation != guest->elevation || host->tile != guest->tile);
+        Object* localActor = localPlayerActor();
+        int localElevation = localActor != nullptr ? localActor->elevation : oldMapElevation;
+        placed = placed && (localElevation == map_elevation || map_set_elevation(localElevation) == 0);
+        if (!placed
+            || session.transitionTo(SessionPhase::Transition) != LocalSessionError::None
+            || session.transitionTo(SessionPhase::Exploration) != LocalSessionError::None) {
+            obj_move_to_tile(host, oldHostTile, oldHostElevation, nullptr);
+            obj_move_to_tile(guest, oldGuestTile, oldGuestElevation, nullptr);
+            obj_set_rotation(host, oldHostRotation, nullptr);
+            obj_set_rotation(guest, oldGuestRotation, nullptr);
+            map_set_elevation(oldMapElevation);
+            session.transitionTo(SessionPhase::Exploration);
+            return execution;
+        }
+        obj_set_rotation(actor, ROTATION_SE, nullptr);
+        if (companionJoins) {
+            obj_set_rotation(companion, ROTATION_SE, nullptr);
+        }
+
+        execution.status = CommandExecutionStatus::Applied;
+        execution.map = destinationMap;
+        execution.hostTile = host->tile;
+        execution.hostElevation = host->elevation;
+        execution.hostRotation = host->rotation;
+        execution.guestTile = guest->tile;
+        execution.guestElevation = guest->elevation;
+        execution.guestRotation = guest->rotation;
+        execution.phaseRevision = session.phaseRevision();
+        return execution;
     }
 
     CommandExecutionStatus attack(Object* actor, Object* target, const AttackCommand& command) override
@@ -1362,6 +1445,40 @@ bool networkWorldApplyPeerItemUse(const ItemUseStartedEvent& itemUse)
     return true;
 }
 
+bool networkWorldApplyPeerElevator(const ElevatorTransitionedEvent& elevator)
+{
+    Object* host = session.entities().findObject(session.playerActorId(kHostPlayerId));
+    Object* guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+    if (!session.isActive()
+        || host == nullptr
+        || guest == nullptr
+        || elevator.elevatorType < 0
+        || elevator.elevatorType >= ELEVATOR_COUNT
+        || elevator.map != map_data.field_34
+        || !hexGridTileIsValid(elevator.hostTile)
+        || !elevationIsValid(elevator.hostElevation)
+        || elevator.hostRotation < 0
+        || elevator.hostRotation >= ROTATION_COUNT
+        || !hexGridTileIsValid(elevator.guestTile)
+        || !elevationIsValid(elevator.guestElevation)
+        || elevator.guestRotation < 0
+        || elevator.guestRotation >= ROTATION_COUNT
+        || (elevator.hostElevation == elevator.guestElevation
+            && elevator.hostTile == elevator.guestTile)
+        || session.applyAuthoritativePhase(SessionPhase::Exploration, elevator.phaseRevision) != LocalSessionError::None) {
+        return false;
+    }
+    register_clear(host);
+    register_clear(guest);
+    Object* localActor = localPlayerActor();
+    return obj_move_to_tile(host, elevator.hostTile, elevator.hostElevation, nullptr) == 0
+        && obj_move_to_tile(guest, elevator.guestTile, elevator.guestElevation, nullptr) == 0
+        && obj_set_rotation(host, elevator.hostRotation, nullptr) == 0
+        && obj_set_rotation(guest, elevator.guestRotation, nullptr) == 0
+        && localActor != nullptr
+        && map_set_elevation(localActor->elevation) == 0;
+}
+
 bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts)
 {
     counts = {};
@@ -1829,6 +1946,94 @@ bool networkWorldVerifyQuestSmokeTest(const QuestSmokeFixture& fixture)
         && host->build.experience == 525
         && guest->build.experience == 525
         && game_get_global_var(GVAR_PLAYER_REPUATION) == questSmokeInitialReputation + 1;
+}
+
+std::optional<ElevatorSmokeFixture> networkWorldPrepareElevatorSmokeTest()
+{
+    if (!session.isActive()) {
+        return std::nullopt;
+    }
+    Object* host = session.entities().findObject(session.playerActorId(kHostPlayerId));
+    Object* guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+    if (host == nullptr || guest == nullptr) {
+        return std::nullopt;
+    }
+
+    anim_stop();
+    for (int elevatorType = 0; elevatorType < ELEVATOR_COUNT; elevatorType++) {
+        int sourceTile = -1;
+        if (!elevator_get_source(elevatorType, map_data.field_34, map_elevation, &sourceTile)
+            || !hexGridTileIsValid(sourceTile)) {
+            continue;
+        }
+
+        int destinationLevel = -1;
+        int destinationElevation = -1;
+        for (int level = 0; level < elevator_get_level_count(elevatorType); level++) {
+            int destinationMap = -1;
+            int candidateElevation = -1;
+            int destinationTile = -1;
+            if (elevator_get_destination(elevatorType,
+                    level,
+                    &destinationMap,
+                    &candidateElevation,
+                    &destinationTile)
+                && destinationMap == map_data.field_34
+                && candidateElevation != map_elevation
+                && elevationIsValid(candidateElevation)
+                && hexGridTileIsValid(destinationTile)) {
+                destinationLevel = level;
+                destinationElevation = candidateElevation;
+                break;
+            }
+        }
+        if (destinationLevel == -1) {
+            continue;
+        }
+
+        bool hostPlaced = false;
+        for (int distance = 5; distance <= 8 && !hostPlaced; distance++) {
+            for (int rotation = 0; rotation < ROTATION_COUNT && !hostPlaced; rotation++) {
+                int tile = tile_num_in_direction(sourceTile, rotation, distance);
+                hostPlaced = hexGridTileIsValid(tile)
+                    && obj_blocking_at(host, tile, map_elevation) == nullptr
+                    && obj_move_to_tile(host, tile, map_elevation, nullptr) == 0;
+            }
+        }
+        bool guestPlaced = false;
+        for (int rotation = 0; rotation < ROTATION_COUNT && !guestPlaced; rotation++) {
+            int tile = tile_num_in_direction(sourceTile, rotation, 1);
+            guestPlaced = hexGridTileIsValid(tile)
+                && obj_blocking_at(guest, tile, map_elevation) == nullptr
+                && obj_move_to_tile(guest, tile, map_elevation, nullptr) == 0;
+        }
+        if (!hostPlaced || !guestPlaced) {
+            return std::nullopt;
+        }
+        return ElevatorSmokeFixture {
+            elevatorType,
+            destinationLevel,
+            map_elevation,
+            host->tile,
+            destinationElevation,
+        };
+    }
+    return std::nullopt;
+}
+
+bool networkWorldVerifyElevatorSmokeTest(const ElevatorSmokeFixture& fixture)
+{
+    Object* host = session.entities().findObject(session.playerActorId(kHostPlayerId));
+    Object* guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+    return host != nullptr
+        && guest != nullptr
+        && session.phase() == SessionPhase::Exploration
+        && host->elevation == fixture.sourceElevation
+        && host->tile == fixture.hostTile
+        && guest->elevation == fixture.destinationElevation
+        && map_elevation == (worldMode == NetworkLaunchMode::Host
+                ? fixture.sourceElevation
+                : fixture.destinationElevation);
 }
 
 bool networkWorldVerifyLootRangeSmokeTest(EntityId targetId)
@@ -2760,6 +2965,11 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
 
     if (session.applyAuthoritativePhase(snapshot.phase, snapshot.phaseRevision) != LocalSessionError::None
         || !applyActorAndCritterState(snapshot)) {
+        return false;
+    }
+    Object* localActor = localPlayerActor();
+    if (localActor == nullptr
+        || (map_elevation != localActor->elevation && map_set_elevation(localActor->elevation) != 0)) {
         return false;
     }
     for (const DoorSnapshot& doorState : snapshot.doors) {

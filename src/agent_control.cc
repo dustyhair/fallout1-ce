@@ -197,6 +197,15 @@ void executeCommand(const AgentControlCommand& command)
         }
         return;
     }
+    case AgentControlCommandType::GameElevator:
+        if (multiplayer::networkRuntimeSubmitLocalElevator(
+                command.elevatorType,
+                command.elevatorLevel)) {
+            agentJournalWriteAgentCommand(command.id, commandName, "accepted", "authoritative elevator transition submitted");
+        } else {
+            agentJournalWriteAgentCommand(command.id, commandName, "rejected", "elevator or destination is unavailable for this transition");
+        }
+        return;
     case AgentControlCommandType::GameGive:
         if (multiplayer::networkRuntimeGiveItemToPlayer(
                 multiplayer::EntityId { command.destinationEntityId },
