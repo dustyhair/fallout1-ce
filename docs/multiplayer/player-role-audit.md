@@ -53,8 +53,9 @@ These are explicit follow-up work, not reasons to overload `obj_dude`:
 - Dialogue execution and voting remain Phase 5. The talker-dependent stat and
   reaction seams are ready, but shared dialogue is still blocked by the modal
   phase guard.
-- Map transitions remain Phase 3B. Map-start placement and `dude_obj` continue
-  to target the story actor until coordinated transition state exists.
+- The shared cross-map elevator boundary now preserves `obj_dude` as the local
+  story actor and recreates and rebinds the remote actor. Ordinary exits and
+  world-map travel remain Phase 3B work and must use that coordinated seam.
 - Combat-only animation, action-point, and equipment assumptions remain part
   of Phase 4 unless they are also reached by an exploration interaction.
 

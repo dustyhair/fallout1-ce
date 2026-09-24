@@ -74,6 +74,7 @@ enum class SmokeScenario {
     Container,
     Quest,
     Elevation,
+    MapTransition,
 };
 SmokeScenario smokeScenario = SmokeScenario::Movement;
 
@@ -100,6 +101,8 @@ const char* smokeScenarioName()
         return "quest";
     case SmokeScenario::Elevation:
         return "elevation";
+    case SmokeScenario::MapTransition:
+        return "map-transition";
     }
     return "unknown";
 }
@@ -1091,6 +1094,8 @@ bool networkRuntimeConfigure(int argc, char** argv)
             smokeScenario = SmokeScenario::Quest;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=elevation") == 0) {
             smokeScenario = SmokeScenario::Elevation;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=map-transition") == 0) {
+            smokeScenario = SmokeScenario::MapTransition;
         }
     }
     if (smokeTestEnabled && launchOptions.mode == NetworkLaunchMode::Disabled) {
@@ -1122,7 +1127,10 @@ const char* networkRuntimeSmokeTestMap()
     if (smokeScenario == SmokeScenario::Quest) {
         return "ShadyW.map";
     }
-    return smokeScenario == SmokeScenario::Elevation ? "Vault13.map" : "V13Ent.map";
+    if (smokeScenario == SmokeScenario::Elevation) {
+        return "Vault13.map";
+    }
+    return smokeScenario == SmokeScenario::MapTransition ? "Brohd12.map" : "V13Ent.map";
 }
 
 bool networkRuntimeRunSmokeTest()
@@ -1198,6 +1206,7 @@ bool networkRuntimeRunSmokeTest()
             std::optional<EntityId> scenarioTargetId;
             std::optional<QuestSmokeFixture> questFixture;
             std::optional<ElevatorSmokeFixture> elevatorFixture;
+            std::optional<MapTransitionSmokeFixture> mapTransitionFixture;
             if (smokeScenario == SmokeScenario::Door) {
                 scenarioTargetId = networkWorldPrepareDoorSmokeTest();
                 scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
@@ -1236,6 +1245,9 @@ bool networkRuntimeRunSmokeTest()
             } else if (smokeScenario == SmokeScenario::Elevation) {
                 elevatorFixture = networkWorldPrepareElevatorSmokeTest();
                 scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
+            } else if (smokeScenario == SmokeScenario::MapTransition) {
+                mapTransitionFixture = networkWorldPrepareMapTransitionSmokeTest();
+                scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
             } else if (scenarioActor != nullptr) {
                 for (int distance = 1; distance <= 4 && scenarioDestinationTile == -1; distance++) {
                     for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
@@ -1250,8 +1262,10 @@ bool networkRuntimeRunSmokeTest()
             }
             if ((smokeScenario != SmokeScenario::Movement
                     && smokeScenario != SmokeScenario::Elevation
+                    && smokeScenario != SmokeScenario::MapTransition
                     && !scenarioTargetId.has_value())
                 || (smokeScenario == SmokeScenario::Elevation && !elevatorFixture.has_value())
+                || (smokeScenario == SmokeScenario::MapTransition && !mapTransitionFixture.has_value())
                 || (smokeScenario == SmokeScenario::Movement && scenarioDestinationTile == -1)) {
                 setStatus("MULTIPLAYER SMOKE TEST FAILED: NO EXPLORATION FIXTURE");
                 break;
@@ -1301,6 +1315,9 @@ bool networkRuntimeRunSmokeTest()
                 break;
             case SmokeScenario::Elevation:
                 scenarioCommand.payload = ElevatorCommand { elevatorFixture->elevatorType, elevatorFixture->destinationLevel };
+                break;
+            case SmokeScenario::MapTransition:
+                scenarioCommand.payload = ElevatorCommand { mapTransitionFixture->elevatorType, mapTransitionFixture->destinationLevel };
                 break;
             }
             if (!scenarioCommandReady) {
@@ -1461,6 +1478,17 @@ bool networkRuntimeRunSmokeTest()
                                     && elevator->hostTile == elevatorFixture->hostTile
                                     && elevator->guestElevation == elevatorFixture->destinationElevation
                                     && networkWorldApplyPeerElevator(*elevator);
+                            } else if (event && event.event.sequence == expectedEventSequence
+                                && event.event.causedBy == scenarioCommand.sequence
+                                && smokeScenario == SmokeScenario::MapTransition) {
+                                const auto* elevator = std::get_if<ElevatorTransitionedEvent>(&event.event.payload);
+                                eventApplied = elevator != nullptr
+                                    && elevator->actorId == scenarioCommand.actorId
+                                    && elevator->elevatorType == mapTransitionFixture->elevatorType
+                                    && elevator->map == mapTransitionFixture->destinationMap
+                                    && elevator->hostElevation == mapTransitionFixture->destinationElevation
+                                    && elevator->guestElevation == mapTransitionFixture->destinationElevation
+                                    && networkWorldApplyPeerElevator(*elevator);
                             }
                             if (eventApplied) {
                                 receivedEventCount++;
@@ -1485,6 +1513,8 @@ bool networkRuntimeRunSmokeTest()
                                     stateConverged = networkWorldVerifyQuestSmokeTest(*questFixture);
                                 } else if (stateConverged && smokeScenario == SmokeScenario::Elevation) {
                                     stateConverged = networkWorldVerifyElevatorSmokeTest(*elevatorFixture);
+                                } else if (stateConverged && smokeScenario == SmokeScenario::MapTransition) {
+                                    stateConverged = networkWorldVerifyMapTransitionSmokeTest(*mapTransitionFixture);
                                 }
                             }
                             if (!stateConverged) {
@@ -1578,6 +1608,11 @@ bool networkRuntimeRunSmokeTest()
                                 payloadMatches = elevator != nullptr
                                     && elevator->elevatorType == elevatorFixture->elevatorType
                                     && elevator->destinationLevel == elevatorFixture->destinationLevel;
+                            } else if (smokeScenario == SmokeScenario::MapTransition) {
+                                const auto* elevator = std::get_if<ElevatorCommand>(&command.command.payload);
+                                payloadMatches = elevator != nullptr
+                                    && elevator->elevatorType == mapTransitionFixture->elevatorType
+                                    && elevator->destinationLevel == mapTransitionFixture->destinationLevel;
                             } else {
                                 const auto* movement = std::get_if<MoveCommand>(&command.command.payload);
                                 payloadMatches = movement != nullptr
@@ -1636,6 +1671,8 @@ bool networkRuntimeRunSmokeTest()
                                 && networkWorldFindObject(questFixture->itemId) == nullptr;
                         case SmokeScenario::Elevation:
                             return networkWorldVerifyElevatorSmokeTest(*elevatorFixture);
+                        case SmokeScenario::MapTransition:
+                            return networkWorldVerifyMapTransitionSmokeTest(*mapTransitionFixture);
                         }
                         return false;
                     };
@@ -1682,10 +1719,13 @@ bool networkRuntimeRunSmokeTest()
                         || networkWorldVerifyQuestSmokeTest(*questFixture);
                     bool elevationCompleted = smokeScenario != SmokeScenario::Elevation
                         || networkWorldVerifyElevatorSmokeTest(*elevatorFixture);
+                    bool mapTransitionCompleted = smokeScenario != SmokeScenario::MapTransition
+                        || networkWorldVerifyMapTransitionSmokeTest(*mapTransitionFixture);
                     bool captured = accepted
                         && scenarioCompleted
                         && questCompleted
                         && elevationCompleted
+                        && mapTransitionCompleted
                         && objectMutated
                         && authoritativeEvents.size() == scenarioFinalEventSequence.value
                         && networkWorldCaptureAuthoritativeState(scenarioFinalEventSequence, state);
@@ -1763,7 +1803,8 @@ bool networkRuntimeRunSmokeTest()
 
             if (smokeScenario == SmokeScenario::Quest) {
                 authorityProbeCounts = scenarioProbeCounts;
-            } else if (smokeScenario == SmokeScenario::Elevation) {
+            } else if (smokeScenario == SmokeScenario::Elevation
+                || smokeScenario == SmokeScenario::MapTransition) {
                 // The transition event itself is applied under the execution probe
                 // above. The standard door/attack probe assumes both actors remain
                 // on the entrance elevation, which is deliberately false here.

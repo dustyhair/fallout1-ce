@@ -96,6 +96,17 @@ struct ElevatorSmokeFixture {
 };
 std::optional<ElevatorSmokeFixture> networkWorldPrepareElevatorSmokeTest();
 bool networkWorldVerifyElevatorSmokeTest(const ElevatorSmokeFixture& fixture);
+struct MapTransitionSmokeFixture {
+    std::int32_t elevatorType = -1;
+    std::int32_t destinationLevel = -1;
+    std::int32_t destinationMap = -1;
+    std::int32_t destinationElevation = -1;
+    std::int32_t guestCaps = 0;
+    EntityId hostActorId;
+    EntityId guestActorId;
+};
+std::optional<MapTransitionSmokeFixture> networkWorldPrepareMapTransitionSmokeTest();
+bool networkWorldVerifyMapTransitionSmokeTest(const MapTransitionSmokeFixture& fixture);
 bool networkWorldVerifyLootRangeSmokeTest(EntityId targetId);
 std::optional<EntityId> networkWorldPreparePlayerTransferSmokeTest();
 bool networkWorldVerifyPlayerTransferRangeSmokeTest(EntityId itemId);

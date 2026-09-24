@@ -72,6 +72,9 @@ constexpr int kAntidotePid = 49;
 
 constexpr std::uint32_t kSharedObjectFlagMask = 0xB70FF839;
 
+bool registerWorldObjects();
+Object* createPeerActor();
+
 std::uint32_t sharedObjectFlags(const Object* object)
 {
     return static_cast<std::uint32_t>(object->flags) & kSharedObjectFlagMask;
@@ -499,6 +502,78 @@ bool beginPickup(Object* actor, Object* target)
     return true;
 }
 
+struct PreservedPeerActor {
+    Inventory inventory {};
+    CritterObjectData critter {};
+    int fid = -1;
+};
+
+void attachInventory(Object* actor, Inventory& inventory)
+{
+    actor->data.inventory = inventory;
+    inventory = {};
+    for (int index = 0; index < actor->data.inventory.length; index++) {
+        actor->data.inventory.items[index].item->owner = actor;
+    }
+}
+
+bool loadSharedMap(int map)
+{
+    if (!session.isActive()
+        || session.phase() != SessionPhase::Transition
+        || peerActor == nullptr
+        || map < 0) {
+        return false;
+    }
+
+    PreservedPeerActor preserved;
+    preserved.inventory = peerActor->data.inventory;
+    preserved.critter = peerActor->data.critter;
+    preserved.critter.combat.whoHitMe = nullptr;
+    preserved.fid = peerActor->fid;
+    peerActor->data.inventory = {};
+
+    session.clearWorldEntities();
+    worldDoors.clear();
+    worldScenery.clear();
+    worldItems.clear();
+    worldCritters.clear();
+    reservedPickupTargets.clear();
+    pendingPickups.clear();
+    deferredEvents.clear();
+    activeLootTargets.clear();
+    activeSharedModal.reset();
+    peerActor = nullptr;
+
+    if (map_load_idx(map) == -1) {
+        obj_inven_free(&preserved.inventory);
+        return false;
+    }
+
+    Object* replacement = createPeerActor();
+    if (replacement == nullptr) {
+        obj_inven_free(&preserved.inventory);
+        return false;
+    }
+    replacement->data.critter = preserved.critter;
+    attachInventory(replacement, preserved.inventory);
+    if (obj_change_fid(replacement, preserved.fid, nullptr) == -1) {
+        preserved.inventory = replacement->data.inventory;
+        replacement->data.inventory = {};
+        obj_inven_free(&preserved.inventory);
+        obj_erase_object(replacement, nullptr);
+        return false;
+    }
+
+    PlayerId peerPlayerId = worldMode == NetworkLaunchMode::Host ? kGuestPlayerId : kHostPlayerId;
+    if (session.rebindPlayerActor(peerPlayerId, replacement) != LocalSessionError::None) {
+        obj_erase_object(replacement, nullptr);
+        return false;
+    }
+    peerActor = replacement;
+    return true;
+}
+
 class NetworkCommandExecutor : public CommandExecutor {
 public:
     CommandExecutionStatus move(Object* actor, const MoveCommand& command) override
@@ -653,10 +728,47 @@ public:
                 &destinationMap,
                 &destinationElevation,
                 &destinationTile)
-            || destinationMap != map_data.field_34
             || !elevationIsValid(destinationElevation)
             || !hexGridTileIsValid(destinationTile)
-            || destinationElevation == actor->elevation) {
+            || (destinationMap == map_data.field_34 && destinationElevation == actor->elevation)
+            || (destinationMap != map_data.field_34 && !companionJoins)) {
+            return execution;
+        }
+
+        if (destinationMap != map_data.field_34) {
+            if (session.transitionTo(SessionPhase::Transition) != LocalSessionError::None
+                || !loadSharedMap(destinationMap)) {
+                return execution;
+            }
+            host = session.entities().findObject(session.playerActorId(kHostPlayerId));
+            guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+            bool loaded = host != nullptr
+                && guest != nullptr
+                && map_data.field_34 == destinationMap
+                && obj_attempt_placement(host, destinationTile, destinationElevation, 0) != -1
+                && obj_attempt_placement(guest, destinationTile, destinationElevation, 2) != -1
+                && host->tile != guest->tile
+                && obj_set_rotation(host, ROTATION_SE, nullptr) == 0
+                && obj_set_rotation(guest, ROTATION_SE, nullptr) == 0;
+            Object* localActor = localPlayerActor();
+            loaded = loaded
+                && localActor != nullptr
+                && map_set_elevation(localActor->elevation) == 0
+                && registerWorldObjects()
+                && session.transitionTo(SessionPhase::Exploration) == LocalSessionError::None;
+            if (!loaded) {
+                return execution;
+            }
+
+            execution.status = CommandExecutionStatus::Applied;
+            execution.map = destinationMap;
+            execution.hostTile = host->tile;
+            execution.hostElevation = host->elevation;
+            execution.hostRotation = host->rotation;
+            execution.guestTile = guest->tile;
+            execution.guestElevation = guest->elevation;
+            execution.guestRotation = guest->rotation;
+            execution.phaseRevision = session.phaseRevision();
             return execution;
         }
 
@@ -956,6 +1068,15 @@ bool registerWorldObjects()
         }
         return true;
     };
+
+    Object* host = session.entities().findObject(session.playerActorId(kHostPlayerId));
+    Object* guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+    if (host == nullptr
+        || guest == nullptr
+        || !registerInventory(registerInventory, host)
+        || !registerInventory(registerInventory, guest)) {
+        return false;
+    }
 
     for (Object* door : doors) {
         EntityRegistrationResult registration = session.registerWorldObject(door);
@@ -1454,7 +1575,7 @@ bool networkWorldApplyPeerElevator(const ElevatorTransitionedEvent& elevator)
         || guest == nullptr
         || elevator.elevatorType < 0
         || elevator.elevatorType >= ELEVATOR_COUNT
-        || elevator.map != map_data.field_34
+        || elevator.map < 0
         || !hexGridTileIsValid(elevator.hostTile)
         || !elevationIsValid(elevator.hostElevation)
         || elevator.hostRotation < 0
@@ -1465,18 +1586,39 @@ bool networkWorldApplyPeerElevator(const ElevatorTransitionedEvent& elevator)
         || elevator.guestRotation >= ROTATION_COUNT
         || (elevator.hostElevation == elevator.guestElevation
             && elevator.hostTile == elevator.guestTile)
-        || session.applyAuthoritativePhase(SessionPhase::Exploration, elevator.phaseRevision) != LocalSessionError::None) {
+        || elevator.phaseRevision == 0) {
         return false;
     }
+
+    bool mapChanged = elevator.map != map_data.field_34;
+    if (mapChanged) {
+        if (elevator.phaseRevision < 2
+            || session.applyAuthoritativePhase(SessionPhase::Transition, elevator.phaseRevision - 1) != LocalSessionError::None
+            || !loadSharedMap(elevator.map)) {
+            return false;
+        }
+        host = session.entities().findObject(session.playerActorId(kHostPlayerId));
+        guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+        if (host == nullptr || guest == nullptr || map_data.field_34 != elevator.map) {
+            return false;
+        }
+    } else if (session.applyAuthoritativePhase(SessionPhase::Exploration, elevator.phaseRevision) != LocalSessionError::None) {
+        return false;
+    }
+
     register_clear(host);
     register_clear(guest);
     Object* localActor = localPlayerActor();
-    return obj_move_to_tile(host, elevator.hostTile, elevator.hostElevation, nullptr) == 0
+    bool applied = obj_move_to_tile(host, elevator.hostTile, elevator.hostElevation, nullptr) == 0
         && obj_move_to_tile(guest, elevator.guestTile, elevator.guestElevation, nullptr) == 0
         && obj_set_rotation(host, elevator.hostRotation, nullptr) == 0
         && obj_set_rotation(guest, elevator.guestRotation, nullptr) == 0
         && localActor != nullptr
-        && map_set_elevation(localActor->elevation) == 0;
+        && map_set_elevation(localActor->elevation) == 0
+        && (!mapChanged || registerWorldObjects());
+    return applied
+        && (!mapChanged
+            || session.applyAuthoritativePhase(SessionPhase::Exploration, elevator.phaseRevision) == LocalSessionError::None);
 }
 
 bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts)
@@ -2034,6 +2176,162 @@ bool networkWorldVerifyElevatorSmokeTest(const ElevatorSmokeFixture& fixture)
         && map_elevation == (worldMode == NetworkLaunchMode::Host
                 ? fixture.sourceElevation
                 : fixture.destinationElevation);
+}
+
+std::optional<MapTransitionSmokeFixture> networkWorldPrepareMapTransitionSmokeTest()
+{
+    if (!session.isActive()) {
+        return std::nullopt;
+    }
+    Object* host = session.entities().findObject(session.playerActorId(kHostPlayerId));
+    Object* guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+    if (host == nullptr || guest == nullptr) {
+        return std::nullopt;
+    }
+
+    anim_stop();
+    for (int elevatorType = 0; elevatorType < ELEVATOR_COUNT; elevatorType++) {
+        int sourceTile = -1;
+        if (!elevator_get_source(elevatorType, map_data.field_34, map_elevation, &sourceTile)
+            || !hexGridTileIsValid(sourceTile)) {
+            continue;
+        }
+
+        int destinationLevel = -1;
+        int destinationMap = -1;
+        int destinationElevation = -1;
+        for (int level = 0; level < elevator_get_level_count(elevatorType); level++) {
+            int candidateMap = -1;
+            int candidateElevation = -1;
+            int candidateTile = -1;
+            if (elevator_get_destination(elevatorType,
+                    level,
+                    &candidateMap,
+                    &candidateElevation,
+                    &candidateTile)
+                && candidateMap != map_data.field_34
+                && elevationIsValid(candidateElevation)
+                && hexGridTileIsValid(candidateTile)) {
+                destinationLevel = level;
+                destinationMap = candidateMap;
+                destinationElevation = candidateElevation;
+                break;
+            }
+        }
+        if (destinationLevel == -1) {
+            continue;
+        }
+
+        bool guestPlaced = false;
+        for (int rotation = 0; rotation < ROTATION_COUNT && !guestPlaced; rotation++) {
+            int tile = tile_num_in_direction(sourceTile, rotation, 1);
+            guestPlaced = hexGridTileIsValid(tile)
+                && obj_blocking_at(guest, tile, map_elevation) == nullptr
+                && obj_move_to_tile(guest, tile, map_elevation, nullptr) == 0;
+        }
+        bool hostRemote = false;
+        for (int distance = 5; distance <= 8 && !hostRemote; distance++) {
+            for (int rotation = 0; rotation < ROTATION_COUNT && !hostRemote; rotation++) {
+                int tile = tile_num_in_direction(sourceTile, rotation, distance);
+                hostRemote = hexGridTileIsValid(tile)
+                    && obj_blocking_at(host, tile, map_elevation) == nullptr
+                    && obj_move_to_tile(host, tile, map_elevation, nullptr) == 0;
+            }
+        }
+        GameCommand readinessProbe;
+        readinessProbe.sequence = CommandSequence { 1 };
+        readinessProbe.playerId = kGuestPlayerId;
+        readinessProbe.actorId = session.playerActorId(kGuestPlayerId);
+        readinessProbe.expectedPhase = SessionPhase::Exploration;
+        readinessProbe.expectedPhaseRevision = session.phaseRevision();
+        readinessProbe.payload = ElevatorCommand { elevatorType, destinationLevel };
+        AuthoritativeCommandResult readinessOutcome = guestPlaced && hostRemote
+            ? networkWorldProcessCommand(readinessProbe)
+            : AuthoritativeCommandResult {};
+        bool readinessRejected = readinessOutcome.result.status == CommandStatus::Rejected
+            && readinessOutcome.result.rejection == CommandRejection::InvalidAction
+            && !readinessOutcome.event.has_value()
+            && map_data.field_34 != destinationMap;
+        commandProcessor.reset();
+
+        bool hostPlaced = false;
+        for (int rotation = 0; rotation < ROTATION_COUNT && !hostPlaced; rotation++) {
+            int tile = tile_num_in_direction(sourceTile, rotation, 1);
+            hostPlaced = hexGridTileIsValid(tile)
+                && obj_blocking_at(host, tile, map_elevation) == nullptr
+                && obj_move_to_tile(host, tile, map_elevation, nullptr) == 0;
+        }
+        int existingGuestCaps = item_caps_total(guest);
+        if (!readinessRejected
+            || !hostPlaced
+            || !guestPlaced
+            || (existingGuestCaps > 0 && item_caps_adjust(guest, -existingGuestCaps) != 0)
+            || item_caps_adjust(guest, 7) != 0) {
+            return std::nullopt;
+        }
+        Inventory& inventory = guest->data.inventory;
+        bool capsRegistered = false;
+        for (int index = 0; index < inventory.length; index++) {
+            Object* item = inventory.items[index].item;
+            if (item != nullptr && item->pid == PROTO_ID_MONEY && inventory.items[index].quantity == 7) {
+                capsRegistered = static_cast<bool>(registerItem(item));
+                break;
+            }
+        }
+        if (!capsRegistered) {
+            return std::nullopt;
+        }
+        return MapTransitionSmokeFixture {
+            elevatorType,
+            destinationLevel,
+            destinationMap,
+            destinationElevation,
+            7,
+            session.playerActorId(kHostPlayerId),
+            session.playerActorId(kGuestPlayerId),
+        };
+    }
+    return std::nullopt;
+}
+
+bool networkWorldVerifyMapTransitionSmokeTest(const MapTransitionSmokeFixture& fixture)
+{
+    Object* host = session.entities().findObject(fixture.hostActorId);
+    Object* guest = session.entities().findObject(fixture.guestActorId);
+    bool capsRegistered = false;
+    if (guest != nullptr) {
+        Inventory& inventory = guest->data.inventory;
+        for (int index = 0; index < inventory.length; index++) {
+            Object* item = inventory.items[index].item;
+            std::optional<EntityId> itemId = item != nullptr
+                ? session.entities().findEntity(item)
+                : std::nullopt;
+            if (item != nullptr
+                && item->pid == PROTO_ID_MONEY
+                && inventory.items[index].quantity == fixture.guestCaps
+                && itemId.has_value()
+                && std::any_of(worldItems.begin(), worldItems.end(), [&](const auto& entry) {
+                    return entry.first == *itemId && entry.second == item;
+                })) {
+                capsRegistered = true;
+                break;
+            }
+        }
+    }
+    return session.isActive()
+        && session.playerActorId(kHostPlayerId) == fixture.hostActorId
+        && session.playerActorId(kGuestPlayerId) == fixture.guestActorId
+        && host != nullptr
+        && guest != nullptr
+        && host != guest
+        && map_data.field_34 == fixture.destinationMap
+        && session.phase() == SessionPhase::Exploration
+        && host->elevation == fixture.destinationElevation
+        && guest->elevation == fixture.destinationElevation
+        && host->tile != guest->tile
+        && capsRegistered
+        && item_caps_total(guest) == fixture.guestCaps
+        && map_elevation == fixture.destinationElevation;
 }
 
 bool networkWorldVerifyLootRangeSmokeTest(EntityId targetId)
