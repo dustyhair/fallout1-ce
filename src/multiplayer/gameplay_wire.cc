@@ -20,6 +20,7 @@ enum class CommandType : std::uint8_t {
     UseSkill = 10,
     UseItemOn = 11,
     Elevator = 12,
+    ExitGrid = 13,
 };
 
 enum class EventType : std::uint8_t {
@@ -36,6 +37,7 @@ enum class EventType : std::uint8_t {
     SkillUseStarted = 11,
     ItemUseStarted = 12,
     ElevatorTransitioned = 13,
+    ExitGridTransitioned = 14,
 };
 
 constexpr std::size_t kCommandHeaderSize = 28;
@@ -64,6 +66,8 @@ constexpr std::size_t kSharedModalEventSize = kEventHeaderSize + 12;
 constexpr std::size_t kSkillEventSize = kEventHeaderSize + 12;
 constexpr std::size_t kItemUseEventSize = kEventHeaderSize + 12;
 constexpr std::size_t kElevatorEventSize = kEventHeaderSize + 40;
+constexpr std::size_t kExitGridEventBaseSize = kEventHeaderSize + 20;
+constexpr std::size_t kTransitionPlacementSize = 20;
 constexpr std::int32_t kAttackHitModeCount = 20;
 constexpr std::int32_t kAttackHitLocationCount = 9;
 
@@ -301,6 +305,11 @@ GameplayWireError validateCommand(const GameCommand& command)
             ? GameplayWireError::None
             : GameplayWireError::InvalidMove;
     }
+    if (const auto* exitGrid = std::get_if<ExitGridCommand>(&command.payload)) {
+        return isValid(exitGrid->exitId)
+            ? GameplayWireError::None
+            : GameplayWireError::InvalidEntityId;
+    }
 
     EntityId targetId;
     if (const auto* interact = std::get_if<InteractCommand>(&command.payload)) {
@@ -496,6 +505,39 @@ GameplayWireError validateEvent(const GameEvent& event)
             ? GameplayWireError::None
             : GameplayWireError::InvalidMove;
     }
+    if (const auto* exitGrid = std::get_if<ExitGridTransitionedEvent>(&event.payload)) {
+        if (!isValid(exitGrid->actorId)
+            || !isValid(exitGrid->exitId)
+            || exitGrid->map < 0
+            || exitGrid->phaseRevision == 0
+            || exitGrid->placements.empty()
+            || exitGrid->placements.size() > kMaximumTransitionPlayers) {
+            return GameplayWireError::InvalidMove;
+        }
+        bool actingPlayerPresent = false;
+        for (std::size_t index = 0; index < exitGrid->placements.size(); index++) {
+            const PlayerTransitionPlacement& placement = exitGrid->placements[index];
+            if (!isValid(placement.playerId)
+                || !isValid(placement.actorId)
+                || placement.tile < 0
+                || placement.elevation < 0
+                || placement.elevation > 2
+                || placement.rotation < 0
+                || placement.rotation >= kActorRotationCount) {
+                return GameplayWireError::InvalidMove;
+            }
+            actingPlayerPresent = actingPlayerPresent || placement.actorId == exitGrid->actorId;
+            for (std::size_t previous = 0; previous < index; previous++) {
+                if (exitGrid->placements[previous].playerId == placement.playerId
+                    || exitGrid->placements[previous].actorId == placement.actorId) {
+                    return GameplayWireError::InvalidMove;
+                }
+            }
+        }
+        return actingPlayerPresent
+            ? GameplayWireError::None
+            : GameplayWireError::InvalidMove;
+    }
 
     EntityId actorId;
     EntityId targetId;
@@ -605,6 +647,9 @@ GameplayWireError encodeGameCommand(const GameCommand& command, ProtocolEnvelope
         appendCommandHeader(command, CommandType::Elevator, envelope.payload);
         appendInt32(envelope.payload, elevator->elevatorType);
         appendInt32(envelope.payload, elevator->destinationLevel);
+    } else if (const auto* exitGrid = std::get_if<ExitGridCommand>(&command.payload)) {
+        appendCommandHeader(command, CommandType::ExitGrid, envelope.payload);
+        appendUInt32(envelope.payload, exitGrid->exitId.value);
     } else {
         const auto* attack = std::get_if<AttackCommand>(&command.payload);
         appendCommandHeader(command, CommandType::Attack, envelope.payload);
@@ -767,6 +812,15 @@ GameCommandDecodeResult decodeGameCommand(const ProtocolEnvelope& envelope)
             readInt32(envelope.payload, 32),
         };
         break;
+    case CommandType::ExitGrid:
+        if (envelope.payload.size() != kTargetCommandSize) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.command.payload = ExitGridCommand {
+            EntityId { readUInt32(envelope.payload, 28) },
+        };
+        break;
     default:
         result.error = GameplayWireError::UnknownPayloadType;
         return result;
@@ -925,6 +979,20 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
         appendInt32(envelope.payload, elevator->guestElevation);
         appendInt32(envelope.payload, elevator->guestRotation);
         appendUInt32(envelope.payload, elevator->phaseRevision);
+    } else if (const auto* exitGrid = std::get_if<ExitGridTransitionedEvent>(&event.payload)) {
+        appendEventHeader(event, EventType::ExitGridTransitioned, envelope.payload);
+        appendUInt32(envelope.payload, exitGrid->actorId.value);
+        appendUInt32(envelope.payload, exitGrid->exitId.value);
+        appendInt32(envelope.payload, exitGrid->map);
+        appendUInt32(envelope.payload, exitGrid->phaseRevision);
+        appendUInt32(envelope.payload, static_cast<std::uint32_t>(exitGrid->placements.size()));
+        for (const PlayerTransitionPlacement& placement : exitGrid->placements) {
+            appendUInt32(envelope.payload, placement.playerId.value);
+            appendUInt32(envelope.payload, placement.actorId.value);
+            appendInt32(envelope.payload, placement.tile);
+            appendInt32(envelope.payload, placement.elevation);
+            appendInt32(envelope.payload, placement.rotation);
+        }
     } else {
         const auto* attack = std::get_if<AttackStartedEvent>(&event.payload);
         appendEventHeader(event, EventType::AttackStarted, envelope.payload);
@@ -1146,6 +1214,39 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
             readUInt32(envelope.payload, 56),
         };
         break;
+    case EventType::ExitGridTransitioned: {
+        if (envelope.payload.size() < kExitGridEventBaseSize) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        std::uint32_t placementCount = readUInt32(envelope.payload, 36);
+        if (placementCount == 0
+            || placementCount > kMaximumTransitionPlayers
+            || envelope.payload.size() != kExitGridEventBaseSize
+                    + static_cast<std::size_t>(placementCount) * kTransitionPlacementSize) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        ExitGridTransitionedEvent exitGrid;
+        exitGrid.actorId = EntityId { readUInt32(envelope.payload, 20) };
+        exitGrid.exitId = EntityId { readUInt32(envelope.payload, 24) };
+        exitGrid.map = readInt32(envelope.payload, 28);
+        exitGrid.phaseRevision = readUInt32(envelope.payload, 32);
+        exitGrid.placements.reserve(placementCount);
+        for (std::uint32_t index = 0; index < placementCount; index++) {
+            std::size_t offset = kExitGridEventBaseSize
+                + static_cast<std::size_t>(index) * kTransitionPlacementSize;
+            exitGrid.placements.push_back(PlayerTransitionPlacement {
+                PlayerId { readUInt32(envelope.payload, offset) },
+                EntityId { readUInt32(envelope.payload, offset + 4) },
+                readInt32(envelope.payload, offset + 8),
+                readInt32(envelope.payload, offset + 12),
+                readInt32(envelope.payload, offset + 16),
+            });
+        }
+        result.event.payload = std::move(exitGrid);
+        break;
+    }
     default:
         result.error = GameplayWireError::UnknownPayloadType;
         return result;

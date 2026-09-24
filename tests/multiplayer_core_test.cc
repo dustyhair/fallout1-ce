@@ -754,6 +754,7 @@ void testGameplayWireFormat()
         GameCommand { CommandSequence { 10 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, UseSkillCommand { EntityId { 40 }, ExplorationSkill::Traps } },
         GameCommand { CommandSequence { 11 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, UseItemOnCommand { EntityId { 43 }, EntityId { 40 } } },
         GameCommand { CommandSequence { 12 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, ElevatorCommand { 8, 1 } },
+        GameCommand { CommandSequence { 13 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, ExitGridCommand { EntityId { 46 } } },
     };
 
     for (std::size_t index = 0; index < commands.size(); index++) {
@@ -941,6 +942,20 @@ void testGameplayWireFormat()
     expect(encodeGameCommand(invalidElevator, elevatorEnvelope) == GameplayWireError::InvalidMove,
         "elevator command rejects an unknown elevator table");
 
+    ProtocolEnvelope exitGridEnvelope = gameplayEnvelope(32);
+    expect(encodeGameCommand(commands[12], exitGridEnvelope) == GameplayWireError::None,
+        "exit-grid command encodes");
+    GameCommandDecodeResult decodedExitGrid = decodeGameCommand(exitGridEnvelope);
+    const ExitGridCommand* exitGrid = decodedExitGrid
+        ? std::get_if<ExitGridCommand>(&decodedExitGrid.command.payload)
+        : nullptr;
+    expect(exitGrid != nullptr && exitGrid->exitId == EntityId { 46 },
+        "exit-grid command round trips its installed-map entity identity");
+    GameCommand invalidExitGrid = commands[12];
+    std::get<ExitGridCommand>(invalidExitGrid.payload).exitId = {};
+    expect(encodeGameCommand(invalidExitGrid, exitGridEnvelope) == GameplayWireError::InvalidEntityId,
+        "exit-grid command rejects an invalid source identity");
+
     CommandResult accepted;
     accepted.commandSequence.value = 1;
     accepted.status = CommandStatus::Accepted;
@@ -984,6 +999,16 @@ void testGameplayWireFormat()
         GameEvent { EventSequence { 17 }, CommandSequence { 10 }, SkillUseStartedEvent { EntityId { 20 }, EntityId { 40 }, ExplorationSkill::Traps } },
         GameEvent { EventSequence { 18 }, CommandSequence { 11 }, ItemUseStartedEvent { EntityId { 20 }, EntityId { 43 }, EntityId { 40 } } },
         GameEvent { EventSequence { 19 }, CommandSequence { 12 }, ElevatorTransitionedEvent { EntityId { 20 }, 8, 6, 14105, 0, 3, 22504, 1, 2, 5 } },
+        GameEvent { EventSequence { 20 }, CommandSequence { 13 }, ExitGridTransitionedEvent {
+            EntityId { 20 },
+            EntityId { 46 },
+            35,
+            {
+                PlayerTransitionPlacement { kHostPlayerId, EntityId { 10 }, 17091, 0, 0 },
+                PlayerTransitionPlacement { kGuestPlayerId, EntityId { 20 }, 17090, 0, 0 },
+            },
+            7,
+        } },
     };
     for (std::size_t index = 0; index < events.size(); index++) {
         ProtocolEnvelope envelope = gameplayEnvelope(30 + index);
@@ -1142,6 +1167,29 @@ void testGameplayWireFormat()
             && elevatorEvent->guestRotation == 2
             && elevatorEvent->phaseRevision == 5,
         "elevator event round trips each actor's independent authoritative placement state");
+
+    ProtocolEnvelope exitGridEventEnvelope = gameplayEnvelope(50);
+    expect(encodeGameEvent(events[13], exitGridEventEnvelope) == GameplayWireError::None,
+        "exit-grid event encodes its bounded placement roster");
+    GameEventDecodeResult decodedExitGridEvent = decodeGameEvent(exitGridEventEnvelope);
+    const ExitGridTransitionedEvent* exitGridEvent = decodedExitGridEvent
+        ? std::get_if<ExitGridTransitionedEvent>(&decodedExitGridEvent.event.payload)
+        : nullptr;
+    expect(exitGridEvent != nullptr
+            && exitGridEvent->actorId == EntityId { 20 }
+            && exitGridEvent->exitId == EntityId { 46 }
+            && exitGridEvent->map == 35
+            && exitGridEvent->phaseRevision == 7
+            && exitGridEvent->placements.size() == 2
+            && exitGridEvent->placements[0].playerId == kHostPlayerId
+            && exitGridEvent->placements[0].actorId == EntityId { 10 }
+            && exitGridEvent->placements[1].playerId == kGuestPlayerId
+            && exitGridEvent->placements[1].tile == 17090,
+        "exit-grid event round trips player-keyed destination placements");
+    GameEvent duplicateExitPlacement = events[13];
+    std::get<ExitGridTransitionedEvent>(duplicateExitPlacement.payload).placements[1].playerId = kHostPlayerId;
+    expect(encodeGameEvent(duplicateExitPlacement, exitGridEventEnvelope) == GameplayWireError::InvalidMove,
+        "exit-grid event rejects duplicate roster participants");
 
     ProtocolEnvelope skillEventEnvelope = gameplayEnvelope(48);
     encodeGameEvent(events[10], skillEventEnvelope);
@@ -2178,6 +2226,24 @@ public:
         return ElevatorExecution { nextStatus, 6, 14105, 0, 3, 22504, 1, 2, 5 };
     }
 
+    ExitGridExecution useExitGrid(Object* actor, Object* target, const ExitGridCommand& command) override
+    {
+        exitGridCalls++;
+        lastActor = actor;
+        lastTarget = target;
+        lastExitGrid = command;
+        recordContext();
+        return ExitGridExecution {
+            nextStatus,
+            35,
+            {
+                PlayerTransitionPlacement { kHostPlayerId, EntityId { 1 }, 17091, 0, 0 },
+                PlayerTransitionPlacement { kGuestPlayerId, EntityId { 2 }, 17090, 0, 0 },
+            },
+            7,
+        };
+    }
+
     CommandExecutionStatus attack(Object* actor, Object* target, const AttackCommand& command) override
     {
         attackCalls++;
@@ -2279,6 +2345,7 @@ public:
     int skillCalls = 0;
     int itemUseCalls = 0;
     int elevatorCalls = 0;
+    int exitGridCalls = 0;
     int attackCalls = 0;
     int modalCalls = 0;
     int transferCalls = 0;
@@ -2297,6 +2364,7 @@ public:
     UseSkillCommand lastSkill;
     UseItemOnCommand lastItemUse;
     ElevatorCommand lastElevator;
+    ExitGridCommand lastExitGrid;
     SharedModalCommand lastModal;
     LocalSession* modalSession = nullptr;
     Object* activeModalActor = nullptr;
@@ -2481,6 +2549,39 @@ void testAuthoritativeCommandProcessing()
             && executor.elevatorCalls == 1
             && !invalidElevator.event.has_value(),
         "command processor rejects an unknown elevator table before engine execution");
+
+    CommandProcessor exitGridProcessor;
+    GameCommand useExitGrid;
+    useExitGrid.sequence.value = 1;
+    useExitGrid.playerId = kGuestPlayerId;
+    useExitGrid.actorId = session.playerActorId(kGuestPlayerId);
+    useExitGrid.expectedPhase = SessionPhase::Exploration;
+    useExitGrid.expectedPhaseRevision = session.phaseRevision();
+    useExitGrid.payload = ExitGridCommand { registeredLootableCritter.entityId };
+    AuthoritativeCommandResult usedExitGrid = exitGridProcessor.process(useExitGrid, session, executor);
+    const ExitGridTransitionedEvent* exitGridEvent = usedExitGrid.event.has_value()
+        ? std::get_if<ExitGridTransitionedEvent>(&usedExitGrid.event->payload)
+        : nullptr;
+    expect(usedExitGrid.result.status == CommandStatus::Accepted
+            && executor.exitGridCalls == 1
+            && executor.lastActor == asGameObject(guestActor)
+            && executor.lastTarget == asGameObject(lootableCritter)
+            && executor.lastExitGrid.exitId == registeredLootableCritter.entityId
+            && exitGridEvent != nullptr
+            && exitGridEvent->actorId == session.playerActorId(kGuestPlayerId)
+            && exitGridEvent->exitId == registeredLootableCritter.entityId
+            && exitGridEvent->map == 35
+            && exitGridEvent->placements.size() == 2
+            && exitGridEvent->placements[1].playerId == kGuestPlayerId
+            && exitGridEvent->phaseRevision == 7,
+        "host resolves an exit-grid target and emits a player-keyed transition roster");
+    useExitGrid.sequence.value = 2;
+    std::get<ExitGridCommand>(useExitGrid.payload).exitId = {};
+    AuthoritativeCommandResult invalidExitGrid = exitGridProcessor.process(useExitGrid, session, executor);
+    expect(invalidExitGrid.result.rejection == CommandRejection::Malformed
+            && executor.exitGridCalls == 1
+            && !invalidExitGrid.event.has_value(),
+        "command processor rejects an invalid exit-grid identity before engine execution");
 
     GameCommand pickup;
     pickup.sequence.value = 2;

@@ -89,6 +89,11 @@ int main()
             && command.elevatorLevel == 1,
         "parses an authoritative elevator type and one-based level")
         && passed;
+    passed = expect(parse("53 game_exit 82", command)
+            && command.type == fallout::AgentControlCommandType::GameExit
+            && command.entityId == 82,
+        "parses an authoritative exit-grid entity")
+        && passed;
     passed = expect(!parse("0 click 10 10", command), "rejects command id zero") && passed;
     passed = expect(!parse("52 click -1 10", command), "rejects negative coordinates") && passed;
     passed = expect(!parse("53 key definitely-not-a-key", command), "rejects an unknown key") && passed;
@@ -100,6 +105,7 @@ int main()
     passed = expect(!parse("59 game_use_item 77 77", command), "rejects using an item on itself") && passed;
     passed = expect(!parse("60 game_elevator 12 1", command), "rejects an unknown elevator type") && passed;
     passed = expect(!parse("61 game_elevator 8 5", command), "rejects an unavailable elevator level") && passed;
+    passed = expect(!parse("62 game_exit 0", command), "rejects an invalid exit-grid entity") && passed;
 
     return passed ? 0 : 1;
 }

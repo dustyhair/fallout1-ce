@@ -80,6 +80,7 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     const UseSkillCommand* skill = std::get_if<UseSkillCommand>(&command.payload);
     const UseItemOnCommand* itemUse = std::get_if<UseItemOnCommand>(&command.payload);
     const ElevatorCommand* elevator = std::get_if<ElevatorCommand>(&command.payload);
+    const ExitGridCommand* exitGrid = std::get_if<ExitGridCommand>(&command.payload);
     const InventoryTransferCommand* transfer = std::get_if<InventoryTransferCommand>(&command.payload);
     const ItemDropCommand* drop = std::get_if<ItemDropCommand>(&command.payload);
     const AttackCommand* attack = std::get_if<AttackCommand>(&command.payload);
@@ -111,6 +112,12 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
             || elevator->destinationLevel > 3) {
             return rejectAndRemember(CommandRejection::Malformed);
         }
+    } else if (exitGrid != nullptr) {
+        if (!isValid(exitGrid->exitId)) {
+            return rejectAndRemember(CommandRejection::Malformed);
+        }
+        targetId = exitGrid->exitId;
+        hasTarget = true;
     } else if (attack != nullptr) {
         targetId = attack->targetId;
         hasTarget = true;
@@ -213,6 +220,16 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
                 elevatorExecution.guestElevation,
                 elevatorExecution.guestRotation,
                 elevatorExecution.phaseRevision,
+            };
+        } else if (exitGrid != nullptr) {
+            ExitGridExecution exitExecution = executor.useExitGrid(actor, target, *exitGrid);
+            executionStatus = exitExecution.status;
+            event.payload = ExitGridTransitionedEvent {
+                command.actorId,
+                exitGrid->exitId,
+                exitExecution.map,
+                std::move(exitExecution.placements),
+                exitExecution.phaseRevision,
             };
         } else if (attack != nullptr) {
             executionStatus = executor.attack(actor, target, *attack);

@@ -43,6 +43,7 @@ Object* peerActor = nullptr;
 CommandProcessor commandProcessor;
 std::vector<std::pair<EntityId, Object*>> worldDoors;
 std::vector<std::pair<EntityId, Object*>> worldScenery;
+std::vector<std::pair<EntityId, Object*>> worldExitGrids;
 std::vector<std::pair<EntityId, Object*>> worldItems;
 std::vector<std::pair<EntityId, Object*>> worldCritters;
 std::unordered_set<EntityId, EntityIdHash> reservedPickupTargets;
@@ -71,6 +72,34 @@ constexpr int kJarvisCuredLocalVariable = 5;
 constexpr int kAntidotePid = 49;
 
 constexpr std::uint32_t kSharedObjectFlagMask = 0xB70FF839;
+
+bool isExitGrid(const Object* object)
+{
+    return object != nullptr
+        && FID_TYPE(object->fid) == OBJ_TYPE_MISC
+        && object->pid >= PROTO_ID_0x5000010
+        && object->pid <= PROTO_ID_0x5000017;
+}
+
+bool exitGridDestination(const Object* exitGrid,
+    int& map,
+    int& tile,
+    int& elevation,
+    int& rotation)
+{
+    if (!isExitGrid(exitGrid)) {
+        return false;
+    }
+    map = exitGrid->data.misc.map;
+    tile = exitGrid->data.misc.tile;
+    elevation = exitGrid->data.misc.elevation;
+    rotation = exitGrid->data.misc.rotation;
+    return map > 0
+        && hexGridTileIsValid(tile)
+        && elevationIsValid(elevation)
+        && rotation >= 0
+        && rotation < ROTATION_COUNT;
+}
 
 bool registerWorldObjects();
 Object* createPeerActor();
@@ -536,6 +565,7 @@ bool loadSharedMap(int map)
     session.clearWorldEntities();
     worldDoors.clear();
     worldScenery.clear();
+    worldExitGrids.clear();
     worldItems.clear();
     worldCritters.clear();
     reservedPickupTargets.clear();
@@ -818,6 +848,81 @@ public:
         return execution;
     }
 
+    ExitGridExecution useExitGrid(Object* actor, Object* target, const ExitGridCommand&) override
+    {
+        ExitGridExecution execution;
+        PlayerCharacterState* actingPlayer = session.players().findByActor(
+            session.entities().findEntity(actor).value_or(EntityId {}));
+        Object* host = session.entities().findObject(session.playerActorId(kHostPlayerId));
+        Object* guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+        Object* companion = actor == host ? guest : host;
+        int destinationMap = -1;
+        int destinationTile = -1;
+        int destinationElevation = -1;
+        int destinationRotation = -1;
+        if (isInCombat()
+            || actingPlayer == nullptr
+            || host == nullptr
+            || guest == nullptr
+            || companion == nullptr
+            || (actor != host && actor != guest)
+            || target == nullptr
+            || actor->tile != target->tile
+            || actor->elevation != target->elevation
+            || companion->elevation != target->elevation
+            || tile_dist(companion->tile, target->tile) > 4
+            || !exitGridDestination(target,
+                destinationMap,
+                destinationTile,
+                destinationElevation,
+                destinationRotation)
+            || session.phase() != SessionPhase::Exploration
+            || session.transitionTo(SessionPhase::Transition) != LocalSessionError::None
+            || !loadSharedMap(destinationMap)) {
+            return execution;
+        }
+
+        host = session.entities().findObject(session.playerActorId(kHostPlayerId));
+        guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+        Object* actingReplacement = session.entities().findObject(session.playerActorId(actingPlayer->id));
+        companion = actingReplacement == host ? guest : host;
+        bool loaded = host != nullptr
+            && guest != nullptr
+            && actingReplacement != nullptr
+            && companion != nullptr
+            && map_data.field_34 == destinationMap
+            && obj_attempt_placement(actingReplacement, destinationTile, destinationElevation, 0) != -1
+            && obj_attempt_placement(companion, destinationTile, destinationElevation, 2) != -1
+            && (host->elevation != guest->elevation || host->tile != guest->tile)
+            && obj_set_rotation(host, destinationRotation, nullptr) == 0
+            && obj_set_rotation(guest, destinationRotation, nullptr) == 0;
+        Object* localActor = localPlayerActor();
+        loaded = loaded
+            && localActor != nullptr
+            && map_set_elevation(localActor->elevation) == 0
+            && registerWorldObjects()
+            && session.transitionTo(SessionPhase::Exploration) == LocalSessionError::None;
+        if (!loaded) {
+            return execution;
+        }
+
+        execution.status = CommandExecutionStatus::Applied;
+        execution.map = destinationMap;
+        for (PlayerId playerId : { kHostPlayerId, kGuestPlayerId }) {
+            EntityId actorId = session.playerActorId(playerId);
+            Object* playerActor = session.entities().findObject(actorId);
+            execution.placements.push_back(PlayerTransitionPlacement {
+                playerId,
+                actorId,
+                playerActor->tile,
+                playerActor->elevation,
+                playerActor->rotation,
+            });
+        }
+        execution.phaseRevision = session.phaseRevision();
+        return execution;
+    }
+
     CommandExecutionStatus attack(Object* actor, Object* target, const AttackCommand& command) override
     {
         // Fail closed until the combat controller can prove active-turn
@@ -1006,6 +1111,7 @@ bool registerWorldObjects()
 {
     worldDoors.clear();
     worldScenery.clear();
+    worldExitGrids.clear();
     worldItems.clear();
     worldCritters.clear();
     reservedPickupTargets.clear();
@@ -1015,6 +1121,7 @@ bool registerWorldObjects()
     activeSharedModal.reset();
     std::vector<Object*> doors;
     std::vector<Object*> scenery;
+    std::vector<Object*> exitGrids;
     std::vector<Object*> items;
     std::vector<Object*> critters;
     for (Object* object = obj_find_first(); object != nullptr; object = obj_find_next()) {
@@ -1022,7 +1129,9 @@ bool registerWorldObjects()
             continue;
         }
         int objectType = FID_TYPE(object->fid);
-        if (objectType == OBJ_TYPE_SCENERY && obj_is_a_portal(object)) {
+        if (isExitGrid(object)) {
+            exitGrids.push_back(object);
+        } else if (objectType == OBJ_TYPE_SCENERY && obj_is_a_portal(object)) {
             doors.push_back(object);
         } else if (objectType == OBJ_TYPE_SCENERY
             && object->tile >= 0) {
@@ -1042,6 +1151,7 @@ bool registerWorldObjects()
     };
     std::sort(doors.begin(), doors.end(), stableObjectOrder);
     std::sort(scenery.begin(), scenery.end(), stableObjectOrder);
+    std::sort(exitGrids.begin(), exitGrids.end(), stableObjectOrder);
     std::sort(items.begin(), items.end(), stableObjectOrder);
     std::sort(critters.begin(), critters.end(), [](const Object* lhs, const Object* rhs) {
         return std::tie(lhs->id, lhs->pid, lhs->elevation)
@@ -1076,6 +1186,14 @@ bool registerWorldObjects()
         || !registerInventory(registerInventory, host)
         || !registerInventory(registerInventory, guest)) {
         return false;
+    }
+
+    for (Object* exitGrid : exitGrids) {
+        EntityRegistrationResult registration = session.registerWorldObject(exitGrid);
+        if (!registration) {
+            return false;
+        }
+        worldExitGrids.emplace_back(registration.entityId, exitGrid);
     }
 
     for (Object* door : doors) {
@@ -1619,6 +1737,65 @@ bool networkWorldApplyPeerElevator(const ElevatorTransitionedEvent& elevator)
     return applied
         && (!mapChanged
             || session.applyAuthoritativePhase(SessionPhase::Exploration, elevator.phaseRevision) == LocalSessionError::None);
+}
+
+bool networkWorldApplyPeerExitGrid(const ExitGridTransitionedEvent& exitGrid)
+{
+    Object* source = session.entities().findObject(exitGrid.exitId);
+    PlayerCharacterState* actingPlayer = session.players().findByActor(exitGrid.actorId);
+    Object* actingActor = actingPlayer != nullptr
+        ? session.entities().findObject(actingPlayer->actorId)
+        : nullptr;
+    int destinationMap = -1;
+    int destinationTile = -1;
+    int destinationElevation = -1;
+    int destinationRotation = -1;
+    if (!session.isActive()
+        || source == nullptr
+        || actingActor == nullptr
+        || !exitGridDestination(source,
+            destinationMap,
+            destinationTile,
+            destinationElevation,
+            destinationRotation)
+        || destinationMap != exitGrid.map
+        || exitGrid.phaseRevision < 2
+        || exitGrid.placements.size() != session.players().size()
+        || session.applyAuthoritativePhase(SessionPhase::Transition, exitGrid.phaseRevision - 1) != LocalSessionError::None
+        || !loadSharedMap(exitGrid.map)) {
+        std::fprintf(stderr, "Multiplayer exit-grid replica failed before destination placement.\n");
+        return false;
+    }
+
+    std::unordered_set<PlayerId, PlayerIdHash> appliedPlayers;
+    for (const PlayerTransitionPlacement& placement : exitGrid.placements) {
+        Object* actor = session.entities().findObject(placement.actorId);
+        if (session.playerActorId(placement.playerId) != placement.actorId
+            || actor == nullptr
+            || !appliedPlayers.insert(placement.playerId).second
+            || obj_move_to_tile(actor, placement.tile, placement.elevation, nullptr) == -1
+            || obj_set_rotation(actor, placement.rotation, nullptr) == -1) {
+            std::fprintf(stderr,
+                "Multiplayer exit-grid replica rejected placement player=%u actor=%u tile=%d elevation=%d rotation=%d.\n",
+                placement.playerId.value,
+                placement.actorId.value,
+                placement.tile,
+                placement.elevation,
+                placement.rotation);
+            return false;
+        }
+    }
+
+    Object* localActor = localPlayerActor();
+    bool applied = appliedPlayers.size() == session.players().size()
+        && localActor != nullptr
+        && map_set_elevation(localActor->elevation) == 0
+        && registerWorldObjects()
+        && session.applyAuthoritativePhase(SessionPhase::Exploration, exitGrid.phaseRevision) == LocalSessionError::None;
+    if (!applied) {
+        std::fprintf(stderr, "Multiplayer exit-grid replica failed destination registration or phase completion.\n");
+    }
+    return applied;
 }
 
 bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts)
@@ -2295,6 +2472,137 @@ std::optional<MapTransitionSmokeFixture> networkWorldPrepareMapTransitionSmokeTe
 }
 
 bool networkWorldVerifyMapTransitionSmokeTest(const MapTransitionSmokeFixture& fixture)
+{
+    Object* host = session.entities().findObject(fixture.hostActorId);
+    Object* guest = session.entities().findObject(fixture.guestActorId);
+    bool capsRegistered = false;
+    if (guest != nullptr) {
+        Inventory& inventory = guest->data.inventory;
+        for (int index = 0; index < inventory.length; index++) {
+            Object* item = inventory.items[index].item;
+            std::optional<EntityId> itemId = item != nullptr
+                ? session.entities().findEntity(item)
+                : std::nullopt;
+            if (item != nullptr
+                && item->pid == PROTO_ID_MONEY
+                && inventory.items[index].quantity == fixture.guestCaps
+                && itemId.has_value()
+                && std::any_of(worldItems.begin(), worldItems.end(), [&](const auto& entry) {
+                    return entry.first == *itemId && entry.second == item;
+                })) {
+                capsRegistered = true;
+                break;
+            }
+        }
+    }
+    return session.isActive()
+        && session.playerActorId(kHostPlayerId) == fixture.hostActorId
+        && session.playerActorId(kGuestPlayerId) == fixture.guestActorId
+        && host != nullptr
+        && guest != nullptr
+        && host != guest
+        && map_data.field_34 == fixture.destinationMap
+        && session.phase() == SessionPhase::Exploration
+        && host->elevation == fixture.destinationElevation
+        && guest->elevation == fixture.destinationElevation
+        && host->tile != guest->tile
+        && capsRegistered
+        && item_caps_total(guest) == fixture.guestCaps
+        && map_elevation == fixture.destinationElevation;
+}
+
+std::optional<ExitGridSmokeFixture> networkWorldPrepareExitGridSmokeTest()
+{
+    if (!session.isActive()) {
+        return std::nullopt;
+    }
+    Object* host = session.entities().findObject(session.playerActorId(kHostPlayerId));
+    Object* guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+    if (host == nullptr || guest == nullptr) {
+        return std::nullopt;
+    }
+
+    anim_stop();
+    for (const auto& entry : worldExitGrids) {
+        Object* exitGrid = entry.second;
+        int destinationMap = -1;
+        int destinationTile = -1;
+        int destinationElevation = -1;
+        int destinationRotation = -1;
+        if (!exitGridDestination(exitGrid,
+                destinationMap,
+                destinationTile,
+                destinationElevation,
+                destinationRotation)
+            || destinationMap == map_data.field_34
+            || obj_move_to_tile(guest, exitGrid->tile, exitGrid->elevation, nullptr) == -1) {
+            continue;
+        }
+
+        bool hostRemote = false;
+        for (int distance = 5; distance <= 8 && !hostRemote; distance++) {
+            for (int rotation = 0; rotation < ROTATION_COUNT && !hostRemote; rotation++) {
+                int tile = tile_num_in_direction(exitGrid->tile, rotation, distance);
+                hostRemote = hexGridTileIsValid(tile)
+                    && obj_blocking_at(host, tile, exitGrid->elevation) == nullptr
+                    && obj_move_to_tile(host, tile, exitGrid->elevation, nullptr) == 0;
+            }
+        }
+        GameCommand readinessProbe;
+        readinessProbe.sequence = CommandSequence { 1 };
+        readinessProbe.playerId = kGuestPlayerId;
+        readinessProbe.actorId = session.playerActorId(kGuestPlayerId);
+        readinessProbe.expectedPhase = SessionPhase::Exploration;
+        readinessProbe.expectedPhaseRevision = session.phaseRevision();
+        readinessProbe.payload = ExitGridCommand { entry.first };
+        AuthoritativeCommandResult readinessOutcome = hostRemote
+            ? networkWorldProcessCommand(readinessProbe)
+            : AuthoritativeCommandResult {};
+        bool readinessRejected = readinessOutcome.result.status == CommandStatus::Rejected
+            && readinessOutcome.result.rejection == CommandRejection::InvalidAction
+            && !readinessOutcome.event.has_value()
+            && map_data.field_34 != destinationMap;
+        commandProcessor.reset();
+
+        bool hostPlaced = false;
+        for (int rotation = 0; rotation < ROTATION_COUNT && !hostPlaced; rotation++) {
+            int tile = tile_num_in_direction(exitGrid->tile, rotation, 1);
+            hostPlaced = hexGridTileIsValid(tile)
+                && obj_blocking_at(host, tile, exitGrid->elevation) == nullptr
+                && obj_move_to_tile(host, tile, exitGrid->elevation, nullptr) == 0;
+        }
+        int existingGuestCaps = item_caps_total(guest);
+        if (!readinessRejected
+            || !hostPlaced
+            || (existingGuestCaps > 0 && item_caps_adjust(guest, -existingGuestCaps) != 0)
+            || item_caps_adjust(guest, 11) != 0) {
+            return std::nullopt;
+        }
+        Inventory& inventory = guest->data.inventory;
+        bool capsRegistered = false;
+        for (int index = 0; index < inventory.length; index++) {
+            Object* item = inventory.items[index].item;
+            if (item != nullptr && item->pid == PROTO_ID_MONEY && inventory.items[index].quantity == 11) {
+                capsRegistered = static_cast<bool>(registerItem(item));
+                break;
+            }
+        }
+        if (!capsRegistered) {
+            return std::nullopt;
+        }
+        return ExitGridSmokeFixture {
+            entry.first,
+            destinationMap,
+            destinationElevation,
+            11,
+            session.playerActorId(kHostPlayerId),
+            session.playerActorId(kGuestPlayerId),
+        };
+    }
+    return std::nullopt;
+}
+
+bool networkWorldVerifyExitGridSmokeTest(const ExitGridSmokeFixture& fixture)
 {
     Object* host = session.entities().findObject(fixture.hostActorId);
     Object* guest = session.entities().findObject(fixture.guestActorId);
@@ -3051,6 +3359,48 @@ std::uint32_t networkWorldPhaseRevision()
     return session.phaseRevision();
 }
 
+std::optional<EntityId> networkWorldReadyLocalExitGrid()
+{
+    if (!session.isActive() || session.phase() != SessionPhase::Exploration) {
+        return std::nullopt;
+    }
+    Object* actor = localPlayerActor();
+    if (actor == nullptr || anim_busy(actor) == -1) {
+        return std::nullopt;
+    }
+    for (const auto& entry : worldExitGrids) {
+        Object* exitGrid = entry.second;
+        int destinationMap = -1;
+        int destinationTile = -1;
+        int destinationElevation = -1;
+        int destinationRotation = -1;
+        if (exitGrid == nullptr
+            || actor->tile != exitGrid->tile
+            || actor->elevation != exitGrid->elevation
+            || !exitGridDestination(exitGrid,
+                destinationMap,
+                destinationTile,
+                destinationElevation,
+                destinationRotation)) {
+            continue;
+        }
+        bool ready = true;
+        for (PlayerId playerId : { kHostPlayerId, kGuestPlayerId }) {
+            Object* playerActor = session.entities().findObject(session.playerActorId(playerId));
+            if (playerActor == nullptr
+                || playerActor->elevation != exitGrid->elevation
+                || tile_dist(playerActor->tile, exitGrid->tile) > 4) {
+                ready = false;
+                break;
+            }
+        }
+        if (ready) {
+            return entry.first;
+        }
+    }
+    return std::nullopt;
+}
+
 bool networkWorldSharedModalActive()
 {
     return activeSharedModal.has_value()
@@ -3192,15 +3542,27 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
 
 bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
 {
+    SnapshotError snapshotError = validateSnapshot(snapshot);
+    bool variablesValid = validateVariableState(snapshot);
     if (!session.isActive()
-        || validateSnapshot(snapshot) != SnapshotError::None
+        || snapshotError != SnapshotError::None
         || snapshot.doors.size() != worldDoors.size()
         || snapshot.scenery.size() != worldScenery.size()
-        || !validateVariableState(snapshot)) {
+        || !variablesValid) {
+        std::fprintf(stderr,
+            "Multiplayer snapshot preflight failed: active=%d error=%d doors=%zu/%zu scenery=%zu/%zu variables=%d.\n",
+            session.isActive() ? 1 : 0,
+            static_cast<int>(snapshotError),
+            snapshot.doors.size(),
+            worldDoors.size(),
+            snapshot.scenery.size(),
+            worldScenery.size(),
+            variablesValid ? 1 : 0);
         return false;
     }
 
     if (!validateActorAndCritterState(snapshot)) {
+        std::fprintf(stderr, "Multiplayer snapshot actor or critter identity preflight failed.\n");
         return false;
     }
     for (const DoorSnapshot& doorState : snapshot.doors) {
@@ -3219,55 +3581,94 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
             return false;
         }
     }
-    std::unordered_set<EntityId, EntityIdHash> snapshotItemIds;
-    for (const ItemSnapshot& itemState : snapshot.items) {
-        snapshotItemIds.insert(itemState.entityId);
+    // A map-load script can create or remove an item only on the authority,
+    // shifting the sequential IDs assigned to otherwise identical static map
+    // items. Rebind every local item against the authoritative holder/location
+    // and descriptor before applying state instead of trusting that local load
+    // order. Non-item entity identities have already passed validation above.
+    std::vector<Object*> localItems;
+    localItems.reserve(worldItems.size());
+    for (const auto& entry : worldItems) {
+        if (entry.second != nullptr) {
+            localItems.push_back(entry.second);
+        }
+        session.entities().unregisterEntity(entry.first);
     }
+    worldItems.clear();
+    std::unordered_set<Object*> reboundItems;
     for (const ItemSnapshot& itemState : snapshot.items) {
-        if (isValid(itemState.holderId)
-            && session.entities().findObject(itemState.holderId) == nullptr
-            && snapshotItemIds.find(itemState.holderId) == snapshotItemIds.end()) {
+        Object* desiredHolder = isValid(itemState.holderId)
+            ? session.entities().findObject(itemState.holderId)
+            : nullptr;
+        if (isValid(itemState.holderId) && desiredHolder == nullptr) {
             return false;
         }
+
+        Object* matched = nullptr;
+        Object* pidFallback = nullptr;
+        for (Object* candidate : localItems) {
+            if (candidate == nullptr
+                || reboundItems.find(candidate) != reboundItems.end()
+                || candidate->pid != itemState.itemDescriptor.pid) {
+                continue;
+            }
+            bool locationMatches = desiredHolder != nullptr
+                ? candidate->owner == desiredHolder
+                : candidate->owner == nullptr
+                    && candidate->tile == itemState.tile
+                    && candidate->elevation == itemState.elevation;
+            if (!locationMatches) {
+                continue;
+            }
+            ItemDescriptor descriptor;
+            if (describeItem(candidate, descriptor)
+                && itemDescriptorsEqual(descriptor, itemState.itemDescriptor)) {
+                matched = candidate;
+                break;
+            }
+            if (pidFallback == nullptr) {
+                pidFallback = candidate;
+            }
+        }
+        if (matched == nullptr) {
+            matched = pidFallback;
+        }
+        bool created = false;
+        if (matched == nullptr) {
+            matched = createItem(itemState.itemDescriptor);
+            created = true;
+        }
+        if (matched == nullptr
+            || session.entities().restoreObject(itemState.entityId, matched) != EntityRegistryError::None) {
+            if (created && matched != nullptr) {
+                obj_erase_object(matched, nullptr);
+            }
+            return false;
+        }
+        reboundItems.insert(matched);
+        trackWorldItem(itemState.entityId, matched);
     }
-    std::vector<Object*> removedItems;
     std::unordered_set<Object*> removedItemPointers;
-    for (const auto& entry : worldItems) {
-        if (snapshotItemIds.find(entry.first) == snapshotItemIds.end()) {
-            removedItems.push_back(entry.second);
-            removedItemPointers.insert(entry.second);
-            session.entities().unregisterEntity(entry.first);
+    for (Object* item : localItems) {
+        if (reboundItems.find(item) == reboundItems.end()) {
+            removedItemPointers.insert(item);
         }
     }
-    worldItems.erase(std::remove_if(worldItems.begin(), worldItems.end(), [&](const auto& entry) {
-        return snapshotItemIds.find(entry.first) == snapshotItemIds.end();
-    }), worldItems.end());
-    for (Object* item : removedItems) {
+    for (Object* item : removedItemPointers) {
         if (item != nullptr && removedItemPointers.find(item->owner) == removedItemPointers.end()) {
             obj_destroy(item);
-        }
-    }
-    for (const ItemSnapshot& itemState : snapshot.items) {
-        if (session.entities().findObject(itemState.entityId) == nullptr) {
-            Object* item = createItem(itemState.itemDescriptor);
-            if (item == nullptr
-                || session.entities().restoreObject(itemState.entityId, item) != EntityRegistryError::None) {
-                if (item != nullptr) {
-                    obj_erase_object(item, nullptr);
-                }
-                return false;
-            }
-            trackWorldItem(itemState.entityId, item);
         }
     }
 
     if (session.applyAuthoritativePhase(snapshot.phase, snapshot.phaseRevision) != LocalSessionError::None
         || !applyActorAndCritterState(snapshot)) {
+        std::fprintf(stderr, "Multiplayer snapshot failed phase or actor application.\n");
         return false;
     }
     Object* localActor = localPlayerActor();
     if (localActor == nullptr
         || (map_elevation != localActor->elevation && map_set_elevation(localActor->elevation) != 0)) {
+        std::fprintf(stderr, "Multiplayer snapshot failed local elevation application.\n");
         return false;
     }
     for (const DoorSnapshot& doorState : snapshot.doors) {
@@ -3275,6 +3676,7 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
         Rect dirtyRect;
         if (obj_set_frame(door, doorState.frame, &dirtyRect) == -1
             || (doorState.locked ? obj_lock(door) : obj_unlock(door)) == -1) {
+            std::fprintf(stderr, "Multiplayer snapshot failed door application.\n");
             return false;
         }
         tile_refresh_rect(&dirtyRect, door->elevation);
@@ -3296,6 +3698,7 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
                 sceneryState.objectFlags,
                 sceneryState.lightDistance,
                 sceneryState.lightIntensity)) {
+            std::fprintf(stderr, "Multiplayer snapshot failed scenery presentation application.\n");
             return false;
         }
         scenery->data.scenery.stairs.destinationMap = sceneryState.data0;
@@ -3310,12 +3713,19 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
                 itemState.objectFlags,
                 itemState.lightDistance,
                 itemState.lightIntensity)) {
+            std::fprintf(stderr, "Multiplayer snapshot failed item presentation application.\n");
             return false;
         }
     }
     for (const ItemSnapshot& itemState : snapshot.items) {
         Object* item = session.entities().findObject(itemState.entityId);
         if (!applyItemDescriptor(item, itemState.itemDescriptor)) {
+            std::fprintf(stderr,
+                "Multiplayer snapshot failed item descriptor application: entity=%u expected_pid=%d actual_pid=%d actual_fid=%d.\n",
+                itemState.entityId.value,
+                itemState.itemDescriptor.pid,
+                item != nullptr ? item->pid : -1,
+                item != nullptr ? item->fid : -1);
             return false;
         }
         Object* desiredHolder = isValid(itemState.holderId)
@@ -3372,6 +3782,7 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
     applyVariableState(snapshot);
     set_game_time(snapshot.gameTime);
     if (!applyTimedEvents(snapshot)) {
+        std::fprintf(stderr, "Multiplayer snapshot failed timed-event application.\n");
         return false;
     }
     if (activeSharedModal.has_value()
@@ -3420,6 +3831,7 @@ void networkWorldLeave()
     session.stop();
     worldDoors.clear();
     worldScenery.clear();
+    worldExitGrids.clear();
     worldItems.clear();
     worldCritters.clear();
     reservedPickupTargets.clear();

@@ -57,6 +57,13 @@ struct ElevatorExecution {
     std::uint32_t phaseRevision = 0;
 };
 
+struct ExitGridExecution {
+    CommandExecutionStatus status = CommandExecutionStatus::InvalidAction;
+    std::int32_t map = -1;
+    std::vector<PlayerTransitionPlacement> placements;
+    std::uint32_t phaseRevision = 0;
+};
+
 class CommandExecutor {
 public:
     virtual ~CommandExecutor() = default;
@@ -75,6 +82,10 @@ public:
         return CommandExecutionStatus::InvalidAction;
     }
     virtual ElevatorExecution useElevator(Object*, const ElevatorCommand&)
+    {
+        return {};
+    }
+    virtual ExitGridExecution useExitGrid(Object*, Object*, const ExitGridCommand&)
     {
         return {};
     }

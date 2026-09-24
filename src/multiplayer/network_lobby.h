@@ -68,6 +68,7 @@ public:
     bool sendLocalSkillUse(EntityId targetId, ExplorationSkill skill, std::uint32_t phaseRevision = 1);
     bool sendLocalItemUse(EntityId itemId, EntityId targetId, std::uint32_t phaseRevision = 1);
     bool sendLocalElevator(std::int32_t elevatorType, std::int32_t destinationLevel, std::uint32_t phaseRevision = 1);
+    bool sendLocalExitGrid(EntityId exitId, std::uint32_t phaseRevision = 1);
     bool sendLocalAttack(EntityId targetId, std::int32_t hitMode, std::int32_t hitLocation, std::uint32_t phaseRevision = 1);
     bool sendLocalSharedModal(SharedModalKind kind, bool open, std::uint32_t phaseRevision = 1);
     bool sendLocalInventoryTransfer(EntityId sourceId,

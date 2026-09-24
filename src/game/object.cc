@@ -1410,7 +1410,9 @@ int obj_move_to_tile(Object* obj, int tile, int elevation, Rect* rect)
 
             if (elevation == elev) {
                 if (FID_TYPE(obj->fid) == OBJ_TYPE_MISC) {
-                    if (obj->pid >= 0x5000010 && obj->pid <= 0x5000017) {
+                    if (obj->pid >= 0x5000010
+                        && obj->pid <= 0x5000017
+                        && !multiplayer::networkWorldActive()) {
                         ObjectData* data = &(obj->data);
 
                         MapTransition transition;

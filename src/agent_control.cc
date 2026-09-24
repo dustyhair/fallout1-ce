@@ -206,6 +206,14 @@ void executeCommand(const AgentControlCommand& command)
             agentJournalWriteAgentCommand(command.id, commandName, "rejected", "elevator or destination is unavailable for this transition");
         }
         return;
+    case AgentControlCommandType::GameExit:
+        if (multiplayer::networkRuntimeSubmitLocalExitGrid(
+                multiplayer::EntityId { command.entityId })) {
+            agentJournalWriteAgentCommand(command.id, commandName, "accepted", "authoritative exit-grid transition submitted");
+        } else {
+            agentJournalWriteAgentCommand(command.id, commandName, "rejected", "exit grid is unavailable or the party is not ready");
+        }
+        return;
     case AgentControlCommandType::GameGive:
         if (multiplayer::networkRuntimeGiveItemToPlayer(
                 multiplayer::EntityId { command.destinationEntityId },

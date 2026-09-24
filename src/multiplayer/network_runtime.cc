@@ -75,6 +75,7 @@ enum class SmokeScenario {
     Quest,
     Elevation,
     MapTransition,
+    ExitGrid,
 };
 SmokeScenario smokeScenario = SmokeScenario::Movement;
 
@@ -103,6 +104,8 @@ const char* smokeScenarioName()
         return "elevation";
     case SmokeScenario::MapTransition:
         return "map-transition";
+    case SmokeScenario::ExitGrid:
+        return "exit-grid";
     }
     return "unknown";
 }
@@ -169,6 +172,7 @@ struct PendingLocalItemDrop {
 };
 
 std::optional<PendingLocalItemDrop> pendingLocalItemDrop;
+std::optional<EntityId> pendingLocalExitGrid;
 
 constexpr std::uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
 constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
@@ -550,10 +554,15 @@ std::vector<AgentJournalInteractableState> visibleInteractableJournalStates(Obje
         int objectCount = obj_create_list(-1, map_elevation, objectType, &objects);
         for (int index = 0; index < objectCount; index++) {
             Object* object = objects[index];
+            bool exitGrid = object != nullptr
+                && objectType == OBJ_TYPE_MISC
+                && object->pid >= PROTO_ID_0x5000010
+                && object->pid <= PROTO_ID_0x5000017;
             if (object == nullptr
                 || object->owner != nullptr
                 || object->tile < 0
-                || (object->flags & OBJECT_HIDDEN) != 0) {
+                || (objectType == OBJ_TYPE_MISC && !exitGrid)
+                || ((object->flags & OBJECT_HIDDEN) != 0 && !exitGrid)) {
                 continue;
             }
             bool door = obj_is_a_portal(object);
@@ -572,7 +581,7 @@ std::vector<AgentJournalInteractableState> visibleInteractableJournalStates(Obje
             AgentJournalInteractableState state;
             state.entityId = entityId->value;
             state.pid = object->pid;
-            state.kind = door ? "door" : container ? "container"
+            state.kind = exitGrid ? "exit" : door ? "door" : container ? "container"
                                                    : objectType == OBJ_TYPE_SCENERY ? "scenery"
                                                                                   : "item";
             const char* name = object_name(object);
@@ -594,6 +603,7 @@ std::vector<AgentJournalInteractableState> visibleInteractableJournalStates(Obje
     };
     appendType(OBJ_TYPE_SCENERY);
     appendType(OBJ_TYPE_ITEM);
+    appendType(OBJ_TYPE_MISC);
     std::sort(states.begin(), states.end(), [](const auto& left, const auto& right) {
         if (left.entityId != right.entityId) {
             return left.entityId < right.entityId;
@@ -893,6 +903,7 @@ void networkRuntimeBackgroundProcess()
     pollReconnect();
     if (lobby.state() == NetworkLobbyState::Disconnected) {
         pendingLocalItemDrop.reset();
+        pendingLocalExitGrid.reset();
     }
     if (networkWorldActive()) {
         presentPendingGameChatMessages();
@@ -968,6 +979,7 @@ void networkRuntimeBackgroundProcess()
                     static_cast<unsigned long long>(result->commandSequence.value),
                     static_cast<int>(result->rejection));
                 pendingLocalItemDrop.reset();
+                pendingLocalExitGrid.reset();
             }
         }
         while (std::optional<GameEvent> event = lobby.takePeerEvent()) {
@@ -990,6 +1002,8 @@ void networkRuntimeBackgroundProcess()
                 applied = networkWorldApplyPeerItemUse(*itemUse);
             } else if (const auto* elevator = std::get_if<ElevatorTransitionedEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerElevator(*elevator);
+            } else if (const auto* exitGrid = std::get_if<ExitGridTransitionedEvent>(&event->payload)) {
+                applied = networkWorldApplyPeerExitGrid(*exitGrid);
             } else if (const auto* modal = std::get_if<SharedModalStateChangedEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerSharedModal(*modal);
             } else if (const auto* transfer = std::get_if<InventoryTransferredEvent>(&event->payload)) {
@@ -1002,6 +1016,9 @@ void networkRuntimeBackgroundProcess()
             if (!applied) {
                 debug_printf("Multiplayer peer event could not be applied.\n");
             } else {
+                if (std::holds_alternative<ExitGridTransitionedEvent>(event->payload)) {
+                    pendingLocalExitGrid.reset();
+                }
                 if (const auto* drop = std::get_if<ItemDroppedEvent>(&event->payload)) {
                     continuePendingLocalItemDrop(*drop);
                 }
@@ -1013,6 +1030,12 @@ void networkRuntimeBackgroundProcess()
         while (std::optional<WorldSnapshot> state = lobby.takeAuthoritativeState()) {
             if (!networkWorldApplyAuthoritativeState(*state)) {
                 debug_printf("Multiplayer authoritative state could not be applied.\n");
+            }
+        }
+        if (!pendingLocalExitGrid.has_value()) {
+            std::optional<EntityId> readyExit = networkWorldReadyLocalExitGrid();
+            if (readyExit.has_value()) {
+                networkRuntimeSubmitLocalExitGrid(*readyExit);
             }
         }
     }
@@ -1096,6 +1119,8 @@ bool networkRuntimeConfigure(int argc, char** argv)
             smokeScenario = SmokeScenario::Elevation;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=map-transition") == 0) {
             smokeScenario = SmokeScenario::MapTransition;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=exit-grid") == 0) {
+            smokeScenario = SmokeScenario::ExitGrid;
         }
     }
     if (smokeTestEnabled && launchOptions.mode == NetworkLaunchMode::Disabled) {
@@ -1105,6 +1130,7 @@ bool networkRuntimeConfigure(int argc, char** argv)
     pendingLocalSheet.reset();
     pendingRecoveryRequest.reset();
     pendingLocalItemDrop.reset();
+    pendingLocalExitGrid.reset();
     discardReconnectTransport();
     reconnectLastApplied = {};
     nextHostCommandSequence = 1;
@@ -1130,7 +1156,10 @@ const char* networkRuntimeSmokeTestMap()
     if (smokeScenario == SmokeScenario::Elevation) {
         return "Vault13.map";
     }
-    return smokeScenario == SmokeScenario::MapTransition ? "Brohd12.map" : "V13Ent.map";
+    if (smokeScenario == SmokeScenario::MapTransition) {
+        return "Brohd12.map";
+    }
+    return smokeScenario == SmokeScenario::ExitGrid ? "Vault13.map" : "V13Ent.map";
 }
 
 bool networkRuntimeRunSmokeTest()
@@ -1207,6 +1236,7 @@ bool networkRuntimeRunSmokeTest()
             std::optional<QuestSmokeFixture> questFixture;
             std::optional<ElevatorSmokeFixture> elevatorFixture;
             std::optional<MapTransitionSmokeFixture> mapTransitionFixture;
+            std::optional<ExitGridSmokeFixture> exitGridFixture;
             if (smokeScenario == SmokeScenario::Door) {
                 scenarioTargetId = networkWorldPrepareDoorSmokeTest();
                 scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
@@ -1248,6 +1278,12 @@ bool networkRuntimeRunSmokeTest()
             } else if (smokeScenario == SmokeScenario::MapTransition) {
                 mapTransitionFixture = networkWorldPrepareMapTransitionSmokeTest();
                 scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
+            } else if (smokeScenario == SmokeScenario::ExitGrid) {
+                exitGridFixture = networkWorldPrepareExitGridSmokeTest();
+                if (exitGridFixture.has_value()) {
+                    scenarioTargetId = exitGridFixture->exitId;
+                }
+                scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
             } else if (scenarioActor != nullptr) {
                 for (int distance = 1; distance <= 4 && scenarioDestinationTile == -1; distance++) {
                     for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
@@ -1263,9 +1299,11 @@ bool networkRuntimeRunSmokeTest()
             if ((smokeScenario != SmokeScenario::Movement
                     && smokeScenario != SmokeScenario::Elevation
                     && smokeScenario != SmokeScenario::MapTransition
+                    && smokeScenario != SmokeScenario::ExitGrid
                     && !scenarioTargetId.has_value())
                 || (smokeScenario == SmokeScenario::Elevation && !elevatorFixture.has_value())
                 || (smokeScenario == SmokeScenario::MapTransition && !mapTransitionFixture.has_value())
+                || (smokeScenario == SmokeScenario::ExitGrid && !exitGridFixture.has_value())
                 || (smokeScenario == SmokeScenario::Movement && scenarioDestinationTile == -1)) {
                 setStatus("MULTIPLAYER SMOKE TEST FAILED: NO EXPLORATION FIXTURE");
                 break;
@@ -1318,6 +1356,9 @@ bool networkRuntimeRunSmokeTest()
                 break;
             case SmokeScenario::MapTransition:
                 scenarioCommand.payload = ElevatorCommand { mapTransitionFixture->elevatorType, mapTransitionFixture->destinationLevel };
+                break;
+            case SmokeScenario::ExitGrid:
+                scenarioCommand.payload = ExitGridCommand { exitGridFixture->exitId };
                 break;
             }
             if (!scenarioCommandReady) {
@@ -1489,6 +1530,16 @@ bool networkRuntimeRunSmokeTest()
                                     && elevator->hostElevation == mapTransitionFixture->destinationElevation
                                     && elevator->guestElevation == mapTransitionFixture->destinationElevation
                                     && networkWorldApplyPeerElevator(*elevator);
+                            } else if (event && event.event.sequence == expectedEventSequence
+                                && event.event.causedBy == scenarioCommand.sequence
+                                && smokeScenario == SmokeScenario::ExitGrid) {
+                                const auto* exitGrid = std::get_if<ExitGridTransitionedEvent>(&event.event.payload);
+                                eventApplied = exitGrid != nullptr
+                                    && exitGrid->actorId == scenarioCommand.actorId
+                                    && exitGrid->exitId == exitGridFixture->exitId
+                                    && exitGrid->map == exitGridFixture->destinationMap
+                                    && exitGrid->placements.size() == 2
+                                    && networkWorldApplyPeerExitGrid(*exitGrid);
                             }
                             if (eventApplied) {
                                 receivedEventCount++;
@@ -1515,6 +1566,8 @@ bool networkRuntimeRunSmokeTest()
                                     stateConverged = networkWorldVerifyElevatorSmokeTest(*elevatorFixture);
                                 } else if (stateConverged && smokeScenario == SmokeScenario::MapTransition) {
                                     stateConverged = networkWorldVerifyMapTransitionSmokeTest(*mapTransitionFixture);
+                                } else if (stateConverged && smokeScenario == SmokeScenario::ExitGrid) {
+                                    stateConverged = networkWorldVerifyExitGridSmokeTest(*exitGridFixture);
                                 }
                             }
                             if (!stateConverged) {
@@ -1613,6 +1666,10 @@ bool networkRuntimeRunSmokeTest()
                                 payloadMatches = elevator != nullptr
                                     && elevator->elevatorType == mapTransitionFixture->elevatorType
                                     && elevator->destinationLevel == mapTransitionFixture->destinationLevel;
+                            } else if (smokeScenario == SmokeScenario::ExitGrid) {
+                                const auto* exitGrid = std::get_if<ExitGridCommand>(&command.command.payload);
+                                payloadMatches = exitGrid != nullptr
+                                    && exitGrid->exitId == exitGridFixture->exitId;
                             } else {
                                 const auto* movement = std::get_if<MoveCommand>(&command.command.payload);
                                 payloadMatches = movement != nullptr
@@ -1673,6 +1730,8 @@ bool networkRuntimeRunSmokeTest()
                             return networkWorldVerifyElevatorSmokeTest(*elevatorFixture);
                         case SmokeScenario::MapTransition:
                             return networkWorldVerifyMapTransitionSmokeTest(*mapTransitionFixture);
+                        case SmokeScenario::ExitGrid:
+                            return networkWorldVerifyExitGridSmokeTest(*exitGridFixture);
                         }
                         return false;
                     };
@@ -1721,11 +1780,14 @@ bool networkRuntimeRunSmokeTest()
                         || networkWorldVerifyElevatorSmokeTest(*elevatorFixture);
                     bool mapTransitionCompleted = smokeScenario != SmokeScenario::MapTransition
                         || networkWorldVerifyMapTransitionSmokeTest(*mapTransitionFixture);
+                    bool exitGridCompleted = smokeScenario != SmokeScenario::ExitGrid
+                        || networkWorldVerifyExitGridSmokeTest(*exitGridFixture);
                     bool captured = accepted
                         && scenarioCompleted
                         && questCompleted
                         && elevationCompleted
                         && mapTransitionCompleted
+                        && exitGridCompleted
                         && objectMutated
                         && authoritativeEvents.size() == scenarioFinalEventSequence.value
                         && networkWorldCaptureAuthoritativeState(scenarioFinalEventSequence, state);
@@ -1804,7 +1866,8 @@ bool networkRuntimeRunSmokeTest()
             if (smokeScenario == SmokeScenario::Quest) {
                 authorityProbeCounts = scenarioProbeCounts;
             } else if (smokeScenario == SmokeScenario::Elevation
-                || smokeScenario == SmokeScenario::MapTransition) {
+                || smokeScenario == SmokeScenario::MapTransition
+                || smokeScenario == SmokeScenario::ExitGrid) {
                 // The transition event itself is applied under the execution probe
                 // above. The standard door/attack probe assumes both actors remain
                 // on the entrance elevation, which is deliberately false here.
@@ -2222,6 +2285,7 @@ bool networkRuntimeEnterWorld()
     nextHostCommandSequence = 1;
     nextAuthoritativeState = {};
     nextAgentWorldReport = {};
+    pendingLocalExitGrid.reset();
     reportLobbyStatus();
     return true;
 }
@@ -2393,6 +2457,24 @@ bool networkRuntimeSubmitLocalElevator(std::int32_t elevatorType, std::int32_t d
     return launchOptions.mode == NetworkLaunchMode::Host
         ? submitHostCommand(ElevatorCommand { elevatorType, destinationLevel })
         : lobby.sendLocalElevator(elevatorType, destinationLevel, networkWorldPhaseRevision());
+}
+
+bool networkRuntimeSubmitLocalExitGrid(EntityId exitId)
+{
+    if (!networkWorldActive()
+        || networkWorldPhase() != SessionPhase::Exploration
+        || !isValid(exitId)) {
+        return false;
+    }
+    bool submitted = launchOptions.mode == NetworkLaunchMode::Host
+        ? submitHostCommand(ExitGridCommand { exitId })
+        : lobby.sendLocalExitGrid(exitId, networkWorldPhaseRevision());
+    if (submitted && launchOptions.mode == NetworkLaunchMode::Join) {
+        pendingLocalExitGrid = exitId;
+    } else if (launchOptions.mode == NetworkLaunchMode::Host) {
+        pendingLocalExitGrid.reset();
+    }
+    return submitted;
 }
 
 bool networkRuntimeHandleLocalAttack(Object* target, int hitMode, int hitLocation)
@@ -2810,6 +2892,7 @@ void networkRuntimeLeaveWorld()
     nextHostCommandSequence = 1;
     pendingRecoveryRequest.reset();
     pendingLocalItemDrop.reset();
+    pendingLocalExitGrid.reset();
     networkWorldLeave();
     agentJournalWriteWorldExit();
 }
@@ -2830,6 +2913,7 @@ void networkRuntimeStop()
     lobbyStarted = false;
     pendingRecoveryRequest.reset();
     pendingLocalItemDrop.reset();
+    pendingLocalExitGrid.reset();
     nextAuthoritativeState = {};
     nextAgentWorldReport = {};
 }
