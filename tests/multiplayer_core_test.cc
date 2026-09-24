@@ -12,6 +12,7 @@
 
 #include "multiplayer/acting_player_context.h"
 #include "multiplayer/character_lobby.h"
+#include "multiplayer/combat_turn_controller.h"
 #include "multiplayer/command_processor.h"
 #include "multiplayer/connection_handshake.h"
 #include "multiplayer/content_manifest.h"
@@ -151,6 +152,104 @@ void testCoreTypes()
     const MoveCommand* move = std::get_if<MoveCommand>(&command.payload);
     expect(move != nullptr, "game command keeps typed movement arguments");
     expect(move != nullptr && move->destinationTile == 12345, "movement destination survives assignment");
+}
+
+void testCombatTurnController()
+{
+    const PlayerId thirdPlayer { 3 };
+    const EntityId hostActor { 10 };
+    const EntityId guestActor { 11 };
+    const EntityId aiActor { 12 };
+    const EntityId thirdActor { 13 };
+    CombatTurnController host;
+    CombatTurnController replica;
+    std::vector<CombatTurnEntry> order {
+        { hostActor, kHostPlayerId },
+        { guestActor, kGuestPlayerId },
+        { aiActor, std::nullopt },
+        { thirdActor, thirdPlayer },
+    };
+    expect(host.begin(order, 100, 30) == CombatTurnResult::Accepted,
+        "four-actor initiative begins");
+    expect(replica.begin(order, 100, 30) == CombatTurnResult::Accepted,
+        "replica accepts the same initiative");
+    expect(host.current()->actorId == hostActor && host.revision() == 1
+            && host.deadline() == 130,
+        "host owns first turn with deadline");
+
+    expect(host.endPlayerTurn(kGuestPlayerId, hostActor, 1, 105)
+            == CombatTurnResult::OutOfTurn,
+        "wrong player cannot end host turn");
+    expect(host.endPlayerTurn(kHostPlayerId, guestActor, 1, 105)
+            == CombatTurnResult::OutOfTurn,
+        "wrong actor cannot end host turn");
+    expect(host.expirePlayerTurn(kGuestPlayerId, hostActor, 1, 130)
+            == CombatTurnResult::OutOfTurn,
+        "timeout cannot name a different owner");
+    expect(host.expirePlayerTurn(kHostPlayerId, hostActor, 1, 129)
+            == CombatTurnResult::NotExpired,
+        "turn cannot expire before deadline");
+    expect(host.current()->actorId == hostActor && host.revision() == 1,
+        "rejected commands do not change turn state");
+
+    expect(host.endPlayerTurn(kHostPlayerId, hostActor, 1, 105)
+            == CombatTurnResult::Accepted,
+        "host advances to guest");
+    expect(replica.endPlayerTurn(kHostPlayerId, hostActor, 1, 105)
+            == CombatTurnResult::Accepted,
+        "replica follows host advancement");
+    expect(host.endPlayerTurn(kHostPlayerId, hostActor, 1, 110)
+            == CombatTurnResult::StaleTurn,
+        "replayed turn cannot advance twice");
+    expect(host.endAiTurn(guestActor, 2, 110) == CombatTurnResult::OutOfTurn,
+        "player actor cannot be advanced as AI");
+    expect(host.endPlayerTurn(kGuestPlayerId, guestActor, 2, 110)
+            == CombatTurnResult::Accepted,
+        "guest advances to AI");
+    expect(replica.endPlayerTurn(kGuestPlayerId, guestActor, 2, 110)
+            == CombatTurnResult::Accepted,
+        "replica follows guest advancement");
+    expect(host.endAiTurn(aiActor, 3, 112) == CombatTurnResult::Accepted,
+        "host AI advances to third player");
+    expect(replica.endAiTurn(aiActor, 3, 112) == CombatTurnResult::Accepted,
+        "replica follows AI advancement");
+
+    expect(host.passDisconnectedPlayer(thirdPlayer, thirdActor, 4, 113)
+            == CombatTurnResult::StillConnected,
+        "connected third player cannot be passed as disconnected");
+    host.setConnected(thirdPlayer, false);
+    replica.setConnected(thirdPlayer, false);
+    expect(host.endPlayerTurn(thirdPlayer, thirdActor, 4, 113)
+            == CombatTurnResult::Disconnected,
+        "disconnected owner cannot issue end-turn command");
+    expect(host.passDisconnectedPlayer(thirdPlayer, thirdActor, 4, 113)
+            == CombatTurnResult::Accepted,
+        "disconnected third player is passed by owner identity");
+    expect(replica.passDisconnectedPlayer(thirdPlayer, thirdActor, 4, 113)
+            == CombatTurnResult::Accepted,
+        "replica follows disconnect pass");
+    expect(host.current()->actorId == replica.current()->actorId
+            && host.revision() == replica.revision()
+            && host.round() == replica.round()
+            && host.round() == 2,
+        "three players and AI retain identical initiative across rounds");
+    expect(host.expirePlayerTurn(kHostPlayerId, hostActor, 5, 143)
+            == CombatTurnResult::Accepted,
+        "owner turn expires at deadline");
+    expect(host.current()->actorId == guestActor,
+        "expired turn advances to next owner");
+
+    const std::uint64_t revision = host.revision();
+    expect(host.begin({ { hostActor, kHostPlayerId }, { hostActor, thirdPlayer } },
+               200, 30)
+            == CombatTurnResult::InvalidOrder,
+        "duplicate actor initiative is rejected");
+    expect(host.revision() == revision,
+        "invalid initiative does not replace active turn");
+    host.stop();
+    expect(host.endPlayerTurn(kGuestPlayerId, guestActor, revision, 200)
+            == CombatTurnResult::Inactive,
+        "stopped combat rejects turn commands");
 }
 
 void testEntityRegistry()
@@ -3561,6 +3660,7 @@ void testNetworkSessionRecoveryPrimitives()
 int main()
 {
     fallout::multiplayer::testCoreTypes();
+    fallout::multiplayer::testCombatTurnController();
     fallout::multiplayer::testEntityRegistry();
     fallout::multiplayer::testEntityRegistryAcrossEngineLifecycles();
     fallout::multiplayer::testPlayerCharacterStateStore();

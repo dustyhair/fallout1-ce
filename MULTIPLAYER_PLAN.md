@@ -439,6 +439,14 @@ Exit condition: two players can complete a small non-combat quest together, chan
 
 ### Phase 4A: combat controller and turn ownership
 
+In progress: the first safety slice classifies registered player actors by
+`PlayerId`, prevents guest-side combat simulation, and prevents the host from
+running a remote player actor through combat AI or its turn script. The host
+currently passes remote turns; live player turns remain disabled. A headless
+turn controller covers owner-keyed initiative, stale/out-of-turn rejection,
+deadlines, and disconnect/pass for three players plus AI. It is not yet wired
+to the engine or replicated to peers.
+
 - Transition into and out of the authoritative Combat phase and replicate the phase revision.
 - Classify every combatant by an owning `PlayerId` or as host AI.
 - Give engine input only to the peer that owns the active actor; never pass a player-owned actor to `combat_ai`.

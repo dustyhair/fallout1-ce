@@ -5864,6 +5864,19 @@ std::optional<EntityId> networkWorldFindEntity(const Object* object)
     return session.entities().findEntity(object);
 }
 
+std::optional<PlayerId> networkWorldCombatOwner(const Object* actor)
+{
+    if (!session.isActive() || actor == nullptr) {
+        return std::nullopt;
+    }
+    std::optional<EntityId> actorId = session.entities().findEntity(actor);
+    if (!actorId.has_value()) {
+        return std::nullopt;
+    }
+    const PlayerCharacterState* player = session.players().findByActor(*actorId);
+    return player != nullptr ? std::optional<PlayerId>(player->id) : std::nullopt;
+}
+
 Object* networkWorldFindObject(EntityId entityId)
 {
     return session.isActive() && isValid(entityId)

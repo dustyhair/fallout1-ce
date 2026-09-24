@@ -38,6 +38,8 @@ add_library(fallout-multiplayer-core STATIC
     "src/multiplayer/acting_player_context.h"
     "src/multiplayer/character_lobby.cc"
     "src/multiplayer/character_lobby.h"
+    "src/multiplayer/combat_turn_controller.cc"
+    "src/multiplayer/combat_turn_controller.h"
     "src/multiplayer/connection_handshake.cc"
     "src/multiplayer/connection_handshake.h"
     "src/multiplayer/content_manifest.cc"

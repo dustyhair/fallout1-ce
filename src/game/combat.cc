@@ -32,6 +32,7 @@
 #include "game/tile.h"
 #include "game/trait.h"
 #include "multiplayer/network_runtime.h"
+#include "multiplayer/network_world.h"
 #include "platform_compat.h"
 #include "plib/color/color.h"
 #include "plib/db/db.h"
@@ -1762,6 +1763,9 @@ static void combat_begin(Object* a1)
         }
 
         combat_state |= COMBAT_STATE_0x01;
+        if (multiplayer::networkWorldActive()) {
+            multiplayer::networkWorldSynchronizeEnginePhase();
+        }
 
         tile_refresh_display();
         game_ui_disable(0);
@@ -1837,6 +1841,9 @@ static void combat_over()
 
     combat_state &= ~COMBAT_STATE_0x01;
     combat_state |= COMBAT_STATE_0x02;
+    if (multiplayer::networkWorldActive()) {
+        multiplayer::networkWorldSynchronizeEnginePhase();
+    }
 
     if (list_total != 0) {
         obj_delete_list(combat_list);
@@ -2233,6 +2240,16 @@ static int combat_turn(Object* a1, bool a2)
 
     combat_turn_obj = a1;
 
+    // Until remote turn input is implemented, pass it without executing an
+    // actor script or AI. A player-owned actor must never become host AI.
+    std::optional<multiplayer::PlayerId> owner = multiplayer::networkWorldCombatOwner(a1);
+    if (owner.has_value() && a1 != obj_dude) {
+        a1->data.critter.combat.ap = 0;
+        a1->data.critter.combat.damageLastTurn = 0;
+        a1->data.critter.combat.results &= ~DAM_LOSE_TURN;
+        return 0;
+    }
+
     combat_ctd_init(&main_ctd, a1, NULL, HIT_MODE_PUNCH, HIT_LOCATION_TORSO);
 
     if ((a1->data.critter.combat.results & (DAM_KNOCKED_OUT | DAM_DEAD | DAM_LOSE_TURN)) != 0) {
@@ -2391,6 +2408,11 @@ static bool combat_should_end()
 // 0x420B20
 void combat(STRUCT_664980* attack)
 {
+    // Replica combat is presentation-only. Its local engine may receive a
+    // scripted combat trigger, but only the host may run the combat loop.
+    if (multiplayer::networkRuntimeIsGuestReplica()) {
+        return;
+    }
     if (attack == NULL
         || (attack->attacker == NULL || attack->attacker->elevation == map_elevation)
         || (attack->defender == NULL || attack->defender->elevation == map_elevation)) {

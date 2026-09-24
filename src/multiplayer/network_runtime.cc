@@ -3469,7 +3469,10 @@ bool networkRuntimeBlockUnsupportedSharedModal(SharedModalKind kind)
 
 bool networkRuntimeWorldPaused()
 {
-    return networkWorldActive() && networkWorldSharedModalActive();
+    return networkWorldActive()
+        && (networkWorldSharedModalActive()
+            || (networkRuntimeIsGuestReplica()
+                && networkWorldPhase() == SessionPhase::Combat));
 }
 
 bool networkRuntimeHandleLocalLootTargetChange(Object* target)

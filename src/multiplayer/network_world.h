@@ -94,6 +94,7 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot);
 bool networkWorldCaptureAuthoritativeState(EventSequence lastIncludedEvent, WorldSnapshot& snapshot);
 bool networkWorldApplyAuthoritativeState(const WorldSnapshot& snapshot);
 std::optional<EntityId> networkWorldFindEntity(const Object* object);
+std::optional<PlayerId> networkWorldCombatOwner(const Object* actor);
 Object* networkWorldFindObject(EntityId entityId);
 Object* networkWorldPlayerActor(PlayerId playerId);
 void networkWorldLeave();
