@@ -133,6 +133,210 @@ bool allConnectedPlayersNear(int tile, int elevation, int radius)
     return true;
 }
 
+struct PlayerActorSlot {
+    PlayerId playerId;
+    EntityId actorId;
+    Object* actor = nullptr;
+};
+
+std::optional<std::vector<PlayerActorSlot>> playerActorRoster()
+{
+    std::vector<PlayerId> ids = session.players().playerIds();
+    if (ids.empty() || ids.size() > kMaximumTransitionPlayers) return std::nullopt;
+    std::vector<PlayerActorSlot> roster;
+    roster.reserve(ids.size());
+    std::unordered_set<EntityId, EntityIdHash> seenActors;
+    for (PlayerId playerId : ids) {
+        EntityId actorId = session.playerActorId(playerId);
+        Object* actor = session.entities().findObject(actorId);
+        if (!isValid(actorId) || actor == nullptr
+            || !seenActors.insert(actorId).second) return std::nullopt;
+        roster.push_back(PlayerActorSlot { playerId, actorId, actor });
+    }
+    return roster;
+}
+
+bool capturePlayerPlacementRoster(std::vector<PlayerTransitionPlacement>& placements)
+{
+    auto roster = playerActorRoster();
+    if (!roster.has_value()) return false;
+    placements.clear();
+    placements.reserve(roster->size());
+    for (const PlayerActorSlot& slot : *roster) {
+        if (!hexGridTileIsValid(slot.actor->tile)
+            || !elevationIsValid(slot.actor->elevation)
+            || slot.actor->rotation < 0 || slot.actor->rotation >= ROTATION_COUNT) {
+            return false;
+        }
+        placements.push_back(PlayerTransitionPlacement {
+            slot.playerId, slot.actorId, slot.actor->tile,
+            slot.actor->elevation, slot.actor->rotation,
+        });
+    }
+    return true;
+}
+
+bool applyPlayerPlacementRoster(const std::vector<PlayerTransitionPlacement>& placements)
+{
+    auto roster = playerActorRoster();
+    if (!roster.has_value() || placements.size() != roster->size()) return false;
+    std::unordered_set<PlayerId, PlayerIdHash> seen;
+    for (const PlayerTransitionPlacement& placement : placements) {
+        auto slot = std::find_if(roster->begin(), roster->end(), [&](const PlayerActorSlot& entry) {
+            return entry.playerId == placement.playerId;
+        });
+        if (slot == roster->end() || slot->actorId != placement.actorId
+            || !seen.insert(placement.playerId).second
+            || !hexGridTileIsValid(placement.tile)
+            || !elevationIsValid(placement.elevation)
+            || placement.rotation < 0 || placement.rotation >= ROTATION_COUNT) {
+            return false;
+        }
+        for (const PlayerTransitionPlacement& prior : placements) {
+            if (&prior == &placement) break;
+            if (prior.tile == placement.tile && prior.elevation == placement.elevation) return false;
+        }
+    }
+    for (const PlayerTransitionPlacement& placement : placements) {
+        Object* actor = session.entities().findObject(placement.actorId);
+        register_clear(actor);
+        if (obj_move_to_tile(actor, placement.tile, placement.elevation, nullptr) == -1
+            || obj_set_rotation(actor, placement.rotation, nullptr) == -1) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool placePlayerRosterAtDestination(PlayerId leadingPlayer,
+    int tile,
+    int elevation,
+    int rotation,
+    bool keepLeaderPosition = false)
+{
+    auto roster = playerActorRoster();
+    if (!roster.has_value() || !hexGridTileIsValid(tile)
+        || !elevationIsValid(elevation)
+        || rotation < 0 || rotation >= ROTATION_COUNT) {
+        return false;
+    }
+    auto leader = std::find_if(roster->begin(), roster->end(), [&](const PlayerActorSlot& entry) {
+        return entry.playerId == leadingPlayer;
+    });
+    if (leader == roster->end()) return false;
+    // A world-map map load has already placed the host. Asking Fallout to
+    // place it again treats its own hex as blocked and shifts the spawn.
+    if ((!keepLeaderPosition
+            && obj_attempt_placement(leader->actor, tile, elevation, 0) == -1)
+        || (keepLeaderPosition
+            && (leader->actor->tile != tile || leader->actor->elevation != elevation))) {
+        return false;
+    }
+    for (const PlayerActorSlot& slot : *roster) {
+        if (slot.playerId == leadingPlayer) continue;
+        if (obj_attempt_placement(slot.actor, tile, elevation, 2) == -1) return false;
+    }
+    std::vector<PlayerTransitionPlacement> placements;
+    if (!capturePlayerPlacementRoster(placements)) return false;
+    for (const PlayerTransitionPlacement& placement : placements) {
+        if (placement.elevation != elevation) return false;
+    }
+    for (std::size_t index = 0; index < placements.size(); index++) {
+        for (std::size_t prior = 0; prior < index; prior++) {
+            if (placements[index].tile == placements[prior].tile
+                && placements[index].elevation == placements[prior].elevation) {
+                return false;
+            }
+        }
+    }
+    for (const PlayerActorSlot& slot : *roster) {
+        if (obj_set_rotation(slot.actor, rotation, nullptr) == -1) return false;
+    }
+    return true;
+}
+
+bool placeReadyElevatorRiders(PlayerId actingPlayer,
+    int sourceTile,
+    int sourceElevation,
+    int destinationTile,
+    int destinationElevation,
+    std::vector<PlayerId>& riders)
+{
+    auto roster = playerActorRoster();
+    std::vector<PlayerTransitionPlacement> previous;
+    if (!roster.has_value() || !capturePlayerPlacementRoster(previous)) return false;
+    auto actor = std::find_if(roster->begin(), roster->end(), [&](const PlayerActorSlot& slot) {
+        return slot.playerId == actingPlayer;
+    });
+    if (actor == roster->end()) return false;
+    riders.clear();
+    riders.push_back(actingPlayer);
+    for (const PlayerActorSlot& slot : *roster) {
+        if (slot.playerId != actingPlayer
+            && slot.actor->elevation == sourceElevation
+            && tile_dist(slot.actor->tile, sourceTile) <= 4) {
+            riders.push_back(slot.playerId);
+        }
+    }
+    for (PlayerId playerId : riders) {
+        auto slot = std::find_if(roster->begin(), roster->end(), [&](const PlayerActorSlot& entry) {
+            return entry.playerId == playerId;
+        });
+        register_clear(slot->actor);
+    }
+    bool placed = obj_attempt_placement(actor->actor,
+        destinationTile, destinationElevation, 0) != -1;
+    for (std::size_t index = 1; placed && index < riders.size(); index++) {
+        auto slot = std::find_if(roster->begin(), roster->end(), [&](const PlayerActorSlot& entry) {
+            return entry.playerId == riders[index];
+        });
+        placed = obj_attempt_placement(slot->actor,
+            destinationTile, destinationElevation, 2) != -1;
+    }
+    std::vector<PlayerTransitionPlacement> resulting;
+    placed = placed && capturePlayerPlacementRoster(resulting);
+    for (PlayerId playerId : riders) {
+        auto placement = std::find_if(resulting.begin(), resulting.end(), [&](const PlayerTransitionPlacement& entry) {
+            return entry.playerId == playerId;
+        });
+        if (placement == resulting.end() || placement->elevation != destinationElevation) {
+            placed = false;
+            break;
+        }
+    }
+    for (std::size_t index = 0; placed && index < resulting.size(); index++) {
+        for (std::size_t prior = 0; prior < index; prior++) {
+            if (resulting[index].tile == resulting[prior].tile
+                && resulting[index].elevation == resulting[prior].elevation) {
+                placed = false;
+                break;
+            }
+        }
+    }
+    if (!placed) applyPlayerPlacementRoster(previous);
+    return placed;
+}
+
+bool fillElevatorExecutionFromRoster(ElevatorExecution& execution)
+{
+    std::vector<PlayerTransitionPlacement> placements;
+    if (!capturePlayerPlacementRoster(placements) || placements.size() != 2) return false;
+    for (const PlayerTransitionPlacement& placement : placements) {
+        if (placement.playerId == kHostPlayerId) {
+            execution.hostTile = placement.tile;
+            execution.hostElevation = placement.elevation;
+            execution.hostRotation = placement.rotation;
+        } else if (placement.playerId == kGuestPlayerId) {
+            execution.guestTile = placement.tile;
+            execution.guestElevation = placement.elevation;
+            execution.guestRotation = placement.rotation;
+        } else {
+            return false;
+        }
+    }
+    return execution.hostTile >= 0 && execution.guestTile >= 0;
+}
+
 bool worldMapProposalSourceReady()
 {
     if (!pendingWorldMapProposal.has_value()
@@ -776,15 +980,9 @@ std::optional<WorldMapArrivedEvent> completeWorldMapTravel(WorldMapArrivalKind k
         terminal.worldY = position.y;
         terminal.gameTime = game_time();
         terminal.kind = kind;
-        for (PlayerId playerId : session.players().playerIds()) {
-            EntityId actorId = session.playerActorId(playerId);
-            Object* actor = session.entities().findObject(actorId);
-            if (actor == nullptr) return std::nullopt;
-            terminal.placements.push_back(PlayerTransitionPlacement {
-                playerId, actorId, actor->tile, actor->elevation, actor->rotation,
-            });
-        }
-        return terminal;
+        return capturePlayerPlacementRoster(terminal.placements)
+            ? std::optional<WorldMapArrivedEvent>(std::move(terminal))
+            : std::nullopt;
     }
 
     int destinationMap = -1;
@@ -808,10 +1006,9 @@ std::optional<WorldMapArrivedEvent> completeWorldMapTravel(WorldMapArrivalKind k
         return std::nullopt;
     }
     Object* hostActor = session.entities().findObject(session.playerActorId(kHostPlayerId));
-    Object* guestActor = session.entities().findObject(session.playerActorId(kGuestPlayerId));
-    if (hostActor == nullptr || guestActor == nullptr
-        || obj_attempt_placement(guestActor, hostActor->tile, hostActor->elevation, 2) == -1
-        || obj_set_rotation(guestActor, hostActor->rotation, nullptr) == -1
+    if (hostActor == nullptr
+        || !placePlayerRosterAtDestination(kHostPlayerId,
+            hostActor->tile, hostActor->elevation, hostActor->rotation, true)
         || map_set_elevation(hostActor->elevation) != 0
         || !registerWorldObjects()
         || session.transitionTo(SessionPhase::Exploration) != LocalSessionError::None) {
@@ -827,15 +1024,9 @@ std::optional<WorldMapArrivedEvent> completeWorldMapTravel(WorldMapArrivalKind k
     arrival.worldY = position.y;
     arrival.gameTime = arrivalTime;
     arrival.kind = kind;
-    for (PlayerId playerId : session.players().playerIds()) {
-        EntityId actorId = session.playerActorId(playerId);
-        Object* actor = session.entities().findObject(actorId);
-        if (actor == nullptr) return std::nullopt;
-        arrival.placements.push_back(PlayerTransitionPlacement {
-            playerId, actorId, actor->tile, actor->elevation, actor->rotation,
-        });
-    }
-    return arrival;
+    return capturePlayerPlacementRoster(arrival.placements)
+        ? std::optional<WorldMapArrivedEvent>(std::move(arrival))
+        : std::nullopt;
 }
 
 // Advance through each due queue boundary on the host only. The replica gets
@@ -1048,21 +1239,21 @@ public:
         ElevatorExecution execution;
         Object* host = session.entities().findObject(session.playerActorId(kHostPlayerId));
         Object* guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
-        Object* companion = actor == host ? guest : host;
+        std::optional<EntityId> actingActorId = session.entities().findEntity(actor);
+        PlayerCharacterState* actingPlayer = actingActorId.has_value()
+            ? session.players().findByActor(*actingActorId)
+            : nullptr;
         int sourceTile = -1;
         if (isInCombat()
             || actor == nullptr
             || host == nullptr
             || guest == nullptr
-            || (actor != host && actor != guest)
+            || actingPlayer == nullptr
             || session.phase() != SessionPhase::Exploration
-            || companion == nullptr
             || !elevator_get_source(command.elevatorType, map_data.field_34, actor->elevation, &sourceTile)
             || tile_dist(actor->tile, sourceTile) > 4) {
             return execution;
         }
-        bool companionJoins = companion->elevation == actor->elevation
-            && tile_dist(companion->tile, sourceTile) <= 4;
 
         int destinationMap = -1;
         int destinationElevation = -1;
@@ -1087,14 +1278,9 @@ public:
             }
             host = session.entities().findObject(session.playerActorId(kHostPlayerId));
             guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
-            bool loaded = host != nullptr
-                && guest != nullptr
-                && map_data.field_34 == destinationMap
-                && obj_attempt_placement(host, destinationTile, destinationElevation, 0) != -1
-                && obj_attempt_placement(guest, destinationTile, destinationElevation, 2) != -1
-                && host->tile != guest->tile
-                && obj_set_rotation(host, ROTATION_SE, nullptr) == 0
-                && obj_set_rotation(guest, ROTATION_SE, nullptr) == 0;
+            bool loaded = map_data.field_34 == destinationMap
+                && placePlayerRosterAtDestination(kHostPlayerId,
+                    destinationTile, destinationElevation, ROTATION_SE);
             Object* localActor = localPlayerActor();
             loaded = loaded
                 && localActor != nullptr
@@ -1105,14 +1291,9 @@ public:
                 return execution;
             }
 
-            execution.status = CommandExecutionStatus::Applied;
             execution.map = destinationMap;
-            execution.hostTile = host->tile;
-            execution.hostElevation = host->elevation;
-            execution.hostRotation = host->rotation;
-            execution.guestTile = guest->tile;
-            execution.guestElevation = guest->elevation;
-            execution.guestRotation = guest->rotation;
+            if (!fillElevatorExecutionFromRoster(execution)) return ElevatorExecution {};
+            execution.status = CommandExecutionStatus::Applied;
             execution.phaseRevision = session.phaseRevision();
             return execution;
         }
@@ -1124,14 +1305,9 @@ public:
         int oldGuestElevation = guest->elevation;
         int oldGuestRotation = guest->rotation;
         int oldMapElevation = map_elevation;
-        register_clear(actor);
-        if (companionJoins) {
-            register_clear(companion);
-        }
-        bool placed = obj_attempt_placement(actor, destinationTile, destinationElevation, 0) != -1
-            && (!companionJoins
-                || obj_attempt_placement(companion, destinationTile, destinationElevation, 2) != -1)
-            && (host->elevation != guest->elevation || host->tile != guest->tile);
+        std::vector<PlayerId> riders;
+        bool placed = placeReadyElevatorRiders(actingPlayer->id,
+            sourceTile, actor->elevation, destinationTile, destinationElevation, riders);
         Object* localActor = localPlayerActor();
         int localElevation = localActor != nullptr ? localActor->elevation : oldMapElevation;
         placed = placed && (localElevation == map_elevation || map_set_elevation(localElevation) == 0);
@@ -1146,19 +1322,16 @@ public:
             session.transitionTo(SessionPhase::Exploration);
             return execution;
         }
-        obj_set_rotation(actor, ROTATION_SE, nullptr);
-        if (companionJoins) {
-            obj_set_rotation(companion, ROTATION_SE, nullptr);
+        for (PlayerId playerId : riders) {
+            Object* rider = session.entities().findObject(session.playerActorId(playerId));
+            if (rider == nullptr || obj_set_rotation(rider, ROTATION_SE, nullptr) == -1) {
+                return execution;
+            }
         }
 
-        execution.status = CommandExecutionStatus::Applied;
         execution.map = destinationMap;
-        execution.hostTile = host->tile;
-        execution.hostElevation = host->elevation;
-        execution.hostRotation = host->rotation;
-        execution.guestTile = guest->tile;
-        execution.guestElevation = guest->elevation;
-        execution.guestRotation = guest->rotation;
+        if (!fillElevatorExecutionFromRoster(execution)) return ElevatorExecution {};
+        execution.status = CommandExecutionStatus::Applied;
         execution.phaseRevision = session.phaseRevision();
         return execution;
     }
@@ -1168,19 +1341,14 @@ public:
         ExitGridExecution execution;
         PlayerCharacterState* actingPlayer = session.players().findByActor(
             session.entities().findEntity(actor).value_or(EntityId {}));
-        Object* host = session.entities().findObject(session.playerActorId(kHostPlayerId));
-        Object* guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
-        Object* companion = actor == host ? guest : host;
+        auto roster = playerActorRoster();
         int destinationMap = -1;
         int destinationTile = -1;
         int destinationElevation = -1;
         int destinationRotation = -1;
         if (isInCombat()
             || actingPlayer == nullptr
-            || host == nullptr
-            || guest == nullptr
-            || companion == nullptr
-            || (actor != host && actor != guest)
+            || !roster.has_value()
             || target == nullptr
             || actor->tile != target->tile
             || actor->elevation != target->elevation
@@ -1216,20 +1384,9 @@ public:
             return execution;
         }
 
-        host = session.entities().findObject(session.playerActorId(kHostPlayerId));
-        guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
-        Object* actingReplacement = session.entities().findObject(session.playerActorId(actingPlayer->id));
-        companion = actingReplacement == host ? guest : host;
-        bool loaded = host != nullptr
-            && guest != nullptr
-            && actingReplacement != nullptr
-            && companion != nullptr
-            && map_data.field_34 == destinationMap
-            && obj_attempt_placement(actingReplacement, destinationTile, destinationElevation, 0) != -1
-            && obj_attempt_placement(companion, destinationTile, destinationElevation, 2) != -1
-            && (host->elevation != guest->elevation || host->tile != guest->tile)
-            && obj_set_rotation(host, destinationRotation, nullptr) == 0
-            && obj_set_rotation(guest, destinationRotation, nullptr) == 0;
+        bool loaded = map_data.field_34 == destinationMap
+            && placePlayerRosterAtDestination(actingPlayer->id,
+                destinationTile, destinationElevation, destinationRotation);
         Object* localActor = localPlayerActor();
         loaded = loaded
             && localActor != nullptr
@@ -1242,17 +1399,7 @@ public:
 
         execution.status = CommandExecutionStatus::Applied;
         execution.map = destinationMap;
-        for (PlayerId playerId : { kHostPlayerId, kGuestPlayerId }) {
-            EntityId actorId = session.playerActorId(playerId);
-            Object* playerActor = session.entities().findObject(actorId);
-            execution.placements.push_back(PlayerTransitionPlacement {
-                playerId,
-                actorId,
-                playerActor->tile,
-                playerActor->elevation,
-                playerActor->rotation,
-            });
-        }
+        if (!capturePlayerPlacementRoster(execution.placements)) return ExitGridExecution {};
         execution.phaseRevision = session.phaseRevision();
         return execution;
     }
@@ -1264,17 +1411,12 @@ public:
         SceneryTransitionExecution execution;
         PlayerCharacterState* actingPlayer = session.players().findByActor(
             session.entities().findEntity(actor).value_or(EntityId {}));
-        Object* host = session.entities().findObject(session.playerActorId(kHostPlayerId));
-        Object* guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
-        Object* companion = actor == host ? guest : host;
+        std::vector<PlayerTransitionPlacement> previous;
         int sceneryType = -1;
         if (isInCombat()
             || actor == nullptr
             || actingPlayer == nullptr
-            || host == nullptr
-            || guest == nullptr
-            || companion == nullptr
-            || (actor != host && actor != guest)
+            || !capturePlayerPlacementRoster(previous)
             || !sceneryTransitionType(target, sceneryType)
             || actor->elevation != target->elevation
             || tile_dist(actor->tile, target->tile) > 4
@@ -1297,12 +1439,6 @@ public:
             return execution;
         }
 
-        int oldHostTile = host->tile;
-        int oldHostElevation = host->elevation;
-        int oldHostRotation = host->rotation;
-        int oldGuestTile = guest->tile;
-        int oldGuestElevation = guest->elevation;
-        int oldGuestRotation = guest->rotation;
         int oldMapElevation = map_elevation;
         capturedSceneryMapTransition.reset();
         scriptedSceneryTransitionInProgress = true;
@@ -1340,10 +1476,7 @@ public:
                 || !loadSharedMap(requestedTransition->map)) {
                 return execution;
             }
-            host = session.entities().findObject(session.playerActorId(kHostPlayerId));
-            guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
-            Object* actingReplacement = session.entities().findObject(session.playerActorId(actingPlayer->id));
-            companion = actingReplacement == host ? guest : host;
+            Object* host = session.entities().findObject(session.playerActorId(kHostPlayerId));
             int destinationTile = requestedTransition->tile;
             int destinationElevation = requestedTransition->elevation;
             int destinationRotation = requestedTransition->rotation;
@@ -1354,16 +1487,9 @@ public:
             if (destinationRotation < 0 || destinationRotation >= ROTATION_COUNT) {
                 destinationRotation = host != nullptr ? host->rotation : ROTATION_SE;
             }
-            bool loaded = host != nullptr
-                && guest != nullptr
-                && actingReplacement != nullptr
-                && companion != nullptr
-                && map_data.field_34 == requestedTransition->map
-                && obj_attempt_placement(actingReplacement, destinationTile, destinationElevation, 0) != -1
-                && obj_attempt_placement(companion, destinationTile, destinationElevation, 2) != -1
-                && (host->elevation != guest->elevation || host->tile != guest->tile)
-                && obj_set_rotation(host, destinationRotation, nullptr) == 0
-                && obj_set_rotation(guest, destinationRotation, nullptr) == 0;
+            bool loaded = map_data.field_34 == requestedTransition->map
+                && placePlayerRosterAtDestination(actingPlayer->id,
+                    destinationTile, destinationElevation, destinationRotation);
             Object* localActor = localPlayerActor();
             loaded = loaded
                 && localActor != nullptr
@@ -1375,31 +1501,33 @@ public:
             }
             execution.map = requestedTransition->map;
         } else {
-            Object* independentCompanion = actor == host ? guest : host;
-            int companionTile = actor == host ? oldGuestTile : oldHostTile;
-            int companionElevation = actor == host ? oldGuestElevation : oldHostElevation;
-            int companionRotation = actor == host ? oldGuestRotation : oldHostRotation;
-            bool companionRestored = obj_move_to_tile(
-                                         independentCompanion,
-                                         companionTile,
-                                         companionElevation,
-                                         nullptr)
-                    != -1
-                && obj_set_rotation(independentCompanion, companionRotation, nullptr) == 0;
-            bool moved = actor->tile != (actor == host ? oldHostTile : oldGuestTile)
-                || actor->elevation != (actor == host ? oldHostElevation : oldGuestElevation);
+            bool companionsRestored = true;
+            bool moved = false;
+            for (const PlayerTransitionPlacement& placement : previous) {
+                Object* participant = session.entities().findObject(placement.actorId);
+                if (participant == nullptr) {
+                    companionsRestored = false;
+                    break;
+                }
+                if (placement.playerId == actingPlayer->id) {
+                    moved = participant->tile != placement.tile
+                        || participant->elevation != placement.elevation;
+                } else if (obj_move_to_tile(participant,
+                               placement.tile, placement.elevation, nullptr) == -1
+                    || obj_set_rotation(participant, placement.rotation, nullptr) == -1) {
+                    companionsRestored = false;
+                    break;
+                }
+            }
             Object* localActor = localPlayerActor();
-            bool applied = companionRestored
+            bool applied = companionsRestored
                 && moved
                 && localActor != nullptr
                 && (localActor->elevation == map_elevation || map_set_elevation(localActor->elevation) == 0)
                 && session.transitionTo(SessionPhase::Transition) == LocalSessionError::None
                 && session.transitionTo(SessionPhase::Exploration) == LocalSessionError::None;
             if (!applied) {
-                obj_move_to_tile(host, oldHostTile, oldHostElevation, nullptr);
-                obj_move_to_tile(guest, oldGuestTile, oldGuestElevation, nullptr);
-                obj_set_rotation(host, oldHostRotation, nullptr);
-                obj_set_rotation(guest, oldGuestRotation, nullptr);
+                applyPlayerPlacementRoster(previous);
                 map_set_elevation(oldMapElevation);
                 if (session.phase() == SessionPhase::Transition) {
                     session.transitionTo(SessionPhase::Exploration);
@@ -1410,17 +1538,7 @@ public:
         }
 
         execution.status = CommandExecutionStatus::Applied;
-        for (PlayerId playerId : { kHostPlayerId, kGuestPlayerId }) {
-            EntityId actorId = session.playerActorId(playerId);
-            Object* playerActor = session.entities().findObject(actorId);
-            execution.placements.push_back(PlayerTransitionPlacement {
-                playerId,
-                actorId,
-                playerActor->tile,
-                playerActor->elevation,
-                playerActor->rotation,
-            });
-        }
+        if (!capturePlayerPlacementRoster(execution.placements)) return SceneryTransitionExecution {};
         execution.phaseRevision = session.phaseRevision();
         return execution;
     }
@@ -2537,13 +2655,18 @@ bool networkWorldApplyPeerElevator(const ElevatorTransitionedEvent& elevator)
         return false;
     }
 
-    register_clear(host);
-    register_clear(guest);
+    std::vector<PlayerTransitionPlacement> placements {
+        PlayerTransitionPlacement {
+            kHostPlayerId, session.playerActorId(kHostPlayerId),
+            elevator.hostTile, elevator.hostElevation, elevator.hostRotation,
+        },
+        PlayerTransitionPlacement {
+            kGuestPlayerId, session.playerActorId(kGuestPlayerId),
+            elevator.guestTile, elevator.guestElevation, elevator.guestRotation,
+        },
+    };
     Object* localActor = localPlayerActor();
-    bool applied = obj_move_to_tile(host, elevator.hostTile, elevator.hostElevation, nullptr) == 0
-        && obj_move_to_tile(guest, elevator.guestTile, elevator.guestElevation, nullptr) == 0
-        && obj_set_rotation(host, elevator.hostRotation, nullptr) == 0
-        && obj_set_rotation(guest, elevator.guestRotation, nullptr) == 0
+    bool applied = applyPlayerPlacementRoster(placements)
         && localActor != nullptr
         && map_set_elevation(localActor->elevation) == 0
         && (!mapChanged || registerWorldObjects());
@@ -2580,27 +2703,8 @@ bool networkWorldApplyPeerExitGrid(const ExitGridTransitionedEvent& exitGrid)
         return false;
     }
 
-    std::unordered_set<PlayerId, PlayerIdHash> appliedPlayers;
-    for (const PlayerTransitionPlacement& placement : exitGrid.placements) {
-        Object* actor = session.entities().findObject(placement.actorId);
-        if (session.playerActorId(placement.playerId) != placement.actorId
-            || actor == nullptr
-            || !appliedPlayers.insert(placement.playerId).second
-            || obj_move_to_tile(actor, placement.tile, placement.elevation, nullptr) == -1
-            || obj_set_rotation(actor, placement.rotation, nullptr) == -1) {
-            std::fprintf(stderr,
-                "Multiplayer exit-grid replica rejected placement player=%u actor=%u tile=%d elevation=%d rotation=%d.\n",
-                placement.playerId.value,
-                placement.actorId.value,
-                placement.tile,
-                placement.elevation,
-                placement.rotation);
-            return false;
-        }
-    }
-
     Object* localActor = localPlayerActor();
-    bool applied = appliedPlayers.size() == session.players().size()
+    bool applied = applyPlayerPlacementRoster(exitGrid.placements)
         && localActor != nullptr
         && map_set_elevation(localActor->elevation) == 0
         && registerWorldObjects()
@@ -2631,18 +2735,7 @@ bool networkWorldApplyPeerWorldMapArrival(const WorldMapArrivedEvent& arrival)
     set_game_time(arrival.gameTime);
     if (arrival.kind == WorldMapArrivalKind::Fatal) {
         if (arrival.map != map_data.field_34) return false;
-        std::unordered_set<PlayerId, PlayerIdHash> appliedPlayers;
-        for (const PlayerTransitionPlacement& placement : arrival.placements) {
-            Object* actor = session.entities().findObject(placement.actorId);
-            if (session.playerActorId(placement.playerId) != placement.actorId
-                || actor == nullptr
-                || !appliedPlayers.insert(placement.playerId).second
-                || obj_move_to_tile(actor, placement.tile, placement.elevation, nullptr) == -1
-                || obj_set_rotation(actor, placement.rotation, nullptr) == -1) {
-                return false;
-            }
-        }
-        if (appliedPlayers.size() != session.players().size()
+        if (!applyPlayerPlacementRoster(arrival.placements)
             || session.applyAuthoritativePhase(SessionPhase::Exploration, arrival.phaseRevision)
                 != LocalSessionError::None) {
             return false;
@@ -2657,19 +2750,8 @@ bool networkWorldApplyPeerWorldMapArrival(const WorldMapArrivedEvent& arrival)
     game_global_vars[GVAR_LOAD_MAP_INDEX] = arrival.entranceIndex;
     if (!loadSharedMap(arrival.map)) return false;
 
-    std::unordered_set<PlayerId, PlayerIdHash> appliedPlayers;
-    for (const PlayerTransitionPlacement& placement : arrival.placements) {
-        Object* actor = session.entities().findObject(placement.actorId);
-        if (session.playerActorId(placement.playerId) != placement.actorId
-            || actor == nullptr
-            || !appliedPlayers.insert(placement.playerId).second
-            || obj_move_to_tile(actor, placement.tile, placement.elevation, nullptr) == -1
-            || obj_set_rotation(actor, placement.rotation, nullptr) == -1) {
-            return false;
-        }
-    }
     Object* localActor = localPlayerActor();
-    bool validRoster = appliedPlayers.size() == session.players().size() && localActor != nullptr;
+    bool validRoster = applyPlayerPlacementRoster(arrival.placements) && localActor != nullptr;
     bool validElevation = validRoster && map_set_elevation(localActor->elevation) == 0;
     bool registered = validElevation && registerWorldObjects();
     bool advanced = registered
@@ -2704,20 +2786,8 @@ bool networkWorldApplyPeerSceneryTransition(const SceneryTransitionedEvent& tran
         return false;
     }
 
-    std::unordered_set<PlayerId, PlayerIdHash> appliedPlayers;
-    for (const PlayerTransitionPlacement& placement : transition.placements) {
-        Object* actor = session.entities().findObject(placement.actorId);
-        if (session.playerActorId(placement.playerId) != placement.actorId
-            || actor == nullptr
-            || !appliedPlayers.insert(placement.playerId).second
-            || obj_move_to_tile(actor, placement.tile, placement.elevation, nullptr) == -1
-            || obj_set_rotation(actor, placement.rotation, nullptr) == -1) {
-            return false;
-        }
-    }
-
     Object* localActor = localPlayerActor();
-    return appliedPlayers.size() == session.players().size()
+    return applyPlayerPlacementRoster(transition.placements)
         && localActor != nullptr
         && map_set_elevation(localActor->elevation) == 0
         && (!mapChanged || registerWorldObjects())
