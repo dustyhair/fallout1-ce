@@ -1,6 +1,7 @@
 #include "game/worldmap.h"
 
 #include <assert.h>
+#include <limits>
 #include <stdio.h>
 #include <string.h>
 
@@ -864,6 +865,13 @@ static int world_xpos;
 // 0x670FD0
 static int world_ypos;
 
+// Only the host may advance these transient travel counters. They are not
+// included in WorldMapState: an in-progress trip must be checkpointed before
+// the live multiplayer UI can drive this stepper.
+static bool authoritative_travel_active;
+static int authoritative_move_counter;
+static int authoritative_visual_counter;
+
 // 0x670FD4
 int world_win;
 
@@ -881,6 +889,8 @@ int init_world_map()
 {
     int column;
     int row;
+
+    authoritative_travel_active = false;
 
     for (row = 0; row < 29; row++) {
         for (column = 0; column < 28; column++) {
@@ -921,6 +931,7 @@ int save_world_map(DB_FILE* stream)
 // 0x4AA280
 int load_world_map(DB_FILE* stream)
 {
+    authoritative_travel_active = false;
     if (db_fread(WorldGrid, sizeof(WorldGrid), 1, stream) != 1) return -1;
     if (db_fread(TwnSelKnwFlag, sizeof(TwnSelKnwFlag), 1, stream) != 1) return -1;
     if (db_freadInt32(stream, &first_visit_flag) == -1) return -1;
@@ -971,7 +982,176 @@ bool worldmap_apply_state(const WorldMapState& state)
     our_section = state.section;
     world_xpos = state.x;
     world_ypos = state.y;
+    authoritative_travel_active = false;
     return true;
+}
+
+void worldmap_authoritative_travel_cancel()
+{
+    authoritative_travel_active = false;
+}
+
+bool worldmap_authoritative_travel_begin(int targetX, int targetY)
+{
+    if (multiplayer::networkRuntimeMode() != multiplayer::NetworkLaunchMode::Host
+        || targetX < 0 || targetX >= 1400
+        || targetY < 0 || targetY >= 1500
+        || world_xpos < 0 || world_xpos >= 1400
+        || world_ypos < 0 || world_ypos >= 1500
+        || obj_dude == nullptr) {
+        return false;
+    }
+
+    target_xpos = targetX;
+    target_ypos = targetY;
+    world_move_init();
+    CalcTimeAdder();
+    authoritative_move_counter = 0;
+    authoritative_visual_counter = 0;
+    wmap_mile = 0;
+    authoritative_travel_active = true;
+    return true;
+}
+
+static bool authoritative_world_event_pending()
+{
+    return (game_global_vars[GVAR_VAULT_WATER] == 0
+               && game_global_vars[GVAR_FIND_WATER_CHIP] != 2)
+        || (game_global_vars[GVAR_VATS_COUNTDOWN] != 0
+            && (game_time() - game_global_vars[GVAR_VATS_COUNTDOWN]) / 10 > 240)
+        || (game_global_vars[GVAR_COUNTDOWN_TO_DESTRUCTION] != 0
+            && (game_time() - game_global_vars[GVAR_COUNTDOWN_TO_DESTRUCTION]) / 10 > 240);
+}
+
+WorldMapTravelStepResult worldmap_authoritative_travel_step()
+{
+    WorldMapTravelStepResult result;
+    result.x = world_xpos;
+    result.y = world_ypos;
+    result.gameTime = game_time();
+    if (multiplayer::networkRuntimeMode() != multiplayer::NetworkLaunchMode::Host
+        || !authoritative_travel_active) {
+        return result;
+    }
+
+    auto finish = [&](WorldMapTravelStepStatus status) {
+        result.status = status;
+        result.x = world_xpos;
+        result.y = world_ypos;
+        result.gameTime = game_time();
+        if (status != WorldMapTravelStepStatus::Moving) {
+            authoritative_travel_active = false;
+        }
+        return result;
+    };
+
+    if (world_xpos == target_xpos && world_ypos == target_ypos) {
+        return finish(WorldMapTravelStepStatus::Arrived);
+    }
+    if (authoritative_world_event_pending()) {
+        return finish(WorldMapTravelStepStatus::WorldEventPending);
+    }
+
+    auto move = [&]() {
+        if (world_move_step() != 0) return WorldMapTravelStepStatus::Arrived;
+        if (world_xpos < 1064 && world_ypos > 0
+            && ((128 >> (world_xpos % 8)) & WALKMASK_MASK_DATA[world_ypos][world_xpos / 8]) != 0) {
+            world_xpos = old_world_xpos;
+            world_ypos = old_world_ypos;
+            return WorldMapTravelStepStatus::Blocked;
+        }
+        return WorldMapTravelStepStatus::Moving;
+    };
+
+    WorldMapTravelStepStatus movement = WorldMapTravelStepStatus::Moving;
+    bool advanceTime = true;
+    switch (WorldTerraTable[world_ypos / 50][world_xpos / 50]) {
+    case TERRAIN_TYPE_MOUNTAIN:
+        if (--authoritative_move_counter <= 0) {
+            movement = move();
+            authoritative_move_counter = 2;
+        }
+        break;
+    case TERRAIN_TYPE_CITY:
+        movement = move();
+        if (movement == WorldMapTravelStepStatus::Moving && --authoritative_move_counter <= 0) {
+            movement = move();
+            authoritative_move_counter = 4;
+            advanceTime = false;
+        }
+        break;
+    default:
+        movement = move();
+        authoritative_move_counter = 0;
+        break;
+    }
+
+    if (advanceTime) {
+        if (time_adder < 0 || game_time() > std::numeric_limits<int>::max() - time_adder) {
+            return finish(WorldMapTravelStepStatus::QueueInterrupted);
+        }
+        int endTime = game_time() + time_adder;
+        // Queue handlers can reschedule themselves immediately. Do not let a
+        // single travel step loop forever on a malformed or dense queue.
+        constexpr int kMaximumQueueBoundariesPerStep = 16384;
+        int boundaries = 0;
+        while (queue_next_time() > 0 && queue_next_time() <= endTime) {
+            if (++boundaries > kMaximumQueueBoundariesPerStep) {
+                return finish(WorldMapTravelStepStatus::QueueInterrupted);
+            }
+            int dueTime = queue_next_time();
+            if (dueTime > game_time()) set_game_time(dueTime);
+            if (queue_process() != 0 || game_user_wants_to_quit != 0) {
+                return finish(WorldMapTravelStepStatus::QueueInterrupted);
+            }
+            if (game_time() > endTime) {
+                return finish(WorldMapTravelStepStatus::QueueInterrupted);
+            }
+            if (authoritative_world_event_pending()) {
+                return finish(WorldMapTravelStepStatus::WorldEventPending);
+            }
+        }
+        set_game_time(endTime);
+    }
+
+    if (authoritative_visual_counter-- <= 0) {
+        authoritative_visual_counter = 2;
+        UpdVisualArea();
+    }
+    if (++wmap_mile >= wmap_day) {
+        wmap_mile = 0;
+        result.dayElapsed = true;
+        partyMemberRestingHeal(24);
+        int roll = roll_random(1, 6) + roll_random(1, 6) + roll_random(1, 6);
+        const int encounterThresholds[] = { 6, 7, 9, 10 };
+        if (InCity(world_xpos, world_ypos) == -1
+            && roll < encounterThresholds[WorldEcountChanceTable[world_ypos / 50][world_xpos / 50]]) {
+            for (int attempt = 0; attempt < 128 && encounter_specials != 63; attempt++) {
+                int specialRoll = roll_random(1, 6) + roll_random(1, 6) + roll_random(1, 6)
+                    - 5 + stat_level(obj_dude, STAT_LUCK) + 2 * perk_level(PERK_EXPLORER);
+                if (specialRoll < 18) break;
+                int selection = roll_random(1, 100);
+                for (int index = 0; index < 6; index++) {
+                    if (selection >= SpclEncRange[index].start && selection <= SpclEncRange[index].end
+                        && (encounter_specials & (1 << index)) == 0) {
+                        encounter_specials |= 1 << index;
+                        result.specialEncounter = index + 1;
+                        return finish(WorldMapTravelStepStatus::Encounter);
+                    }
+                }
+            }
+            return finish(WorldMapTravelStepStatus::Encounter);
+        }
+    }
+
+    if (authoritative_world_event_pending()) {
+        return finish(WorldMapTravelStepStatus::WorldEventPending);
+    }
+    return finish(movement == WorldMapTravelStepStatus::Blocked
+            ? WorldMapTravelStepStatus::Blocked
+            : world_xpos == target_xpos && world_ypos == target_ypos
+                ? WorldMapTravelStepStatus::Arrived
+                : WorldMapTravelStepStatus::Moving);
 }
 
 // NOTE: It's the biggest function in Fallout 1 and Fallout 2 containing more

@@ -165,6 +165,32 @@ struct WorldMapState {
 void worldmap_capture_state(WorldMapState& state);
 bool worldmap_apply_state(const WorldMapState& state);
 
+// A host-only, headless travel step. This deliberately stops before any map
+// load or world-map movie; callers must publish the resulting world state and
+// resolve interruptions before advancing again.
+enum class WorldMapTravelStepStatus {
+    Invalid,
+    Moving,
+    Arrived,
+    Blocked,
+    QueueInterrupted,
+    Encounter,
+    WorldEventPending,
+};
+
+struct WorldMapTravelStepResult {
+    WorldMapTravelStepStatus status = WorldMapTravelStepStatus::Invalid;
+    int x = 0;
+    int y = 0;
+    int gameTime = 0;
+    int specialEncounter = 0; // Zero denotes an ordinary encounter.
+    bool dayElapsed = false;
+};
+
+bool worldmap_authoritative_travel_begin(int targetX, int targetY);
+WorldMapTravelStepResult worldmap_authoritative_travel_step();
+void worldmap_authoritative_travel_cancel();
+
 extern int world_win;
 extern int our_section;
 extern int our_town;

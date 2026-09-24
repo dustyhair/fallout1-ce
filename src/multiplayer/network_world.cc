@@ -3806,6 +3806,23 @@ bool networkWorldRunSharedModalSmokeTest()
     int startingWorldTime = game_time();
     WorldMapState startingWorldMap;
     worldmap_capture_state(startingWorldMap);
+    // The headless stepper must never execute on a replica. An already-reached
+    // target is also a useful no-op check before any travel UI is connected.
+    bool invalidTravelTargetRejected = !worldmap_authoritative_travel_begin(-1, 0);
+    bool travelStepperGuarded = false;
+    if (worldMode == NetworkLaunchMode::Host) {
+        travelStepperGuarded = worldmap_authoritative_travel_begin(startingWorldMap.x, startingWorldMap.y);
+        WorldMapTravelStepResult step = worldmap_authoritative_travel_step();
+        travelStepperGuarded = travelStepperGuarded
+            && step.status == WorldMapTravelStepStatus::Arrived
+            && step.x == startingWorldMap.x
+            && step.y == startingWorldMap.y
+            && step.gameTime == startingWorldTime
+            && !step.dayElapsed;
+    } else {
+        travelStepperGuarded = !worldmap_authoritative_travel_begin(startingWorldMap.x, startingWorldMap.y)
+            && worldmap_authoritative_travel_step().status == WorldMapTravelStepStatus::Invalid;
+    }
     GameCommand open;
     open.sequence = CommandSequence { 1 };
     open.playerId = kGuestPlayerId;
@@ -4033,7 +4050,8 @@ bool networkWorldRunSharedModalSmokeTest()
         && !networkWorldSharedModalActive();
 
     commandProcessor.reset();
-    return travelWaitsForConsent && proposerRetainsControl && proposerCanRoute
+    return invalidTravelTargetRejected && travelStepperGuarded
+        && travelWaitsForConsent && proposerRetainsControl && proposerCanRoute
         && onlyProposerCanRoute && proposerCanClearRoute && onlyProposerCanClose
         && proposerCanCancel && hostCanProposeAndRoute && routeHasNoWorldEffects
         && hostTakeoverWorks
