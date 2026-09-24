@@ -102,6 +102,9 @@ WorldSnapshot sampleSnapshot()
     snapshot.doors = {
         DoorSnapshot { EntityId { 9 }, true, false, 5 },
     };
+    snapshot.scenery = {
+        ScenerySnapshot { EntityId { 13 }, 0x02000001, 0x02000002, 20108, 0, 2, 1, 0x10, 2, 1000, 7, 8 },
+    };
     snapshot.items = {
         ItemSnapshot { EntityId { 10 }, EntityId { 1 }, -1, -1, 2, ItemDescriptor { 40, 0, 0, 0 } },
         ItemSnapshot { EntityId { 11 }, {}, 20104, 0, 1, ItemDescriptor { 41, 0, 0, 0 } },
@@ -2588,7 +2591,7 @@ void testSnapshotRoundTripAndRecovery()
                                                         + PC_TRAIT_MAX
                                                         + 4)
         * sizeof(std::uint32_t);
-    expect(packet.size() == kSnapshotHeaderSize + 44 + 2 * (32 + characterBuildWireSize) + 36 + 12 + 2 * 36 + 6 * 4 + 2 * 36,
+    expect(packet.size() == kSnapshotHeaderSize + 48 + 2 * (32 + characterBuildWireSize) + 36 + 12 + 48 + 2 * 56 + 6 * 4 + 2 * 36,
         "snapshot packet declares a fixed-width payload");
     expect(packet[0] == 'F' && packet[1] == 'C' && packet[2] == 'M' && packet[3] == 'S', "snapshot magic uses network byte order");
 
@@ -2613,6 +2616,13 @@ void testSnapshotRoundTripAndRecovery()
             && decoded.snapshot.critters[0].actionPoints == 7,
         "snapshot keeps authoritative NPC combat state");
     expect(decoded.snapshot.doors.size() == 1 && decoded.snapshot.doors[0].open, "snapshot keeps door state");
+    expect(decoded.snapshot.scenery.size() == 1
+            && decoded.snapshot.scenery[0].entityId == EntityId { 13 }
+            && decoded.snapshot.scenery[0].pid == 0x02000001
+            && decoded.snapshot.scenery[0].fid == 0x02000002
+            && decoded.snapshot.scenery[0].frame == 1
+            && decoded.snapshot.scenery[0].data1 == 8,
+        "snapshot keeps concrete non-door scenery state");
     expect(decoded.snapshot.items.size() == 2
             && decoded.snapshot.items[0].holderId == EntityId { 1 }
             && decoded.snapshot.items[0].quantity == 2
@@ -2669,11 +2679,17 @@ void testSnapshotRoundTripAndRecovery()
     SnapshotDigestResult doorDriftDigest = computeSnapshotDigest(doorDrift);
     expect(firstDivergentSection(authoritativeDigest.digest, doorDriftDigest.digest) == SnapshotSection::Doors, "door drift reports the door section");
 
+    WorldSnapshot sceneryDrift = decoded.snapshot;
+    sceneryDrift.scenery[0].frame++;
+    SnapshotDigestResult sceneryDriftDigest = computeSnapshotDigest(sceneryDrift);
+    expect(firstDivergentSection(authoritativeDigest.digest, sceneryDriftDigest.digest) == SnapshotSection::Scenery,
+        "non-door scenery drift reports the scenery section");
+
     WorldSnapshot itemDrift = decoded.snapshot;
-    itemDrift.items[0].quantity++;
+    itemDrift.items[0].frame++;
     SnapshotDigestResult itemDriftDigest = computeSnapshotDigest(itemDrift);
     expect(firstDivergentSection(authoritativeDigest.digest, itemDriftDigest.digest) == SnapshotSection::Items,
-        "inventory drift reports the item section");
+        "item presentation drift reports the item section");
 
     WorldSnapshot globalDrift = decoded.snapshot;
     globalDrift.gameGlobalVariables[0]++;
@@ -2782,6 +2798,19 @@ void testSnapshotRoundTripAndRecovery()
     invalidItem.items[0].itemDescriptor = {};
     expect(validateSnapshot(invalidItem) == SnapshotError::InvalidItemState,
         "snapshot requires enough item description to recreate a missing entity");
+    invalidItem = authoritative;
+    invalidItem.items[0].objectFlags = 0x40000000;
+    expect(validateSnapshot(invalidItem) == SnapshotError::InvalidItemState,
+        "snapshot rejects local-only item visibility state");
+
+    WorldSnapshot invalidScenery = authoritative;
+    invalidScenery.scenery[0].objectFlags = 0x40000000;
+    expect(validateSnapshot(invalidScenery) == SnapshotError::InvalidSceneryState,
+        "snapshot rejects local-only scenery visibility state");
+    invalidScenery = authoritative;
+    invalidScenery.scenery[0].pid = 0x01000001;
+    expect(validateSnapshot(invalidScenery) == SnapshotError::InvalidSceneryState,
+        "snapshot rejects a non-scenery prototype in the scenery section");
 
     WorldSnapshot tooManyVariables = authoritative;
     tooManyVariables.mapLocalVariables.assign(kMaxSnapshotVariables + 1, 0);

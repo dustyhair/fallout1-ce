@@ -13,12 +13,13 @@ namespace fallout {
 namespace multiplayer {
 
 constexpr std::uint32_t kSnapshotMagic = 0x46434D53;
-constexpr std::uint16_t kSnapshotVersion = 8;
+constexpr std::uint16_t kSnapshotVersion = 9;
 constexpr std::size_t kSnapshotHeaderSize = 28;
-constexpr std::size_t kMaxSnapshotPayloadSize = 64 * 1024;
+constexpr std::size_t kMaxSnapshotPayloadSize = 512 * 1024;
 constexpr std::size_t kMaxSnapshotActors = 16;
 constexpr std::size_t kMaxSnapshotCritters = 2048;
 constexpr std::size_t kMaxSnapshotDoors = 1024;
+constexpr std::size_t kMaxSnapshotScenery = 8192;
 constexpr std::size_t kMaxSnapshotItems = 4096;
 constexpr std::size_t kMaxSnapshotVariables = 8192;
 constexpr std::size_t kMaxSnapshotTimedEvents = 1024;
@@ -43,6 +44,23 @@ struct DoorSnapshot {
     std::int32_t frame = 0;
 };
 
+// Shared mutable state for non-door scenery. Local visibility/selection bits
+// are deliberately excluded from objectFlags by the engine adapter.
+struct ScenerySnapshot {
+    EntityId entityId;
+    std::int32_t pid = -1;
+    std::int32_t fid = -1;
+    std::int32_t tile = -1;
+    std::int32_t elevation = -1;
+    std::int32_t rotation = -1;
+    std::int32_t frame = 0;
+    std::uint32_t objectFlags = 0;
+    std::int32_t lightDistance = 0;
+    std::int32_t lightIntensity = 0;
+    std::int32_t data0 = 0;
+    std::int32_t data1 = 0;
+};
+
 struct CritterSnapshot {
     EntityId entityId;
     std::int32_t pid = -1;
@@ -62,6 +80,11 @@ struct ItemSnapshot {
     std::int32_t elevation = -1;
     std::uint32_t quantity = 1;
     ItemDescriptor itemDescriptor;
+    std::int32_t fid = 0;
+    std::int32_t frame = 0;
+    std::uint32_t objectFlags = 0;
+    std::int32_t lightDistance = 0;
+    std::int32_t lightIntensity = 0;
 };
 
 struct TimedEventSnapshot {
@@ -81,6 +104,7 @@ struct WorldSnapshot {
     std::vector<ActorSnapshot> actors;
     std::vector<CritterSnapshot> critters;
     std::vector<DoorSnapshot> doors;
+    std::vector<ScenerySnapshot> scenery;
     std::vector<ItemSnapshot> items;
     std::vector<std::int32_t> gameGlobalVariables;
     std::vector<std::int32_t> mapGlobalVariables;
@@ -104,6 +128,7 @@ enum class SnapshotError {
     TooManyActors,
     TooManyCritters,
     TooManyDoors,
+    TooManyScenery,
     TooManyItems,
     TooManyVariables,
     TooManyTimedEvents,
@@ -114,6 +139,7 @@ enum class SnapshotError {
     InvalidActorState,
     InvalidCritterState,
     InvalidDoorState,
+    InvalidSceneryState,
     InvalidItemState,
     InvalidTimedEventState,
 };
@@ -134,6 +160,7 @@ enum class SnapshotSection {
     Actors,
     Critters,
     Doors,
+    Scenery,
     Items,
     Globals,
     MapVariables,
@@ -145,6 +172,7 @@ struct SectionedStateDigest {
     std::uint64_t actors = 0;
     std::uint64_t critters = 0;
     std::uint64_t doors = 0;
+    std::uint64_t scenery = 0;
     std::uint64_t items = 0;
     std::uint64_t globals = 0;
     std::uint64_t mapVariables = 0;
@@ -158,6 +186,7 @@ constexpr bool operator==(const SectionedStateDigest& lhs, const SectionedStateD
         && lhs.actors == rhs.actors
         && lhs.critters == rhs.critters
         && lhs.doors == rhs.doors
+        && lhs.scenery == rhs.scenery
         && lhs.items == rhs.items
         && lhs.globals == rhs.globals
         && lhs.mapVariables == rhs.mapVariables

@@ -24,6 +24,10 @@ Passing `--multiplayer-smoke-scenario=transfer` creates the same seven-cap guest
 
 Passing `--multiplayer-smoke-scenario=skill` places the guest beside the same registered door and submits Traps through the real skill command. The host runs the asynchronous skill action under the guest character context; the guest applies only the ordered presentation boundary. Both processes then require the same complete authoritative state digest and replay the skill event after reconnect.
 
+Passing `--multiplayer-smoke-scenario=scenery` selects a registered non-door scenery object, preferring one with a script, and submits Science through the same skill path. After the host action completes, the fixture changes one shared scenery flag only on the host. The version 9 checkpoint must repair that flag and converge the complete scenery section on the guest without guest-side rule execution.
+
+Passing `--multiplayer-smoke-scenario=container` places the guest beside a registered ground container and submits Lockpick. The fixture changes one shared container flag only on the host, and the checkpoint must converge the complete item section—including container art/frame, flags, and light—before authenticated replay.
+
 This hook makes the two-process path runnable under Xvfb:
 
 ```text
@@ -35,7 +39,7 @@ fallout-ce --multiplayer-join=127.0.0.1:45455 --multiplayer-smoke-test
 
 Lobby readiness gates the local new-game flow and proves that both selected character builds crossed the real TCP connection. During exploration, host input publishes authoritative movement, facing, and usable-door events. Guest input sends commands to the host; accepted commands return a result and then enter the same session-wide event stream. Movement events carry the exact hex route chosen by the host, and multiplayer clients continue network and animation processing while their window is unfocused. Doors receive matching entity IDs from a canonical map scan before play starts.
 
-The host retains a bounded journal of published exploration events for recovery. A guest detecting an event gap requests recovery from its last contiguous sequence. After a socket closes, guest input is blocked while it reconnects with its session, slot, credential, host certificate pin, and last confirmed applied event. The host keeps its listener and journal alive, then replays a retained suffix or sends a checked actor, critter, door, registered-item, world-time, and indexed game/map/script-variable snapshot when the gap predates the journal.
+The host retains a bounded journal of published exploration events for recovery. A guest detecting an event gap requests recovery from its last contiguous sequence. After a socket closes, guest input is blocked while it reconnects with its session, slot, credential, host certificate pin, and last confirmed applied event. The host keeps its listener and journal alive, then replays a retained suffix or sends a checked actor, critter, door, non-door-scenery, registered-item, world-time, and indexed game/map/script-variable snapshot when the gap predates the journal.
 
 Ground-item pickup uses the same host-authoritative live path as movement and doors. Both peers register the initial map's ground items in a deterministic order, the guest sends only the shared item ID, and the host reserves an accepted item until Fallout's deferred pickup callback finishes. A second command for that item is rejected while the first animation is pending.
 

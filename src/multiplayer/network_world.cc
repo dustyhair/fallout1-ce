@@ -40,6 +40,7 @@ LocalSession session;
 Object* peerActor = nullptr;
 CommandProcessor commandProcessor;
 std::vector<std::pair<EntityId, Object*>> worldDoors;
+std::vector<std::pair<EntityId, Object*>> worldScenery;
 std::vector<std::pair<EntityId, Object*>> worldItems;
 std::vector<std::pair<EntityId, Object*>> worldCritters;
 std::unordered_set<EntityId, EntityIdHash> reservedPickupTargets;
@@ -60,6 +61,37 @@ bool itemDropInProgress = false;
 NetworkLaunchMode worldMode = NetworkLaunchMode::Disabled;
 EntityId expectedSplitEntityId;
 EntityId lastSplitEntityId;
+
+constexpr std::uint32_t kSharedObjectFlagMask = 0xB70FF839;
+
+std::uint32_t sharedObjectFlags(const Object* object)
+{
+    return static_cast<std::uint32_t>(object->flags) & kSharedObjectFlagMask;
+}
+
+bool applySharedObjectPresentation(Object* object,
+    std::int32_t fid,
+    std::int32_t frame,
+    std::uint32_t objectFlags,
+    std::int32_t lightDistance,
+    std::int32_t lightIntensity)
+{
+    if (object == nullptr || (objectFlags & ~kSharedObjectFlagMask) != 0) {
+        return false;
+    }
+    Rect dirtyRect {};
+    if ((object->fid != fid && obj_change_fid(object, fid, &dirtyRect) == -1)
+        || (object->frame != frame && obj_set_frame(object, frame, &dirtyRect) == -1)) {
+        return false;
+    }
+    if (object->lightDistance != lightDistance || object->lightIntensity != lightIntensity) {
+        obj_set_light(object, lightDistance, lightIntensity, &dirtyRect);
+    }
+    object->flags = static_cast<int>((static_cast<std::uint32_t>(object->flags) & ~kSharedObjectFlagMask)
+        | objectFlags);
+    tile_refresh_rect(&dirtyRect, object->elevation);
+    return true;
+}
 
 bool captureVariables(const int* variables, int count, std::vector<std::int32_t>& captured)
 {
@@ -746,6 +778,7 @@ NetworkCommandExecutor commandExecutor;
 bool registerWorldObjects()
 {
     worldDoors.clear();
+    worldScenery.clear();
     worldItems.clear();
     worldCritters.clear();
     reservedPickupTargets.clear();
@@ -754,6 +787,7 @@ bool registerWorldObjects()
     activeLootTargets.clear();
     activeSharedModal.reset();
     std::vector<Object*> doors;
+    std::vector<Object*> scenery;
     std::vector<Object*> items;
     std::vector<Object*> critters;
     for (Object* object = obj_find_first(); object != nullptr; object = obj_find_next()) {
@@ -763,6 +797,9 @@ bool registerWorldObjects()
         int objectType = FID_TYPE(object->fid);
         if (objectType == OBJ_TYPE_SCENERY && obj_is_a_portal(object)) {
             doors.push_back(object);
+        } else if (objectType == OBJ_TYPE_SCENERY
+            && object->tile >= 0) {
+            scenery.push_back(object);
         } else if (objectType == OBJ_TYPE_ITEM
             && object->owner == nullptr
             && object->tile >= 0) {
@@ -777,6 +814,7 @@ bool registerWorldObjects()
             < std::tie(rhs->elevation, rhs->tile, rhs->pid, rhs->id, rhs->fid);
     };
     std::sort(doors.begin(), doors.end(), stableObjectOrder);
+    std::sort(scenery.begin(), scenery.end(), stableObjectOrder);
     std::sort(items.begin(), items.end(), stableObjectOrder);
     std::sort(critters.begin(), critters.end(), [](const Object* lhs, const Object* rhs) {
         return std::tie(lhs->id, lhs->pid, lhs->elevation)
@@ -810,6 +848,13 @@ bool registerWorldObjects()
             return false;
         }
         worldDoors.emplace_back(registration.entityId, door);
+    }
+    for (Object* object : scenery) {
+        EntityRegistrationResult registration = session.registerWorldObject(object);
+        if (!registration) {
+            return false;
+        }
+        worldScenery.emplace_back(registration.entityId, object);
     }
     for (Object* item : items) {
         EntityRegistrationResult registration = session.registerWorldObject(item);
@@ -1541,6 +1586,105 @@ std::optional<EntityId> networkWorldPrepareSkillSmokeTest()
         }
     }
     return std::nullopt;
+}
+
+std::optional<EntityId> networkWorldPrepareScenerySmokeTest()
+{
+    if (!session.isActive() || worldScenery.empty()) {
+        return std::nullopt;
+    }
+    Object* actor = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+    if (actor == nullptr) {
+        return std::nullopt;
+    }
+
+    anim_stop();
+    std::vector<std::pair<EntityId, Object*>> candidates = worldScenery;
+    std::stable_sort(candidates.begin(), candidates.end(), [](const auto& left, const auto& right) {
+        int leftSid = -1;
+        int rightSid = -1;
+        bool leftScripted = obj_sid(left.second, &leftSid) != -1;
+        bool rightScripted = obj_sid(right.second, &rightSid) != -1;
+        return leftScripted && !rightScripted;
+    });
+    for (const auto& entry : candidates) {
+        Object* scenery = entry.second;
+        if (scenery == nullptr
+            || !hexGridTileIsValid(scenery->tile)
+            || !elevationIsValid(scenery->elevation)) {
+            continue;
+        }
+        for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+            int tile = tile_num_in_direction(scenery->tile, rotation, 1);
+            if (hexGridTileIsValid(tile)
+                && obj_blocking_at(actor, tile, scenery->elevation) == nullptr
+                && obj_move_to_tile(actor, tile, scenery->elevation, nullptr) == 0) {
+                return entry.first;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+bool networkWorldMutateScenerySmokeTest(EntityId targetId)
+{
+    auto entry = std::find_if(worldScenery.begin(), worldScenery.end(), [&](const auto& candidate) {
+        return candidate.first == targetId;
+    });
+    if (worldMode != NetworkLaunchMode::Host
+        || entry == worldScenery.end()
+        || entry->second == nullptr) {
+        return false;
+    }
+    entry->second->flags ^= OBJECT_NO_HIGHLIGHT;
+    return true;
+}
+
+std::optional<EntityId> networkWorldPrepareContainerSmokeTest()
+{
+    if (!session.isActive()) {
+        return std::nullopt;
+    }
+    Object* actor = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+    if (actor == nullptr) {
+        return std::nullopt;
+    }
+
+    anim_stop();
+    for (const auto& entry : worldItems) {
+        Object* container = entry.second;
+        if (container == nullptr
+            || container->owner != nullptr
+            || item_get_type(container) != ITEM_TYPE_CONTAINER
+            || !hexGridTileIsValid(container->tile)
+            || !elevationIsValid(container->elevation)) {
+            continue;
+        }
+        for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+            int tile = tile_num_in_direction(container->tile, rotation, 1);
+            if (hexGridTileIsValid(tile)
+                && obj_blocking_at(actor, tile, container->elevation) == nullptr
+                && obj_move_to_tile(actor, tile, container->elevation, nullptr) == 0) {
+                return entry.first;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+bool networkWorldMutateContainerSmokeTest(EntityId targetId)
+{
+    auto entry = std::find_if(worldItems.begin(), worldItems.end(), [&](const auto& candidate) {
+        return candidate.first == targetId;
+    });
+    if (worldMode != NetworkLaunchMode::Host
+        || entry == worldItems.end()
+        || entry->second == nullptr
+        || item_get_type(entry->second) != ITEM_TYPE_CONTAINER) {
+        return false;
+    }
+    entry->second->flags ^= OBJECT_NO_HIGHLIGHT;
+    return true;
 }
 
 bool networkWorldVerifyLootRangeSmokeTest(EntityId targetId)
@@ -2277,6 +2421,29 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
             player->build,
         });
     }
+    for (const auto& entry : worldScenery) {
+        Object* scenery = entry.second;
+        if (scenery == nullptr
+            || session.entities().findObject(entry.first) != scenery
+            || anim_busy(scenery) == -1
+            || scenery->tile < 0) {
+            return false;
+        }
+        captured.scenery.push_back(ScenerySnapshot {
+            entry.first,
+            scenery->pid,
+            scenery->fid,
+            scenery->tile,
+            scenery->elevation,
+            scenery->rotation,
+            scenery->frame,
+            sharedObjectFlags(scenery),
+            scenery->lightDistance,
+            scenery->lightIntensity,
+            scenery->data.scenery.stairs.destinationMap,
+            scenery->data.scenery.stairs.destinationBuiltTile,
+        });
+    }
     for (const auto& entry : worldCritters) {
         Object* critter = entry.second;
         if (critter == nullptr
@@ -2336,6 +2503,11 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
             itemState.holderId = *holderId;
             itemState.quantity = static_cast<std::uint32_t>(quantity);
         }
+        itemState.fid = item->fid;
+        itemState.frame = item->frame;
+        itemState.objectFlags = sharedObjectFlags(item);
+        itemState.lightDistance = item->lightDistance;
+        itemState.lightIntensity = item->lightIntensity;
         captured.items.push_back(itemState);
     }
     if (!captureVariables(game_global_vars, num_game_global_vars, captured.gameGlobalVariables)
@@ -2356,6 +2528,7 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
     if (!session.isActive()
         || validateSnapshot(snapshot) != SnapshotError::None
         || snapshot.doors.size() != worldDoors.size()
+        || snapshot.scenery.size() != worldScenery.size()
         || !validateVariableState(snapshot)) {
         return false;
     }
@@ -2368,6 +2541,14 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
         if (door == nullptr
             || !obj_is_a_portal(door)
             || doorState.open != (doorState.frame != 0)) {
+            return false;
+        }
+    }
+    for (const ScenerySnapshot& sceneryState : snapshot.scenery) {
+        Object* scenery = session.entities().findObject(sceneryState.entityId);
+        if (scenery == nullptr
+            || FID_TYPE(scenery->fid) != OBJ_TYPE_SCENERY
+            || scenery->pid != sceneryState.pid) {
             return false;
         }
     }
@@ -2408,6 +2589,40 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
             return false;
         }
         tile_refresh_rect(&dirtyRect, door->elevation);
+    }
+    for (const ScenerySnapshot& sceneryState : snapshot.scenery) {
+        Object* scenery = session.entities().findObject(sceneryState.entityId);
+        Rect dirtyRect {};
+        if ((scenery->tile != sceneryState.tile || scenery->elevation != sceneryState.elevation)
+            && obj_move_to_tile(scenery, sceneryState.tile, sceneryState.elevation, &dirtyRect) == -1) {
+            return false;
+        }
+        if (scenery->rotation != sceneryState.rotation
+            && obj_set_rotation(scenery, sceneryState.rotation, &dirtyRect) == -1) {
+            return false;
+        }
+        if (!applySharedObjectPresentation(scenery,
+                sceneryState.fid,
+                sceneryState.frame,
+                sceneryState.objectFlags,
+                sceneryState.lightDistance,
+                sceneryState.lightIntensity)) {
+            return false;
+        }
+        scenery->data.scenery.stairs.destinationMap = sceneryState.data0;
+        scenery->data.scenery.stairs.destinationBuiltTile = sceneryState.data1;
+        tile_refresh_rect(&dirtyRect, scenery->elevation);
+    }
+    for (const ItemSnapshot& itemState : snapshot.items) {
+        Object* item = session.entities().findObject(itemState.entityId);
+        if (!applySharedObjectPresentation(item,
+                itemState.fid,
+                itemState.frame,
+                itemState.objectFlags,
+                itemState.lightDistance,
+                itemState.lightIntensity)) {
+            return false;
+        }
     }
     for (const ItemSnapshot& itemState : snapshot.items) {
         Object* item = session.entities().findObject(itemState.entityId);
@@ -2515,6 +2730,7 @@ void networkWorldLeave()
 {
     session.stop();
     worldDoors.clear();
+    worldScenery.clear();
     worldItems.clear();
     worldCritters.clear();
     reservedPickupTargets.clear();

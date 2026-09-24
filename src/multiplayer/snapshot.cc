@@ -8,7 +8,7 @@ namespace fallout {
 namespace multiplayer {
 namespace {
 
-constexpr std::size_t kSnapshotPayloadHeaderSize = 44;
+constexpr std::size_t kSnapshotPayloadHeaderSize = 48;
 constexpr std::size_t kCharacterBuildValueCount = SAVEABLE_STAT_COUNT * 2
     + SKILL_COUNT
     + PERK_COUNT
@@ -19,11 +19,13 @@ constexpr std::size_t kCharacterBuildSnapshotSize = kCharacterBuildValueCount * 
 constexpr std::size_t kActorSnapshotSize = 32 + kCharacterBuildSnapshotSize;
 constexpr std::size_t kCritterSnapshotSize = 36;
 constexpr std::size_t kDoorSnapshotSize = 12;
-constexpr std::size_t kItemSnapshotSize = 36;
+constexpr std::size_t kScenerySnapshotSize = 48;
+constexpr std::size_t kItemSnapshotSize = 56;
 constexpr std::size_t kTimedEventSnapshotSize = 36;
 constexpr std::size_t kSnapshotProtectedOffset = 20;
 constexpr std::uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
 constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
+constexpr std::uint32_t kSharedObjectFlagMask = 0xB70FF839;
 
 void appendUint8(std::vector<std::uint8_t>& bytes, std::uint8_t value)
 {
@@ -108,6 +110,9 @@ WorldSnapshot canonicalize(const WorldSnapshot& snapshot)
         return lhs.entityId.value < rhs.entityId.value;
     });
     std::sort(canonical.doors.begin(), canonical.doors.end(), [](const DoorSnapshot& lhs, const DoorSnapshot& rhs) {
+        return lhs.entityId.value < rhs.entityId.value;
+    });
+    std::sort(canonical.scenery.begin(), canonical.scenery.end(), [](const ScenerySnapshot& lhs, const ScenerySnapshot& rhs) {
         return lhs.entityId.value < rhs.entityId.value;
     });
     std::sort(canonical.items.begin(), canonical.items.end(), [](const ItemSnapshot& lhs, const ItemSnapshot& rhs) {
@@ -215,6 +220,22 @@ void appendDoor(std::vector<std::uint8_t>& bytes, const DoorSnapshot& door)
     appendUint32(bytes, static_cast<std::uint32_t>(door.frame));
 }
 
+void appendScenery(std::vector<std::uint8_t>& bytes, const ScenerySnapshot& scenery)
+{
+    appendUint32(bytes, scenery.entityId.value);
+    appendUint32(bytes, static_cast<std::uint32_t>(scenery.pid));
+    appendUint32(bytes, static_cast<std::uint32_t>(scenery.fid));
+    appendUint32(bytes, static_cast<std::uint32_t>(scenery.tile));
+    appendUint32(bytes, static_cast<std::uint32_t>(scenery.elevation));
+    appendUint32(bytes, static_cast<std::uint32_t>(scenery.rotation));
+    appendUint32(bytes, static_cast<std::uint32_t>(scenery.frame));
+    appendUint32(bytes, scenery.objectFlags);
+    appendUint32(bytes, static_cast<std::uint32_t>(scenery.lightDistance));
+    appendUint32(bytes, static_cast<std::uint32_t>(scenery.lightIntensity));
+    appendUint32(bytes, static_cast<std::uint32_t>(scenery.data0));
+    appendUint32(bytes, static_cast<std::uint32_t>(scenery.data1));
+}
+
 void appendCritter(std::vector<std::uint8_t>& bytes, const CritterSnapshot& critter)
 {
     appendUint32(bytes, critter.entityId.value);
@@ -239,6 +260,11 @@ void appendItem(std::vector<std::uint8_t>& bytes, const ItemSnapshot& item)
     appendUint32(bytes, static_cast<std::uint32_t>(item.itemDescriptor.extendedFlags));
     appendUint32(bytes, static_cast<std::uint32_t>(item.itemDescriptor.data0));
     appendUint32(bytes, static_cast<std::uint32_t>(item.itemDescriptor.data1));
+    appendUint32(bytes, static_cast<std::uint32_t>(item.fid));
+    appendUint32(bytes, static_cast<std::uint32_t>(item.frame));
+    appendUint32(bytes, item.objectFlags);
+    appendUint32(bytes, static_cast<std::uint32_t>(item.lightDistance));
+    appendUint32(bytes, static_cast<std::uint32_t>(item.lightIntensity));
 }
 
 void appendVariables(std::vector<std::uint8_t>& bytes, const std::vector<std::int32_t>& variables)
@@ -304,6 +330,9 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
     }
     if (snapshot.doors.size() > kMaxSnapshotDoors) {
         return SnapshotError::TooManyDoors;
+    }
+    if (snapshot.scenery.size() > kMaxSnapshotScenery) {
+        return SnapshotError::TooManyScenery;
     }
     if (snapshot.items.size() > kMaxSnapshotItems) {
         return SnapshotError::TooManyItems;
@@ -372,6 +401,26 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
         }
     }
 
+    for (const ScenerySnapshot& scenery : snapshot.scenery) {
+        if (!isValid(scenery.entityId)
+            || !entityIds.insert(scenery.entityId.value).second) {
+            return !isValid(scenery.entityId) ? SnapshotError::InvalidEntityId : SnapshotError::DuplicateEntityId;
+        }
+        if (scenery.pid < 0
+            || (static_cast<std::uint32_t>(scenery.pid) >> 24) != 2
+            || scenery.fid < 0
+            || ((static_cast<std::uint32_t>(scenery.fid) & 0x0F000000) >> 24) != 2
+            || scenery.tile < 0
+            || scenery.elevation < 0 || scenery.elevation > 2
+            || scenery.rotation < 0 || scenery.rotation > 5
+            || scenery.frame < 0
+            || (scenery.objectFlags & ~kSharedObjectFlagMask) != 0
+            || scenery.lightDistance < 0 || scenery.lightDistance > 8
+            || scenery.lightIntensity < 0 || scenery.lightIntensity > 65536) {
+            return SnapshotError::InvalidSceneryState;
+        }
+    }
+
     for (const ItemSnapshot& item : snapshot.items) {
         if (!isValid(item.entityId)) {
             return SnapshotError::InvalidEntityId;
@@ -385,6 +434,12 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
             || !hasItemDescriptor(item.itemDescriptor)
             || item.itemDescriptor.pid < 0
             || (static_cast<std::uint32_t>(item.itemDescriptor.pid) >> 24) != 0
+            || item.fid < 0
+            || ((static_cast<std::uint32_t>(item.fid) & 0x0F000000) >> 24) != 0
+            || item.frame < 0
+            || (item.objectFlags & ~kSharedObjectFlagMask) != 0
+            || item.lightDistance < 0 || item.lightDistance > 8
+            || item.lightIntensity < 0 || item.lightIntensity > 65536
             || (onGround && (item.quantity != 1 || item.tile < 0 || item.elevation < 0 || item.elevation > 2))
             || (!onGround && (item.tile != -1 || item.elevation != -1 || item.holderId == item.entityId))) {
             return SnapshotError::InvalidItemState;
@@ -413,6 +468,7 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
         + snapshot.actors.size() * kActorSnapshotSize
         + snapshot.critters.size() * kCritterSnapshotSize
         + snapshot.doors.size() * kDoorSnapshotSize
+        + snapshot.scenery.size() * kScenerySnapshotSize
         + snapshot.items.size() * kItemSnapshotSize
         + (snapshot.gameGlobalVariables.size()
               + snapshot.mapGlobalVariables.size()
@@ -440,6 +496,7 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
         + canonical.actors.size() * kActorSnapshotSize
         + canonical.critters.size() * kCritterSnapshotSize
         + canonical.doors.size() * kDoorSnapshotSize
+        + canonical.scenery.size() * kScenerySnapshotSize
         + canonical.items.size() * kItemSnapshotSize
         + (canonical.gameGlobalVariables.size()
               + canonical.mapGlobalVariables.size()
@@ -455,6 +512,7 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
     appendUint32(payload, static_cast<std::uint32_t>(canonical.actors.size()));
     appendUint32(payload, static_cast<std::uint32_t>(canonical.critters.size()));
     appendUint32(payload, static_cast<std::uint32_t>(canonical.doors.size()));
+    appendUint32(payload, static_cast<std::uint32_t>(canonical.scenery.size()));
     appendUint32(payload, static_cast<std::uint32_t>(canonical.items.size()));
     appendUint32(payload, static_cast<std::uint32_t>(canonical.gameGlobalVariables.size()));
     appendUint32(payload, static_cast<std::uint32_t>(canonical.mapGlobalVariables.size()));
@@ -468,6 +526,9 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
     }
     for (const DoorSnapshot& door : canonical.doors) {
         appendDoor(payload, door);
+    }
+    for (const ScenerySnapshot& scenery : canonical.scenery) {
+        appendScenery(payload, scenery);
     }
     for (const ItemSnapshot& item : canonical.items) {
         appendItem(payload, item);
@@ -555,6 +616,7 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
     std::uint32_t actorCount = readUint32(packet, offset);
     std::uint32_t critterCount = readUint32(packet, offset);
     std::uint32_t doorCount = readUint32(packet, offset);
+    std::uint32_t sceneryCount = readUint32(packet, offset);
     std::uint32_t itemCount = readUint32(packet, offset);
     std::uint32_t gameGlobalCount = readUint32(packet, offset);
     std::uint32_t mapGlobalCount = readUint32(packet, offset);
@@ -571,6 +633,10 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
     }
     if (doorCount > kMaxSnapshotDoors) {
         result.error = SnapshotError::TooManyDoors;
+        return result;
+    }
+    if (sceneryCount > kMaxSnapshotScenery) {
+        result.error = SnapshotError::TooManyScenery;
         return result;
     }
     if (itemCount > kMaxSnapshotItems) {
@@ -592,6 +658,7 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
         + static_cast<std::size_t>(actorCount) * kActorSnapshotSize
         + static_cast<std::size_t>(critterCount) * kCritterSnapshotSize
         + static_cast<std::size_t>(doorCount) * kDoorSnapshotSize
+        + static_cast<std::size_t>(sceneryCount) * kScenerySnapshotSize
         + static_cast<std::size_t>(itemCount) * kItemSnapshotSize
         + (static_cast<std::size_t>(gameGlobalCount)
               + static_cast<std::size_t>(mapGlobalCount)
@@ -653,6 +720,24 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
         result.snapshot.doors.push_back(door);
     }
 
+    result.snapshot.scenery.reserve(sceneryCount);
+    for (std::uint32_t index = 0; index < sceneryCount; index++) {
+        ScenerySnapshot scenery;
+        scenery.entityId.value = readUint32(packet, offset);
+        scenery.pid = static_cast<std::int32_t>(readUint32(packet, offset));
+        scenery.fid = static_cast<std::int32_t>(readUint32(packet, offset));
+        scenery.tile = static_cast<std::int32_t>(readUint32(packet, offset));
+        scenery.elevation = static_cast<std::int32_t>(readUint32(packet, offset));
+        scenery.rotation = static_cast<std::int32_t>(readUint32(packet, offset));
+        scenery.frame = static_cast<std::int32_t>(readUint32(packet, offset));
+        scenery.objectFlags = readUint32(packet, offset);
+        scenery.lightDistance = static_cast<std::int32_t>(readUint32(packet, offset));
+        scenery.lightIntensity = static_cast<std::int32_t>(readUint32(packet, offset));
+        scenery.data0 = static_cast<std::int32_t>(readUint32(packet, offset));
+        scenery.data1 = static_cast<std::int32_t>(readUint32(packet, offset));
+        result.snapshot.scenery.push_back(scenery);
+    }
+
     result.snapshot.items.reserve(itemCount);
     for (std::uint32_t index = 0; index < itemCount; index++) {
         ItemSnapshot item;
@@ -665,6 +750,11 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
         item.itemDescriptor.extendedFlags = static_cast<std::int32_t>(readUint32(packet, offset));
         item.itemDescriptor.data0 = static_cast<std::int32_t>(readUint32(packet, offset));
         item.itemDescriptor.data1 = static_cast<std::int32_t>(readUint32(packet, offset));
+        item.fid = static_cast<std::int32_t>(readUint32(packet, offset));
+        item.frame = static_cast<std::int32_t>(readUint32(packet, offset));
+        item.objectFlags = readUint32(packet, offset);
+        item.lightDistance = static_cast<std::int32_t>(readUint32(packet, offset));
+        item.lightIntensity = static_cast<std::int32_t>(readUint32(packet, offset));
         result.snapshot.items.push_back(item);
     }
 
@@ -743,6 +833,13 @@ SnapshotDigestResult computeSnapshotDigest(const WorldSnapshot& snapshot)
     }
     result.digest.doors = digestBytes(doorBytes);
 
+    std::vector<std::uint8_t> sceneryBytes;
+    appendUint32(sceneryBytes, static_cast<std::uint32_t>(canonical.scenery.size()));
+    for (const ScenerySnapshot& scenery : canonical.scenery) {
+        appendScenery(sceneryBytes, scenery);
+    }
+    result.digest.scenery = digestBytes(sceneryBytes);
+
     std::vector<std::uint8_t> itemBytes;
     appendUint32(itemBytes, static_cast<std::uint32_t>(canonical.items.size()));
     for (const ItemSnapshot& item : canonical.items) {
@@ -774,6 +871,7 @@ SnapshotDigestResult computeSnapshotDigest(const WorldSnapshot& snapshot)
     appendUint64(overallBytes, result.digest.actors);
     appendUint64(overallBytes, result.digest.critters);
     appendUint64(overallBytes, result.digest.doors);
+    appendUint64(overallBytes, result.digest.scenery);
     appendUint64(overallBytes, result.digest.items);
     appendUint64(overallBytes, result.digest.globals);
     appendUint64(overallBytes, result.digest.mapVariables);
@@ -795,6 +893,9 @@ SnapshotSection firstDivergentSection(const SectionedStateDigest& expected, cons
     }
     if (expected.doors != actual.doors) {
         return SnapshotSection::Doors;
+    }
+    if (expected.scenery != actual.scenery) {
+        return SnapshotSection::Scenery;
     }
     if (expected.items != actual.items) {
         return SnapshotSection::Items;
