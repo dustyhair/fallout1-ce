@@ -30,6 +30,7 @@ const CharacterCreationSheet* networkRuntimePeerSheet();
 bool networkRuntimeSendChatMessage(const char* text);
 std::optional<LobbyChatMessage> networkRuntimeTakeChatMessage();
 bool networkRuntimeHandleGameChatInput(int keyCode);
+bool networkRuntimeHandleCombatInput(int keyCode);
 bool networkRuntimeSmokeTestEnabled();
 const char* networkRuntimeSmokeTestMap();
 bool networkRuntimeRunSmokeTest();

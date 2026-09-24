@@ -39,7 +39,8 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     };
 
     const SharedModalCommand* modal = std::get_if<SharedModalCommand>(&command.payload);
-    SessionPhase requiredPhase = std::holds_alternative<AttackCommand>(command.payload)
+    SessionPhase requiredPhase = (std::holds_alternative<AttackCommand>(command.payload)
+            || std::holds_alternative<EndTurnCommand>(command.payload))
         ? SessionPhase::Combat
         : std::holds_alternative<WorldMapRouteCommand>(command.payload)
         ? SessionPhase::Transition
@@ -90,6 +91,7 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     const InventoryTransferCommand* transfer = std::get_if<InventoryTransferCommand>(&command.payload);
     const ItemDropCommand* drop = std::get_if<ItemDropCommand>(&command.payload);
     const AttackCommand* attack = std::get_if<AttackCommand>(&command.payload);
+    const EndTurnCommand* endTurn = std::get_if<EndTurnCommand>(&command.payload);
     const WorldMapRouteCommand* worldMapRoute = std::get_if<WorldMapRouteCommand>(&command.payload);
     Object* target = nullptr;
     EntityId targetId;
@@ -294,6 +296,15 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
         } else if (attack != nullptr) {
             executionStatus = executor.attack(actor, target, *attack);
             event.payload = AttackStartedEvent { command.actorId, attack->targetId, attack->hitMode, attack->hitLocation };
+        } else if (endTurn != nullptr) {
+            EndTurnExecution turn = executor.endTurn(actor, command.playerId, *endTurn);
+            executionStatus = turn.status;
+            event.payload = CombatTurnStateChangedEvent {
+                command.actorId,
+                SessionPhase::Combat,
+                session.phaseRevision(),
+                std::move(turn.state),
+            };
         } else if (modal != nullptr) {
             SharedModalExecution modalExecution = executor.setSharedModal(actor, *modal);
             executionStatus = modalExecution.status;

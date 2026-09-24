@@ -1,6 +1,6 @@
 # Two-player co-op plan
 
-Status: Phases 0, 1, 2, 2.25, 2.5, 3A, and 3B are complete on the `multiplayer-plan` branch. Transport, lobby, journal, snapshot recovery, authenticated reconnect, content manifest, and first-contact fingerprint verification are implemented. Same-map exploration converges through the host command processor and authoritative checkpoints; replicas do not rerun rule-bearing scripts, rolls, or timed queues. Installed-data two-process scenarios cover movement, doors, pickup, loot, inventory gifts, skills, item-on-target quest completion, scenery and container state, XP, independent elevator, ladder, and typed-stair travel, shared cross-map elevators, exits, and typed stairs, agreed rest, and world-map travel into towns, terrain, and encounters. Each scenario compares full section digests and replays events after authenticated reconnect. Live combat attacks remain blocked until authoritative turn ownership is implemented.
+Status: Phases 0, 1, 2, 2.25, 2.5, 3A, 3B, and 4A are complete on the `multiplayer-plan` branch. Transport, lobby, journal, snapshot recovery, authenticated reconnect, content manifest, and first-contact fingerprint verification are implemented. Same-map exploration converges through the host command processor and authoritative checkpoints; replicas do not rerun rule-bearing scripts, rolls, or timed queues. Installed-data two-process scenarios cover movement, doors, pickup, loot, inventory gifts, skills, item-on-target quest completion, scenery and container state, XP, independent elevator, ladder, and typed-stair travel, shared cross-map elevators, exits, and typed stairs, agreed rest, world-map travel into towns, terrain, and encounters, and semantic combat turn ownership. Live player combat actions, including attacks, remain blocked until Phase 4B replicates their complete authoritative effects.
 
 ## Goal
 
@@ -439,22 +439,31 @@ Exit condition: two players can complete a small non-combat quest together, chan
 
 ### Phase 4A: combat controller and turn ownership
 
-In progress: the first safety slice classifies registered player actors by
-`PlayerId`, prevents guest-side combat simulation, and prevents the host from
-running a remote player actor through combat AI or its turn script. The host
-currently passes remote turns; live player turns remain disabled. A headless
-turn controller covers owner-keyed initiative, stale/out-of-turn rejection,
-deadlines, and disconnect/pass for three players plus AI. It is not yet wired
-to the engine or replicated to peers.
+Complete: the host promotes all same-elevation player actors into Fallout's
+initiative roster and classifies each active actor by `PlayerId` or host AI.
+Gameplay wire version 21 carries a revision-keyed End Turn command and
+ordered combat-state events. Snapshot version 13 carries the same initiative,
+active actor, turn revision, round, and deadline for reconnect and correction.
+The guest's Space key ends only its own turn; the host waits for that command,
+the 60-second deadline, or a disconnect pass. Host and AI turns advance from
+the engine loop, while guest combat remains passive. A three-player-plus-AI
+headless test covers identical initiative on both views, stale/out-of-turn
+rejection, timeout, and disconnect. The installed-data two-process
+`combat-turn` scenario exercises the real host combat loop and guest command,
+checks matching post-combat digests, and verifies zero guest scripts, attacks,
+and RNG use. Host takeover of a disconnected combatant is not enabled; the
+selected 4A policy is pass. Player movement, attack, item, reload, and stance
+actions in combat remain gated for 4B.
 
-- Transition into and out of the authoritative Combat phase and replicate the phase revision.
-- Classify every combatant by an owning `PlayerId` or as host AI.
-- Give engine input only to the peer that owns the active actor; never pass a player-owned actor to `combat_ai`.
-- Add semantic end-turn, timeout, disconnect/pass, and optional host-takeover policies.
-- Keep the guest combat simulation passive: it renders host-selected results but does not advance AI, scripts, rolls, damage, ammo, or death checks.
-- Key player-controlled turns, deadlines, disconnect handling, and optional
-  takeover by the active actor's owning `PlayerId`. The controller must not use
-  a host-turn/guest-turn enum; include a three-player headless initiative test.
+- [x] Transition into and out of the authoritative Combat phase and replicate the phase revision.
+- [x] Classify every combatant by an owning `PlayerId` or as host AI.
+- [x] Give end-turn input only to the peer that owns the active actor; never pass a player-owned actor to `combat_ai`. Complete combat actions belong to 4B.
+- [x] Add semantic end-turn, timeout, and disconnect/pass policies. Host takeover remains an optional later policy.
+- [x] Keep the guest combat simulation passive: it renders host-selected state but does not advance AI, scripts, rolls, damage, ammo, or death checks.
+- [x] Key player-controlled turns, deadlines, and disconnect handling by the
+  active actor's owning `PlayerId`, without a host-turn/guest-turn enum.
+  Include a three-player headless initiative test. Host takeover remains an
+  optional later policy; 4A passes disconnected turns.
 
 Exit condition: initiative advances through host, guest, and AI actors in the same order on both views, and an out-of-turn command cannot mutate state.
 
@@ -467,7 +476,7 @@ Exit condition: initiative advances through host, guest, and AI actors in the sa
   recovery acknowledgement per participant so another player's reconnect does
   not stall or rewind the authoritative turn.
 
-Do not enable live attack commands merely because their wire format exists. The runtime must reject them until Phase 4A ownership and complete authoritative combat effects are in place.
+Do not enable live attack commands merely because their wire format exists. Phase 4A ownership is in place, but the runtime must continue rejecting attacks until Phase 4B publishes their complete authoritative effects.
 
 Exit condition: a complete encounter survives save, load, and guest reconnection.
 

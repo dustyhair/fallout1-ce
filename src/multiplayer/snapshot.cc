@@ -4,6 +4,8 @@
 #include <limits>
 #include <unordered_set>
 
+#include "multiplayer/combat_turn_controller.h"
+
 namespace fallout {
 namespace multiplayer {
 namespace {
@@ -24,6 +26,7 @@ constexpr std::size_t kItemSnapshotSize = 56;
 constexpr std::size_t kTimedEventSnapshotSize = 36;
 constexpr std::size_t kWorldMapSnapshotSize = 31 * 29 + 15 * 7 + 6 * sizeof(std::uint32_t);
 constexpr std::size_t kWorldMapTravelSnapshotSize = 20 + 14 * sizeof(std::uint32_t);
+constexpr std::size_t kCombatStateBaseSize = 28;
 constexpr std::size_t kSnapshotProtectedOffset = 20;
 constexpr std::uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
 constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
@@ -89,6 +92,19 @@ void appendWorldMapTravel(std::vector<std::uint8_t>& bytes, const WorldMapTravel
     appendUint32(bytes, static_cast<std::uint32_t>(progress.miles));
     appendUint32(bytes, static_cast<std::uint32_t>(progress.dayLength));
     appendUint32(bytes, static_cast<std::uint32_t>(progress.timeAdder));
+}
+
+void appendCombatTurnState(std::vector<std::uint8_t>& bytes, const CombatTurnState& state)
+{
+    appendUint64(bytes, state.revision);
+    appendUint64(bytes, state.round);
+    appendUint32(bytes, state.activeIndex);
+    appendUint32(bytes, state.remainingMilliseconds);
+    appendUint32(bytes, static_cast<std::uint32_t>(state.initiative.size()));
+    for (const CombatInitiativeEntry& entry : state.initiative) {
+        appendUint32(bytes, entry.actorId.value);
+        appendUint32(bytes, entry.ownerId.value);
+    }
 }
 
 std::uint8_t readUint8(const std::vector<std::uint8_t>& bytes, std::size_t& offset)
@@ -357,6 +373,9 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
     if (snapshot.phaseRevision == 0) {
         return SnapshotError::InvalidPhaseRevision;
     }
+    if (!isValidCombatTurnState(snapshot.combat, snapshot.phase)) {
+        return SnapshotError::InvalidCombatState;
+    }
     if (snapshot.gameTime <= 0) {
         return SnapshotError::InvalidGameTime;
     }
@@ -468,6 +487,27 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
         }
     }
 
+    for (const CombatInitiativeEntry& entry : snapshot.combat.initiative) {
+        if (isValid(entry.ownerId)) {
+            auto actor = std::find_if(snapshot.actors.begin(), snapshot.actors.end(),
+                [&](const ActorSnapshot& candidate) {
+                    return candidate.entityId == entry.actorId
+                        && candidate.ownerId == entry.ownerId;
+                });
+            if (actor == snapshot.actors.end()) {
+                return SnapshotError::InvalidCombatState;
+            }
+        } else {
+            auto critter = std::find_if(snapshot.critters.begin(), snapshot.critters.end(),
+                [&](const CritterSnapshot& candidate) {
+                    return candidate.entityId == entry.actorId;
+                });
+            if (critter == snapshot.critters.end()) {
+                return SnapshotError::InvalidCombatState;
+            }
+        }
+    }
+
     for (const DoorSnapshot& door : snapshot.doors) {
         if (!isValid(door.entityId)) {
             return SnapshotError::InvalidEntityId;
@@ -554,7 +594,10 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
               + snapshot.mapLocalVariables.size())
             * sizeof(std::uint32_t)
         + snapshot.timedEvents.size() * kTimedEventSnapshotSize
-        + kWorldMapSnapshotSize;
+        + kWorldMapSnapshotSize
+        + kWorldMapTravelSnapshotSize
+        + kCombatStateBaseSize
+        + snapshot.combat.initiative.size() * 8;
     if (payloadSize > kMaxSnapshotPayloadSize) {
         return SnapshotError::PayloadTooLarge;
     }
@@ -584,7 +627,9 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
             * sizeof(std::uint32_t)
         + canonical.timedEvents.size() * kTimedEventSnapshotSize
         + kWorldMapSnapshotSize
-        + kWorldMapTravelSnapshotSize);
+        + kWorldMapTravelSnapshotSize
+        + kCombatStateBaseSize
+        + canonical.combat.initiative.size() * 8);
 
     appendUint8(payload, static_cast<std::uint8_t>(canonical.phase));
     appendUint8(payload, 0);
@@ -623,6 +668,7 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
     }
     appendWorldMap(payload, canonical.worldMap);
     appendWorldMapTravel(payload, canonical.worldMapTravel);
+    appendCombatTurnState(payload, canonical.combat);
 
     std::vector<std::uint8_t> protectedBytes;
     protectedBytes.reserve(sizeof(std::uint64_t) + payload.size());
@@ -750,12 +796,17 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
             * sizeof(std::uint32_t)
         + static_cast<std::size_t>(timedEventCount) * kTimedEventSnapshotSize
         + kWorldMapSnapshotSize
-        + kWorldMapTravelSnapshotSize;
+        + kWorldMapTravelSnapshotSize
+        + kCombatStateBaseSize;
     if (payloadSize < expectedPayloadSize) {
         result.error = SnapshotError::TruncatedPayload;
         return result;
     }
-    if (payloadSize > expectedPayloadSize) {
+    std::size_t combatCountOffset = kSnapshotHeaderSize
+        + expectedPayloadSize - sizeof(std::uint32_t);
+    std::uint32_t combatCount = readUint32(packet, combatCountOffset);
+    if (combatCount > kMaximumCombatInitiative
+        || payloadSize != expectedPayloadSize + static_cast<std::size_t>(combatCount) * 8) {
         result.error = SnapshotError::TrailingData;
         return result;
     }
@@ -910,6 +961,22 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
         return result;
     }
 
+    CombatTurnState& combat = result.snapshot.combat;
+    combat.revision = readUint64(packet, offset);
+    combat.round = readUint64(packet, offset);
+    combat.activeIndex = readUint32(packet, offset);
+    combat.remainingMilliseconds = readUint32(packet, offset);
+    if (readUint32(packet, offset) != combatCount) {
+        result.error = SnapshotError::InvalidCombatState;
+        return result;
+    }
+    for (std::uint32_t index = 0; index < combatCount; index++) {
+        combat.initiative.push_back({
+            EntityId { readUint32(packet, offset) },
+            PlayerId { readUint32(packet, offset) },
+        });
+    }
+
     result.error = validateSnapshot(result.snapshot);
     if (result.error == SnapshotError::None) {
         result.snapshot = canonicalize(result.snapshot);
@@ -933,6 +1000,11 @@ SnapshotDigestResult computeSnapshotDigest(const WorldSnapshot& snapshot)
     appendUint8(sessionBytes, static_cast<std::uint8_t>(canonical.phase));
     appendUint32(sessionBytes, canonical.phaseRevision);
     appendUint32(sessionBytes, static_cast<std::uint32_t>(canonical.gameTime));
+    CombatTurnState digestCombat = canonical.combat;
+    // Deadlines are host-monotonic and drift between state captures. The
+    // authoritative identity/order/revision, not the UI countdown, is state.
+    digestCombat.remainingMilliseconds = 0;
+    appendCombatTurnState(sessionBytes, digestCombat);
     result.digest.session = digestBytes(sessionBytes);
 
     std::vector<std::uint8_t> actorBytes;

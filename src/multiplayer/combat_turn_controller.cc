@@ -1,5 +1,6 @@
 #include "multiplayer/combat_turn_controller.h"
 
+#include <algorithm>
 #include <limits>
 #include <unordered_set>
 #include <utility>
@@ -17,11 +18,33 @@ std::uint64_t deadlineAfter(std::uint64_t now, std::uint64_t duration)
 
 } // namespace
 
+bool isValidCombatTurnState(const CombatTurnState& state, SessionPhase phase)
+{
+    if (phase != SessionPhase::Combat || state.initiative.empty()) {
+        return state.revision == 0 && state.round == 0
+            && state.activeIndex == 0 && state.remainingMilliseconds == 0
+            && state.initiative.empty();
+    }
+    if (state.revision == 0 || state.round == 0
+        || state.initiative.size() > kMaximumCombatInitiative
+        || state.activeIndex >= state.initiative.size()) {
+        return false;
+    }
+    std::unordered_set<EntityId, EntityIdHash> seen;
+    for (const CombatInitiativeEntry& entry : state.initiative) {
+        if (!isValid(entry.actorId) || !seen.insert(entry.actorId).second) {
+            return false;
+        }
+    }
+    return true;
+}
+
 CombatTurnResult CombatTurnController::begin(std::vector<CombatTurnEntry> order,
-    std::uint64_t now, std::uint64_t turnDuration)
+    std::uint64_t now, std::uint64_t turnDuration,
+    std::uint64_t initialRevision, std::uint64_t round)
 {
     std::unordered_set<EntityId, EntityIdHash> seen;
-    if (order.empty() || turnDuration == 0) {
+    if (order.empty() || turnDuration == 0 || initialRevision == 0 || round == 0) {
         return CombatTurnResult::InvalidOrder;
     }
     for (const CombatTurnEntry& entry : order) {
@@ -35,11 +58,50 @@ CombatTurnResult CombatTurnController::begin(std::vector<CombatTurnEntry> order,
     _order = std::move(order);
     _disconnected.clear();
     _index = 0;
-    _revision = 1;
-    _round = 1;
+    _revision = initialRevision;
+    _round = round;
     _duration = turnDuration;
     _deadline = deadlineAfter(now, _duration);
     return CombatTurnResult::Accepted;
+}
+
+bool CombatTurnController::restore(const CombatTurnState& state, std::uint64_t now)
+{
+    if (!isValidCombatTurnState(state, SessionPhase::Combat)) {
+        return false;
+    }
+    std::vector<CombatTurnEntry> order;
+    order.reserve(state.initiative.size());
+    for (const CombatInitiativeEntry& entry : state.initiative) {
+        order.push_back({ entry.actorId,
+            isValid(entry.ownerId) ? std::optional<PlayerId>(entry.ownerId) : std::nullopt });
+    }
+    _order = std::move(order);
+    _disconnected.clear();
+    _index = state.activeIndex;
+    _revision = state.revision;
+    _round = state.round;
+    _duration = state.remainingMilliseconds;
+    _deadline = deadlineAfter(now, _duration);
+    return true;
+}
+
+CombatTurnState CombatTurnController::snapshot(std::uint64_t now) const
+{
+    CombatTurnState state;
+    if (!active()) {
+        return state;
+    }
+    state.revision = _revision;
+    state.round = _round;
+    state.activeIndex = static_cast<std::uint32_t>(_index);
+    state.remainingMilliseconds = static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(_deadline > now ? _deadline - now : 0,
+            std::numeric_limits<std::uint32_t>::max()));
+    for (const CombatTurnEntry& entry : _order) {
+        state.initiative.push_back({ entry.actorId, entry.owner.value_or(PlayerId {}) });
+    }
+    return state;
 }
 
 void CombatTurnController::stop()
@@ -115,6 +177,19 @@ CombatTurnResult CombatTurnController::endPlayerTurn(PlayerId playerId,
     }
     if (_disconnected.find(playerId) != _disconnected.end()) {
         return CombatTurnResult::Disconnected;
+    }
+    return passPlayerTurn(playerId, actorId, revision, now);
+}
+
+CombatTurnResult CombatTurnController::passPlayerTurn(PlayerId playerId,
+    EntityId actorId, std::uint64_t revision, std::uint64_t now)
+{
+    CombatTurnResult result = checkTurn(actorId, revision);
+    if (result != CombatTurnResult::Accepted) {
+        return result;
+    }
+    if (!current()->owner.has_value() || *current()->owner != playerId) {
+        return CombatTurnResult::OutOfTurn;
     }
     advance(now);
     return CombatTurnResult::Accepted;

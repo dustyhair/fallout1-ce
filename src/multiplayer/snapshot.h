@@ -14,7 +14,7 @@ namespace fallout {
 namespace multiplayer {
 
 constexpr std::uint32_t kSnapshotMagic = 0x46434D53;
-constexpr std::uint16_t kSnapshotVersion = 12;
+constexpr std::uint16_t kSnapshotVersion = 13;
 constexpr std::size_t kSnapshotHeaderSize = 28;
 constexpr std::size_t kMaxSnapshotPayloadSize = 512 * 1024;
 constexpr std::size_t kMaxSnapshotActors = 16;
@@ -119,6 +119,7 @@ struct WorldSnapshot {
     std::int32_t gameTime = 1;
     WorldMapState worldMap;
     WorldMapTravelSnapshot worldMapTravel;
+    CombatTurnState combat;
     std::vector<ActorSnapshot> actors;
     std::vector<CritterSnapshot> critters;
     std::vector<DoorSnapshot> doors;
@@ -162,6 +163,7 @@ enum class SnapshotError {
     InvalidTimedEventState,
     InvalidWorldMapState,
     InvalidWorldMapTravelState,
+    InvalidCombatState,
 };
 
 struct SnapshotDecodeResult {

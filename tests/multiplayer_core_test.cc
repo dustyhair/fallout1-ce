@@ -250,6 +250,17 @@ void testCombatTurnController()
     expect(host.endPlayerTurn(kGuestPlayerId, guestActor, revision, 200)
             == CombatTurnResult::Inactive,
         "stopped combat rejects turn commands");
+
+    CombatTurnController incapacitated;
+    expect(incapacitated.begin({ { thirdActor, thirdPlayer } }, 100, 30)
+            == CombatTurnResult::Accepted,
+        "incapacitated owner fixture starts");
+    incapacitated.setConnected(thirdPlayer, false);
+    expect(incapacitated.endPlayerTurn(thirdPlayer, thirdActor, 1, 101)
+            == CombatTurnResult::Disconnected
+            && incapacitated.passPlayerTurn(thirdPlayer, thirdActor, 1, 101)
+                == CombatTurnResult::Accepted,
+        "host may pass an incapacitated owner without accepting disconnected input");
 }
 
 void testEntityRegistry()
@@ -1920,6 +1931,99 @@ void pollNetworkLobbies(NetworkLobby& host, NetworkLobby& guest)
     }
 }
 
+void testNetworkCombatTurnTransport()
+{
+    SessionId sessionId { 0xACCE5510ULL };
+    LoopbackTransportPair pair = createLoopbackTransportPair();
+    NetworkLobby host;
+    NetworkLobby guest;
+    expect(host.start(NetworkLaunchMode::Host, sessionId, std::move(pair.first))
+            && guest.start(NetworkLaunchMode::Join, sessionId, std::move(pair.second)),
+        "combat transport peers start");
+    expect(host.submitLocalSheet(sampleCharacterSheet(kHostPlayerId, "Host"))
+            == CharacterLobbyError::None
+            && guest.submitLocalSheet(sampleCharacterSheet(kGuestPlayerId, "Guest"))
+                == CharacterLobbyError::None,
+        "combat transport peers submit character sheets");
+    pollNetworkLobbies(host, guest);
+    expect(host.requestStart(), "combat transport host starts world");
+    for (int attempt = 0; attempt < 100 && !guest.startRequested(); attempt++) {
+        host.poll();
+        guest.poll();
+    }
+    expect(host.startRequested() && guest.startRequested(),
+        "combat transport peers enter world");
+
+    CombatTurnState state;
+    state.revision = 2;
+    state.round = 1;
+    state.activeIndex = 1;
+    state.remainingMilliseconds = 60000;
+    state.initiative = {
+        { EntityId { 1 }, kHostPlayerId },
+        { EntityId { 2 }, kGuestPlayerId },
+        { EntityId { 3 }, {} },
+    };
+    expect(host.publishDeferredEvent(GameEvent {
+               {}, CommandSequence { 1 },
+               CombatTurnStateChangedEvent {
+                   EntityId { 1 }, SessionPhase::Combat, 4, state,
+               },
+           }),
+        "host publishes authoritative guest turn");
+    guest.poll();
+    std::optional<GameEvent> begun = guest.takePeerEvent();
+    const auto* begunState = begun
+        ? std::get_if<CombatTurnStateChangedEvent>(&begun->payload) : nullptr;
+    expect(begunState != nullptr && begunState->state.revision == 2
+            && begunState->state.initiative[begunState->state.activeIndex].ownerId
+                == kGuestPlayerId,
+        "guest receives ordered combat turn over live transport");
+    expect(begun && guest.confirmPeerEventApplied(begun->sequence),
+        "guest confirms combat turn event");
+
+    expect(guest.sendLocalEndTurn(2, 4),
+        "guest sends semantic end-turn through command channel");
+    host.poll();
+    std::optional<GameCommand> command = host.takePeerCommand();
+    const auto* endTurn = command
+        ? std::get_if<EndTurnCommand>(&command->payload) : nullptr;
+    expect(command && command->playerId == kGuestPlayerId
+            && command->actorId == EntityId { 2 }
+            && command->expectedPhase == SessionPhase::Combat
+            && command->expectedPhaseRevision == 4
+            && endTurn != nullptr && endTurn->turnRevision == 2,
+        "host receives owner and revision keyed end-turn intent");
+    if (!command) {
+        return;
+    }
+    state.revision = 3;
+    state.activeIndex = 2;
+    AuthoritativeCommandResult outcome;
+    outcome.result.commandSequence = command->sequence;
+    outcome.result.status = CommandStatus::Accepted;
+    outcome.result.rejection = CommandRejection::None;
+    outcome.event = GameEvent {
+        {}, command->sequence,
+        CombatTurnStateChangedEvent {
+            EntityId { 2 }, SessionPhase::Combat, 4, state,
+        },
+    };
+    expect(host.sendCommandOutcome(std::move(outcome)),
+        "host publishes accepted end-turn and next AI turn");
+    guest.poll();
+    std::optional<CommandResult> result = guest.takeCommandResult();
+    std::optional<GameEvent> next = guest.takePeerEvent();
+    const auto* nextState = next
+        ? std::get_if<CombatTurnStateChangedEvent>(&next->payload) : nullptr;
+    expect(result && result->status == CommandStatus::Accepted
+            && nextState != nullptr && nextState->state.revision == 3
+            && nextState->state.initiative[nextState->state.activeIndex].ownerId.value == 0,
+        "guest receives confirmed transition to host AI without simulating it");
+    expect(next && guest.confirmPeerEventApplied(next->sequence),
+        "guest confirms next combat turn event");
+}
+
 void testNetworkCharacterLobby()
 {
     SessionId sessionId { 0x1029384756ABCDEFULL };
@@ -2603,6 +2707,23 @@ public:
         };
     }
 
+    EndTurnExecution endTurn(Object* actor, PlayerId playerId,
+        const EndTurnCommand& command) override
+    {
+        endTurnCalls++;
+        if (combatTurns == nullptr || modalSession == nullptr) {
+            return {};
+        }
+        std::optional<EntityId> actorId = modalSession->entities().findEntity(actor);
+        if (!actorId.has_value()
+            || combatTurns->endPlayerTurn(playerId, *actorId,
+                   command.turnRevision, 100)
+                != CombatTurnResult::Accepted) {
+            return {};
+        }
+        return { CommandExecutionStatus::Applied, combatTurns->snapshot(100) };
+    }
+
     InventoryTransferExecution transferInventory(Object* actor,
         Object* source,
         Object* destination,
@@ -2668,6 +2789,7 @@ public:
     int restCalls = 0;
     int attackCalls = 0;
     int modalCalls = 0;
+    int endTurnCalls = 0;
     int transferCalls = 0;
     int dropCalls = 0;
     Object* lastActor = nullptr;
@@ -2689,10 +2811,131 @@ public:
     RestCommand lastRest;
     SharedModalCommand lastModal;
     LocalSession* modalSession = nullptr;
+    CombatTurnController* combatTurns = nullptr;
     Object* activeModalActor = nullptr;
     SharedModalKind activeModalKind = SharedModalKind::Dialogue;
     std::unordered_set<Object*> reservedPickupTargets;
 };
+
+void testCombatTurnCommandsAndReplication()
+{
+    TestObject hostActor;
+    TestObject guestActor;
+    TestObject aiActor;
+    LocalSession session;
+    expect(session.start(asGameObject(hostActor), asGameObject(guestActor))
+            == LocalSessionError::None,
+        "combat command session starts");
+    submitBothCharacterSheets(session);
+    expect(session.transitionTo(SessionPhase::Loading) == LocalSessionError::None
+            && session.transitionTo(SessionPhase::Exploration) == LocalSessionError::None
+            && session.transitionTo(SessionPhase::Combat) == LocalSessionError::None,
+        "combat command session enters authoritative combat phase");
+    EntityRegistrationResult ai = session.registerWorldObject(asGameObject(aiActor));
+    CombatTurnController turns;
+    expect(turns.begin({
+               { session.playerActorId(kHostPlayerId), kHostPlayerId },
+               { session.playerActorId(kGuestPlayerId), kGuestPlayerId },
+               { ai.entityId, std::nullopt },
+           }, 100, 60000)
+            == CombatTurnResult::Accepted,
+        "combat command test begins ordered host, guest, AI initiative");
+    RecordingCommandExecutor executor;
+    executor.modalSession = &session;
+    executor.combatTurns = &turns;
+    CommandProcessor processor;
+
+    GameCommand guest;
+    guest.sequence.value = 1;
+    guest.playerId = kGuestPlayerId;
+    guest.actorId = session.playerActorId(kGuestPlayerId);
+    guest.expectedPhase = SessionPhase::Combat;
+    guest.expectedPhaseRevision = session.phaseRevision();
+    guest.payload = EndTurnCommand { 1 };
+    AuthoritativeCommandResult rejected = processor.process(guest, session, executor);
+    expect(rejected.result.rejection == CommandRejection::InvalidAction
+            && !rejected.event.has_value()
+            && turns.revision() == 1
+            && turns.current()->actorId == session.playerActorId(kHostPlayerId),
+        "out-of-turn guest command cannot mutate host turn or emit an event");
+
+    GameCommand host = guest;
+    host.playerId = kHostPlayerId;
+    host.actorId = session.playerActorId(kHostPlayerId);
+    AuthoritativeCommandResult advanced = processor.process(host, session, executor);
+    const auto* hostEvent = advanced.event.has_value()
+        ? std::get_if<CombatTurnStateChangedEvent>(&advanced.event->payload)
+        : nullptr;
+    expect(advanced.result.status == CommandStatus::Accepted
+            && hostEvent != nullptr
+            && hostEvent->state.revision == 2
+            && hostEvent->state.initiative[hostEvent->state.activeIndex].ownerId == kGuestPlayerId,
+        "host end-turn publishes next guest-owned turn");
+    expect(processor.process(host, session, executor).replayed
+            && turns.revision() == 2,
+        "replayed end-turn cannot advance twice");
+
+    guest.sequence.value = 2;
+    guest.payload = EndTurnCommand { 1 };
+    rejected = processor.process(guest, session, executor);
+    expect(rejected.result.rejection == CommandRejection::InvalidAction
+            && turns.revision() == 2,
+        "stale turn revision is rejected without changing initiative");
+    guest.sequence.value = 3;
+    guest.payload = EndTurnCommand { 2 };
+    advanced = processor.process(guest, session, executor);
+    expect(advanced.result.status == CommandStatus::Accepted
+            && turns.current()->actorId == ai.entityId,
+        "guest end-turn advances to host AI");
+
+    ProtocolEnvelope envelope = sampleEnvelope();
+    envelope.sessionId.value = 5;
+    envelope.sequence = 2;
+    expect(encodeGameCommand(guest, envelope) == GameplayWireError::None,
+        "semantic end-turn command encodes");
+    GameCommandDecodeResult decodedCommand = decodeGameCommand(envelope);
+    expect(decodedCommand && std::get<EndTurnCommand>(decodedCommand.command.payload).turnRevision == 2,
+        "semantic end-turn revision survives wire round-trip");
+
+    GameEvent event;
+    event.sequence.value = 9;
+    event.causedBy.value = 3;
+    event.payload = CombatTurnStateChangedEvent {
+        guest.actorId, SessionPhase::Combat, session.phaseRevision(),
+        turns.snapshot(100),
+    };
+    expect(encodeGameEvent(event, envelope) == GameplayWireError::None,
+        "combat turn state event encodes");
+    GameEventDecodeResult decodedEvent = decodeGameEvent(envelope);
+    const auto* replicated = decodedEvent
+        ? std::get_if<CombatTurnStateChangedEvent>(&decodedEvent.event.payload)
+        : nullptr;
+    expect(replicated != nullptr
+            && replicated->state.revision == turns.revision()
+            && replicated->state.initiative.size() == 3
+            && replicated->state.initiative[replicated->state.activeIndex].actorId == ai.entityId,
+        "combat initiative and active actor survive event wire round-trip");
+
+    WorldSnapshot snapshot = sampleSnapshot();
+    snapshot.phase = SessionPhase::Combat;
+    snapshot.combat = turns.snapshot(100);
+    snapshot.combat.initiative[0].actorId = snapshot.actors[1].entityId;
+    snapshot.combat.initiative[1].actorId = snapshot.actors[0].entityId;
+    snapshot.combat.initiative[2].actorId = snapshot.critters[0].entityId;
+    expect(validateSnapshot(snapshot) == SnapshotError::None,
+        "combat recovery snapshot accepts owned player and AI roster");
+    std::vector<std::uint8_t> packet;
+    expect(encodeSnapshot(snapshot, packet) == SnapshotError::None,
+        "combat recovery snapshot encodes");
+    SnapshotDecodeResult decodedSnapshot = decodeSnapshot(packet);
+    expect(decodedSnapshot
+            && decodedSnapshot.snapshot.combat.revision == turns.revision()
+            && decodedSnapshot.snapshot.combat.initiative.size() == 3,
+        "combat recovery snapshot restores initiative and turn revision");
+    snapshot.combat.initiative[1].ownerId = kHostPlayerId;
+    expect(validateSnapshot(snapshot) == SnapshotError::InvalidCombatState,
+        "combat snapshot rejects mismatched player ownership");
+}
 
 void testAuthoritativeCommandProcessing()
 {
@@ -3219,7 +3462,7 @@ void testSnapshotRoundTripAndRecovery()
                                                         + PC_TRAIT_MAX
                                                         + 4)
         * sizeof(std::uint32_t);
-    expect(packet.size() == kSnapshotHeaderSize + 48 + 2 * (32 + characterBuildWireSize) + 36 + 12 + 48 + 2 * 56 + 6 * 4 + 2 * 36 + 31 * 29 + 15 * 7 + 6 * 4 + 20 + 14 * 4,
+    expect(packet.size() == kSnapshotHeaderSize + 48 + 2 * (32 + characterBuildWireSize) + 36 + 12 + 48 + 2 * 56 + 6 * 4 + 2 * 36 + 31 * 29 + 15 * 7 + 6 * 4 + 20 + 14 * 4 + 28,
         "snapshot packet declares a fixed-width payload");
     expect(packet[0] == 'F' && packet[1] == 'C' && packet[2] == 'M' && packet[3] == 'S', "snapshot magic uses network byte order");
 
@@ -3676,7 +3919,9 @@ int main()
     fallout::multiplayer::testTcpTransportAndHandshake();
     fallout::multiplayer::testNetworkLaunchAndBootstrap();
     fallout::multiplayer::testNetworkCharacterLobby();
+    fallout::multiplayer::testNetworkCombatTurnTransport();
     fallout::multiplayer::testLocalSessionLifecycle();
+    fallout::multiplayer::testCombatTurnCommandsAndReplication();
     fallout::multiplayer::testAuthoritativeCommandProcessing();
     fallout::multiplayer::testSnapshotRoundTripAndRecovery();
     fallout::multiplayer::testNetworkSessionRecoveryPrimitives();

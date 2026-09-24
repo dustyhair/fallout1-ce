@@ -39,6 +39,7 @@
 #include "game/tile.h"
 #include "game/worldmap.h"
 #include "multiplayer/acting_player_context.h"
+#include "multiplayer/combat_turn_controller.h"
 #include "multiplayer/local_player_context.h"
 #include "multiplayer/local_session.h"
 #include "multiplayer/presentation_bridge.h"
@@ -52,6 +53,14 @@ namespace {
 LocalSession session;
 Object* peerActor = nullptr;
 CommandProcessor commandProcessor;
+CombatTurnController combatTurns;
+constexpr std::uint64_t kCombatTurnDurationMilliseconds = 60000;
+
+std::uint64_t combatClockMilliseconds()
+{
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
 std::vector<std::pair<EntityId, Object*>> worldDoors;
 std::vector<std::pair<EntityId, Object*>> worldScenery;
 std::vector<std::pair<EntityId, Object*>> worldExitGrids;
@@ -64,6 +73,7 @@ struct PendingPickup {
 };
 std::unordered_map<EntityId, PendingPickup, EntityIdHash> pendingPickups;
 std::deque<GameEvent> deferredEvents;
+
 std::unordered_map<Object*, Object*> activeLootTargets;
 struct ActiveSharedModal {
     EntityId actorId;
@@ -358,6 +368,23 @@ bool worldMapProposalSourceReady()
 constexpr auto kRestProposalLifetime = std::chrono::seconds(90);
 constexpr auto kWorldMapProposalLifetime = std::chrono::seconds(90);
 NetworkLaunchMode worldMode = NetworkLaunchMode::Disabled;
+
+void queueCombatTurnState()
+{
+    if (!session.isActive() || worldMode != NetworkLaunchMode::Host) {
+        return;
+    }
+    deferredEvents.push_back(GameEvent {
+        {},
+        CommandSequence { 1 }, // Engine-originated combat boundary.
+        CombatTurnStateChangedEvent {
+            session.playerActorId(kHostPlayerId),
+            session.phase(),
+            session.phaseRevision(),
+            combatTurns.snapshot(combatClockMilliseconds()),
+        },
+    });
+}
 EntityId expectedSplitEntityId;
 EntityId lastSplitEntityId;
 int questSmokeInitialReputation = 0;
@@ -1641,6 +1668,27 @@ public:
         return CommandExecutionStatus::InvalidAction;
     }
 
+    EndTurnExecution endTurn(Object* actor, PlayerId playerId,
+        const EndTurnCommand& command) override
+    {
+        EndTurnExecution execution;
+        if (worldMode != NetworkLaunchMode::Host
+            || session.phase() != SessionPhase::Combat
+            || actor == nullptr) {
+            return execution;
+        }
+        std::optional<EntityId> actorId = session.entities().findEntity(actor);
+        if (!actorId.has_value()
+            || combatTurns.endPlayerTurn(playerId, *actorId,
+                   command.turnRevision, combatClockMilliseconds())
+                != CombatTurnResult::Accepted) {
+            return execution;
+        }
+        execution.status = CommandExecutionStatus::Applied;
+        execution.state = combatTurns.snapshot(combatClockMilliseconds());
+        return execution;
+    }
+
     SharedModalExecution setSharedModal(Object* actor, const SharedModalCommand& command) override
     {
         SharedModalExecution execution;
@@ -1928,6 +1976,7 @@ NetworkCommandExecutor commandExecutor;
 
 bool registerWorldObjects()
 {
+    combatTurns.stop();
     worldDoors.clear();
     worldScenery.clear();
     worldExitGrids.clear();
@@ -5320,6 +5369,9 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
     captured.lastIncludedEvent = lastIncludedEvent;
     captured.phase = session.phase();
     captured.phaseRevision = session.phaseRevision();
+    if (captured.phase == SessionPhase::Combat) {
+        captured.combat = combatTurns.snapshot(combatClockMilliseconds());
+    }
     captured.gameTime = game_time();
     worldmap_capture_state(captured.worldMap);
     worldmap_capture_travel_progress(captured.worldMapTravel.progress);
@@ -5673,6 +5725,13 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
         std::fprintf(stderr, "Multiplayer snapshot failed phase or actor application.\n");
         return false;
     }
+    if (snapshot.phase == SessionPhase::Combat && !snapshot.combat.initiative.empty()) {
+        if (!combatTurns.restore(snapshot.combat, combatClockMilliseconds())) {
+            return false;
+        }
+    } else {
+        combatTurns.stop();
+    }
     Object* localActor = localPlayerActor();
     if (localActor == nullptr
         || (map_elevation != localActor->elevation && map_set_elevation(localActor->elevation) != 0)) {
@@ -5877,6 +5936,151 @@ std::optional<PlayerId> networkWorldCombatOwner(const Object* actor)
     return player != nullptr ? std::optional<PlayerId>(player->id) : std::nullopt;
 }
 
+bool networkWorldCombatBeginRound(Object* const* actors, int count)
+{
+    if (worldMode != NetworkLaunchMode::Host || !session.isActive()
+        || session.phase() != SessionPhase::Combat || actors == nullptr || count <= 0
+        || count > static_cast<int>(kMaximumCombatInitiative)) {
+        return false;
+    }
+    std::vector<CombatTurnEntry> order;
+    order.reserve(count);
+    for (int index = 0; index < count; index++) {
+        Object* actor = actors[index];
+        if (actor == nullptr) {
+            return false;
+        }
+        std::optional<EntityId> actorId = session.entities().findEntity(actor);
+        if (!actorId.has_value()) {
+            EntityRegistrationResult registration = session.registerWorldObject(actor);
+            if (!registration) {
+                return false;
+            }
+            actorId = registration.entityId;
+            worldCritters.emplace_back(*actorId, actor);
+        }
+        order.push_back({ *actorId, networkWorldCombatOwner(actor) });
+    }
+    std::uint64_t revision = combatTurns.active() ? combatTurns.revision() + 1 : 1;
+    std::uint64_t round = combatTurns.active() ? combatTurns.round() + 1 : 1;
+    if (combatTurns.begin(std::move(order), combatClockMilliseconds(),
+            kCombatTurnDurationMilliseconds, revision, round)
+        != CombatTurnResult::Accepted) {
+        return false;
+    }
+    queueCombatTurnState();
+    return true;
+}
+
+bool networkWorldCombatTurnMatches(const Object* actor)
+{
+    if (!session.isActive()) {
+        return true;
+    }
+    std::optional<EntityId> actorId = session.entities().findEntity(actor);
+    return actorId.has_value() && combatTurns.current() != nullptr
+        && combatTurns.current()->actorId == *actorId;
+}
+
+void networkWorldCombatCompleteTurn(Object* actor, std::uint64_t expectedRevision)
+{
+    if (worldMode != NetworkLaunchMode::Host
+        || expectedRevision == 0
+        || combatTurns.revision() != expectedRevision
+        || !networkWorldCombatTurnMatches(actor)) {
+        return;
+    }
+    std::optional<EntityId> actorId = session.entities().findEntity(actor);
+    if (!actorId.has_value()) {
+        return;
+    }
+    const CombatTurnEntry* turn = combatTurns.current();
+    std::uint64_t now = combatClockMilliseconds();
+    CombatTurnResult result = turn->owner.has_value()
+        ? combatTurns.passPlayerTurn(*turn->owner, *actorId, combatTurns.revision(), now)
+        : combatTurns.endAiTurn(*actorId, combatTurns.revision(), now);
+    if (result == CombatTurnResult::Accepted) {
+        queueCombatTurnState();
+    }
+}
+
+void networkWorldCombatSetPlayerConnected(PlayerId playerId, bool connected)
+{
+    if (worldMode == NetworkLaunchMode::Host && combatTurns.active()) {
+        combatTurns.setConnected(playerId, connected);
+    }
+}
+
+void networkWorldCombatTick()
+{
+    if (worldMode != NetworkLaunchMode::Host || session.phase() != SessionPhase::Combat
+        || combatTurns.current() == nullptr || !combatTurns.current()->owner.has_value()) {
+        return;
+    }
+    CombatTurnEntry active = *combatTurns.current();
+    std::uint64_t revision = combatTurns.revision();
+    std::uint64_t now = combatClockMilliseconds();
+    CombatTurnResult result = combatTurns.passDisconnectedPlayer(*active.owner,
+        active.actorId, revision, now);
+    if (result == CombatTurnResult::StillConnected) {
+        result = combatTurns.expirePlayerTurn(*active.owner, active.actorId,
+            revision, now);
+    }
+    if (result == CombatTurnResult::Accepted) {
+        queueCombatTurnState();
+    }
+}
+
+void networkWorldCombatStop()
+{
+    if (!combatTurns.active()) {
+        return;
+    }
+    combatTurns.stop();
+    queueCombatTurnState();
+}
+
+std::optional<PlayerId> networkWorldActiveCombatOwner()
+{
+    const CombatTurnEntry* turn = combatTurns.current();
+    return session.phase() == SessionPhase::Combat && turn != nullptr
+        ? turn->owner : std::nullopt;
+}
+
+std::uint64_t networkWorldCombatTurnRevision()
+{
+    return combatTurns.revision();
+}
+
+bool networkWorldApplyPeerCombatTurn(const CombatTurnStateChangedEvent& event)
+{
+    if (worldMode != NetworkLaunchMode::Join || !session.isActive()
+        || !isValidCombatTurnState(event.state, event.phase)
+        || event.phaseRevision == 0
+        || (event.phase != SessionPhase::Combat
+            && event.phase != SessionPhase::Exploration)) {
+        return false;
+    }
+    if (event.phaseRevision < session.phaseRevision()) {
+        return true;
+    }
+    if (event.phase == SessionPhase::Combat
+        && session.phase() == SessionPhase::Combat
+        && event.phaseRevision == session.phaseRevision()
+        && event.state.revision < combatTurns.revision()) {
+        return true;
+    }
+    if (session.applyAuthoritativePhase(event.phase, event.phaseRevision)
+        != LocalSessionError::None) {
+        return false;
+    }
+    if (event.phase == SessionPhase::Exploration || event.state.initiative.empty()) {
+        combatTurns.stop();
+        return true;
+    }
+    return combatTurns.restore(event.state, combatClockMilliseconds());
+}
+
 Object* networkWorldFindObject(EntityId entityId)
 {
     return session.isActive() && isValid(entityId)
@@ -5894,6 +6098,7 @@ Object* networkWorldPlayerActor(PlayerId playerId)
 
 void networkWorldLeave()
 {
+    combatTurns.stop();
     session.stop();
     worldDoors.clear();
     worldScenery.clear();

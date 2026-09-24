@@ -110,6 +110,7 @@ bool isSupportedLiveEvent(const GameEventPayload& payload)
         || std::holds_alternative<InventoryTransferredEvent>(payload)
         || std::holds_alternative<ItemDroppedEvent>(payload)
         || std::holds_alternative<AttackStartedEvent>(payload)
+        || std::holds_alternative<CombatTurnStateChangedEvent>(payload)
         || std::holds_alternative<SharedModalStateChangedEvent>(payload)
         || std::holds_alternative<WorldMapRouteSelectedEvent>(payload)
         || std::holds_alternative<WorldMapArrivedEvent>(payload);
@@ -286,6 +287,18 @@ bool NetworkLobby::sendLocalAttack(EntityId targetId, std::int32_t hitMode, std:
         phaseRevision);
 }
 
+bool NetworkLobby::sendLocalEndTurn(std::uint64_t turnRevision, std::uint32_t phaseRevision)
+{
+    if (_mode != NetworkLaunchMode::Join) {
+        return false;
+    }
+    EntityId actorId { _mode == NetworkLaunchMode::Host
+            ? kHostPlayerId.value : kGuestPlayerId.value };
+    return sendLocalAction(
+        CombatTurnStateChangedEvent { actorId, SessionPhase::Combat, phaseRevision, {} },
+        EndTurnCommand { turnRevision }, phaseRevision, SessionPhase::Combat);
+}
+
 bool NetworkLobby::sendLocalSharedModal(SharedModalKind kind, bool open, SessionPhase currentPhase, std::uint32_t phaseRevision)
 {
     PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
@@ -377,7 +390,8 @@ bool NetworkLobby::sendLocalAction(
         const SharedModalCommand* modal = std::get_if<SharedModalCommand>(&commandPayload);
         command.expectedPhase = phaseOverride != SessionPhase::Lobby
             ? phaseOverride
-            : std::holds_alternative<AttackCommand>(commandPayload)
+            : (std::holds_alternative<AttackCommand>(commandPayload)
+                || std::holds_alternative<EndTurnCommand>(commandPayload))
             ? SessionPhase::Combat
             : modal != nullptr && !modal->open
             ? sharedModalPhase(modal->kind)

@@ -289,6 +289,12 @@ struct AttackCommand {
     std::int32_t hitLocation = 0;
 };
 
+// A player may end only the combat turn identified by this revision. Combat
+// actions remain disabled until their full effects can be replicated in 4B.
+struct EndTurnCommand {
+    std::uint64_t turnRevision = 0;
+};
+
 struct SharedModalCommand {
     SharedModalKind kind = SharedModalKind::Dialogue;
     bool open = false;
@@ -311,7 +317,7 @@ constexpr bool isValid(const WorldMapRouteCommand& route)
             && route.targetY >= 0 && route.targetY < kWorldMapHeight;
 }
 
-using GameCommandPayload = std::variant<MoveCommand, FaceCommand, InteractCommand, PickupCommand, LootCommand, UseSkillCommand, UseItemOnCommand, ElevatorCommand, ExitGridCommand, SceneryTransitionCommand, RestCommand, InventoryTransferCommand, ItemDropCommand, AttackCommand, SharedModalCommand, WorldMapRouteCommand>;
+using GameCommandPayload = std::variant<MoveCommand, FaceCommand, InteractCommand, PickupCommand, LootCommand, UseSkillCommand, UseItemOnCommand, ElevatorCommand, ExitGridCommand, SceneryTransitionCommand, RestCommand, InventoryTransferCommand, ItemDropCommand, AttackCommand, EndTurnCommand, SharedModalCommand, WorldMapRouteCommand>;
 
 struct GameCommand {
     CommandSequence sequence;
@@ -499,6 +505,28 @@ struct AttackStartedEvent {
     std::int32_t hitLocation = 0;
 };
 
+struct CombatInitiativeEntry {
+    EntityId actorId;
+    PlayerId ownerId; // Zero identifies host-controlled AI.
+};
+
+constexpr std::size_t kMaximumCombatInitiative = 2048;
+
+struct CombatTurnState {
+    std::uint64_t revision = 0;
+    std::uint64_t round = 0;
+    std::uint32_t activeIndex = 0;
+    std::uint32_t remainingMilliseconds = 0;
+    std::vector<CombatInitiativeEntry> initiative;
+};
+
+struct CombatTurnStateChangedEvent {
+    EntityId actorId; // Host actor identifies system-generated boundaries.
+    SessionPhase phase = SessionPhase::Exploration;
+    std::uint32_t phaseRevision = 0;
+    CombatTurnState state;
+};
+
 struct SharedModalStateChangedEvent {
     EntityId actorId;
     SharedModalKind kind = SharedModalKind::Dialogue;
@@ -514,7 +542,7 @@ struct WorldMapRouteSelectedEvent {
     bool clear = false;
 };
 
-using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, ItemPickupCompletedEvent, LootStartedEvent, SkillUseStartedEvent, ItemUseStartedEvent, ElevatorTransitionedEvent, ExitGridTransitionedEvent, SceneryTransitionedEvent, RestStateChangedEvent, InventoryTransferredEvent, ItemDroppedEvent, AttackStartedEvent, SharedModalStateChangedEvent, WorldMapRouteSelectedEvent, WorldMapArrivedEvent>;
+using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, ItemPickupCompletedEvent, LootStartedEvent, SkillUseStartedEvent, ItemUseStartedEvent, ElevatorTransitionedEvent, ExitGridTransitionedEvent, SceneryTransitionedEvent, RestStateChangedEvent, InventoryTransferredEvent, ItemDroppedEvent, AttackStartedEvent, CombatTurnStateChangedEvent, SharedModalStateChangedEvent, WorldMapRouteSelectedEvent, WorldMapArrivedEvent>;
 
 struct GameEvent {
     EventSequence sequence;

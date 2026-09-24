@@ -91,6 +91,7 @@ enum class SmokeScenario {
     TypedStairsCrossMap,
     Rest,
     WorldMapTravel,
+    CombatTurn,
 };
 SmokeScenario smokeScenario = SmokeScenario::Movement;
 bool smokeWorldMapGuestController = false;
@@ -101,6 +102,11 @@ bool smokeWorldMapQueue = false;
 int smokeRestMinutes = 10;
 bool smokeRestInterrupt = false;
 bool smokeWorldMapState = false;
+bool smokeCombatAutoEnd = false;
+std::uint64_t smokeCombatAutoEndRevision = 0;
+std::vector<PlayerId> smokeCombatObservedOwners;
+bool smokeCombatObservedExit = false;
+bool smokeCombatReceivedExplorationState = false;
 
 const char* smokeScenarioName()
 {
@@ -144,6 +150,8 @@ const char* smokeScenarioName()
             : smokeWorldMapTown ? "worldmap-town"
             : smokeWorldMapTakeover ? "worldmap-takeover"
             : smokeWorldMapGuestController ? "worldmap-guest" : "worldmap-host";
+    case SmokeScenario::CombatTurn:
+        return "combat-turn";
     }
     return "unknown";
 }
@@ -171,6 +179,7 @@ std::chrono::steady_clock::time_point reconnectDeadline;
 std::chrono::steady_clock::time_point nextReconnectAttempt;
 EventSequence reconnectLastApplied;
 std::uint64_t nextHostCommandSequence = 1;
+std::uint64_t lastSentCombatEndRevision = 0;
 std::chrono::steady_clock::time_point nextAuthoritativeState;
 std::chrono::steady_clock::time_point nextAgentWorldReport;
 std::optional<std::int32_t> pendingLocalRestRequest;
@@ -935,7 +944,8 @@ bool submitHostCommand(GameCommandPayload payload)
     command.sequence.value = nextHostCommandSequence++;
     command.playerId = kHostPlayerId;
     command.actorId = EntityId { kHostPlayerId.value };
-    command.expectedPhase = std::holds_alternative<AttackCommand>(payload)
+    command.expectedPhase = (std::holds_alternative<AttackCommand>(payload)
+            || std::holds_alternative<EndTurnCommand>(payload))
         ? SessionPhase::Combat
         : std::holds_alternative<WorldMapRouteCommand>(payload)
         ? SessionPhase::Transition
@@ -987,6 +997,17 @@ void networkRuntimeBackgroundProcess()
     if (networkWorldActive()) {
         presentPendingGameChatMessages();
         if (launchOptions.mode == NetworkLaunchMode::Host) {
+            networkWorldCombatSetPlayerConnected(kGuestPlayerId,
+                lobby.state() == NetworkLobbyState::Ready);
+            networkWorldCombatTick();
+            if (smokeCombatAutoEnd
+                && isInCombat()
+                && combat_whose_turn() == obj_dude
+                && networkWorldActiveCombatOwner() == kHostPlayerId
+                && networkWorldCombatTurnRevision() != smokeCombatAutoEndRevision) {
+                smokeCombatAutoEndRevision = networkWorldCombatTurnRevision();
+                combat_end_turn();
+            }
             if (!networkWorldSynchronizeEnginePhase()) {
                 debug_printf("Multiplayer session phase could not follow the engine phase.\n");
             }
@@ -1070,6 +1091,7 @@ void networkRuntimeBackgroundProcess()
                     static_cast<int>(result->rejection));
                 pendingLocalItemDrop.reset();
                 pendingLocalExitGrid.reset();
+                lastSentCombatEndRevision = 0;
             }
         }
         while (std::optional<GameEvent> event = lobby.takePeerEvent()) {
@@ -1110,6 +1132,32 @@ void networkRuntimeBackgroundProcess()
                 applied = networkWorldApplyItemDrop(*drop);
             } else if (const auto* attack = std::get_if<AttackStartedEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerAttack(*attack);
+            } else if (const auto* combat = std::get_if<CombatTurnStateChangedEvent>(&event->payload)) {
+                applied = networkWorldApplyPeerCombatTurn(*combat);
+                if (applied) {
+                    if (smokeScenario == SmokeScenario::CombatTurn) {
+                        if (combat->phase == SessionPhase::Exploration) {
+                            smokeCombatObservedExit = true;
+                        } else if (!combat->state.initiative.empty()) {
+                            PlayerId owner = combat->state.initiative[combat->state.activeIndex].ownerId;
+                            smokeCombatObservedOwners.push_back(owner);
+                        }
+                    }
+                    lastSentCombatEndRevision = 0;
+                    if (combat->phase == SessionPhase::Exploration) {
+                        char message[] = "Combat ended.";
+                        display_print(message);
+                    } else if (networkWorldActiveCombatOwner() == kGuestPlayerId) {
+                        char message[] = "Your combat turn. Press Space to end turn.";
+                        display_print(message);
+                    } else if (networkWorldActiveCombatOwner() == kHostPlayerId) {
+                        char message[] = "Host player's combat turn.";
+                        display_print(message);
+                    } else {
+                        char message[] = "Host AI combat turn.";
+                        display_print(message);
+                    }
+                }
             }
             if (!applied) {
                 debug_printf("Multiplayer peer event could not be applied.\n");
@@ -1134,6 +1182,10 @@ void networkRuntimeBackgroundProcess()
             }
             if (!networkWorldApplyAuthoritativeState(*state)) {
                 debug_printf("Multiplayer authoritative state could not be applied.\n");
+            } else if (smokeScenario == SmokeScenario::CombatTurn
+                && state->phase == SessionPhase::Exploration
+                && smokeCombatObservedExit) {
+                smokeCombatReceivedExplorationState = true;
             }
         }
         if (pendingLocalExitGrid.has_value()
@@ -1247,6 +1299,8 @@ bool networkRuntimeConfigure(int argc, char** argv)
             smokeScenario = SmokeScenario::TypedStairsCrossMap;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=rest") == 0) {
             smokeScenario = SmokeScenario::Rest;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=combat-turn") == 0) {
+            smokeScenario = SmokeScenario::CombatTurn;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=worldmap-host") == 0) {
             smokeScenario = SmokeScenario::WorldMapTravel;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=worldmap-guest") == 0) {
@@ -1314,6 +1368,11 @@ bool networkRuntimeConfigure(int argc, char** argv)
         return false;
     }
     pendingLocalSheet.reset();
+    smokeCombatAutoEnd = false;
+    smokeCombatAutoEndRevision = 0;
+    smokeCombatObservedOwners.clear();
+    smokeCombatObservedExit = false;
+    smokeCombatReceivedExplorationState = false;
     pendingRecoveryRequest.reset();
     pendingLocalItemDrop.reset();
     pendingLocalExitGrid.reset();
@@ -1627,6 +1686,92 @@ static bool runLiveWorldMapTravelSmoke(const SessionId sessionId)
     return true;
 }
 
+static bool runLiveCombatTurnSmoke(SessionId sessionId)
+{
+    const bool host = launchOptions.mode == NetworkLaunchMode::Host;
+    const std::uint32_t explorationRevision = networkWorldPhaseRevision();
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    engineExecutionProbeBegin();
+    if (host) {
+        smokeCombatAutoEnd = true;
+        // No hostile action is needed: this exercises the real sequential
+        // engine loop with two owned actors and semantic end-turn over TLS.
+        combat(nullptr);
+        smokeCombatAutoEnd = false;
+    }
+    while (std::chrono::steady_clock::now() < deadline) {
+        networkRuntimeBackgroundProcess();
+        if (!host && networkWorldActiveCombatOwner() == kGuestPlayerId) {
+            networkRuntimeHandleCombatInput(KEY_SPACE);
+        }
+        if (networkWorldPhase() == SessionPhase::Exploration
+            && networkWorldPhaseRevision() >= explorationRevision + 2
+            && (host || (smokeCombatObservedExit
+                    && smokeCombatReceivedExplorationState))) {
+            if (!host) {
+                break;
+            }
+            // Give the post-combat checkpoint time to reach the replica.
+            auto settleUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(350);
+            while (std::chrono::steady_clock::now() < settleUntil) {
+                networkRuntimeBackgroundProcess();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    EngineExecutionProbeCounts counts = engineExecutionProbeEnd();
+    WorldSnapshot snapshot;
+    SnapshotDigestResult digest;
+    std::string observedOwners;
+    for (PlayerId owner : smokeCombatObservedOwners) {
+        if (!observedOwners.empty()) {
+            observedOwners += ',';
+        }
+        observedOwners += std::to_string(owner.value);
+    }
+    bool sawOrderedTurns = host
+        ? smokeCombatAutoEndRevision != 0
+        : smokeCombatObservedOwners.size() >= 2
+            && smokeCombatObservedOwners[0] == kHostPlayerId
+            && smokeCombatObservedOwners[1] == kGuestPlayerId;
+    bool passed = sawOrderedTurns
+        && networkWorldPhase() == SessionPhase::Exploration
+        && networkWorldPhaseRevision() >= explorationRevision + 2
+        && (host || (smokeCombatObservedExit
+                && smokeCombatReceivedExplorationState
+                && counts.scriptProcedures == 0
+                && counts.combatAttacks == 0
+                && counts.randomDraws == 0))
+        && networkWorldCaptureAuthoritativeState(
+            host ? lobby.latestAuthoritativeEvent() : lobby.lastAppliedEvent(), snapshot)
+        && (digest = computeSnapshotDigest(snapshot));
+    if (!passed) {
+        std::fprintf(stderr,
+            "Combat smoke failed role=%s phase=%d revision=%u turns=%zu end=%d state=%d auto=%llu rules=%u/%u/%u.\n",
+            host ? "host" : "guest", static_cast<int>(networkWorldPhase()),
+            networkWorldPhaseRevision(), smokeCombatObservedOwners.size(),
+            smokeCombatObservedExit, smokeCombatReceivedExplorationState,
+            static_cast<unsigned long long>(smokeCombatAutoEndRevision),
+            counts.scriptProcedures, counts.combatAttacks, counts.randomDraws);
+        setStatus("MULTIPLAYER COMBAT SMOKE FAILED: TURN OWNERSHIP");
+        return false;
+    }
+    std::fprintf(stdout,
+        "MULTIPLAYER_SMOKE_TEST_PASS role=%s session=%llu command=combat-turn phase=%u event=%llu owners=%s digest=%llu scripts=%u attacks=%u rng=%u\n",
+        host ? "host" : "guest",
+        static_cast<unsigned long long>(sessionId.value),
+        snapshot.phaseRevision,
+        static_cast<unsigned long long>(snapshot.lastIncludedEvent.value),
+        host ? "host-authoritative" : observedOwners.c_str(),
+        static_cast<unsigned long long>(digest.digest.overall),
+        counts.scriptProcedures, counts.combatAttacks, counts.randomDraws);
+    std::fflush(stdout);
+    return true;
+}
+
 bool networkRuntimeRunSmokeTest()
 {
     if (!smokeTestEnabled || launchOptions.mode == NetworkLaunchMode::Disabled) {
@@ -1660,7 +1805,9 @@ bool networkRuntimeRunSmokeTest()
         }
 
         if (lobbyStarted && lobby.state() == NetworkLobbyState::Ready) {
-            if (smokeScenario == SmokeScenario::WorldMapTravel && !lobby.startRequested()) {
+            if ((smokeScenario == SmokeScenario::WorldMapTravel
+                    || smokeScenario == SmokeScenario::CombatTurn)
+                && !lobby.startRequested()) {
                 if (launchOptions.mode == NetworkLaunchMode::Host
                     && !networkRuntimeRequestStart()) {
                     setStatus("MULTIPLAYER WORLD-MAP SMOKE FAILED: LOBBY START");
@@ -1692,6 +1839,10 @@ bool networkRuntimeRunSmokeTest()
 
             if (smokeScenario == SmokeScenario::WorldMapTravel) {
                 if (runLiveWorldMapTravelSmoke(bootstrap.sessionId())) return true;
+                break;
+            }
+            if (smokeScenario == SmokeScenario::CombatTurn) {
+                if (runLiveCombatTurnSmoke(bootstrap.sessionId())) return true;
                 break;
             }
 
@@ -2921,6 +3072,29 @@ bool networkRuntimeHandleGameChatInput(int keyCode)
     return true;
 }
 
+bool networkRuntimeHandleCombatInput(int keyCode)
+{
+    if (launchOptions.mode != NetworkLaunchMode::Join
+        || !networkWorldActive()
+        || networkWorldPhase() != SessionPhase::Combat
+        || keyCode != KEY_SPACE) {
+        return false;
+    }
+    std::uint64_t revision = networkWorldCombatTurnRevision();
+    if (networkWorldActiveCombatOwner() != kGuestPlayerId || revision == 0) {
+        char message[] = "It is not your combat turn.";
+        display_print(message);
+    } else if (lastSentCombatEndRevision != revision) {
+        if (lobby.sendLocalEndTurn(revision, networkWorldPhaseRevision())) {
+            lastSentCombatEndRevision = revision;
+        } else {
+            char message[] = "Combat end-turn could not be sent.";
+            display_print(message);
+        }
+    }
+    return true;
+}
+
 bool networkRuntimeSubmitLocalCharacter(Object* actor)
 {
     if (launchOptions.mode == NetworkLaunchMode::Disabled) {
@@ -3070,6 +3244,7 @@ bool networkRuntimeEnterWorld()
     }
     lastSentLocalRotation = -1;
     nextHostCommandSequence = 1;
+    lastSentCombatEndRevision = 0;
     nextAuthoritativeState = {};
     nextAgentWorldReport = {};
     pendingLocalExitGrid = networkWorldReadyLocalExitGrid();
@@ -3773,6 +3948,7 @@ void networkRuntimeLeaveWorld()
 {
     lastSentLocalRotation = -1;
     nextHostCommandSequence = 1;
+    lastSentCombatEndRevision = 0;
     pendingRecoveryRequest.reset();
     pendingLocalItemDrop.reset();
     pendingLocalExitGrid.reset();

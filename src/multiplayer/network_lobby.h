@@ -72,6 +72,7 @@ public:
     bool sendLocalSceneryTransition(EntityId transitionId, std::uint32_t phaseRevision = 1);
     bool sendLocalRest(std::int32_t minutes, std::uint32_t phaseRevision = 1);
     bool sendLocalAttack(EntityId targetId, std::int32_t hitMode, std::int32_t hitLocation, std::uint32_t phaseRevision = 1);
+    bool sendLocalEndTurn(std::uint64_t turnRevision, std::uint32_t phaseRevision);
     bool sendLocalSharedModal(SharedModalKind kind, bool open, SessionPhase currentPhase, std::uint32_t phaseRevision = 1);
     bool sendLocalWorldMapRoute(const WorldMapRouteCommand& route, std::uint32_t phaseRevision = 1);
     bool sendLocalInventoryTransfer(EntityId sourceId,

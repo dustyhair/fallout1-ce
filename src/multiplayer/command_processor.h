@@ -77,6 +77,11 @@ struct RestExecution {
     bool interrupted = false;
 };
 
+struct EndTurnExecution {
+    CommandExecutionStatus status = CommandExecutionStatus::InvalidAction;
+    CombatTurnState state;
+};
+
 class CommandExecutor {
 public:
     virtual ~CommandExecutor() = default;
@@ -113,6 +118,10 @@ public:
     virtual CommandExecutionStatus attack(Object*, Object*, const AttackCommand&)
     {
         return CommandExecutionStatus::InvalidAction;
+    }
+    virtual EndTurnExecution endTurn(Object*, PlayerId, const EndTurnCommand&)
+    {
+        return {};
     }
     virtual SharedModalExecution setSharedModal(Object*, const SharedModalCommand&)
     {

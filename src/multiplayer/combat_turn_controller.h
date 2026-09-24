@@ -18,6 +18,8 @@ struct CombatTurnEntry {
     std::optional<PlayerId> owner;
 };
 
+bool isValidCombatTurnState(const CombatTurnState& state, SessionPhase phase);
+
 enum class CombatTurnResult {
     Accepted,
     InvalidOrder,
@@ -32,7 +34,10 @@ enum class CombatTurnResult {
 class CombatTurnController {
 public:
     CombatTurnResult begin(std::vector<CombatTurnEntry> order,
-        std::uint64_t now, std::uint64_t turnDuration);
+        std::uint64_t now, std::uint64_t turnDuration,
+        std::uint64_t initialRevision = 1, std::uint64_t round = 1);
+    bool restore(const CombatTurnState& state, std::uint64_t now);
+    CombatTurnState snapshot(std::uint64_t now) const;
     void stop();
 
     bool active() const;
@@ -42,6 +47,8 @@ public:
     std::uint64_t round() const;
 
     CombatTurnResult endPlayerTurn(PlayerId playerId, EntityId actorId,
+        std::uint64_t revision, std::uint64_t now);
+    CombatTurnResult passPlayerTurn(PlayerId playerId, EntityId actorId,
         std::uint64_t revision, std::uint64_t now);
     CombatTurnResult endAiTurn(EntityId actorId, std::uint64_t revision,
         std::uint64_t now);

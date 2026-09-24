@@ -405,7 +405,9 @@ static void main_game_loop()
             continue;
         }
         bool multiplayerPaused = multiplayer::networkRuntimeWorldPaused();
-        if (!multiplayer::networkRuntimeHandleGameChatInput(keyCode) && !multiplayerPaused) {
+        if (!multiplayer::networkRuntimeHandleCombatInput(keyCode)
+            && !multiplayer::networkRuntimeHandleGameChatInput(keyCode)
+            && !multiplayerPaused) {
             game_handle_input(keyCode, false);
         }
 

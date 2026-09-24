@@ -3,6 +3,8 @@
 #include <limits>
 #include <variant>
 
+#include "multiplayer/combat_turn_controller.h"
+
 namespace fallout {
 namespace multiplayer {
 namespace {
@@ -24,6 +26,7 @@ enum class CommandType : std::uint8_t {
     SceneryTransition = 14,
     Rest = 15,
     WorldMapRoute = 16,
+    EndTurn = 17,
 };
 
 enum class EventType : std::uint8_t {
@@ -45,6 +48,7 @@ enum class EventType : std::uint8_t {
     RestStateChanged = 16,
     WorldMapRouteSelected = 17,
     WorldMapArrived = 18,
+    CombatTurnStateChanged = 19,
 };
 
 constexpr std::size_t kCommandHeaderSize = 28;
@@ -55,6 +59,7 @@ constexpr std::size_t kItemDescriptorSize = 16;
 constexpr std::size_t kInventoryTransferCommandSize = kCommandHeaderSize + 20 + kItemDescriptorSize;
 constexpr std::size_t kItemDropCommandSize = kCommandHeaderSize + 16 + kItemDescriptorSize;
 constexpr std::size_t kAttackCommandSize = kCommandHeaderSize + 12;
+constexpr std::size_t kEndTurnCommandSize = kCommandHeaderSize + 8;
 constexpr std::size_t kSharedModalCommandSize = kCommandHeaderSize + 4;
 constexpr std::size_t kSkillCommandSize = kCommandHeaderSize + 8;
 constexpr std::size_t kItemUseCommandSize = kCommandHeaderSize + 8;
@@ -69,6 +74,7 @@ constexpr std::size_t kFacingEventSize = kEventHeaderSize + 8;
 constexpr std::size_t kInventoryTransferEventSize = kEventHeaderSize + 28 + kItemDescriptorSize;
 constexpr std::size_t kItemDropEventSize = kEventHeaderSize + 32 + kItemDescriptorSize;
 constexpr std::size_t kAttackEventSize = kEventHeaderSize + 16;
+constexpr std::size_t kCombatTurnEventBaseSize = kEventHeaderSize + 40;
 constexpr std::size_t kSharedModalEventSize = kEventHeaderSize + 12;
 constexpr std::size_t kSkillEventSize = kEventHeaderSize + 12;
 constexpr std::size_t kItemUseEventSize = kEventHeaderSize + 12;
@@ -288,6 +294,11 @@ GameplayWireError validateCommand(const GameCommand& command)
             ? GameplayWireError::None
             : GameplayWireError::InvalidAttack;
     }
+    if (const auto* endTurn = std::get_if<EndTurnCommand>(&command.payload)) {
+        return endTurn->turnRevision != 0
+            ? GameplayWireError::None
+            : GameplayWireError::InvalidCombatTurn;
+    }
     if (const auto* modal = std::get_if<SharedModalCommand>(&command.payload)) {
         return isValid(modal->kind)
             ? GameplayWireError::None
@@ -460,6 +471,14 @@ GameplayWireError validateEvent(const GameEvent& event)
                 && attack->hitLocation >= 0 && attack->hitLocation < kAttackHitLocationCount
             ? GameplayWireError::None
             : GameplayWireError::InvalidAttack;
+    }
+    if (const auto* combat = std::get_if<CombatTurnStateChangedEvent>(&event.payload)) {
+        return isValid(combat->actorId) && combat->phaseRevision != 0
+                && (combat->phase == SessionPhase::Combat
+                    || combat->phase == SessionPhase::Exploration)
+                && isValidCombatTurnState(combat->state, combat->phase)
+            ? GameplayWireError::None
+            : GameplayWireError::InvalidCombatTurn;
     }
     if (const auto* pickup = std::get_if<ItemPickupCompletedEvent>(&event.payload)) {
         if (!isValid(pickup->actorId)
@@ -771,6 +790,9 @@ GameplayWireError encodeGameCommand(const GameCommand& command, ProtocolEnvelope
     } else if (const auto* rest = std::get_if<RestCommand>(&command.payload)) {
         appendCommandHeader(command, CommandType::Rest, envelope.payload);
         appendInt32(envelope.payload, rest->minutes);
+    } else if (const auto* endTurn = std::get_if<EndTurnCommand>(&command.payload)) {
+        appendCommandHeader(command, CommandType::EndTurn, envelope.payload);
+        appendUInt64(envelope.payload, endTurn->turnRevision);
     } else {
         const auto* attack = std::get_if<AttackCommand>(&command.payload);
         appendCommandHeader(command, CommandType::Attack, envelope.payload);
@@ -889,6 +911,13 @@ GameCommandDecodeResult decodeGameCommand(const ProtocolEnvelope& envelope)
             readInt32(envelope.payload, 32),
             readInt32(envelope.payload, 36),
         };
+        break;
+    case CommandType::EndTurn:
+        if (envelope.payload.size() != kEndTurnCommandSize) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.command.payload = EndTurnCommand { readUInt64(envelope.payload, 28) };
         break;
     case CommandType::SharedModal:
         if (envelope.payload.size() != kSharedModalCommandSize
@@ -1192,6 +1221,21 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
         appendInt32(envelope.payload, rest->gameTime);
         appendUInt32(envelope.payload, rest->phaseRevision);
         appendUInt32(envelope.payload, rest->interrupted ? 1 : 0);
+    } else if (const auto* combat = std::get_if<CombatTurnStateChangedEvent>(&event.payload)) {
+        appendEventHeader(event, EventType::CombatTurnStateChanged, envelope.payload);
+        appendUInt32(envelope.payload, combat->actorId.value);
+        envelope.payload.push_back(static_cast<std::uint8_t>(combat->phase));
+        envelope.payload.insert(envelope.payload.end(), 3, 0);
+        appendUInt32(envelope.payload, combat->phaseRevision);
+        appendUInt64(envelope.payload, combat->state.revision);
+        appendUInt64(envelope.payload, combat->state.round);
+        appendUInt32(envelope.payload, combat->state.activeIndex);
+        appendUInt32(envelope.payload, combat->state.remainingMilliseconds);
+        appendUInt32(envelope.payload, static_cast<std::uint32_t>(combat->state.initiative.size()));
+        for (const CombatInitiativeEntry& entry : combat->state.initiative) {
+            appendUInt32(envelope.payload, entry.actorId.value);
+            appendUInt32(envelope.payload, entry.ownerId.value);
+        }
     } else {
         const auto* attack = std::get_if<AttackStartedEvent>(&event.payload);
         appendEventHeader(event, EventType::AttackStarted, envelope.payload);
@@ -1358,6 +1402,39 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
             readInt32(envelope.payload, 32),
         };
         break;
+    case EventType::CombatTurnStateChanged: {
+        if (envelope.payload.size() < kCombatTurnEventBaseSize
+            || envelope.payload[25] != 0
+            || envelope.payload[26] != 0
+            || envelope.payload[27] != 0) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        std::uint32_t count = readUInt32(envelope.payload, 56);
+        if (count > kMaximumCombatInitiative
+            || envelope.payload.size() != kCombatTurnEventBaseSize
+                + static_cast<std::size_t>(count) * 8) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        CombatTurnStateChangedEvent combat;
+        combat.actorId.value = readUInt32(envelope.payload, 20);
+        combat.phase = static_cast<SessionPhase>(envelope.payload[24]);
+        combat.phaseRevision = readUInt32(envelope.payload, 28);
+        combat.state.revision = readUInt64(envelope.payload, 32);
+        combat.state.round = readUInt64(envelope.payload, 40);
+        combat.state.activeIndex = readUInt32(envelope.payload, 48);
+        combat.state.remainingMilliseconds = readUInt32(envelope.payload, 52);
+        for (std::uint32_t index = 0; index < count; index++) {
+            std::size_t offset = kCombatTurnEventBaseSize + static_cast<std::size_t>(index) * 8;
+            combat.state.initiative.push_back({
+                EntityId { readUInt32(envelope.payload, offset) },
+                PlayerId { readUInt32(envelope.payload, offset + 4) },
+            });
+        }
+        result.event.payload = std::move(combat);
+        break;
+    }
     case EventType::SharedModalStateChanged:
         if (envelope.payload.size() != kSharedModalEventSize
             || envelope.payload[25] > 1
@@ -1600,6 +1677,8 @@ const char* gameplayWireErrorMessage(GameplayWireError error)
         return "invalid exploration skill";
     case GameplayWireError::InvalidAttack:
         return "invalid attack payload";
+    case GameplayWireError::InvalidCombatTurn:
+        return "invalid combat turn payload";
     case GameplayWireError::InvalidModal:
         return "invalid shared modal payload";
     case GameplayWireError::InvalidQuantity:

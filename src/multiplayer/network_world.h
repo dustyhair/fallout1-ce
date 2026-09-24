@@ -95,6 +95,15 @@ bool networkWorldCaptureAuthoritativeState(EventSequence lastIncludedEvent, Worl
 bool networkWorldApplyAuthoritativeState(const WorldSnapshot& snapshot);
 std::optional<EntityId> networkWorldFindEntity(const Object* object);
 std::optional<PlayerId> networkWorldCombatOwner(const Object* actor);
+bool networkWorldCombatBeginRound(Object* const* actors, int count);
+bool networkWorldCombatTurnMatches(const Object* actor);
+void networkWorldCombatCompleteTurn(Object* actor, std::uint64_t expectedRevision);
+void networkWorldCombatSetPlayerConnected(PlayerId playerId, bool connected);
+void networkWorldCombatTick();
+void networkWorldCombatStop();
+std::optional<PlayerId> networkWorldActiveCombatOwner();
+std::uint64_t networkWorldCombatTurnRevision();
+bool networkWorldApplyPeerCombatTurn(const CombatTurnStateChangedEvent& event);
 Object* networkWorldFindObject(EntityId entityId);
 Object* networkWorldPlayerActor(PlayerId playerId);
 void networkWorldLeave();

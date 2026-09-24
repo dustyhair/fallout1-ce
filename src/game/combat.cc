@@ -1844,6 +1844,7 @@ static void combat_over()
     if (multiplayer::networkWorldActive()) {
         multiplayer::networkWorldSynchronizeEnginePhase();
     }
+    multiplayer::networkWorldCombatStop();
 
     if (list_total != 0) {
         obj_delete_list(combat_list);
@@ -1935,7 +1936,7 @@ static void combat_add_noncoms()
             list_com += 1;
             list_noncom -= 1;
 
-            if (obj != obj_dude) {
+            if (obj != obj_dude && !multiplayer::networkWorldActive()) {
                 combat_turn(obj, false);
             }
         }
@@ -2039,6 +2040,25 @@ static void combat_sequence_init(Object* a1, Object* a2)
                 next += 1;
                 break;
             }
+        }
+    }
+
+    // Fallout normally promotes only the local dude plus the initiating
+    // attacker/defender. Other player actors must enter the same initiative
+    // roster even when they did not trigger the encounter themselves.
+    for (int index = next; index < list_total;) {
+        Object* actor = combat_list[index];
+        if (actor != obj_dude
+            && multiplayer::networkWorldCombatOwner(actor).has_value()) {
+            Object* displaced = combat_list[next];
+            combat_list[next] = actor;
+            combat_list[index] = displaced;
+            next++;
+            if (index < next) {
+                index = next;
+            }
+        } else {
+            index++;
         }
     }
 
@@ -2165,6 +2185,7 @@ void combat_turn_run()
 static int combat_input()
 {
     int input;
+    std::uint64_t turnRevision = multiplayer::networkWorldCombatTurnRevision();
 
     while ((combat_state & COMBAT_STATE_0x02) != 0) {
         sharedFpsLimiter.mark();
@@ -2191,6 +2212,12 @@ static int combat_input()
 
         input = get_input();
 
+        if (multiplayer::networkWorldActive()
+            && (!multiplayer::networkWorldCombatTurnMatches(obj_dude)
+                || multiplayer::networkWorldCombatTurnRevision() != turnRevision)) {
+            break;
+        }
+
         if (input == KEY_SPACE) {
             break;
         }
@@ -2199,7 +2226,9 @@ static int combat_input()
             combat_end();
         } else {
             scripts_check_state_in_combat();
-            game_handle_input(input, true);
+            if (!multiplayer::networkWorldActive()) {
+                game_handle_input(input, true);
+            }
         }
 
         renderPresent();
@@ -2239,15 +2268,29 @@ static int combat_turn(Object* a1, bool a2)
     Script* script;
 
     combat_turn_obj = a1;
+    std::uint64_t turnRevision = multiplayer::networkWorldCombatTurnRevision();
 
-    // Until remote turn input is implemented, pass it without executing an
-    // actor script or AI. A player-owned actor must never become host AI.
+    // A remote player never runs through host AI or a local turn script. The
+    // host waits for the owner's semantic End Turn, timeout, or disconnect.
     std::optional<multiplayer::PlayerId> owner = multiplayer::networkWorldCombatOwner(a1);
     if (owner.has_value() && a1 != obj_dude) {
+        bool unableToAct = (a1->data.critter.combat.results
+            & (DAM_KNOCKED_OUT | DAM_DEAD | DAM_LOSE_TURN)) != 0;
+        while (!unableToAct && multiplayer::networkWorldCombatTurnMatches(a1)
+            && multiplayer::networkWorldCombatTurnRevision() == turnRevision
+            && game_user_wants_to_quit == 0 && combat_end_due_to_load == 0) {
+            sharedFpsLimiter.mark();
+            get_input();
+            renderPresent();
+            sharedFpsLimiter.throttle();
+        }
+        if (unableToAct) {
+            multiplayer::networkWorldCombatCompleteTurn(a1, turnRevision);
+        }
         a1->data.critter.combat.ap = 0;
         a1->data.critter.combat.damageLastTurn = 0;
         a1->data.critter.combat.results &= ~DAM_LOSE_TURN;
-        return 0;
+        return game_user_wants_to_quit != 0 || combat_end_due_to_load != 0 ? -1 : 0;
     }
 
     combat_ctd_init(&main_ctd, a1, NULL, HIT_MODE_PUNCH, HIT_LOCATION_TORSO);
@@ -2351,6 +2394,8 @@ static int combat_turn(Object* a1, bool a2)
         }
     }
 
+    multiplayer::networkWorldCombatCompleteTurn(a1, turnRevision);
+
     a1->data.critter.combat.damageLastTurn = 0;
 
     if ((obj_dude->data.critter.combat.results & DAM_DEAD) != 0) {
@@ -2442,6 +2487,10 @@ void combat(STRUCT_664980* attack)
                 combat_sequence_init(NULL, NULL);
             }
 
+            if (multiplayer::networkWorldActive()) {
+                multiplayer::networkWorldCombatBeginRound(combat_list, list_com);
+            }
+
             gcsd = attack;
             v6 = 0;
         }
@@ -2468,8 +2517,14 @@ void combat(STRUCT_664980* attack)
             }
 
             combat_sequence();
+            if (combat_should_end()) {
+                break;
+            }
+            if (multiplayer::networkWorldActive() && list_com > 0) {
+                multiplayer::networkWorldCombatBeginRound(combat_list, list_com);
+            }
             v6 = 0;
-        } while (!combat_should_end());
+        } while (true);
 
         if (combat_end_due_to_load) {
             game_ui_enable();
