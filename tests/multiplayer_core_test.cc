@@ -752,6 +752,7 @@ void testGameplayWireFormat()
         GameCommand { CommandSequence { 8 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, AttackCommand { EntityId { 42 }, 1, 8 } },
         GameCommand { CommandSequence { 9 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, SharedModalCommand { SharedModalKind::Dialogue, true } },
         GameCommand { CommandSequence { 10 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, UseSkillCommand { EntityId { 40 }, ExplorationSkill::Traps } },
+        GameCommand { CommandSequence { 11 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, UseItemOnCommand { EntityId { 43 }, EntityId { 40 } } },
     };
 
     for (std::size_t index = 0; index < commands.size(); index++) {
@@ -909,6 +910,22 @@ void testGameplayWireFormat()
     expect(encodeGameCommand(invalidSkill, skillEnvelope) == GameplayWireError::InvalidSkill,
         "targeted skill command rejects an unsupported skill");
 
+    ProtocolEnvelope itemUseEnvelope = gameplayEnvelope(30);
+    expect(encodeGameCommand(commands[10], itemUseEnvelope) == GameplayWireError::None,
+        "item-on-target command encodes");
+    GameCommandDecodeResult decodedItemUse = decodeGameCommand(itemUseEnvelope);
+    const UseItemOnCommand* itemUse = decodedItemUse
+        ? std::get_if<UseItemOnCommand>(&decodedItemUse.command.payload)
+        : nullptr;
+    expect(itemUse != nullptr
+            && itemUse->itemId == EntityId { 43 }
+            && itemUse->targetId == EntityId { 40 },
+        "item-on-target command round trips both shared identities");
+    GameCommand invalidItemUse = commands[10];
+    std::get<UseItemOnCommand>(invalidItemUse.payload).targetId = EntityId { 43 };
+    expect(encodeGameCommand(invalidItemUse, itemUseEnvelope) == GameplayWireError::InvalidEntityId,
+        "item-on-target command rejects an item used on itself");
+
     CommandResult accepted;
     accepted.commandSequence.value = 1;
     accepted.status = CommandStatus::Accepted;
@@ -950,6 +967,7 @@ void testGameplayWireFormat()
         GameEvent { EventSequence { 15 }, CommandSequence { 3 }, ItemPickupCompletedEvent { EntityId { 20 }, EntityId { 41 }, true, 1, ItemDescriptor { 40, 7, 8, 9 } } },
         GameEvent { EventSequence { 16 }, CommandSequence { 9 }, SharedModalStateChangedEvent { EntityId { 20 }, SharedModalKind::Dialogue, true, SessionPhase::Dialogue, 4 } },
         GameEvent { EventSequence { 17 }, CommandSequence { 10 }, SkillUseStartedEvent { EntityId { 20 }, EntityId { 40 }, ExplorationSkill::Traps } },
+        GameEvent { EventSequence { 18 }, CommandSequence { 11 }, ItemUseStartedEvent { EntityId { 20 }, EntityId { 43 }, EntityId { 40 } } },
     };
     for (std::size_t index = 0; index < events.size(); index++) {
         ProtocolEnvelope envelope = gameplayEnvelope(30 + index);
@@ -1101,6 +1119,18 @@ void testGameplayWireFormat()
             && skillEvent->targetId == EntityId { 40 }
             && skillEvent->skill == ExplorationSkill::Traps,
         "skill-use event round trips without requesting replica-side rules");
+
+    ProtocolEnvelope itemUseEventEnvelope = gameplayEnvelope(49);
+    encodeGameEvent(events[11], itemUseEventEnvelope);
+    GameEventDecodeResult decodedItemUseEvent = decodeGameEvent(itemUseEventEnvelope);
+    const ItemUseStartedEvent* itemUseEvent = decodedItemUseEvent
+        ? std::get_if<ItemUseStartedEvent>(&decodedItemUseEvent.event.payload)
+        : nullptr;
+    expect(itemUseEvent != nullptr
+            && itemUseEvent->actorId == EntityId { 20 }
+            && itemUseEvent->itemId == EntityId { 43 }
+            && itemUseEvent->targetId == EntityId { 40 },
+        "item-use event round trips as a presentation cue without replica-side scripts");
 
     ProtocolEnvelope missingSession = gameplayEnvelope(42);
     missingSession.sessionId = {};
@@ -2093,6 +2123,17 @@ public:
         return nextStatus;
     }
 
+    CommandExecutionStatus useItemOn(Object* actor, Object* item, Object* target, const UseItemOnCommand& command) override
+    {
+        itemUseCalls++;
+        lastActor = actor;
+        lastSource = item;
+        lastTarget = target;
+        lastItemUse = command;
+        recordContext();
+        return nextStatus;
+    }
+
     CommandExecutionStatus attack(Object* actor, Object* target, const AttackCommand& command) override
     {
         attackCalls++;
@@ -2192,6 +2233,7 @@ public:
     int pickupCalls = 0;
     int lootCalls = 0;
     int skillCalls = 0;
+    int itemUseCalls = 0;
     int attackCalls = 0;
     int modalCalls = 0;
     int transferCalls = 0;
@@ -2208,6 +2250,7 @@ public:
     FaceCommand lastFace;
     AttackCommand lastAttack;
     UseSkillCommand lastSkill;
+    UseItemOnCommand lastItemUse;
     SharedModalCommand lastModal;
     LocalSession* modalSession = nullptr;
     Object* activeModalActor = nullptr;
@@ -2327,6 +2370,36 @@ void testAuthoritativeCommandProcessing()
             && executor.skillCalls == 1
             && !invalidSkillUse.event.has_value(),
         "command processor rejects unsupported skills before engine execution");
+
+    CommandProcessor itemUseProcessor;
+    GameCommand useItem;
+    useItem.sequence.value = 1;
+    useItem.playerId = kGuestPlayerId;
+    useItem.actorId = session.playerActorId(kGuestPlayerId);
+    useItem.expectedPhase = SessionPhase::Exploration;
+    useItem.expectedPhaseRevision = session.phaseRevision();
+    useItem.payload = UseItemOnCommand { registeredItem.entityId, registeredLootableCritter.entityId };
+    AuthoritativeCommandResult usedItem = itemUseProcessor.process(useItem, session, executor);
+    const ItemUseStartedEvent* itemUseEvent = usedItem.event.has_value()
+        ? std::get_if<ItemUseStartedEvent>(&usedItem.event->payload)
+        : nullptr;
+    expect(usedItem.result.status == CommandStatus::Accepted
+            && executor.itemUseCalls == 1
+            && executor.lastActor == asGameObject(guestActor)
+            && executor.lastSource == asGameObject(item)
+            && executor.lastTarget == asGameObject(lootableCritter)
+            && executor.lastActingPlayerId == kGuestPlayerId
+            && itemUseEvent != nullptr
+            && itemUseEvent->itemId == registeredItem.entityId
+            && itemUseEvent->targetId == registeredLootableCritter.entityId,
+        "host resolves and executes guest-owned item use under the acting-player context");
+    useItem.sequence.value = 2;
+    std::get<UseItemOnCommand>(useItem.payload).targetId = registeredItem.entityId;
+    AuthoritativeCommandResult invalidItemUse = itemUseProcessor.process(useItem, session, executor);
+    expect(invalidItemUse.result.rejection == CommandRejection::Malformed
+            && executor.itemUseCalls == 1
+            && !invalidItemUse.event.has_value(),
+        "command processor rejects an item used on itself before engine execution");
 
     GameCommand pickup;
     pickup.sequence.value = 2;

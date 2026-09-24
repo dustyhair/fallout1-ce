@@ -72,6 +72,7 @@ enum class SmokeScenario {
     Skill,
     Scenery,
     Container,
+    Quest,
 };
 SmokeScenario smokeScenario = SmokeScenario::Movement;
 
@@ -94,6 +95,8 @@ const char* smokeScenarioName()
         return "scenery";
     case SmokeScenario::Container:
         return "container";
+    case SmokeScenario::Quest:
+        return "quest";
     }
     return "unknown";
 }
@@ -977,6 +980,8 @@ void networkRuntimeBackgroundProcess()
                 applied = networkWorldApplyPeerLoot(*loot);
             } else if (const auto* skill = std::get_if<SkillUseStartedEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerSkillUse(*skill);
+            } else if (const auto* itemUse = std::get_if<ItemUseStartedEvent>(&event->payload)) {
+                applied = networkWorldApplyPeerItemUse(*itemUse);
             } else if (const auto* modal = std::get_if<SharedModalStateChangedEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerSharedModal(*modal);
             } else if (const auto* transfer = std::get_if<InventoryTransferredEvent>(&event->payload)) {
@@ -1077,6 +1082,8 @@ bool networkRuntimeConfigure(int argc, char** argv)
             smokeScenario = SmokeScenario::Scenery;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=container") == 0) {
             smokeScenario = SmokeScenario::Container;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=quest") == 0) {
+            smokeScenario = SmokeScenario::Quest;
         }
     }
     if (smokeTestEnabled && launchOptions.mode == NetworkLaunchMode::Disabled) {
@@ -1101,6 +1108,11 @@ bool networkRuntimeConfigure(int argc, char** argv)
 bool networkRuntimeSmokeTestEnabled()
 {
     return smokeTestEnabled;
+}
+
+const char* networkRuntimeSmokeTestMap()
+{
+    return smokeScenario == SmokeScenario::Quest ? "ShadyW.map" : "V13Ent.map";
 }
 
 bool networkRuntimeRunSmokeTest()
@@ -1174,6 +1186,7 @@ bool networkRuntimeRunSmokeTest()
             int scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
             int scenarioDestinationTile = -1;
             std::optional<EntityId> scenarioTargetId;
+            std::optional<QuestSmokeFixture> questFixture;
             if (smokeScenario == SmokeScenario::Door) {
                 scenarioTargetId = networkWorldPrepareDoorSmokeTest();
                 scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
@@ -1202,6 +1215,12 @@ bool networkRuntimeRunSmokeTest()
                 scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
             } else if (smokeScenario == SmokeScenario::Container) {
                 scenarioTargetId = networkWorldPrepareContainerSmokeTest();
+                scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
+            } else if (smokeScenario == SmokeScenario::Quest) {
+                questFixture = networkWorldPrepareQuestSmokeTest();
+                if (questFixture.has_value()) {
+                    scenarioTargetId = questFixture->targetId;
+                }
                 scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
             } else if (scenarioActor != nullptr) {
                 for (int distance = 1; distance <= 4 && scenarioDestinationTile == -1; distance++) {
@@ -1260,6 +1279,9 @@ bool networkRuntimeRunSmokeTest()
             case SmokeScenario::Container:
                 scenarioCommand.payload = UseSkillCommand { *scenarioTargetId, ExplorationSkill::Lockpick };
                 break;
+            case SmokeScenario::Quest:
+                scenarioCommand.payload = UseItemOnCommand { questFixture->itemId, questFixture->targetId };
+                break;
             }
             if (!scenarioCommandReady) {
                 break;
@@ -1270,6 +1292,9 @@ bool networkRuntimeRunSmokeTest()
 
             bool gameplayPassed = false;
             std::vector<GameEvent> authoritativeEvents;
+            if (smokeScenario == SmokeScenario::Quest) {
+                engineExecutionProbeBegin();
+            }
             if (launchOptions.mode == NetworkLaunchMode::Join) {
                 ProtocolEnvelope commandEnvelope;
                 commandEnvelope.sessionId = sessionId;
@@ -1396,6 +1421,15 @@ bool networkRuntimeRunSmokeTest()
                                     && skill->targetId == *scenarioTargetId
                                     && skill->skill == ExplorationSkill::Science
                                     && networkWorldApplyPeerSkillUse(*skill);
+                            } else if (event && event.event.sequence == expectedEventSequence
+                                && event.event.causedBy == scenarioCommand.sequence
+                                && smokeScenario == SmokeScenario::Quest) {
+                                const auto* itemUse = std::get_if<ItemUseStartedEvent>(&event.event.payload);
+                                eventApplied = itemUse != nullptr
+                                    && itemUse->actorId == scenarioCommand.actorId
+                                    && itemUse->itemId == questFixture->itemId
+                                    && itemUse->targetId == questFixture->targetId
+                                    && networkWorldApplyPeerItemUse(*itemUse);
                             }
                             if (eventApplied) {
                                 receivedEventCount++;
@@ -1416,6 +1450,9 @@ bool networkRuntimeRunSmokeTest()
                                 SnapshotDigestResult actualDigest = computeSnapshotDigest(localState);
                                 stateConverged = expectedDigest && actualDigest
                                     && expectedDigest.digest == actualDigest.digest;
+                                if (stateConverged && smokeScenario == SmokeScenario::Quest) {
+                                    stateConverged = networkWorldVerifyQuestSmokeTest(*questFixture);
+                                }
                             }
                             if (!stateConverged) {
                                 std::fprintf(stderr,
@@ -1498,6 +1535,11 @@ bool networkRuntimeRunSmokeTest()
                                 payloadMatches = skill != nullptr
                                     && skill->targetId == *scenarioTargetId
                                     && skill->skill == ExplorationSkill::Lockpick;
+                            } else if (smokeScenario == SmokeScenario::Quest) {
+                                const auto* itemUse = std::get_if<UseItemOnCommand>(&command.command.payload);
+                                payloadMatches = itemUse != nullptr
+                                    && itemUse->itemId == questFixture->itemId
+                                    && itemUse->targetId == questFixture->targetId;
                             } else {
                                 const auto* movement = std::get_if<MoveCommand>(&command.command.payload);
                                 payloadMatches = movement != nullptr
@@ -1551,6 +1593,9 @@ bool networkRuntimeRunSmokeTest()
                             return anim_busy(scenarioActor) != -1;
                         case SmokeScenario::Container:
                             return anim_busy(scenarioActor) != -1;
+                        case SmokeScenario::Quest:
+                            return anim_busy(scenarioActor) != -1
+                                && networkWorldFindObject(questFixture->itemId) == nullptr;
                         }
                         return false;
                     };
@@ -1593,8 +1638,11 @@ bool networkRuntimeRunSmokeTest()
                     anim_stop();
                     bool accepted = outcome.result.status == CommandStatus::Accepted;
                     bool scenarioCompleted = actionComplete();
+                    bool questCompleted = smokeScenario != SmokeScenario::Quest
+                        || networkWorldVerifyQuestSmokeTest(*questFixture);
                     bool captured = accepted
                         && scenarioCompleted
+                        && questCompleted
                         && objectMutated
                         && authoritativeEvents.size() == scenarioFinalEventSequence.value
                         && networkWorldCaptureAuthoritativeState(scenarioFinalEventSequence, state);
@@ -1650,14 +1698,29 @@ bool networkRuntimeRunSmokeTest()
                 }
             }
 
-            if (!gameplayPassed) {
+            EngineExecutionProbeCounts scenarioProbeCounts;
+            bool scenarioAuthorityPassed = true;
+            if (smokeScenario == SmokeScenario::Quest) {
+                scenarioProbeCounts = engineExecutionProbeEnd();
+                scenarioAuthorityPassed = launchOptions.mode == NetworkLaunchMode::Host
+                    ? scenarioProbeCounts.scriptProcedures > 0 && scenarioProbeCounts.combatAttacks == 0
+                    : scenarioProbeCounts.scriptProcedures == 0
+                        && scenarioProbeCounts.combatAttacks == 0
+                        && scenarioProbeCounts.randomDraws == 0;
+            }
+
+            if (!gameplayPassed || !scenarioAuthorityPassed) {
                 if (runtimeStatus.find("SMOKE TEST FAILED") == std::string::npos) {
-                    setStatus("MULTIPLAYER SMOKE TEST FAILED: GAMEPLAY WIRE EXCHANGE");
+                    setStatus(!scenarioAuthorityPassed
+                            ? "MULTIPLAYER SMOKE TEST FAILED: QUEST AUTHORITY PROBE"
+                            : "MULTIPLAYER SMOKE TEST FAILED: GAMEPLAY WIRE EXCHANGE");
                 }
                 break;
             }
 
-            if (!networkWorldRunEngineAuthoritySmokeTest(authorityProbeCounts)) {
+            if (smokeScenario == SmokeScenario::Quest) {
+                authorityProbeCounts = scenarioProbeCounts;
+            } else if (!networkWorldRunEngineAuthoritySmokeTest(authorityProbeCounts)) {
                 setStatus("MULTIPLAYER SMOKE TEST FAILED: ENGINE AUTHORITY PROBE");
                 break;
             }
@@ -2195,6 +2258,35 @@ bool networkRuntimeHandleLocalSkillUse(Object* target, int skill)
     }
     if (!lobby.sendLocalSkillUse(*targetId, explorationSkill, networkWorldPhaseRevision())) {
         debug_printf("Multiplayer skill command could not be sent.\n");
+    }
+    return true;
+}
+
+bool networkRuntimeHandleLocalItemUse(Object* actor, Object* item, Object* target)
+{
+    if (!networkWorldActive() || actor != localPlayerActor()) {
+        return false;
+    }
+    if (networkWorldPhase() != SessionPhase::Exploration
+        || item == nullptr
+        || target == nullptr
+        || item == target
+        || FID_TYPE(item->fid) != OBJ_TYPE_ITEM
+        || obj_top_environment(item) != actor) {
+        debug_printf("Multiplayer item use is unavailable for this actor, item, or target.\n");
+        return true;
+    }
+    std::optional<EntityId> itemId = networkWorldFindEntity(item);
+    std::optional<EntityId> targetId = networkWorldFindEntity(target);
+    if (!itemId.has_value() || !targetId.has_value()) {
+        debug_printf("Multiplayer item use requires shared item and target identities.\n");
+        return true;
+    }
+    bool submitted = launchOptions.mode == NetworkLaunchMode::Host
+        ? submitHostCommand(UseItemOnCommand { *itemId, *targetId })
+        : lobby.sendLocalItemUse(*itemId, *targetId, networkWorldPhaseRevision());
+    if (!submitted) {
+        debug_printf("Multiplayer item-use command could not be sent.\n");
     }
     return true;
 }

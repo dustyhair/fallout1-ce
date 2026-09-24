@@ -1,6 +1,6 @@
 # Authoritative command routing
 
-The command processor handles movement, door use, ground-item pickup, looting, targeted exploration skills, loot-window inventory transfers, direct player gifts, and player item drops. The developer session uses the interaction subset in process, while the live network host validates every guest action. Its input and output contain only multiplayer value types and entity IDs.
+The command processor handles movement, door use, ground-item pickup, looting, targeted exploration skills, directly owned item-on-target use, loot-window inventory transfers, direct player gifts, and player item drops. The developer session uses the interaction subset in process, while the live network host validates every guest action. Its input and output contain only multiplayer value types and entity IDs.
 
 For every command, the processor checks:
 
@@ -25,6 +25,8 @@ Inventory drops use the same authority rule. Guest input stays unchanged until t
 The same inventory command supports a deliberately narrow player-gift path before the full trade UI exists. The source must be the acting player's direct inventory, the destination must be the other player actor, both actors must be adjacent on the same elevation, and the item must already have a shared identity and cannot be equipped or active. The receiver cannot use this path to take an item, and player actors cannot be opened as loot targets to bypass that direction rule. Ordinary stacks and caps can be split; the host assigns the remainder identity and publishes the same transfer event used by loot. The `game_give` semantic command exposes this path for co-op testing.
 
 Targeted exploration skills use the same registered target lookup and acting-player context. Only the seven targetable skills are accepted. The host runs the normal asynchronous action, including movement, scripts, rolls, progression, and mutations. The peer skill event is only an ordered presentation boundary; it cannot invoke any of those rule-bearing paths. Actors, critters, ground items, doors, and non-door scenery are targetable. Recovery checkpoints carry concrete state for all initial registered scenery and items; targets created dynamically outside the authoritative inventory paths still fail closed until they receive a shared lifecycle and identity.
+
+Item-on-target use likewise accepts only a registered item directly owned by the acting player and a registered target on the same elevation. The host schedules the normal Fallout action under the acting-player context. Its event carries only actor, item, and target identities; the guest does not execute the target script. The following checkpoint supplies all mutations and removes a consumed registered item. The `game_use_item` semantic command exposes exactly this path to agents.
 
 The [snapshot recovery format](snapshot-recovery.md) records the holder or ground position of every registered item so a recovery snapshot repairs pickup, loot, gift, and drop mutations after their journal events have expired.
 

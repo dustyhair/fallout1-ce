@@ -27,6 +27,8 @@
 #include "game/textobj.h"
 #include "game/tile.h"
 #include "game/trait.h"
+#include "multiplayer/network_runtime.h"
+#include "multiplayer/network_world.h"
 #include "plib/color/color.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/input.h"
@@ -1074,9 +1076,13 @@ int a_use_obj(Object* a1, Object* a2, Object* a3)
 }
 
 // 0x411F2C
-int action_use_an_item_on_object(Object* critter, Object* item, Object* target)
+int action_use_an_item_on_object(Object* critter, Object* target, Object* item)
 {
-    return a_use_obj(critter, item, target);
+    if (!multiplayer::networkWorldItemUseInProgress()
+        && multiplayer::networkRuntimeHandleLocalItemUse(critter, item, target)) {
+        return 0;
+    }
+    return a_use_obj(critter, target, item);
 }
 
 // 0x411F78

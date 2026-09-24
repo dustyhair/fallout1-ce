@@ -12,6 +12,7 @@
 
 #include <limits.h>
 #include <stddef.h>
+#include <cstdio>
 
 #include "agent_control.h"
 #include "agent_journal.h"
@@ -129,7 +130,9 @@ int gnw_main(int argc, char** argv)
 
     if (multiplayer::networkRuntimeSmokeTestEnabled()) {
         roll_set_seed(0xBEEFFEED);
-        main_load_new(mainMap);
+        char smokeMap[64];
+        std::snprintf(smokeMap, sizeof(smokeMap), "%s", multiplayer::networkRuntimeSmokeTestMap());
+        main_load_new(smokeMap);
         bool passed = multiplayer::networkRuntimeRunSmokeTest();
         multiplayer::networkRuntimeStop();
         main_unload_new();

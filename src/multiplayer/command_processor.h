@@ -58,6 +58,10 @@ public:
     {
         return CommandExecutionStatus::InvalidAction;
     }
+    virtual CommandExecutionStatus useItemOn(Object*, Object*, Object*, const UseItemOnCommand&)
+    {
+        return CommandExecutionStatus::InvalidAction;
+    }
     virtual CommandExecutionStatus attack(Object*, Object*, const AttackCommand&)
     {
         return CommandExecutionStatus::InvalidAction;

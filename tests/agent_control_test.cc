@@ -77,14 +77,21 @@ int main()
             && command.entityId == 77,
         "parses a semantic targeted skill command")
         && passed;
+    passed = expect(parse("51 game_use_item 81 77", command)
+            && command.type == fallout::AgentControlCommandType::GameUseItem
+            && command.itemEntityId == 81
+            && command.entityId == 77,
+        "parses a semantic item-on-target command")
+        && passed;
     passed = expect(!parse("0 click 10 10", command), "rejects command id zero") && passed;
-    passed = expect(!parse("51 click -1 10", command), "rejects negative coordinates") && passed;
-    passed = expect(!parse("52 key definitely-not-a-key", command), "rejects an unknown key") && passed;
-    passed = expect(!parse("53 move 10 20 trailing", command), "rejects trailing coordinate input") && passed;
-    passed = expect(!parse("54 game_move 10 3 walk", command), "rejects an invalid elevation") && passed;
-    passed = expect(!parse("55 game_door 0", command), "rejects an invalid entity id") && passed;
-    passed = expect(!parse("56 game_give 1 77 0", command), "rejects a zero gift quantity") && passed;
-    passed = expect(!parse("57 game_skill gambling 77", command), "rejects an unsupported targeted skill") && passed;
+    passed = expect(!parse("52 click -1 10", command), "rejects negative coordinates") && passed;
+    passed = expect(!parse("53 key definitely-not-a-key", command), "rejects an unknown key") && passed;
+    passed = expect(!parse("54 move 10 20 trailing", command), "rejects trailing coordinate input") && passed;
+    passed = expect(!parse("55 game_move 10 3 walk", command), "rejects an invalid elevation") && passed;
+    passed = expect(!parse("56 game_door 0", command), "rejects an invalid entity id") && passed;
+    passed = expect(!parse("57 game_give 1 77 0", command), "rejects a zero gift quantity") && passed;
+    passed = expect(!parse("58 game_skill gambling 77", command), "rejects an unsupported targeted skill") && passed;
+    passed = expect(!parse("59 game_use_item 77 77", command), "rejects using an item on itself") && passed;
 
     return passed ? 0 : 1;
 }

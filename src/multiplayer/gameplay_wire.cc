@@ -18,6 +18,7 @@ enum class CommandType : std::uint8_t {
     Attack = 8,
     SharedModal = 9,
     UseSkill = 10,
+    UseItemOn = 11,
 };
 
 enum class EventType : std::uint8_t {
@@ -32,6 +33,7 @@ enum class EventType : std::uint8_t {
     ItemPickupCompleted = 9,
     SharedModalStateChanged = 10,
     SkillUseStarted = 11,
+    ItemUseStarted = 12,
 };
 
 constexpr std::size_t kCommandHeaderSize = 28;
@@ -44,6 +46,7 @@ constexpr std::size_t kItemDropCommandSize = kCommandHeaderSize + 16 + kItemDesc
 constexpr std::size_t kAttackCommandSize = kCommandHeaderSize + 12;
 constexpr std::size_t kSharedModalCommandSize = kCommandHeaderSize + 4;
 constexpr std::size_t kSkillCommandSize = kCommandHeaderSize + 8;
+constexpr std::size_t kItemUseCommandSize = kCommandHeaderSize + 8;
 constexpr std::size_t kCommandResultSize = 24;
 constexpr std::size_t kEventHeaderSize = 20;
 constexpr std::size_t kMovementEventHeaderSize = kEventHeaderSize + 20;
@@ -56,6 +59,7 @@ constexpr std::size_t kItemDropEventSize = kEventHeaderSize + 32 + kItemDescript
 constexpr std::size_t kAttackEventSize = kEventHeaderSize + 16;
 constexpr std::size_t kSharedModalEventSize = kEventHeaderSize + 12;
 constexpr std::size_t kSkillEventSize = kEventHeaderSize + 12;
+constexpr std::size_t kItemUseEventSize = kEventHeaderSize + 12;
 constexpr std::int32_t kAttackHitModeCount = 20;
 constexpr std::int32_t kAttackHitLocationCount = 9;
 
@@ -278,6 +282,13 @@ GameplayWireError validateCommand(const GameCommand& command)
             ? GameplayWireError::None
             : GameplayWireError::InvalidSkill;
     }
+    if (const auto* itemUse = std::get_if<UseItemOnCommand>(&command.payload)) {
+        return isValid(itemUse->itemId)
+                && isValid(itemUse->targetId)
+                && itemUse->itemId != itemUse->targetId
+            ? GameplayWireError::None
+            : GameplayWireError::InvalidEntityId;
+    }
 
     EntityId targetId;
     if (const auto* interact = std::get_if<InteractCommand>(&command.payload)) {
@@ -443,6 +454,15 @@ GameplayWireError validateEvent(const GameEvent& event)
             ? GameplayWireError::None
             : GameplayWireError::InvalidSkill;
     }
+    if (const auto* itemUse = std::get_if<ItemUseStartedEvent>(&event.payload)) {
+        return isValid(itemUse->actorId)
+                && isValid(itemUse->itemId)
+                && isValid(itemUse->targetId)
+                && itemUse->actorId != itemUse->itemId
+                && itemUse->itemId != itemUse->targetId
+            ? GameplayWireError::None
+            : GameplayWireError::InvalidEntityId;
+    }
 
     EntityId actorId;
     EntityId targetId;
@@ -544,6 +564,10 @@ GameplayWireError encodeGameCommand(const GameCommand& command, ProtocolEnvelope
         appendCommandHeader(command, CommandType::UseSkill, envelope.payload);
         appendUInt32(envelope.payload, skill->targetId.value);
         appendInt32(envelope.payload, static_cast<std::int32_t>(skill->skill));
+    } else if (const auto* itemUse = std::get_if<UseItemOnCommand>(&command.payload)) {
+        appendCommandHeader(command, CommandType::UseItemOn, envelope.payload);
+        appendUInt32(envelope.payload, itemUse->itemId.value);
+        appendUInt32(envelope.payload, itemUse->targetId.value);
     } else {
         const auto* attack = std::get_if<AttackCommand>(&command.payload);
         appendCommandHeader(command, CommandType::Attack, envelope.payload);
@@ -684,6 +708,16 @@ GameCommandDecodeResult decodeGameCommand(const ProtocolEnvelope& envelope)
         result.command.payload = UseSkillCommand {
             EntityId { readUInt32(envelope.payload, 28) },
             static_cast<ExplorationSkill>(readInt32(envelope.payload, 32)),
+        };
+        break;
+    case CommandType::UseItemOn:
+        if (envelope.payload.size() != kItemUseCommandSize) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.command.payload = UseItemOnCommand {
+            EntityId { readUInt32(envelope.payload, 28) },
+            EntityId { readUInt32(envelope.payload, 32) },
         };
         break;
     default:
@@ -827,6 +861,11 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
         appendUInt32(envelope.payload, skill->actorId.value);
         appendUInt32(envelope.payload, skill->targetId.value);
         appendInt32(envelope.payload, static_cast<std::int32_t>(skill->skill));
+    } else if (const auto* itemUse = std::get_if<ItemUseStartedEvent>(&event.payload)) {
+        appendEventHeader(event, EventType::ItemUseStarted, envelope.payload);
+        appendUInt32(envelope.payload, itemUse->actorId.value);
+        appendUInt32(envelope.payload, itemUse->itemId.value);
+        appendUInt32(envelope.payload, itemUse->targetId.value);
     } else {
         const auto* attack = std::get_if<AttackStartedEvent>(&event.payload);
         appendEventHeader(event, EventType::AttackStarted, envelope.payload);
@@ -1017,6 +1056,17 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
             EntityId { readUInt32(envelope.payload, 20) },
             EntityId { readUInt32(envelope.payload, 24) },
             static_cast<ExplorationSkill>(readInt32(envelope.payload, 28)),
+        };
+        break;
+    case EventType::ItemUseStarted:
+        if (envelope.payload.size() != kItemUseEventSize) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.event.payload = ItemUseStartedEvent {
+            EntityId { readUInt32(envelope.payload, 20) },
+            EntityId { readUInt32(envelope.payload, 24) },
+            EntityId { readUInt32(envelope.payload, 28) },
         };
         break;
     default:

@@ -15,6 +15,7 @@
 #include "game/critter.h"
 #include "game/engine_execution_probe.h"
 #include "game/game.h"
+#include "game/game_vars.h"
 #include "game/intface.h"
 #include "game/inventry.h"
 #include "game/item.h"
@@ -58,9 +59,15 @@ struct ActiveSharedModal {
 std::optional<ActiveSharedModal> activeSharedModal;
 bool inventoryTransferInProgress = false;
 bool itemDropInProgress = false;
+bool itemUseInProgress = false;
 NetworkLaunchMode worldMode = NetworkLaunchMode::Disabled;
 EntityId expectedSplitEntityId;
 EntityId lastSplitEntityId;
+int questSmokeInitialReputation = 0;
+
+constexpr int kJarvisScriptIndex = 439;
+constexpr int kJarvisCuredLocalVariable = 5;
+constexpr int kAntidotePid = 49;
 
 constexpr std::uint32_t kSharedObjectFlagMask = 0xB70FF839;
 
@@ -589,6 +596,31 @@ public:
             return CommandExecutionStatus::InvalidAction;
         }
         return CommandExecutionStatus::Applied;
+    }
+
+    CommandExecutionStatus useItemOn(Object* actor,
+        Object* item,
+        Object* target,
+        const UseItemOnCommand&) override
+    {
+        if (isInCombat()
+            || actor == nullptr
+            || item == nullptr
+            || target == nullptr
+            || item == target
+            || actor->elevation != target->elevation
+            || target->tile < 0
+            || FID_TYPE(item->fid) != OBJ_TYPE_ITEM
+            || topEnvironmentOrSelf(item) != actor
+            || anim_busy(actor) == -1) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        itemUseInProgress = true;
+        int rc = action_use_an_item_on_object(actor, target, item);
+        itemUseInProgress = false;
+        return rc != -1
+            ? CommandExecutionStatus::Applied
+            : CommandExecutionStatus::InvalidAction;
     }
 
     CommandExecutionStatus attack(Object* actor, Object* target, const AttackCommand& command) override
@@ -1305,6 +1337,31 @@ bool networkWorldApplyPeerSkillUse(const SkillUseStartedEvent& skillUse)
     return true;
 }
 
+bool networkWorldApplyPeerItemUse(const ItemUseStartedEvent& itemUse)
+{
+    if (!session.isActive() || isInCombat()) {
+        return false;
+    }
+    PlayerCharacterState* player = session.players().findByActor(itemUse.actorId);
+    Object* actor = player != nullptr ? session.entities().findObject(player->actorId) : nullptr;
+    Object* target = session.entities().findObject(itemUse.targetId);
+    Object* item = session.entities().findObject(itemUse.itemId);
+    if (player == nullptr
+        || actor == nullptr
+        || target == nullptr
+        || actor->elevation != target->elevation
+        || target->tile < 0
+        || (item != nullptr
+            && (FID_TYPE(item->fid) != OBJ_TYPE_ITEM || topEnvironmentOrSelf(item) != actor))) {
+        return false;
+    }
+
+    // The item use is only an ordered presentation boundary on replicas. The
+    // target script, inventory consumption, rolls, variables, queue changes,
+    // and XP arrive in the following authoritative state.
+    return true;
+}
+
 bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts)
 {
     counts = {};
@@ -1687,6 +1744,93 @@ bool networkWorldMutateContainerSmokeTest(EntityId targetId)
     return true;
 }
 
+std::optional<QuestSmokeFixture> networkWorldPrepareQuestSmokeTest()
+{
+    if (!session.isActive()) {
+        return std::nullopt;
+    }
+    Object* actor = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+    PlayerCharacterState* host = session.players().find(kHostPlayerId);
+    PlayerCharacterState* guest = session.players().find(kGuestPlayerId);
+    if (actor == nullptr || host == nullptr || guest == nullptr) {
+        return std::nullopt;
+    }
+
+    anim_stop();
+    for (const auto& entry : worldCritters) {
+        Object* target = entry.second;
+        int sid = -1;
+        Script* script = nullptr;
+        ProgramValue cured;
+        if (target == nullptr
+            || obj_sid(target, &sid) == -1
+            || scr_ptr(sid, &script) == -1
+            || script == nullptr
+            || script->scr_script_idx != kJarvisScriptIndex
+            || scr_get_local_var(sid, kJarvisCuredLocalVariable, cured) == -1
+            || cured.integerValue != 0
+            || !hexGridTileIsValid(target->tile)
+            || !elevationIsValid(target->elevation)) {
+            continue;
+        }
+
+        bool placed = false;
+        for (int rotation = 0; rotation < ROTATION_COUNT && !placed; rotation++) {
+            int tile = tile_num_in_direction(target->tile, rotation, 1);
+            placed = hexGridTileIsValid(tile)
+                && obj_blocking_at(actor, tile, target->elevation) == nullptr
+                && obj_move_to_tile(actor, tile, target->elevation, nullptr) == 0;
+        }
+        if (!placed) {
+            return std::nullopt;
+        }
+
+        Object* antidote = nullptr;
+        if (obj_pid_new(&antidote, kAntidotePid) == -1
+            || antidote == nullptr
+            || item_add_force(actor, antidote, 1) != 0
+            || obj_disconnect(antidote, nullptr) == -1) {
+            if (antidote != nullptr) {
+                obj_destroy(antidote);
+            }
+            return std::nullopt;
+        }
+        EntityRegistrationResult registration = registerItem(antidote);
+        if (!registration) {
+            obj_destroy(antidote);
+            return std::nullopt;
+        }
+        questSmokeInitialReputation = game_get_global_var(GVAR_PLAYER_REPUATION);
+        return QuestSmokeFixture { entry.first, registration.entityId };
+    }
+    return std::nullopt;
+}
+
+bool networkWorldVerifyQuestSmokeTest(const QuestSmokeFixture& fixture)
+{
+    Object* target = session.entities().findObject(fixture.targetId);
+    PlayerCharacterState* host = session.players().find(kHostPlayerId);
+    PlayerCharacterState* guest = session.players().find(kGuestPlayerId);
+    int sid = -1;
+    Script* script = nullptr;
+    ProgramValue cured;
+    return session.isActive()
+        && target != nullptr
+        && host != nullptr
+        && guest != nullptr
+        && obj_sid(target, &sid) != -1
+        && scr_ptr(sid, &script) != -1
+        && script != nullptr
+        && script->scr_script_idx == kJarvisScriptIndex
+        && scr_get_local_var(sid, kJarvisCuredLocalVariable, cured) != -1
+        && cured.integerValue == 1
+        && session.entities().findObject(fixture.itemId) == nullptr
+        && networkWorldFindObject(fixture.itemId) == nullptr
+        && host->build.experience == 525
+        && guest->build.experience == 525
+        && game_get_global_var(GVAR_PLAYER_REPUATION) == questSmokeInitialReputation + 1;
+}
+
 bool networkWorldVerifyLootRangeSmokeTest(EntityId targetId)
 {
     Object* actor = session.entities().findObject(session.playerActorId(kGuestPlayerId));
@@ -1985,6 +2129,26 @@ bool networkWorldIsLocalItemDrop(Object* source, Object* item)
         && item != nullptr
         && topEnvironmentOrSelf(source) == obj_dude
         && item_count(source, item) > 0;
+}
+
+bool networkWorldItemUseInProgress()
+{
+    return itemUseInProgress;
+}
+
+void networkWorldHandleObjectDestroyed(Object* object)
+{
+    if (!session.isActive() || object == nullptr || FID_TYPE(object->fid) != OBJ_TYPE_ITEM) {
+        return;
+    }
+    std::optional<EntityId> entityId = session.entities().findEntity(object);
+    if (!entityId.has_value()) {
+        return;
+    }
+    session.entities().unregisterEntity(*entityId);
+    worldItems.erase(std::remove_if(worldItems.begin(), worldItems.end(), [&](const auto& entry) {
+        return entry.first == *entityId;
+    }), worldItems.end());
 }
 
 void networkWorldHandleItemReplacement(Object* removed, Object* replacement)
@@ -2563,6 +2727,23 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
             return false;
         }
     }
+    std::vector<Object*> removedItems;
+    std::unordered_set<Object*> removedItemPointers;
+    for (const auto& entry : worldItems) {
+        if (snapshotItemIds.find(entry.first) == snapshotItemIds.end()) {
+            removedItems.push_back(entry.second);
+            removedItemPointers.insert(entry.second);
+            session.entities().unregisterEntity(entry.first);
+        }
+    }
+    worldItems.erase(std::remove_if(worldItems.begin(), worldItems.end(), [&](const auto& entry) {
+        return snapshotItemIds.find(entry.first) == snapshotItemIds.end();
+    }), worldItems.end());
+    for (Object* item : removedItems) {
+        if (item != nullptr && removedItemPointers.find(item->owner) == removedItemPointers.end()) {
+            obj_destroy(item);
+        }
+    }
     for (const ItemSnapshot& itemState : snapshot.items) {
         if (session.entities().findObject(itemState.entityId) == nullptr) {
             Object* item = createItem(itemState.itemDescriptor);
@@ -2739,6 +2920,7 @@ void networkWorldLeave()
     activeLootTargets.clear();
     activeSharedModal.reset();
     itemDropInProgress = false;
+    itemUseInProgress = false;
     expectedSplitEntityId = {};
     lastSplitEntityId = {};
     worldMode = NetworkLaunchMode::Disabled;

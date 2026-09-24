@@ -23,6 +23,7 @@
 #include "game/tile.h"
 #include "game/worldmap.h"
 #include "multiplayer/developer_local_session.h"
+#include "multiplayer/network_world.h"
 #include "plib/color/color.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/grbuf.h"
@@ -1965,6 +1966,8 @@ int obj_erase_object(Object* object, Rect* rect)
     if (object == NULL) {
         return -1;
     }
+
+    multiplayer::networkWorldHandleObjectDestroyed(object);
 
     gmouse_remove_item_outline(object);
 

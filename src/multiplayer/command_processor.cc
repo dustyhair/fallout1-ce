@@ -78,6 +78,7 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     const PickupCommand* pickup = std::get_if<PickupCommand>(&command.payload);
     const LootCommand* loot = std::get_if<LootCommand>(&command.payload);
     const UseSkillCommand* skill = std::get_if<UseSkillCommand>(&command.payload);
+    const UseItemOnCommand* itemUse = std::get_if<UseItemOnCommand>(&command.payload);
     const InventoryTransferCommand* transfer = std::get_if<InventoryTransferCommand>(&command.payload);
     const ItemDropCommand* drop = std::get_if<ItemDropCommand>(&command.payload);
     const AttackCommand* attack = std::get_if<AttackCommand>(&command.payload);
@@ -99,6 +100,9 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
         }
         targetId = skill->targetId;
         hasTarget = true;
+    } else if (itemUse != nullptr) {
+        targetId = itemUse->targetId;
+        hasTarget = true;
     } else if (attack != nullptr) {
         targetId = attack->targetId;
         hasTarget = true;
@@ -113,7 +117,15 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     Object* source = nullptr;
     Object* destination = nullptr;
     Object* item = nullptr;
-    if (transfer != nullptr) {
+    if (itemUse != nullptr) {
+        if (!isValid(itemUse->itemId) || itemUse->itemId == itemUse->targetId) {
+            return rejectAndRemember(CommandRejection::Malformed);
+        }
+        item = session.entities().findObject(itemUse->itemId);
+        if (item == nullptr) {
+            return rejectAndRemember(CommandRejection::MissingEntity);
+        }
+    } else if (transfer != nullptr) {
         bool descriptorValid = hasItemDescriptor(transfer->itemDescriptor)
             && transfer->itemDescriptor.pid >= 0
             && (static_cast<std::uint32_t>(transfer->itemDescriptor.pid) >> 24) == 0;
@@ -176,6 +188,9 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
         } else if (skill != nullptr) {
             executionStatus = executor.useSkill(actor, target, *skill);
             event.payload = SkillUseStartedEvent { command.actorId, skill->targetId, skill->skill };
+        } else if (itemUse != nullptr) {
+            executionStatus = executor.useItemOn(actor, item, target, *itemUse);
+            event.payload = ItemUseStartedEvent { command.actorId, itemUse->itemId, itemUse->targetId };
         } else if (attack != nullptr) {
             executionStatus = executor.attack(actor, target, *attack);
             event.payload = AttackStartedEvent { command.actorId, attack->targetId, attack->hitMode, attack->hitLocation };

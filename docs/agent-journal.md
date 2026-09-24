@@ -40,11 +40,12 @@ When a multiplayer world is active, prefer the semantic commands below. They ent
 13 game_door 77
 14 game_pickup 88
 15 game_skill traps 42
-15 game_loot 91
-16 game_give 1 88 3
+16 game_loot 91
+17 game_use_item 88 42
+18 game_give 1 88 3
 ```
 
-`game_move` takes a map tile, elevation from 0 through 2, and optional `walk` or `run`. Entity commands take an entity ID reported by the journal. `game_skill` takes one of `first_aid`, `doctor`, `lockpick`, `steal`, `traps`, `science`, or `repair`, followed by a registered target ID. `game_give` takes the destination player's actor entity ID, a registered item ID from `local_inventory`, and a positive quantity. It can give ordinary items or caps, but only from the sender's direct inventory to an adjacent player. A syntactically accepted command can still be rejected by authority checks for phase, ownership, range, target state, or another gameplay rule. Movement, facing, doors, pickup, loot initiation, targeted exploration skills, and direct player gifts are currently supported; dialogue and combat verbs remain planned. Live multiplayer combat input remains blocked until authoritative turn ownership is implemented.
+`game_move` takes a map tile, elevation from 0 through 2, and optional `walk` or `run`. Entity commands take an entity ID reported by the journal. `game_skill` takes one of `first_aid`, `doctor`, `lockpick`, `steal`, `traps`, `science`, or `repair`, followed by a registered target ID. `game_use_item` takes a registered item ID from `local_inventory` followed by a registered target ID; the item must be directly owned by the acting player. `game_give` takes the destination player's actor entity ID, a registered item ID from `local_inventory`, and a positive quantity. It can give ordinary items or caps, but only from the sender's direct inventory to an adjacent player. A syntactically accepted command can still be rejected by authority checks for phase, ownership, range, target state, or another gameplay rule. Movement, facing, doors, pickup, loot initiation, targeted exploration skills, item use, and direct player gifts are currently supported; dialogue and combat verbs remain planned. Live multiplayer combat input remains blocked until authoritative turn ownership is implemented.
 
 An agent can read the existing context and then wait for new records without polling screenshots:
 

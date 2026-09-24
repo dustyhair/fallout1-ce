@@ -124,6 +124,25 @@ bool parseGive(std::istringstream& input, AgentControlCommand& command, std::str
     return true;
 }
 
+bool parseItemUse(std::istringstream& input, AgentControlCommand& command, std::string& error)
+{
+    std::uint64_t item = 0;
+    std::uint64_t target = 0;
+    if (!(input >> item >> target)
+        || hasTrailingInput(input)
+        || item == 0
+        || target == 0
+        || item == target
+        || item > std::numeric_limits<std::uint32_t>::max()
+        || target > std::numeric_limits<std::uint32_t>::max()) {
+        error = "expected: game_use_item <item id> <target id>";
+        return false;
+    }
+    command.itemEntityId = static_cast<std::uint32_t>(item);
+    command.entityId = static_cast<std::uint32_t>(target);
+    return true;
+}
+
 bool parseSkill(std::istringstream& input, AgentControlCommand& command, std::string& error)
 {
     std::string name;
@@ -277,6 +296,10 @@ bool agentControlParseCommand(const std::string& line,
         command.type = AgentControlCommandType::GameSkill;
         return parseSkill(input, command, error);
     }
+    if (verb == "game_use_item") {
+        command.type = AgentControlCommandType::GameUseItem;
+        return parseItemUse(input, command, error);
+    }
     if (verb == "game_give") {
         command.type = AgentControlCommandType::GameGive;
         return parseGive(input, command, error);
@@ -311,6 +334,8 @@ const char* agentControlCommandTypeName(AgentControlCommandType type)
         return "game_loot";
     case AgentControlCommandType::GameSkill:
         return "game_skill";
+    case AgentControlCommandType::GameUseItem:
+        return "game_use_item";
     case AgentControlCommandType::GameGive:
         return "game_give";
     }

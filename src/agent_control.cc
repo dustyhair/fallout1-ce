@@ -10,6 +10,7 @@
 
 #include "agent_control_command.h"
 #include "agent_journal.h"
+#include "multiplayer/local_player_context.h"
 #include "multiplayer/network_runtime.h"
 #include "multiplayer/network_world.h"
 #include "plib/gnw/input.h"
@@ -178,6 +179,21 @@ void executeCommand(const AgentControlCommand& command)
             agentJournalWriteAgentCommand(command.id, commandName, "accepted", "semantic skill use submitted");
         } else {
             agentJournalWriteAgentCommand(command.id, commandName, "rejected", "skill or target is unavailable for this action");
+        }
+        return;
+    }
+    case AgentControlCommandType::GameUseItem: {
+        Object* actor = multiplayer::localPlayerActor();
+        Object* item = multiplayer::networkWorldFindObject(multiplayer::EntityId { command.itemEntityId });
+        Object* target = multiplayer::networkWorldFindObject(multiplayer::EntityId { command.entityId });
+        bool submitted = actor != nullptr
+            && item != nullptr
+            && target != nullptr
+            && multiplayer::networkRuntimeHandleLocalItemUse(actor, item, target);
+        if (submitted) {
+            agentJournalWriteAgentCommand(command.id, commandName, "accepted", "semantic item use submitted");
+        } else {
+            agentJournalWriteAgentCommand(command.id, commandName, "rejected", "item or target is unavailable for this action");
         }
         return;
     }
