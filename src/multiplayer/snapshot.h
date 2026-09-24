@@ -14,7 +14,7 @@ namespace fallout {
 namespace multiplayer {
 
 constexpr std::uint32_t kSnapshotMagic = 0x46434D53;
-constexpr std::uint16_t kSnapshotVersion = 11;
+constexpr std::uint16_t kSnapshotVersion = 12;
 constexpr std::size_t kSnapshotHeaderSize = 28;
 constexpr std::size_t kMaxSnapshotPayloadSize = 512 * 1024;
 constexpr std::size_t kMaxSnapshotActors = 16;
@@ -108,6 +108,7 @@ struct WorldMapTravelSnapshot {
     WorldMapTravelStage stage = WorldMapTravelStage::None;
     std::int32_t targetX = -1;
     std::int32_t targetY = -1;
+    WorldMapTravelProgress progress;
 };
 
 struct WorldSnapshot {

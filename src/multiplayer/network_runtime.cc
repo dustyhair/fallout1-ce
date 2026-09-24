@@ -1386,7 +1386,9 @@ bool networkRuntimeRunSmokeTest()
                     || (state.specialEncounters == (initialWorldMap.specialEncounters ^ 1)
                         && state.grid[42] == (initialWorldMap.grid[42] == 0 ? 1 : 0)
                         && state.knownTownEntrances[4]
-                            == (initialWorldMap.knownTownEntrances[4] == 0 ? 1 : 0));
+                            == (initialWorldMap.knownTownEntrances[4] == 0 ? 1 : 0)
+                        && state.x == 1327
+                        && state.y == 325);
             };
             if (smokeScenario == SmokeScenario::Rest && smokeRestInterrupt
                 && launchOptions.mode == NetworkLaunchMode::Host) {
@@ -2083,7 +2085,26 @@ bool networkRuntimeRunSmokeTest()
                         changedWorldMap.grid[42] = changedWorldMap.grid[42] == 0 ? 1 : 0;
                         changedWorldMap.knownTownEntrances[4]
                             = changedWorldMap.knownTownEntrances[4] == 0 ? 1 : 0;
-                        objectMutated = objectMutated && worldmap_apply_state(changedWorldMap);
+                        changedWorldMap.x = 1325;
+                        changedWorldMap.y = 325; // Two city-terrain pixels move without a time tick.
+                        int savedVaultWater = game_global_vars[GVAR_VAULT_WATER];
+                        int savedVatsCountdown = game_global_vars[GVAR_VATS_COUNTDOWN];
+                        int savedMasterCountdown = game_global_vars[GVAR_COUNTDOWN_TO_DESTRUCTION];
+                        game_global_vars[GVAR_VAULT_WATER] = 1;
+                        game_global_vars[GVAR_VATS_COUNTDOWN] = 0;
+                        game_global_vars[GVAR_COUNTDOWN_TO_DESTRUCTION] = 0;
+                        int beforeTravelTime = game_time();
+                        bool travelStarted = worldmap_apply_state(changedWorldMap)
+                            && worldmap_authoritative_travel_begin(1328, 325);
+                        WorldMapTravelStepResult travelStep = worldmap_authoritative_travel_step();
+                        worldmap_authoritative_travel_cancel();
+                        game_global_vars[GVAR_VAULT_WATER] = savedVaultWater;
+                        game_global_vars[GVAR_VATS_COUNTDOWN] = savedVatsCountdown;
+                        game_global_vars[GVAR_COUNTDOWN_TO_DESTRUCTION] = savedMasterCountdown;
+                        objectMutated = objectMutated && travelStarted
+                            && travelStep.status == WorldMapTravelStepStatus::Moving
+                            && travelStep.x == 1327 && travelStep.y == 325
+                            && travelStep.gameTime == beforeTravelTime;
                     }
                     if (smokeScenario == SmokeScenario::Door && outcome.event.has_value()) {
                         auto* door = std::get_if<DoorUseStartedEvent>(&outcome.event->payload);

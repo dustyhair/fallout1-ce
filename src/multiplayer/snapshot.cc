@@ -23,7 +23,7 @@ constexpr std::size_t kScenerySnapshotSize = 48;
 constexpr std::size_t kItemSnapshotSize = 56;
 constexpr std::size_t kTimedEventSnapshotSize = 36;
 constexpr std::size_t kWorldMapSnapshotSize = 31 * 29 + 15 * 7 + 6 * sizeof(std::uint32_t);
-constexpr std::size_t kWorldMapTravelSnapshotSize = 20;
+constexpr std::size_t kWorldMapTravelSnapshotSize = 20 + 14 * sizeof(std::uint32_t);
 constexpr std::size_t kSnapshotProtectedOffset = 20;
 constexpr std::uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
 constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
@@ -74,6 +74,21 @@ void appendWorldMapTravel(std::vector<std::uint8_t>& bytes, const WorldMapTravel
     appendUint32(bytes, static_cast<std::uint32_t>(state.stage));
     appendUint32(bytes, static_cast<std::uint32_t>(state.targetX));
     appendUint32(bytes, static_cast<std::uint32_t>(state.targetY));
+    const WorldMapTravelProgress& progress = state.progress;
+    appendUint32(bytes, progress.active ? 1 : 0);
+    appendUint32(bytes, static_cast<std::uint32_t>(progress.targetX));
+    appendUint32(bytes, static_cast<std::uint32_t>(progress.targetY));
+    appendUint32(bytes, static_cast<std::uint32_t>(progress.deltaX));
+    appendUint32(bytes, static_cast<std::uint32_t>(progress.deltaY));
+    appendUint32(bytes, static_cast<std::uint32_t>(progress.lineError));
+    appendUint32(bytes, static_cast<std::uint32_t>(progress.lineIndex));
+    appendUint32(bytes, static_cast<std::uint32_t>(progress.xIncrement));
+    appendUint32(bytes, static_cast<std::uint32_t>(progress.yIncrement));
+    appendUint32(bytes, static_cast<std::uint32_t>(progress.moveCounter));
+    appendUint32(bytes, static_cast<std::uint32_t>(progress.visualCounter));
+    appendUint32(bytes, static_cast<std::uint32_t>(progress.miles));
+    appendUint32(bytes, static_cast<std::uint32_t>(progress.dayLength));
+    appendUint32(bytes, static_cast<std::uint32_t>(progress.timeAdder));
 }
 
 std::uint8_t readUint8(const std::vector<std::uint8_t>& bytes, std::size_t& offset)
@@ -387,7 +402,12 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
             return actor.entityId == actorId;
         });
     };
-    if ((travel.stage == WorldMapTravelStage::None
+    if (!worldmap_validate_travel_progress(travel.progress, worldMap)
+        || (travel.progress.active
+            && (travel.stage != WorldMapTravelStage::Approved
+                || travel.targetX != travel.progress.targetX
+                || travel.targetY != travel.progress.targetY))
+        || (travel.stage == WorldMapTravelStage::None
             && (isValid(travel.proposerActorId) || isValid(travel.controllerActorId) || !noRoute))
         || (travel.stage == WorldMapTravelStage::Proposed
             && (snapshot.phase != SessionPhase::Exploration
@@ -869,6 +889,26 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
     travel.stage = static_cast<WorldMapTravelStage>(readUint32(packet, offset));
     travel.targetX = static_cast<std::int32_t>(readUint32(packet, offset));
     travel.targetY = static_cast<std::int32_t>(readUint32(packet, offset));
+    WorldMapTravelProgress& progress = travel.progress;
+    std::uint32_t active = readUint32(packet, offset);
+    progress.active = active == 1;
+    progress.targetX = static_cast<std::int32_t>(readUint32(packet, offset));
+    progress.targetY = static_cast<std::int32_t>(readUint32(packet, offset));
+    progress.deltaX = static_cast<std::int32_t>(readUint32(packet, offset));
+    progress.deltaY = static_cast<std::int32_t>(readUint32(packet, offset));
+    progress.lineError = static_cast<std::int32_t>(readUint32(packet, offset));
+    progress.lineIndex = static_cast<std::int32_t>(readUint32(packet, offset));
+    progress.xIncrement = static_cast<std::int32_t>(readUint32(packet, offset));
+    progress.yIncrement = static_cast<std::int32_t>(readUint32(packet, offset));
+    progress.moveCounter = static_cast<std::int32_t>(readUint32(packet, offset));
+    progress.visualCounter = static_cast<std::int32_t>(readUint32(packet, offset));
+    progress.miles = static_cast<std::int32_t>(readUint32(packet, offset));
+    progress.dayLength = static_cast<std::int32_t>(readUint32(packet, offset));
+    progress.timeAdder = static_cast<std::int32_t>(readUint32(packet, offset));
+    if (active > 1) {
+        result.error = SnapshotError::InvalidWorldMapTravelState;
+        return result;
+    }
 
     result.error = validateSnapshot(result.snapshot);
     if (result.error == SnapshotError::None) {

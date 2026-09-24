@@ -672,6 +672,7 @@ bool loadSharedMap(int map)
     approvedWorldMapProposalSequence = {};
     selectedWorldMapRoute.reset();
     pendingWorldMapProposal.reset();
+    worldmap_authoritative_travel_cancel();
     peerActor = nullptr;
 
     if (map_load_idx(map) == -1) {
@@ -1418,6 +1419,7 @@ public:
                 approvedWorldMapProposerActorId = {};
                 approvedWorldMapProposalSequence = {};
                 selectedWorldMapRoute.reset();
+                worldmap_authoritative_travel_cancel();
             } else {
                 return execution;
             }
@@ -1467,6 +1469,7 @@ public:
         } else {
             selectedWorldMapRoute = std::make_pair(command.targetX, command.targetY);
         }
+        worldmap_authoritative_travel_cancel();
         return CommandExecutionStatus::Applied;
     }
 
@@ -2149,6 +2152,7 @@ bool networkWorldApplyPeerSharedModal(const SharedModalStateChangedEvent& modal)
             activeSharedModal = ActiveSharedModal { modal.actorId, modal.kind };
             approvedWorldMapProposerActorId = modal.actorId;
             selectedWorldMapRoute.reset();
+            worldmap_authoritative_travel_cancel();
             return true;
         }
         if (!modal.open && modal.phase == SessionPhase::Exploration) {
@@ -2168,6 +2172,7 @@ bool networkWorldApplyPeerSharedModal(const SharedModalStateChangedEvent& modal)
                 approvedWorldMapProposerActorId = {};
                 approvedWorldMapProposalSequence = {};
                 selectedWorldMapRoute.reset();
+                worldmap_authoritative_travel_cancel();
                 return true;
             }
             return !activeSharedModal.has_value()
@@ -2226,6 +2231,7 @@ bool networkWorldApplyPeerWorldMapRoute(const WorldMapRouteSelectedEvent& route)
     } else {
         selectedWorldMapRoute = std::make_pair(route.targetX, route.targetY);
     }
+    worldmap_authoritative_travel_cancel();
     return true;
 }
 
@@ -3878,6 +3884,55 @@ bool networkWorldRunSharedModalSmokeTest()
         && routeSnapshot.worldMapTravel.proposerActorId == actorId
         && routeSnapshot.worldMapTravel.targetX == 725
         && routeSnapshot.worldMapTravel.targetY == 616;
+    bool hostTravelProgressRoundTrip = true;
+    if (worldMode == NetworkLaunchMode::Host) {
+        WorldMapState travelFixture = startingWorldMap;
+        travelFixture.x = 1325;
+        travelFixture.y = 325; // City terrain, outside the walkmask.
+        int savedVaultWater = game_global_vars[GVAR_VAULT_WATER];
+        int savedVatsCountdown = game_global_vars[GVAR_VATS_COUNTDOWN];
+        int savedMasterCountdown = game_global_vars[GVAR_COUNTDOWN_TO_DESTRUCTION];
+        game_global_vars[GVAR_VAULT_WATER] = 1;
+        game_global_vars[GVAR_VATS_COUNTDOWN] = 0;
+        game_global_vars[GVAR_COUNTDOWN_TO_DESTRUCTION] = 0;
+        hostTravelProgressRoundTrip = worldmap_apply_state(travelFixture)
+            && worldmap_authoritative_travel_begin(725, 616);
+        WorldMapTravelStepResult movement = worldmap_authoritative_travel_step();
+        WorldMapState movedMap;
+        worldmap_capture_state(movedMap);
+        WorldSnapshot movingSnapshot;
+        std::vector<std::uint8_t> movingPacket;
+        SnapshotDecodeResult decodedMoving;
+        hostTravelProgressRoundTrip = hostTravelProgressRoundTrip
+            && movement.status == WorldMapTravelStepStatus::Moving
+            && movement.x != travelFixture.x
+            && movement.gameTime == startingWorldTime
+            && !movement.dayElapsed
+            && networkWorldCaptureSnapshot(EventSequence {}, movingSnapshot)
+            && movingSnapshot.worldMapTravel.progress.active
+            && encodeSnapshot(movingSnapshot, movingPacket) == SnapshotError::None;
+        if (hostTravelProgressRoundTrip) {
+            decodedMoving = decodeSnapshot(movingPacket);
+            hostTravelProgressRoundTrip = decodedMoving
+                && decodedMoving.snapshot.worldMapTravel.progress.active
+                && decodedMoving.snapshot.worldMapTravel.progress.lineIndex
+                    == movingSnapshot.worldMapTravel.progress.lineIndex
+                && worldmap_apply_state(movedMap)
+                && worldmap_apply_travel_progress(decodedMoving.snapshot.worldMapTravel.progress);
+            WorldMapTravelProgress restoredProgress;
+            worldmap_capture_travel_progress(restoredProgress);
+            hostTravelProgressRoundTrip = hostTravelProgressRoundTrip
+                && restoredProgress.active
+                && restoredProgress.lineIndex == movingSnapshot.worldMapTravel.progress.lineIndex
+                && restoredProgress.miles == movingSnapshot.worldMapTravel.progress.miles;
+        }
+        worldmap_authoritative_travel_cancel();
+        hostTravelProgressRoundTrip = worldmap_apply_state(startingWorldMap)
+            && hostTravelProgressRoundTrip;
+        game_global_vars[GVAR_VAULT_WATER] = savedVaultWater;
+        game_global_vars[GVAR_VATS_COUNTDOWN] = savedVatsCountdown;
+        game_global_vars[GVAR_COUNTDOWN_TO_DESTRUCTION] = savedMasterCountdown;
+    }
     GameCommand unauthorizedRoute = route;
     unauthorizedRoute.playerId = kHostPlayerId;
     unauthorizedRoute.actorId = session.playerActorId(kHostPlayerId);
@@ -4050,7 +4105,7 @@ bool networkWorldRunSharedModalSmokeTest()
         && !networkWorldSharedModalActive();
 
     commandProcessor.reset();
-    return invalidTravelTargetRejected && travelStepperGuarded
+    return invalidTravelTargetRejected && travelStepperGuarded && hostTravelProgressRoundTrip
         && travelWaitsForConsent && proposerRetainsControl && proposerCanRoute
         && onlyProposerCanRoute && proposerCanClearRoute && onlyProposerCanClose
         && proposerCanCancel && hostCanProposeAndRoute && routeHasNoWorldEffects
@@ -4669,6 +4724,7 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
     captured.phaseRevision = session.phaseRevision();
     captured.gameTime = game_time();
     worldmap_capture_state(captured.worldMap);
+    worldmap_capture_travel_progress(captured.worldMapTravel.progress);
     if (pendingWorldMapProposal.has_value()) {
         captured.worldMapTravel.proposerActorId = pendingWorldMapProposal->proposerActorId;
         captured.worldMapTravel.controllerActorId = pendingWorldMapProposal->proposerActorId;
@@ -5108,6 +5164,10 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
         std::fprintf(stderr, "Multiplayer snapshot failed world-map state application.\n");
         return false;
     }
+    if (!worldmap_apply_travel_progress(snapshot.worldMapTravel.progress)) {
+        std::fprintf(stderr, "Multiplayer snapshot failed world-map travel application.\n");
+        return false;
+    }
     if (!applyTimedEvents(snapshot)) {
         std::fprintf(stderr, "Multiplayer snapshot failed timed-event application.\n");
         return false;
@@ -5207,6 +5267,7 @@ void networkWorldLeave()
     approvedWorldMapProposalSequence = {};
     selectedWorldMapRoute.reset();
     pendingWorldMapProposal.reset();
+    worldmap_authoritative_travel_cancel();
     itemDropInProgress = false;
     itemUseInProgress = false;
     scriptedSceneryTransitionInProgress = false;

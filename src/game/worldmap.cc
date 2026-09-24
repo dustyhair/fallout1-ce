@@ -991,6 +991,49 @@ void worldmap_authoritative_travel_cancel()
     authoritative_travel_active = false;
 }
 
+void worldmap_capture_travel_progress(WorldMapTravelProgress& progress)
+{
+    progress = {};
+    if (!authoritative_travel_active) return;
+    progress.active = true;
+    progress.targetX = target_xpos;
+    progress.targetY = target_ypos;
+    progress.deltaX = deltaLineX;
+    progress.deltaY = deltaLineY;
+    progress.lineError = line_error;
+    progress.lineIndex = line_index;
+    progress.xIncrement = x_line_inc;
+    progress.yIncrement = y_line_inc;
+    progress.moveCounter = authoritative_move_counter;
+    progress.visualCounter = authoritative_visual_counter;
+    progress.miles = static_cast<int>(wmap_mile);
+    progress.dayLength = static_cast<int>(wmap_day);
+    progress.timeAdder = time_adder;
+}
+
+bool worldmap_apply_travel_progress(const WorldMapTravelProgress& progress)
+{
+    WorldMapState worldMap;
+    worldmap_capture_state(worldMap);
+    if (!worldmap_validate_travel_progress(progress, worldMap)) return false;
+    authoritative_travel_active = progress.active;
+    if (!progress.active) return true;
+    target_xpos = progress.targetX;
+    target_ypos = progress.targetY;
+    deltaLineX = progress.deltaX;
+    deltaLineY = progress.deltaY;
+    line_error = progress.lineError;
+    line_index = progress.lineIndex;
+    x_line_inc = progress.xIncrement;
+    y_line_inc = progress.yIncrement;
+    authoritative_move_counter = progress.moveCounter;
+    authoritative_visual_counter = progress.visualCounter;
+    wmap_mile = static_cast<unsigned int>(progress.miles);
+    wmap_day = static_cast<unsigned int>(progress.dayLength);
+    time_adder = progress.timeAdder;
+    return true;
+}
+
 bool worldmap_authoritative_travel_begin(int targetX, int targetY)
 {
     if (multiplayer::networkRuntimeMode() != multiplayer::NetworkLaunchMode::Host

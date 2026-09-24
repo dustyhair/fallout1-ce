@@ -3078,7 +3078,7 @@ void testSnapshotRoundTripAndRecovery()
                                                         + PC_TRAIT_MAX
                                                         + 4)
         * sizeof(std::uint32_t);
-    expect(packet.size() == kSnapshotHeaderSize + 48 + 2 * (32 + characterBuildWireSize) + 36 + 12 + 48 + 2 * 56 + 6 * 4 + 2 * 36 + 31 * 29 + 15 * 7 + 6 * 4 + 20,
+    expect(packet.size() == kSnapshotHeaderSize + 48 + 2 * (32 + characterBuildWireSize) + 36 + 12 + 48 + 2 * 56 + 6 * 4 + 2 * 36 + 31 * 29 + 15 * 7 + 6 * 4 + 20 + 14 * 4,
         "snapshot packet declares a fixed-width payload");
     expect(packet[0] == 'F' && packet[1] == 'C' && packet[2] == 'M' && packet[3] == 'S', "snapshot magic uses network byte order");
 
@@ -3237,6 +3237,27 @@ void testSnapshotRoundTripAndRecovery()
     SnapshotDigestResult routeDriftDigest = computeSnapshotDigest(routeDrift);
     expect(firstDivergentSection(travelDigest.digest, routeDriftDigest.digest) == SnapshotSection::WorldMap,
         "travel-controller drift reports the world-map section");
+    approvedTravel.worldMapTravel.progress = WorldMapTravelProgress {
+        true, 512, 824, 563, 749, 0, 1, -1, 1, 2, 1, 1, 80, 10800
+    };
+    expect(encodeSnapshot(approvedTravel, planningPacket) == SnapshotError::None
+            && decodeSnapshot(planningPacket).snapshot.worldMapTravel.progress.active
+            && decodeSnapshot(planningPacket).snapshot.worldMapTravel.progress.lineIndex == 1,
+        "snapshot recovers an active world-map travel line");
+    WorldSnapshot travelCounterDrift = approvedTravel;
+    travelCounterDrift.worldMapTravel.progress.lineIndex = 2;
+    SnapshotDigestResult travelCounterDigest = computeSnapshotDigest(travelCounterDrift);
+    expect(firstDivergentSection(computeSnapshotDigest(approvedTravel).digest,
+               travelCounterDigest.digest) == SnapshotSection::WorldMap,
+        "travel-counter drift reports the world-map section");
+    WorldSnapshot invalidTravelCounter = approvedTravel;
+    invalidTravelCounter.worldMapTravel.progress.lineIndex = 1500;
+    expect(validateSnapshot(invalidTravelCounter) == SnapshotError::InvalidWorldMapTravelState,
+        "snapshot rejects an impossible travel line index");
+    WorldSnapshot mismatchedTravelTarget = approvedTravel;
+    mismatchedTravelTarget.worldMapTravel.progress.targetX = 513;
+    expect(validateSnapshot(mismatchedTravelTarget) == SnapshotError::InvalidWorldMapTravelState,
+        "snapshot rejects a travel line for a different selected route");
     approvedTravel.worldMapTravel.targetX = kWorldMapWidth;
     expect(validateSnapshot(approvedTravel) == SnapshotError::InvalidWorldMapTravelState,
         "snapshot rejects an out-of-bounds travel target");

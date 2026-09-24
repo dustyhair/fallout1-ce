@@ -187,9 +187,57 @@ struct WorldMapTravelStepResult {
     bool dayElapsed = false;
 };
 
+struct WorldMapTravelProgress {
+    bool active = false;
+    std::int32_t targetX = -1;
+    std::int32_t targetY = -1;
+    std::int32_t deltaX = 0;
+    std::int32_t deltaY = 0;
+    std::int32_t lineError = 0;
+    std::int32_t lineIndex = 0;
+    std::int32_t xIncrement = 0;
+    std::int32_t yIncrement = 0;
+    std::int32_t moveCounter = 0;
+    std::int32_t visualCounter = 0;
+    std::int32_t miles = 0;
+    std::int32_t dayLength = 0;
+    std::int32_t timeAdder = 0;
+};
+
 bool worldmap_authoritative_travel_begin(int targetX, int targetY);
 WorldMapTravelStepResult worldmap_authoritative_travel_step();
 void worldmap_authoritative_travel_cancel();
+void worldmap_capture_travel_progress(WorldMapTravelProgress& progress);
+inline bool worldmap_validate_travel_progress(const WorldMapTravelProgress& progress, const WorldMapState& worldMap)
+{
+    if (!progress.active) {
+        return progress.targetX == -1 && progress.targetY == -1
+            && progress.deltaX == 0 && progress.deltaY == 0
+            && progress.lineError == 0 && progress.lineIndex == 0
+            && progress.xIncrement == 0 && progress.yIncrement == 0
+            && progress.moveCounter == 0 && progress.visualCounter == 0
+            && progress.miles == 0 && progress.dayLength == 0
+            && progress.timeAdder == 0;
+    }
+
+    int pathLength = progress.deltaX > progress.deltaY ? progress.deltaX : progress.deltaY;
+    return progress.targetX >= 0 && progress.targetX < 1400
+        && progress.targetY >= 0 && progress.targetY < 1500
+        && worldMap.x >= 0 && worldMap.x < 1400
+        && worldMap.y >= 0 && worldMap.y < 1500
+        && progress.deltaX >= 0 && progress.deltaX < 1400
+        && progress.deltaY >= 0 && progress.deltaY < 1500
+        && progress.lineIndex >= 0 && progress.lineIndex <= pathLength
+        && progress.lineError >= -pathLength && progress.lineError <= pathLength
+        && (progress.xIncrement == -1 || progress.xIncrement == 1)
+        && (progress.yIncrement == -1 || progress.yIncrement == 1)
+        && progress.moveCounter >= 0 && progress.moveCounter <= 4
+        && progress.visualCounter >= 0 && progress.visualCounter <= 2
+        && progress.dayLength >= 60 && progress.dayLength <= 120
+        && progress.miles >= 0 && progress.miles < progress.dayLength
+        && progress.timeAdder >= 0 && progress.timeAdder <= 14400;
+}
+bool worldmap_apply_travel_progress(const WorldMapTravelProgress& progress);
 
 extern int world_win;
 extern int our_section;
