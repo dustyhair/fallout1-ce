@@ -293,6 +293,43 @@ void agentJournalWriteWorldState(const AgentJournalWorldState& state)
     } else {
         fields << "null";
     }
+    fields << ",\"dialogue\":";
+    if (state.dialogue.has_value()) {
+        const auto& dialogue = *state.dialogue;
+        fields << "{\"revision\":" << dialogue.revision
+               << ",\"talker_player_id\":" << dialogue.talkerPlayerId
+               << ",\"target_id\":" << dialogue.targetId
+               << ",\"reply\":" << jsonString(dialogue.reply.c_str())
+               << ",\"options\":[";
+        for (std::size_t index = 0; index < dialogue.options.size(); index++) {
+            if (index != 0) fields << ',';
+            fields << jsonString(dialogue.options[index].c_str());
+        }
+        fields << "],\"votes\":[";
+        for (std::size_t index = 0; index < dialogue.votes.size(); index++) {
+            if (index != 0) fields << ',';
+            const auto& vote = dialogue.votes[index];
+            fields << "{\"player_id\":" << vote.playerId
+                   << ",\"option\":" << vote.option
+                   << ",\"connected\":" << booleanValue(vote.connected) << '}';
+        }
+        fields << "]}";
+    } else {
+        fields << "null";
+    }
+    fields << ",\"shared_activity\":[";
+    for (std::size_t index = 0; index < state.sharedActivity.size(); index++) {
+        if (index != 0) fields << ',';
+        const auto& entry = state.sharedActivity[index];
+        fields << "{\"id\":" << entry.id
+               << ",\"source_player_id\":" << entry.sourcePlayerId
+               << ",\"source_name\":" << jsonString(entry.sourceName.c_str())
+               << ",\"kind\":" << jsonString(entry.kind.c_str())
+               << ",\"subject\":" << entry.subject
+               << ",\"value\":" << entry.value
+               << ",\"text\":" << jsonString(entry.text.c_str()) << '}';
+    }
+    fields << ']';
     fields << ",\"host\":" << actorJson(state.host)
            << ",\"guest\":" << actorJson(state.guest)
            << ",\"local_inventory\":[";

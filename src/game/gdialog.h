@@ -22,6 +22,7 @@ int gdialog_reset();
 int gdialog_exit();
 bool dialog_active();
 void gdialog_enter(Object* target, int a2);
+void gdialog_multiplayer_guest_process();
 void dialogue_system_enter();
 void gdialog_setup_speech(const char* audioFileName);
 void gdialog_free_speech();

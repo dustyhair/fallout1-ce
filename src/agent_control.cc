@@ -281,6 +281,27 @@ void executeCommand(const AgentControlCommand& command)
             agentJournalWriteAgentCommand(command.id, commandName, "rejected", "rest is unavailable or invalid");
         }
         return;
+    case AgentControlCommandType::GameTalk:
+        if (multiplayer::networkRuntimeSubmitLocalTalk(
+                multiplayer::EntityId { command.entityId })) {
+            agentJournalWriteAgentCommand(command.id, commandName, "accepted",
+                "dialogue request submitted");
+        } else {
+            agentJournalWriteAgentCommand(command.id, commandName, "rejected",
+                "dialogue target or phase unavailable");
+        }
+        return;
+    case AgentControlCommandType::GameVote:
+        if (multiplayer::networkRuntimeSubmitDialogueVote(
+                command.dialogueRevision,
+                static_cast<std::uint8_t>(command.dialogueOption - 1))) {
+            agentJournalWriteAgentCommand(command.id, commandName, "accepted",
+                "revision-keyed dialogue vote submitted");
+        } else {
+            agentJournalWriteAgentCommand(command.id, commandName, "rejected",
+                "dialogue revision or option unavailable");
+        }
+        return;
     case AgentControlCommandType::GameGive:
         if (multiplayer::networkRuntimeGiveItemToPlayer(
                 multiplayer::EntityId { command.destinationEntityId },

@@ -1,6 +1,6 @@
 # Two-player co-op plan
 
-Status: Phases 0, 1, 2, 2.25, 2.5, 3A, 3B, 4A, and 4B are complete on the `multiplayer-plan` branch. Transport, lobby, journal, snapshot recovery, authenticated reconnect, content manifest, and first-contact fingerprint verification are implemented. Same-map exploration converges through the host command processor and authoritative checkpoints; replicas do not rerun rule-bearing scripts, rolls, or timed queues. Installed-data two-process scenarios cover movement, doors, pickup, loot, inventory gifts, skills, item-on-target quest completion, scenery and container state, XP, independent elevator, ladder, and typed-stair travel, shared cross-map elevators, exits, and typed stairs, agreed rest, world-map travel into towns, terrain, and encounters, and combat actions, effects, statuses, script-queued entry, and reconnect with complete authoritative checkpoints.
+Status: Phases 0, 1, 2, 2.25, 2.5, 3A, 3B, 4A, 4B, and 5 are complete on the `multiplayer-plan` branch. Transport, lobby, journal, snapshot recovery, authenticated reconnect, content manifest, and first-contact fingerprint verification are implemented. Same-map exploration converges through the host command processor and authoritative checkpoints; replicas do not rerun rule-bearing scripts, rolls, or timed queues. Installed-data two-process scenarios cover movement, doors, pickup, loot, inventory gifts, skills, item-on-target quest completion, scenery and container state, XP, independent elevator, ladder, and typed-stair travel, shared cross-map elevators, exits, and typed stairs, agreed rest, world-map travel into towns, terrain, and encounters, combat actions, effects, statuses, script-queued entry, and reconnect with complete authoritative checkpoints, plus host- and guest-led branching dialogue, split votes, attributed quest activity, talker skill checks, and a script-requested combat transition.
 
 ## Goal
 
@@ -532,6 +532,24 @@ exit condition; requiring them here conflicted with that phase's ownership.
   cover a three-player majority in headless tests while retaining two-process
   engine scenarios.
 
+Implemented voting default: a strict majority wins. If all connected voters
+have voted or the round times out with no majority, compare the strongest
+supporter of each tied option by Charisma, then Intelligence, using each
+character's scoped in-game stats frozen when the options appear. Only an exact
+stat tie uses one host-side random draw among the tied options. Disconnected
+players abstain without changing the frozen eligible roster. Talker-decides,
+host-decides, and host-tie policies remain available to the controller; the
+shared dialogue UI uses the stat-based majority default.
+
+Verification: `dialogue` and `dialogue-guest` installed-data two-process smoke
+scenarios cover a three-reply branch, visible conflicting ballots, an exact
+stat tie and a guest Intelligence win, host-only option/script execution, a
+dialogue-context Speech check for a guest talker, one attributed quest entry
+on each peer, and script-queued combat entry and exit. Headless tests cover a
+three-player majority, disconnect/timeout rules, bounded wire validation, and
+ordered, deduplicated multi-player activity replay through snapshots. Durable
+save/load of the shared feed remains Phase 6 sidecar work.
+
 Exit condition: the players can complete branching dialogue with a tie, a skill check, a quest update, and a combat transition.
 
 ### Phase 6: loot, trade, and recovery
@@ -695,7 +713,7 @@ Use these as provisional defaults. They keep Phase 0 unblocked and give later ph
 | First host and guest platforms | Linux and Windows desktop | Phase 2 transport selection |
 | Internet connection model | LAN and direct IP only, no relay in the MVP | Phase 2 lobby work |
 | Direct-IP first contact | Display an ephemeral SHA-256 host fingerprint and verify it when supplied out of band; omission is explicitly trusted LAN/TOFU | Phase 2 completion |
-| Tied dialogue vote | The talker decides after both votes are visible | Phase 5 |
+| Tied dialogue vote | Highest Charisma among tied options, then Intelligence; an exact stat tie uses one host random draw | Phase 5 |
 | Shared XP | Grant the original full award to both characters | Phase 1 progression tests |
 | Disconnected guest | The actor passes in combat and becomes unavailable for new exploration actions until reconnection | Phase 4 |
 | Compatibility manifest | Hash scripts, maps, prototypes, message files, and gameplay configuration. Exclude music, speech, and other presentation-only files | Phase 2 handshake |

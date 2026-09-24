@@ -16,6 +16,7 @@
 #include "game/critter.h"
 #include "game/gconfig.h"
 #include "game/object.h"
+#include "multiplayer/network_runtime.h"
 #include "plib/gnw/debug.h"
 #include "tts_audio.h"
 
@@ -248,6 +249,9 @@ static std::string dialogCachePath(const std::string& text, int speakerListId, b
 bool ttsInit()
 {
     configGetBool(&game_config, GAME_CONFIG_TTS_KEY, GAME_CONFIG_TTS_ENABLED_KEY, &tts_enabled);
+    if (multiplayer::networkRuntimeSmokeTestEnabled()) {
+        tts_enabled = false;
+    }
     configGetBool(&game_config, GAME_CONFIG_TTS_KEY, GAME_CONFIG_TTS_SPEAK_OPTIONS_KEY, &tts_speak_options);
 
     char* stringValue = nullptr;
@@ -261,7 +265,10 @@ bool ttsInit()
     bool speechDispatcherAvailable = false;
 
 #if defined(FALLOUT_HAVE_SPEECHD)
-    tts_connection = spd_open("fallout-ce-tts", "main", nullptr, SPD_MODE_THREADED);
+    // Headless multiplayer smoke runs must not contact Speech Dispatcher.
+    if (!multiplayer::networkRuntimeSmokeTestEnabled()) {
+        tts_connection = spd_open("fallout-ce-tts", "main", nullptr, SPD_MODE_THREADED);
+    }
     if (tts_connection == nullptr) {
         debug_printf("Text-to-speech: could not connect to Speech Dispatcher.\n");
     } else {

@@ -68,6 +68,13 @@ bool networkRuntimeRequestSharedModal(SharedModalKind kind, bool open);
 bool networkRuntimeSubmitLocalWorldMapRoute(std::int32_t targetX, std::int32_t targetY, bool clear = false);
 void networkRuntimeFlushWorldMapTerminalEvent();
 bool networkRuntimeBlockUnsupportedSharedModal(SharedModalKind kind);
+bool networkRuntimeHandleLocalTalk(Object* target);
+bool networkRuntimeSubmitLocalTalk(EntityId targetId);
+bool networkRuntimeBeginDialogue();
+void networkRuntimeEndDialogue();
+bool networkRuntimeSubmitDialogueVote(std::uint64_t revision, std::uint8_t option);
+void networkRuntimeObserveDialogueDecision(std::uint64_t revision, std::uint8_t option);
+void networkRuntimeProcessPendingTalk();
 bool networkRuntimeWorldPaused();
 bool networkRuntimeHandleLocalLootTargetChange(Object* target);
 bool networkRuntimeHandleLocalInventoryTransfer(Object* source,

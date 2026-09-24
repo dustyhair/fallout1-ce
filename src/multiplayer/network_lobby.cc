@@ -117,7 +117,11 @@ bool isSupportedLiveEvent(const GameEventPayload& payload)
         || std::holds_alternative<PartyExperienceAwardedEvent>(payload)
         || std::holds_alternative<SharedModalStateChangedEvent>(payload)
         || std::holds_alternative<WorldMapRouteSelectedEvent>(payload)
-        || std::holds_alternative<WorldMapArrivedEvent>(payload);
+        || std::holds_alternative<WorldMapArrivedEvent>(payload)
+        || std::holds_alternative<DialogueRequestedEvent>(payload)
+        || std::holds_alternative<DialogueVoteRecordedEvent>(payload)
+        || std::holds_alternative<DialoguePresentationEvent>(payload)
+        || std::holds_alternative<SharedActivityPublishedEvent>(payload);
 }
 
 } // namespace
@@ -351,6 +355,22 @@ bool NetworkLobby::sendLocalCombatFace(std::int32_t rotation,
         phaseRevision, SessionPhase::Combat);
 }
 
+bool NetworkLobby::sendLocalTalk(EntityId targetId, std::uint32_t phaseRevision)
+{
+    return _mode == NetworkLaunchMode::Join && sendLocalAction(
+        DialogueRequestedEvent { EntityId { kGuestPlayerId.value }, targetId, phaseRevision + 1 },
+        TalkCommand { targetId }, phaseRevision);
+}
+
+bool NetworkLobby::sendLocalDialogueVote(std::uint64_t revision,
+    std::uint8_t option, std::uint32_t phaseRevision)
+{
+    return _mode == NetworkLaunchMode::Join && sendLocalAction(
+        DialogueVoteRecordedEvent { EntityId { kGuestPlayerId.value }, revision, option },
+        DialogueVoteCommand { revision, option }, phaseRevision,
+        SessionPhase::Dialogue);
+}
+
 bool NetworkLobby::sendLocalSharedModal(SharedModalKind kind, bool open, SessionPhase currentPhase, std::uint32_t phaseRevision)
 {
     PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
@@ -449,6 +469,8 @@ bool NetworkLobby::sendLocalAction(
                 || std::holds_alternative<CombatFaceCommand>(commandPayload)
                 || std::holds_alternative<EndTurnCommand>(commandPayload))
             ? SessionPhase::Combat
+            : std::holds_alternative<DialogueVoteCommand>(commandPayload)
+            ? SessionPhase::Dialogue
             : modal != nullptr && !modal->open
             ? sharedModalPhase(modal->kind)
             : SessionPhase::Exploration;

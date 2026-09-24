@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -337,6 +338,17 @@ struct SharedModalCommand {
     bool open = false;
 };
 
+struct TalkCommand {
+    EntityId targetId;
+};
+
+struct DialogueVoteCommand {
+    std::uint64_t revision = 0;
+    std::uint8_t option = 0;
+};
+
+constexpr std::uint8_t kMaximumDialogueOptions = 30;
+
 constexpr std::int32_t kWorldMapWidth = 1400;
 constexpr std::int32_t kWorldMapHeight = 1500;
 
@@ -354,7 +366,7 @@ constexpr bool isValid(const WorldMapRouteCommand& route)
             && route.targetY >= 0 && route.targetY < kWorldMapHeight;
 }
 
-using GameCommandPayload = std::variant<MoveCommand, FaceCommand, InteractCommand, PickupCommand, LootCommand, UseSkillCommand, UseItemOnCommand, ElevatorCommand, ExitGridCommand, SceneryTransitionCommand, RestCommand, InventoryTransferCommand, ItemDropCommand, AttackCommand, CombatMoveCommand, CombatItemCommand, CombatReloadCommand, CombatFaceCommand, EndTurnCommand, SharedModalCommand, WorldMapRouteCommand>;
+using GameCommandPayload = std::variant<MoveCommand, FaceCommand, InteractCommand, PickupCommand, LootCommand, UseSkillCommand, UseItemOnCommand, ElevatorCommand, ExitGridCommand, SceneryTransitionCommand, RestCommand, InventoryTransferCommand, ItemDropCommand, AttackCommand, CombatMoveCommand, CombatItemCommand, CombatReloadCommand, CombatFaceCommand, EndTurnCommand, SharedModalCommand, WorldMapRouteCommand, TalkCommand, DialogueVoteCommand>;
 
 struct GameCommand {
     CommandSequence sequence;
@@ -598,6 +610,48 @@ struct SharedModalStateChangedEvent {
     std::uint32_t phaseRevision = 0;
 };
 
+struct DialogueRequestedEvent {
+    EntityId actorId;
+    EntityId targetId;
+    std::uint32_t phaseRevision = 0;
+};
+
+struct DialogueVoteRecordedEvent {
+    EntityId actorId;
+    std::uint64_t revision = 0;
+    std::uint8_t option = 0;
+};
+
+struct DialoguePresentationEvent {
+    EntityId actorId;
+    EntityId targetId;
+    std::uint64_t revision = 0;
+    std::uint8_t policy = 1;
+    std::string reply;
+    std::vector<std::string> options;
+};
+
+enum class SharedActivityKind : std::uint8_t {
+    Quest = 1,
+    Discovery = 2,
+    WorldOutcome = 3,
+};
+
+struct SharedActivityEntry {
+    std::uint64_t id = 0;
+    PlayerId sourceId; // Zero means the world/system, not a player.
+    std::string sourceName;
+    SharedActivityKind kind = SharedActivityKind::Quest;
+    std::int32_t subject = 0; // Quest message id or world-map town id.
+    std::int32_t value = 0;
+    std::string text;
+};
+
+struct SharedActivityPublishedEvent {
+    EntityId actorId; // Host actor for system-originated entries.
+    SharedActivityEntry entry;
+};
+
 struct WorldMapRouteSelectedEvent {
     EntityId actorId;
     std::int32_t targetX = -1;
@@ -605,7 +659,7 @@ struct WorldMapRouteSelectedEvent {
     bool clear = false;
 };
 
-using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, ItemPickupCompletedEvent, LootStartedEvent, SkillUseStartedEvent, ItemUseStartedEvent, ElevatorTransitionedEvent, ExitGridTransitionedEvent, SceneryTransitionedEvent, RestStateChangedEvent, InventoryTransferredEvent, ItemDroppedEvent, AttackStartedEvent, CombatTurnStateChangedEvent, CombatActionResolvedEvent, PartyExperienceAwardedEvent, SharedModalStateChangedEvent, WorldMapRouteSelectedEvent, WorldMapArrivedEvent>;
+using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, ItemPickupCompletedEvent, LootStartedEvent, SkillUseStartedEvent, ItemUseStartedEvent, ElevatorTransitionedEvent, ExitGridTransitionedEvent, SceneryTransitionedEvent, RestStateChangedEvent, InventoryTransferredEvent, ItemDroppedEvent, AttackStartedEvent, CombatTurnStateChangedEvent, CombatActionResolvedEvent, PartyExperienceAwardedEvent, SharedModalStateChangedEvent, WorldMapRouteSelectedEvent, WorldMapArrivedEvent, DialogueRequestedEvent, DialogueVoteRecordedEvent, DialoguePresentationEvent, SharedActivityPublishedEvent>;
 
 struct GameEvent {
     EventSequence sequence;

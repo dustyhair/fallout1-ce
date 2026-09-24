@@ -27,6 +27,8 @@ constexpr std::size_t kTimedEventSnapshotSize = 36;
 constexpr std::size_t kWorldMapSnapshotSize = 31 * 29 + 15 * 7 + 6 * sizeof(std::uint32_t);
 constexpr std::size_t kWorldMapTravelSnapshotSize = 20 + 14 * sizeof(std::uint32_t);
 constexpr std::size_t kCombatStateBaseSize = 32;
+constexpr std::size_t kDialogueSnapshotBaseSize = 8;
+constexpr std::size_t kMaximumSharedActivityEntries = 64;
 constexpr std::size_t kSnapshotProtectedOffset = 20;
 constexpr std::uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
 constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
@@ -103,6 +105,71 @@ void appendCombatTurnState(std::vector<std::uint8_t>& bytes, const CombatTurnSta
     for (const CombatInitiativeEntry& entry : state.initiative) {
         appendUint32(bytes, entry.actorId.value);
         appendUint32(bytes, entry.ownerId.value);
+    }
+}
+
+std::size_t dialogueSnapshotSize(const WorldSnapshot& snapshot)
+{
+    std::size_t size = kDialogueSnapshotBaseSize;
+    if (!snapshot.dialoguePresentation.has_value()) return size;
+    size += 20 + snapshot.dialoguePresentation->reply.size()
+        + snapshot.dialogueBallots.size() * 8;
+    for (const std::string& option : snapshot.dialoguePresentation->options) {
+        size += 2 + option.size();
+    }
+    return size;
+}
+
+void appendDialogue(std::vector<std::uint8_t>& bytes, const WorldSnapshot& snapshot)
+{
+    appendUint32(bytes, snapshot.dialogueActorId.value);
+    appendUint32(bytes, snapshot.dialoguePresentation.has_value() ? 1 : 0);
+    if (!snapshot.dialoguePresentation.has_value()) return;
+    const DialoguePresentationEvent& state = *snapshot.dialoguePresentation;
+    appendUint32(bytes, state.targetId.value);
+    appendUint64(bytes, state.revision);
+    appendUint8(bytes, state.policy);
+    appendUint8(bytes, static_cast<std::uint8_t>(state.options.size()));
+    appendUint16(bytes, static_cast<std::uint16_t>(state.reply.size()));
+    appendUint8(bytes, static_cast<std::uint8_t>(snapshot.dialogueBallots.size()));
+    appendUint8(bytes, 0);
+    appendUint16(bytes, 0);
+    bytes.insert(bytes.end(), state.reply.begin(), state.reply.end());
+    for (const std::string& option : state.options) {
+        appendUint16(bytes, static_cast<std::uint16_t>(option.size()));
+        bytes.insert(bytes.end(), option.begin(), option.end());
+    }
+    for (const DialogueBallot& ballot : snapshot.dialogueBallots) {
+        appendUint32(bytes, ballot.playerId.value);
+        appendUint8(bytes, ballot.option.value_or(255));
+        appendUint8(bytes, ballot.connected ? 1 : 0);
+        appendUint16(bytes, 0);
+    }
+}
+
+std::size_t sharedActivitySnapshotSize(const WorldSnapshot& snapshot)
+{
+    std::size_t size = 4;
+    for (const SharedActivityEntry& entry : snapshot.sharedActivity) {
+        size += 24 + entry.sourceName.size() + entry.text.size();
+    }
+    return size;
+}
+
+void appendSharedActivity(std::vector<std::uint8_t>& bytes,
+    const WorldSnapshot& snapshot)
+{
+    appendUint32(bytes, static_cast<std::uint32_t>(snapshot.sharedActivity.size()));
+    for (const SharedActivityEntry& entry : snapshot.sharedActivity) {
+        appendUint64(bytes, entry.id);
+        appendUint32(bytes, entry.sourceId.value);
+        appendUint8(bytes, static_cast<std::uint8_t>(entry.kind));
+        appendUint8(bytes, static_cast<std::uint8_t>(entry.sourceName.size()));
+        appendUint16(bytes, static_cast<std::uint16_t>(entry.text.size()));
+        appendUint32(bytes, static_cast<std::uint32_t>(entry.subject));
+        appendUint32(bytes, static_cast<std::uint32_t>(entry.value));
+        bytes.insert(bytes.end(), entry.sourceName.begin(), entry.sourceName.end());
+        bytes.insert(bytes.end(), entry.text.begin(), entry.text.end());
     }
 }
 
@@ -423,6 +490,55 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
     if (snapshot.timedEvents.size() > kMaxSnapshotTimedEvents) {
         return SnapshotError::TooManyTimedEvents;
     }
+    if (snapshot.phase == SessionPhase::Dialogue) {
+        if (!isValid(snapshot.dialogueActorId)
+            || !std::any_of(snapshot.actors.begin(), snapshot.actors.end(),
+                [&](const ActorSnapshot& actor) {
+                    return actor.entityId == snapshot.dialogueActorId;
+                })) return SnapshotError::InvalidDialogueState;
+    } else if (isValid(snapshot.dialogueActorId)
+        || snapshot.dialoguePresentation.has_value()
+        || !snapshot.dialogueBallots.empty()) {
+        return SnapshotError::InvalidDialogueState;
+    }
+    if (snapshot.dialoguePresentation.has_value()) {
+        const auto& presentation = *snapshot.dialoguePresentation;
+        if (presentation.actorId != snapshot.dialogueActorId
+            || !isValid(presentation.targetId) || presentation.revision == 0
+            || presentation.policy < 1 || presentation.policy > 4
+            || presentation.reply.empty() || presentation.reply.size() > 899
+            || presentation.options.empty() || presentation.options.size() > kMaximumDialogueOptions
+            || snapshot.dialogueBallots.empty()
+            || snapshot.dialogueBallots.size() > kMaximumTransitionPlayers) {
+            return SnapshotError::InvalidDialogueState;
+        }
+        for (const std::string& option : presentation.options) {
+            if (option.empty() || option.size() > 899) return SnapshotError::InvalidDialogueState;
+        }
+        std::unordered_set<std::uint32_t> seen;
+        for (const DialogueBallot& ballot : snapshot.dialogueBallots) {
+            if (!isValid(ballot.playerId) || !seen.insert(ballot.playerId.value).second
+                || (ballot.option.has_value()
+                    && *ballot.option >= presentation.options.size())) {
+                return SnapshotError::InvalidDialogueState;
+            }
+        }
+    } else if (!snapshot.dialogueBallots.empty()) {
+        return SnapshotError::InvalidDialogueState;
+    }
+    if (snapshot.sharedActivity.size() > kMaximumSharedActivityEntries) {
+        return SnapshotError::InvalidDialogueState;
+    }
+    std::uint64_t previousActivityId = 0;
+    for (const SharedActivityEntry& entry : snapshot.sharedActivity) {
+        if (entry.id <= previousActivityId || entry.kind < SharedActivityKind::Quest
+            || entry.kind > SharedActivityKind::WorldOutcome
+            || entry.sourceName.empty() || entry.sourceName.size() > 32
+            || entry.text.empty() || entry.text.size() > 160) {
+            return SnapshotError::InvalidDialogueState;
+        }
+        previousActivityId = entry.id;
+    }
     const WorldMapState& worldMap = snapshot.worldMap;
     if (worldMap.firstVisits < 0 || worldMap.firstVisits > 0xFFF
         || worldMap.specialEncounters < 0 || worldMap.specialEncounters > 0x3F
@@ -639,7 +755,9 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
         + kWorldMapSnapshotSize
         + kWorldMapTravelSnapshotSize
         + kCombatStateBaseSize
-        + snapshot.combat.initiative.size() * 8;
+        + snapshot.combat.initiative.size() * 8
+        + dialogueSnapshotSize(snapshot)
+        + sharedActivitySnapshotSize(snapshot);
     if (payloadSize > kMaxSnapshotPayloadSize) {
         return SnapshotError::PayloadTooLarge;
     }
@@ -671,7 +789,9 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
         + kWorldMapSnapshotSize
         + kWorldMapTravelSnapshotSize
         + kCombatStateBaseSize
-        + canonical.combat.initiative.size() * 8);
+        + canonical.combat.initiative.size() * 8
+        + dialogueSnapshotSize(canonical)
+        + sharedActivitySnapshotSize(canonical));
 
     appendUint8(payload, static_cast<std::uint8_t>(canonical.phase));
     appendUint8(payload, 0);
@@ -712,6 +832,8 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
     appendWorldMapTravel(payload, canonical.worldMapTravel);
     appendCombatTurnState(payload, canonical.combat);
     appendUint32(payload, static_cast<std::uint32_t>(canonical.combatFreeMove));
+    appendDialogue(payload, canonical);
+    appendSharedActivity(payload, canonical);
 
     std::vector<std::uint8_t> protectedBytes;
     protectedBytes.reserve(sizeof(std::uint64_t) + payload.size());
@@ -849,7 +971,9 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
         + expectedPayloadSize - 2 * sizeof(std::uint32_t);
     std::uint32_t combatCount = readUint32(packet, combatCountOffset);
     if (combatCount > kMaximumCombatInitiative
-        || payloadSize != expectedPayloadSize + static_cast<std::size_t>(combatCount) * 8) {
+        || payloadSize < expectedPayloadSize
+            + static_cast<std::size_t>(combatCount) * 8
+            + kDialogueSnapshotBaseSize + 4) {
         result.error = SnapshotError::TrailingData;
         return result;
     }
@@ -1037,6 +1161,110 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
         });
     }
     result.snapshot.combatFreeMove = static_cast<std::int32_t>(readUint32(packet, offset));
+    result.snapshot.dialogueActorId.value = readUint32(packet, offset);
+    std::uint32_t dialoguePresent = readUint32(packet, offset);
+    if (dialoguePresent > 1) {
+        result.error = SnapshotError::InvalidDialogueState;
+        return result;
+    }
+    if (dialoguePresent != 0) {
+        if (offset + 20 > packet.size()) {
+            result.error = SnapshotError::TruncatedPayload;
+            return result;
+        }
+        DialoguePresentationEvent presentation;
+        presentation.actorId = result.snapshot.dialogueActorId;
+        presentation.targetId.value = readUint32(packet, offset);
+        presentation.revision = readUint64(packet, offset);
+        presentation.policy = readUint8(packet, offset);
+        std::uint8_t optionCount = readUint8(packet, offset);
+        std::uint16_t replyLength = readUint16(packet, offset);
+        std::uint8_t ballotCount = readUint8(packet, offset);
+        if (readUint8(packet, offset) != 0 || readUint16(packet, offset) != 0
+            || optionCount == 0 || optionCount > kMaximumDialogueOptions
+            || replyLength == 0 || replyLength > 899
+            || ballotCount == 0 || ballotCount > kMaximumTransitionPlayers
+            || offset + replyLength > packet.size()) {
+            result.error = SnapshotError::InvalidDialogueState;
+            return result;
+        }
+        presentation.reply.assign(packet.begin() + offset,
+            packet.begin() + offset + replyLength);
+        offset += replyLength;
+        for (std::uint8_t index = 0; index < optionCount; index++) {
+            if (offset + 2 > packet.size()) {
+                result.error = SnapshotError::TruncatedPayload;
+                return result;
+            }
+            std::uint16_t length = readUint16(packet, offset);
+            if (length == 0 || length > 899 || offset + length > packet.size()) {
+                result.error = SnapshotError::InvalidDialogueState;
+                return result;
+            }
+            presentation.options.emplace_back(packet.begin() + offset,
+                packet.begin() + offset + length);
+            offset += length;
+        }
+        for (std::uint8_t index = 0; index < ballotCount; index++) {
+            if (offset + 8 > packet.size()) {
+                result.error = SnapshotError::TruncatedPayload;
+                return result;
+            }
+            DialogueBallot ballot;
+            ballot.playerId.value = readUint32(packet, offset);
+            std::uint8_t choice = readUint8(packet, offset);
+            std::uint8_t connected = readUint8(packet, offset);
+            if (readUint16(packet, offset) != 0 || connected > 1
+                || (choice != 255 && choice >= optionCount)) {
+                result.error = SnapshotError::InvalidDialogueState;
+                return result;
+            }
+            if (choice != 255) ballot.option = choice;
+            ballot.connected = connected != 0;
+            result.snapshot.dialogueBallots.push_back(ballot);
+        }
+        result.snapshot.dialoguePresentation = std::move(presentation);
+    }
+    if (offset + 4 > packet.size()) {
+        result.error = SnapshotError::TruncatedPayload;
+        return result;
+    }
+    std::uint32_t activityCount = readUint32(packet, offset);
+    if (activityCount > kMaximumSharedActivityEntries) {
+        result.error = SnapshotError::InvalidDialogueState;
+        return result;
+    }
+    for (std::uint32_t index = 0; index < activityCount; index++) {
+        if (offset + 24 > packet.size()) {
+            result.error = SnapshotError::TruncatedPayload;
+            return result;
+        }
+        SharedActivityEntry entry;
+        entry.id = readUint64(packet, offset);
+        entry.sourceId.value = readUint32(packet, offset);
+        entry.kind = static_cast<SharedActivityKind>(readUint8(packet, offset));
+        std::uint8_t nameLength = readUint8(packet, offset);
+        std::uint16_t textLength = readUint16(packet, offset);
+        entry.subject = static_cast<std::int32_t>(readUint32(packet, offset));
+        entry.value = static_cast<std::int32_t>(readUint32(packet, offset));
+        if (nameLength == 0 || nameLength > 32 || textLength == 0
+            || textLength > 160
+            || offset + nameLength + textLength > packet.size()) {
+            result.error = SnapshotError::InvalidDialogueState;
+            return result;
+        }
+        entry.sourceName.assign(packet.begin() + offset,
+            packet.begin() + offset + nameLength);
+        offset += nameLength;
+        entry.text.assign(packet.begin() + offset,
+            packet.begin() + offset + textLength);
+        offset += textLength;
+        result.snapshot.sharedActivity.push_back(std::move(entry));
+    }
+    if (offset != packet.size()) {
+        result.error = SnapshotError::TrailingData;
+        return result;
+    }
 
     result.error = validateSnapshot(result.snapshot);
     if (result.error == SnapshotError::None) {
@@ -1067,6 +1295,8 @@ SnapshotDigestResult computeSnapshotDigest(const WorldSnapshot& snapshot)
     digestCombat.remainingMilliseconds = 0;
     appendCombatTurnState(sessionBytes, digestCombat);
     appendUint32(sessionBytes, static_cast<std::uint32_t>(canonical.combatFreeMove));
+    appendDialogue(sessionBytes, canonical);
+    appendSharedActivity(sessionBytes, canonical);
     result.digest.session = digestBytes(sessionBytes);
 
     std::vector<std::uint8_t> actorBytes;

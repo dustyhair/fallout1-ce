@@ -32,6 +32,8 @@ enum class CommandType : std::uint8_t {
     CombatItem = 19,
     CombatReload = 20,
     CombatFace = 21,
+    Talk = 22,
+    DialogueVote = 23,
 };
 
 enum class EventType : std::uint8_t {
@@ -56,6 +58,10 @@ enum class EventType : std::uint8_t {
     CombatTurnStateChanged = 19,
     CombatActionResolved = 20,
     PartyExperienceAwarded = 21,
+    DialogueRequested = 22,
+    DialogueVoteRecorded = 23,
+    DialoguePresentation = 24,
+    SharedActivityPublished = 25,
 };
 
 constexpr std::size_t kCommandHeaderSize = 28;
@@ -72,6 +78,7 @@ constexpr std::size_t kCombatItemCommandSize = kCommandHeaderSize + 16;
 constexpr std::size_t kCombatReloadCommandSize = kCommandHeaderSize + 16;
 constexpr std::size_t kCombatFaceCommandSize = kCommandHeaderSize + 12;
 constexpr std::size_t kSharedModalCommandSize = kCommandHeaderSize + 4;
+constexpr std::size_t kDialogueVoteCommandSize = kCommandHeaderSize + 12;
 constexpr std::size_t kSkillCommandSize = kCommandHeaderSize + 8;
 constexpr std::size_t kItemUseCommandSize = kCommandHeaderSize + 8;
 constexpr std::size_t kElevatorCommandSize = kCommandHeaderSize + 8;
@@ -90,6 +97,7 @@ constexpr std::size_t kCombatActionEventSize = kEventHeaderSize + 24;
 constexpr std::size_t kPartyExperienceEventBaseSize = kEventHeaderSize + 12;
 constexpr std::size_t kPlayerProgressionSize = 20;
 constexpr std::size_t kSharedModalEventSize = kEventHeaderSize + 12;
+constexpr std::size_t kDialogueVoteEventSize = kEventHeaderSize + 16;
 constexpr std::size_t kSkillEventSize = kEventHeaderSize + 12;
 constexpr std::size_t kItemUseEventSize = kEventHeaderSize + 12;
 constexpr std::size_t kElevatorEventSize = kEventHeaderSize + 40;
@@ -340,6 +348,13 @@ GameplayWireError validateCommand(const GameCommand& command)
             ? GameplayWireError::None
             : GameplayWireError::InvalidModal;
     }
+    if (const auto* talk = std::get_if<TalkCommand>(&command.payload)) {
+        return isValid(talk->targetId) ? GameplayWireError::None : GameplayWireError::InvalidEntityId;
+    }
+    if (const auto* vote = std::get_if<DialogueVoteCommand>(&command.payload)) {
+        return vote->revision != 0 && vote->option < kMaximumDialogueOptions
+            ? GameplayWireError::None : GameplayWireError::InvalidModal;
+    }
     if (const auto* route = std::get_if<WorldMapRouteCommand>(&command.payload)) {
         return isValid(*route) ? GameplayWireError::None : GameplayWireError::InvalidMove;
     }
@@ -573,6 +588,35 @@ GameplayWireError validateEvent(const GameEvent& event)
                        && modal->phase == SessionPhase::Exploration))
             ? GameplayWireError::None
             : GameplayWireError::InvalidModal;
+    }
+    if (const auto* requested = std::get_if<DialogueRequestedEvent>(&event.payload)) {
+        return isValid(requested->actorId) && isValid(requested->targetId)
+                && requested->phaseRevision != 0
+            ? GameplayWireError::None : GameplayWireError::InvalidEntityId;
+    }
+    if (const auto* vote = std::get_if<DialogueVoteRecordedEvent>(&event.payload)) {
+        return isValid(vote->actorId) && vote->revision != 0 && vote->option < kMaximumDialogueOptions
+            ? GameplayWireError::None : GameplayWireError::InvalidModal;
+    }
+    if (const auto* presentation = std::get_if<DialoguePresentationEvent>(&event.payload)) {
+        if (!isValid(presentation->actorId) || !isValid(presentation->targetId)
+            || presentation->revision == 0 || presentation->policy < 1
+            || presentation->policy > 4 || presentation->reply.empty()
+            || presentation->reply.size() > 899 || presentation->options.empty()
+            || presentation->options.size() > kMaximumDialogueOptions) return GameplayWireError::InvalidModal;
+        for (const std::string& option : presentation->options) {
+            if (option.empty() || option.size() > 899) return GameplayWireError::InvalidModal;
+        }
+        return GameplayWireError::None;
+    }
+    if (const auto* activity = std::get_if<SharedActivityPublishedEvent>(&event.payload)) {
+        const SharedActivityEntry& entry = activity->entry;
+        return isValid(activity->actorId) && entry.id != 0
+                && entry.kind >= SharedActivityKind::Quest
+                && entry.kind <= SharedActivityKind::WorldOutcome
+                && !entry.sourceName.empty() && entry.sourceName.size() <= 32
+                && !entry.text.empty() && entry.text.size() <= 160
+            ? GameplayWireError::None : GameplayWireError::InvalidModal;
     }
     if (const auto* route = std::get_if<WorldMapRouteSelectedEvent>(&event.payload)) {
         return isValid(route->actorId)
@@ -824,6 +868,13 @@ GameplayWireError encodeGameCommand(const GameCommand& command, ProtocolEnvelope
         envelope.payload.push_back(static_cast<std::uint8_t>(modal->kind));
         envelope.payload.push_back(modal->open ? 1 : 0);
         appendUInt16(envelope.payload, 0);
+    } else if (const auto* talk = std::get_if<TalkCommand>(&command.payload)) {
+        appendCommandHeader(command, CommandType::Talk, envelope.payload);
+        appendUInt32(envelope.payload, talk->targetId.value);
+    } else if (const auto* vote = std::get_if<DialogueVoteCommand>(&command.payload)) {
+        appendCommandHeader(command, CommandType::DialogueVote, envelope.payload);
+        appendUInt64(envelope.payload, vote->revision);
+        appendUInt32(envelope.payload, vote->option);
     } else if (const auto* route = std::get_if<WorldMapRouteCommand>(&command.payload)) {
         appendCommandHeader(command, CommandType::WorldMapRoute, envelope.payload);
         appendInt32(envelope.payload, route->targetX);
@@ -1057,6 +1108,24 @@ GameCommandDecodeResult decodeGameCommand(const ProtocolEnvelope& envelope)
             envelope.payload[29] != 0,
         };
         break;
+    case CommandType::Talk:
+        if (envelope.payload.size() != kTargetCommandSize) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.command.payload = TalkCommand { EntityId { readUInt32(envelope.payload, 28) } };
+        break;
+    case CommandType::DialogueVote:
+        if (envelope.payload.size() != kDialogueVoteCommandSize
+            || readUInt32(envelope.payload, 36) >= kMaximumDialogueOptions) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.command.payload = DialogueVoteCommand {
+            readUInt64(envelope.payload, 28),
+            static_cast<std::uint8_t>(readUInt32(envelope.payload, 36)),
+        };
+        break;
     case CommandType::WorldMapRoute:
         if (envelope.payload.size() != kWorldMapRouteCommandSize
             || envelope.payload[36] > 1
@@ -1263,6 +1332,41 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
         envelope.payload.push_back(static_cast<std::uint8_t>(modal->phase));
         envelope.payload.push_back(0);
         appendUInt32(envelope.payload, modal->phaseRevision);
+    } else if (const auto* requested = std::get_if<DialogueRequestedEvent>(&event.payload)) {
+        appendEventHeader(event, EventType::DialogueRequested, envelope.payload);
+        appendUInt32(envelope.payload, requested->actorId.value);
+        appendUInt32(envelope.payload, requested->targetId.value);
+        appendUInt32(envelope.payload, requested->phaseRevision);
+    } else if (const auto* vote = std::get_if<DialogueVoteRecordedEvent>(&event.payload)) {
+        appendEventHeader(event, EventType::DialogueVoteRecorded, envelope.payload);
+        appendUInt32(envelope.payload, vote->actorId.value);
+        appendUInt64(envelope.payload, vote->revision);
+        appendUInt32(envelope.payload, vote->option);
+    } else if (const auto* presentation = std::get_if<DialoguePresentationEvent>(&event.payload)) {
+        appendEventHeader(event, EventType::DialoguePresentation, envelope.payload);
+        appendUInt32(envelope.payload, presentation->actorId.value);
+        appendUInt32(envelope.payload, presentation->targetId.value);
+        appendUInt64(envelope.payload, presentation->revision);
+        envelope.payload.push_back(presentation->policy);
+        envelope.payload.push_back(static_cast<std::uint8_t>(presentation->options.size()));
+        appendUInt16(envelope.payload, static_cast<std::uint16_t>(presentation->reply.size()));
+        envelope.payload.insert(envelope.payload.end(), presentation->reply.begin(), presentation->reply.end());
+        for (const std::string& option : presentation->options) {
+            appendUInt16(envelope.payload, static_cast<std::uint16_t>(option.size()));
+            envelope.payload.insert(envelope.payload.end(), option.begin(), option.end());
+        }
+    } else if (const auto* activity = std::get_if<SharedActivityPublishedEvent>(&event.payload)) {
+        appendEventHeader(event, EventType::SharedActivityPublished, envelope.payload);
+        appendUInt32(envelope.payload, activity->actorId.value);
+        appendUInt64(envelope.payload, activity->entry.id);
+        appendUInt32(envelope.payload, activity->entry.sourceId.value);
+        envelope.payload.push_back(static_cast<std::uint8_t>(activity->entry.kind));
+        envelope.payload.push_back(static_cast<std::uint8_t>(activity->entry.sourceName.size()));
+        appendUInt16(envelope.payload, static_cast<std::uint16_t>(activity->entry.text.size()));
+        appendInt32(envelope.payload, activity->entry.subject);
+        appendInt32(envelope.payload, activity->entry.value);
+        envelope.payload.insert(envelope.payload.end(), activity->entry.sourceName.begin(), activity->entry.sourceName.end());
+        envelope.payload.insert(envelope.payload.end(), activity->entry.text.begin(), activity->entry.text.end());
     } else if (const auto* route = std::get_if<WorldMapRouteSelectedEvent>(&event.payload)) {
         appendEventHeader(event, EventType::WorldMapRouteSelected, envelope.payload);
         appendUInt32(envelope.payload, route->actorId.value);
@@ -1818,6 +1922,105 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
             readUInt32(envelope.payload, 40) != 0,
         };
         break;
+    case EventType::DialogueRequested:
+        if (envelope.payload.size() != kTargetEventSize + 4) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.event.payload = DialogueRequestedEvent {
+            EntityId { readUInt32(envelope.payload, 20) },
+            EntityId { readUInt32(envelope.payload, 24) },
+            readUInt32(envelope.payload, 28),
+        };
+        break;
+    case EventType::DialogueVoteRecorded:
+        if (envelope.payload.size() != kDialogueVoteEventSize
+            || readUInt32(envelope.payload, 32) >= kMaximumDialogueOptions) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.event.payload = DialogueVoteRecordedEvent {
+            EntityId { readUInt32(envelope.payload, 20) },
+            readUInt64(envelope.payload, 24),
+            static_cast<std::uint8_t>(readUInt32(envelope.payload, 32)),
+        };
+        break;
+    case EventType::DialoguePresentation: {
+        if (envelope.payload.size() < 40) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        DialoguePresentationEvent presentation;
+        presentation.actorId.value = readUInt32(envelope.payload, 20);
+        presentation.targetId.value = readUInt32(envelope.payload, 24);
+        presentation.revision = readUInt64(envelope.payload, 28);
+        presentation.policy = envelope.payload[36];
+        std::uint8_t count = envelope.payload[37];
+        std::uint16_t length = readUInt16(envelope.payload, 38);
+        if (!isValid(presentation.actorId) || !isValid(presentation.targetId)
+            || presentation.revision == 0
+            || presentation.policy < 1 || presentation.policy > 4) {
+            result.error = GameplayWireError::InvalidModal;
+            return result;
+        }
+        if (count == 0 || count > kMaximumDialogueOptions || length == 0 || length > 899
+            || envelope.payload.size() < 40 + length) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        std::size_t offset = 40;
+        presentation.reply.assign(envelope.payload.begin() + offset,
+            envelope.payload.begin() + offset + length);
+        offset += length;
+        for (std::uint8_t index = 0; index < count; index++) {
+            if (offset + 2 > envelope.payload.size()) {
+                result.error = GameplayWireError::InvalidLength;
+                return result;
+            }
+            length = readUInt16(envelope.payload, offset);
+            offset += 2;
+            if (length == 0 || length > 899 || offset + length > envelope.payload.size()) {
+                result.error = GameplayWireError::InvalidLength;
+                return result;
+            }
+            presentation.options.emplace_back(envelope.payload.begin() + offset,
+                envelope.payload.begin() + offset + length);
+            offset += length;
+        }
+        if (offset != envelope.payload.size()) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.event.payload = std::move(presentation);
+        break;
+    }
+    case EventType::SharedActivityPublished: {
+        if (envelope.payload.size() < 48) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        SharedActivityPublishedEvent activity;
+        activity.actorId.value = readUInt32(envelope.payload, 20);
+        activity.entry.id = readUInt64(envelope.payload, 24);
+        activity.entry.sourceId.value = readUInt32(envelope.payload, 32);
+        activity.entry.kind = static_cast<SharedActivityKind>(envelope.payload[36]);
+        std::uint8_t nameLength = envelope.payload[37];
+        std::uint16_t textLength = readUInt16(envelope.payload, 38);
+        activity.entry.subject = readInt32(envelope.payload, 40);
+        activity.entry.value = readInt32(envelope.payload, 44);
+        if (nameLength == 0 || nameLength > 32 || textLength == 0
+            || textLength > 160 || envelope.payload.size()
+                != 48 + nameLength + textLength) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        activity.entry.sourceName.assign(envelope.payload.begin() + 48,
+            envelope.payload.begin() + 48 + nameLength);
+        activity.entry.text.assign(envelope.payload.begin() + 48 + nameLength,
+            envelope.payload.end());
+        result.event.payload = std::move(activity);
+        break;
+    }
     default:
         result.error = GameplayWireError::UnknownPayloadType;
         return result;

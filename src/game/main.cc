@@ -22,6 +22,7 @@
 #include "game/cycle.h"
 #include "game/endgame.h"
 #include "game/game.h"
+#include "game/gdialog.h"
 #include "game/gconfig.h"
 #include "game/gmouse.h"
 #include "game/gmovie.h"
@@ -400,6 +401,8 @@ static void main_game_loop()
         multiplayer::developerLocalSessionEnsureStarted();
 
         int keyCode = get_input();
+        multiplayer::networkRuntimeProcessPendingTalk();
+        gdialog_multiplayer_guest_process();
         if (multiplayer::networkWorldWorldMapTravelApproved()) {
             worldmap_multiplayer_open();
             continue;

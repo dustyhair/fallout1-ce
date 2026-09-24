@@ -23,6 +23,8 @@ enum class AgentControlCommandType {
     GameExit,
     GameStairs,
     GameRest,
+    GameTalk,
+    GameVote,
     GameGive,
     GameAttack,
     GameReload,
@@ -45,6 +47,8 @@ struct AgentControlCommand {
     int elevatorType = -1;
     int elevatorLevel = -1;
     int restMinutes = 0;
+    int dialogueOption = 0; // One-based in the agent protocol.
+    std::uint64_t dialogueRevision = 0;
     std::uint32_t entityId = 0;
     std::uint32_t itemEntityId = 0;
     std::uint32_t destinationEntityId = 0;

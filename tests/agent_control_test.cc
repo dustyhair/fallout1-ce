@@ -87,6 +87,22 @@ int main()
             && command.type == fallout::AgentControlCommandType::GameEndTurn,
         "parses a semantic combat end turn")
         && passed;
+    passed = expect(parse("47 game_talk 82", command)
+            && command.type == fallout::AgentControlCommandType::GameTalk
+            && command.entityId == 82,
+        "parses a semantic dialogue request")
+        && passed;
+    passed = expect(parse("47 game_vote 42 2", command)
+            && command.type == fallout::AgentControlCommandType::GameVote
+            && command.dialogueRevision == 42
+            && command.dialogueOption == 2,
+        "parses a revision-keyed one-based dialogue vote")
+        && passed;
+    passed = expect(!parse("47 game_vote 0 1", command)
+            && !parse("47 game_vote 42 0", command)
+            && !parse("47 game_vote 42 31", command),
+        "rejects invalid dialogue revisions and options")
+        && passed;
     passed = expect(parse("48 game_pickup 77", command)
             && command.type == fallout::AgentControlCommandType::GamePickup
             && command.entityId == 77,

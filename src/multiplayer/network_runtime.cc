@@ -23,8 +23,10 @@
 #include "game/critter.h"
 #include "game/display.h"
 #include "game/game.h"
+#include "game/game_vars.h"
 #include "game/gconfig.h"
 #include "game/gmouse.h"
+#include "game/gdialog.h"
 #include "game/intface.h"
 #include "game/inventry.h"
 #include "game/item.h"
@@ -39,11 +41,13 @@
 #include "game/queue.h"
 #include "game/roll.h"
 #include "game/scripts.h"
+#include "game/skill.h"
 #include "game/stat.h"
 #include "game/textobj.h"
 #include "game/tile.h"
 #include "game/worldmap.h"
 #include "multiplayer/character_build_bridge.h"
+#include "multiplayer/acting_player_context.h"
 #include "multiplayer/content_manifest.h"
 #include "multiplayer/gameplay_wire.h"
 #include "multiplayer/local_player_context.h"
@@ -106,8 +110,15 @@ enum class SmokeScenario {
     CombatReconnect,
     CombatElevation,
     CombatScriptStatus,
+    Dialogue,
+    DialogueGuest,
 };
 SmokeScenario smokeScenario = SmokeScenario::Movement;
+bool isDialogueSmokeScenario()
+{
+    return smokeScenario == SmokeScenario::Dialogue
+        || smokeScenario == SmokeScenario::DialogueGuest;
+}
 bool smokeWorldMapGuestController = false;
 bool smokeWorldMapTakeover = false;
 bool smokeWorldMapTown = false;
@@ -124,6 +135,13 @@ bool smokeCombatHostReattached = false;
 bool smokeCombatPostReconnectGuestTurnCompleted = false;
 bool smokeCombatScriptStatusObserved = false;
 bool smokeCombatScriptStatusSeeded = false;
+std::uint64_t smokeDialogueLastVotedRevision = 0;
+int smokeDialogueRounds = 0;
+bool smokeDialogueTieObserved = false;
+bool smokeDialogueTalkerStatsObserved = false;
+bool smokeDialogueSkillCheckExecuted = false;
+bool smokeDialogueGuestPresentationObserved = false;
+bool smokeDialogueStatWinnerObserved = false;
 std::vector<PlayerId> smokeCombatObservedOwners;
 bool smokeCombatObservedExit = false;
 bool smokeCombatReceivedExplorationState = false;
@@ -205,6 +223,10 @@ const char* smokeScenarioName()
         return "combat-elevation";
     case SmokeScenario::CombatScriptStatus:
         return "combat-script-status";
+    case SmokeScenario::Dialogue:
+        return "dialogue";
+    case SmokeScenario::DialogueGuest:
+        return "dialogue-guest";
     }
     return "unknown";
 }
@@ -770,6 +792,29 @@ void reportAgentWorldState()
     state.pendingRestMinutes = networkWorldPendingRestMinutes();
     state.pendingRestProposerId = networkWorldPendingRestProposer().value;
     state.pendingRestProposerName = networkWorldPendingRestProposerName();
+    if (const auto* presentation = networkWorldDialoguePresentation()) {
+        AgentJournalWorldState::Dialogue dialogue;
+        dialogue.revision = presentation->revision;
+        dialogue.talkerPlayerId = networkWorldCombatOwner(
+            networkWorldFindObject(presentation->actorId)).value_or(PlayerId {}).value;
+        dialogue.targetId = presentation->targetId.value;
+        dialogue.reply = presentation->reply;
+        dialogue.options = presentation->options;
+        for (const DialogueBallot& ballot : networkWorldDialogueBallots()) {
+            dialogue.votes.push_back({ ballot.playerId.value,
+                ballot.option.has_value() ? static_cast<int>(*ballot.option) + 1 : 0,
+                ballot.connected });
+        }
+        state.dialogue = std::move(dialogue);
+    }
+    for (const SharedActivityEntry& entry : networkWorldSharedActivity()) {
+        state.sharedActivity.push_back({ entry.id, entry.sourceId.value,
+            entry.sourceName,
+            entry.kind == SharedActivityKind::Quest ? "quest"
+                : entry.kind == SharedActivityKind::Discovery ? "discovery"
+                : "world_outcome",
+            entry.subject, entry.value, entry.text });
+    }
     state.host = actorJournalState(kHostPlayerId, hostIsLocal);
     state.guest = actorJournalState(kGuestPlayerId, !hostIsLocal);
     Object* hostActor = networkWorldPlayerActor(kHostPlayerId);
@@ -1014,6 +1059,8 @@ bool submitHostCommand(GameCommandPayload payload)
     command.expectedPhase = (isCheckpointedCombatAction(payload)
             || std::holds_alternative<EndTurnCommand>(payload))
         ? SessionPhase::Combat
+        : std::holds_alternative<DialogueVoteCommand>(payload)
+        ? SessionPhase::Dialogue
         : std::holds_alternative<WorldMapRouteCommand>(payload)
         ? SessionPhase::Transition
         : std::holds_alternative<SharedModalCommand>(payload)
@@ -1095,7 +1142,10 @@ void networkRuntimeBackgroundProcess()
         }
         presentPendingGameChatMessages();
         if (launchOptions.mode == NetworkLaunchMode::Host) {
+            networkWorldObserveWorldMapDiscoveries();
             networkWorldCombatSetPlayerConnected(kGuestPlayerId,
+                lobby.state() == NetworkLobbyState::Ready);
+            networkWorldDialogueSetConnected(kGuestPlayerId,
                 lobby.state() == NetworkLobbyState::Ready);
             networkWorldCombatTick();
             if (smokeCombatAutoEnd
@@ -1198,6 +1248,15 @@ void networkRuntimeBackgroundProcess()
                     break;
                 }
                 AuthoritativeCommandResult outcome = networkWorldProcessCommand(*command);
+                if (isDialogueSmokeScenario()
+                    && std::holds_alternative<DialogueVoteCommand>(command->payload)) {
+                    const auto& ballots = networkWorldDialogueBallots();
+                    if (ballots.size() == 2 && ballots[0].option.has_value()
+                        && ballots[1].option.has_value()
+                        && ballots[0].option != ballots[1].option) {
+                        smokeDialogueTieObserved = true;
+                    }
+                }
                 if (smokeScenario == SmokeScenario::CombatReconnect
                     && outcome.result.status == CommandStatus::Accepted) {
                     if (std::holds_alternative<AttackCommand>(command->payload)) {
@@ -1336,6 +1395,22 @@ void networkRuntimeBackgroundProcess()
                 applied = networkWorldApplyPeerRest(*rest);
             } else if (const auto* modal = std::get_if<SharedModalStateChangedEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerSharedModal(*modal);
+            } else if (const auto* requested = std::get_if<DialogueRequestedEvent>(&event->payload)) {
+                applied = networkWorldApplyPeerDialogueRequested(*requested);
+            } else if (const auto* vote = std::get_if<DialogueVoteRecordedEvent>(&event->payload)) {
+                applied = networkWorldApplyPeerDialogueVote(*vote);
+                if (isDialogueSmokeScenario() && applied) {
+                    const auto& ballots = networkWorldDialogueBallots();
+                    if (ballots.size() == 2 && ballots[0].option.has_value()
+                        && ballots[1].option.has_value()
+                        && ballots[0].option != ballots[1].option) {
+                        smokeDialogueTieObserved = true;
+                    }
+                }
+            } else if (const auto* presentation = std::get_if<DialoguePresentationEvent>(&event->payload)) {
+                applied = networkWorldApplyPeerDialoguePresentation(*presentation);
+            } else if (const auto* activity = std::get_if<SharedActivityPublishedEvent>(&event->payload)) {
+                applied = networkWorldApplyPeerSharedActivity(*activity);
             } else if (const auto* route = std::get_if<WorldMapRouteSelectedEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerWorldMapRoute(*route);
             } else if (const auto* transfer = std::get_if<InventoryTransferredEvent>(&event->payload)) {
@@ -1444,7 +1519,8 @@ void networkRuntimeBackgroundProcess()
             // The lobby drains ordered events before state packets. A state
             // captured before a map-arrival event must not roll the freshly
             // loaded destination back to its old transition phase.
-            if (state->lastIncludedEvent.value < lobby.lastAppliedEvent().value) {
+            if (state->lastIncludedEvent.value < lobby.lastAppliedEvent().value
+                || state->phaseRevision < networkWorldPhaseRevision()) {
                 continue;
             }
             if (!networkWorldApplyAuthoritativeState(*state)) {
@@ -1540,6 +1616,45 @@ void networkRuntimeBackgroundProcess()
             std::optional<EntityId> readyExit = networkWorldReadyLocalExitGrid();
             if (readyExit.has_value()) {
                 networkRuntimeSubmitLocalExitGrid(*readyExit);
+            }
+        }
+        if (isDialogueSmokeScenario()
+            && networkWorldPhase() == SessionPhase::Dialogue) {
+            if (const auto* presentation = networkWorldDialoguePresentation();
+                presentation != nullptr
+                && presentation->revision != smokeDialogueLastVotedRevision) {
+                if (smokeScenario == SmokeScenario::DialogueGuest
+                    && presentation->actorId == EntityId { kGuestPlayerId.value }) {
+                    smokeDialogueGuestPresentationObserved = true;
+                }
+                std::uint8_t option = launchOptions.mode == NetworkLaunchMode::Host
+                    ? 0
+                    : static_cast<std::uint8_t>(presentation->options.size() > 1 ? 1 : 0);
+                std::uint64_t revision = presentation->revision;
+                if (networkRuntimeSubmitDialogueVote(revision, option)) {
+                    if (launchOptions.mode == NetworkLaunchMode::Join) {
+                        for (const DialogueBallot& ballot : networkWorldDialogueBallots()) {
+                            if (ballot.playerId == kHostPlayerId
+                                && ballot.option.has_value()
+                                && *ballot.option != option) {
+                                smokeDialogueTieObserved = true;
+                            }
+                        }
+                    }
+                    smokeDialogueLastVotedRevision = revision;
+                    smokeDialogueRounds++;
+                    std::fprintf(stderr,
+                        "Dialogue smoke %s voted revision=%llu option=%u count=%zu.\n",
+                        launchOptions.mode == NetworkLaunchMode::Host ? "host" : "guest",
+                        static_cast<unsigned long long>(revision), option,
+                        presentation->options.size());
+                }
+            }
+            const auto& ballots = networkWorldDialogueBallots();
+            if (ballots.size() == 2 && ballots[0].option.has_value()
+                && ballots[1].option.has_value()
+                && ballots[0].option != ballots[1].option) {
+                smokeDialogueTieObserved = true;
             }
         }
     }
@@ -1673,6 +1788,10 @@ bool networkRuntimeConfigure(int argc, char** argv)
             smokeScenario = SmokeScenario::CombatElevation;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=combat-script-status") == 0) {
             smokeScenario = SmokeScenario::CombatScriptStatus;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=dialogue") == 0) {
+            smokeScenario = SmokeScenario::Dialogue;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=dialogue-guest") == 0) {
+            smokeScenario = SmokeScenario::DialogueGuest;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=worldmap-host") == 0) {
             smokeScenario = SmokeScenario::WorldMapTravel;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=worldmap-guest") == 0) {
@@ -1792,7 +1911,8 @@ const char* networkRuntimeSmokeTestMap()
         || smokeScenario == SmokeScenario::TypedStairsCrossMap) {
         return "ChilDrn2.map";
     }
-    if (smokeScenario == SmokeScenario::Quest || smokeScenario == SmokeScenario::Rest) {
+    if (smokeScenario == SmokeScenario::Quest || smokeScenario == SmokeScenario::Rest
+        || isDialogueSmokeScenario()) {
         return "ShadyW.map";
     }
     if (smokeScenario == SmokeScenario::Elevation) {
@@ -2077,7 +2197,7 @@ static bool runLiveWorldMapTravelSmoke(const SessionId sessionId)
     return true;
 }
 
-static bool runLiveCombatTurnSmoke(SessionId sessionId)
+static bool runLiveCombatTurnSmoke(SessionId sessionId, bool reportPass = true)
 {
     const bool host = launchOptions.mode == NetworkLaunchMode::Host;
     const bool killScenario = smokeScenario == SmokeScenario::CombatKill;
@@ -2331,16 +2451,205 @@ static bool runLiveCombatTurnSmoke(SessionId sessionId)
         setStatus("MULTIPLAYER COMBAT SMOKE FAILED: TURN OWNERSHIP");
         return false;
     }
+    if (reportPass) {
+        std::fprintf(stdout,
+            "MULTIPLAYER_SMOKE_TEST_PASS role=%s session=%llu command=%s phase=%u event=%llu owners=%s digest=%llu scripts=%u attacks=%u rng=%u\n",
+            host ? "host" : "guest",
+            static_cast<unsigned long long>(sessionId.value),
+            smokeScenarioName(),
+            snapshot.phaseRevision,
+            static_cast<unsigned long long>(snapshot.lastIncludedEvent.value),
+            host ? "host-authoritative" : observedOwners.c_str(),
+            static_cast<unsigned long long>(digest.digest.overall),
+            counts.scriptProcedures, counts.combatAttacks, counts.randomDraws);
+        std::fflush(stdout);
+    }
+    return true;
+}
+
+static bool runLiveDialogueSmoke(const SessionId sessionId)
+{
+    bool host = launchOptions.mode == NetworkLaunchMode::Host;
+    bool guestProposer = smokeScenario == SmokeScenario::DialogueGuest;
+    smokeDialogueLastVotedRevision = 0;
+    smokeDialogueRounds = 0;
+    smokeDialogueTieObserved = false;
+    smokeDialogueTalkerStatsObserved = false;
+    smokeDialogueSkillCheckExecuted = false;
+    smokeDialogueGuestPresentationObserved = false;
+    smokeDialogueStatWinnerObserved = false;
+    engineExecutionProbeBegin();
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(75);
+    if (host) {
+        std::vector<EntityId> targets = networkWorldDialogueSmokeTargets();
+        std::fprintf(stderr, "Dialogue smoke found %zu scripted NPC candidates.\n",
+            targets.size());
+        for (std::size_t index = 0; index < targets.size()
+                && index < (guestProposer ? 1u : 8u)
+                && std::chrono::steady_clock::now() < deadline
+                && smokeDialogueRounds < 2; index++) {
+            EntityId targetId = targets[index];
+            Object* target = networkWorldFindObject(targetId);
+            std::fprintf(stderr, "Dialogue smoke trying target=%u name=%s.\n",
+                targetId.value, target != nullptr ? object_name(target) : "missing");
+            if (!networkWorldMovePartyNearDialogueTarget(targetId)) {
+                std::fprintf(stderr, "Dialogue smoke could not position party at target=%u.\n",
+                    targetId.value);
+                continue;
+            }
+            WorldSnapshot fixture;
+            bool captured = networkWorldCaptureAuthoritativeState(
+                lobby.latestAuthoritativeEvent(), fixture);
+            bool sent = captured && lobby.sendAuthoritativeState(fixture);
+            if (!sent) {
+                std::fprintf(stderr,
+                    "Dialogue smoke fixture target=%u captured=%d sent=%d phase=%d.\n",
+                    targetId.value, captured, sent,
+                    static_cast<int>(networkWorldPhase()));
+                continue;
+            }
+            for (int attempt = 0; attempt < 200; attempt++) {
+                networkRuntimeBackgroundProcess();
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            bool submitted = false;
+            if (guestProposer) {
+                while (std::chrono::steady_clock::now() < deadline
+                    && networkWorldPhase() == SessionPhase::Exploration) {
+                    networkRuntimeBackgroundProcess();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                submitted = networkWorldPhase() == SessionPhase::Dialogue;
+            } else {
+                submitted = networkRuntimeSubmitLocalTalk(targetId);
+            }
+            std::fprintf(stderr,
+                "Dialogue smoke target=%u submitted=%d phase=%d hostTile=%d guestTile=%d.\n",
+                targetId.value, submitted, static_cast<int>(networkWorldPhase()),
+                networkWorldPlayerActor(kHostPlayerId)->tile,
+                networkWorldPlayerActor(kGuestPlayerId)->tile);
+            if (submitted) {
+                networkRuntimeProcessPendingTalk();
+            }
+            for (int attempt = 0; attempt < 20; attempt++) {
+                networkRuntimeBackgroundProcess();
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        }
+        Object* actor = networkWorldPlayerActor(kHostPlayerId);
+        PlayerCharacterState* player = playerStateForActor(actor);
+        if (actor != nullptr && player != nullptr) {
+            ScopedActingPlayerContext acting(*player, actor);
+            game_set_global_var(GVAR_RESCUE_TANDI,
+                std::max(1, game_get_global_var(GVAR_RESCUE_TANDI) + 1));
+        }
+    } else if (guestProposer) {
+        bool submitted = false;
+        while (std::chrono::steady_clock::now() < deadline && !submitted) {
+            networkRuntimeBackgroundProcess();
+            std::vector<EntityId> targets = networkWorldDialogueSmokeTargets();
+            Object* actor = networkWorldPlayerActor(kGuestPlayerId);
+            if (networkWorldPhase() == SessionPhase::Exploration
+                && actor != nullptr && !targets.empty()) {
+                Object* target = networkWorldFindObject(targets.front());
+                if (target != nullptr && obj_dist(actor, target) <= 2) {
+                    submitted = networkRuntimeSubmitLocalTalk(targets.front());
+                    std::fprintf(stderr,
+                        "Dialogue smoke guest talk submitted=%d target=%u.\n",
+                        submitted, targets.front().value);
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    bool sawQuest = false;
+    int questEntries = 0;
+    while (std::chrono::steady_clock::now() < deadline) {
+        networkRuntimeBackgroundProcess();
+        if (!host && networkWorldPhase() == SessionPhase::Dialogue
+            && networkWorldDialoguePresentation() != nullptr) {
+            gdialog_multiplayer_guest_process();
+        }
+        questEntries = 0;
+        for (const SharedActivityEntry& entry : networkWorldSharedActivity()) {
+            if (entry.kind == SharedActivityKind::Quest
+                && entry.subject == pipboy_quest_message_id_for_global(GVAR_RESCUE_TANDI)
+                && entry.sourceId == kHostPlayerId) {
+                sawQuest = true;
+                questEntries++;
+            }
+        }
+        if (sawQuest && smokeDialogueRounds >= 2
+            && networkWorldPhase() == SessionPhase::Exploration
+            && (host
+                ? lobby.acknowledgedEvent(kGuestPlayerId).value
+                    >= lobby.latestAuthoritativeEvent().value
+                : lobby.lastAppliedEvent().value
+                    >= lobby.latestAuthoritativeEvent().value)) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    bool activityReplayValid = true;
+    if (!host && questEntries == 1) {
+        std::vector<SharedActivityEntry> entries = networkWorldSharedActivity();
+        auto found = std::find_if(entries.begin(), entries.end(),
+            [](const SharedActivityEntry& entry) {
+                return entry.kind == SharedActivityKind::Quest
+                    && entry.subject == pipboy_quest_message_id_for_global(GVAR_RESCUE_TANDI)
+                    && entry.sourceId == kHostPlayerId;
+            });
+        if (found == entries.end()) {
+            activityReplayValid = false;
+        } else {
+            SharedActivityPublishedEvent duplicate {
+                EntityId { kHostPlayerId.value }, *found };
+            activityReplayValid = networkWorldApplyPeerSharedActivity(duplicate)
+                && networkWorldSharedActivity().size() == entries.size();
+            duplicate.entry.text += "!";
+            activityReplayValid = activityReplayValid
+                && !networkWorldApplyPeerSharedActivity(duplicate)
+                && networkWorldSharedActivity().size() == entries.size();
+        }
+    }
+    EngineExecutionProbeCounts counts = engineExecutionProbeEnd();
+    WorldSnapshot snapshot;
+    bool passed = activityReplayValid && sawQuest && questEntries == 1
+        && smokeDialogueRounds >= 2
+        && smokeDialogueTieObserved
+        && networkWorldPhase() == SessionPhase::Exploration
+        && networkWorldCaptureAuthoritativeState(
+            host ? lobby.latestAuthoritativeEvent() : lobby.lastAppliedEvent(), snapshot)
+        && (!guestProposer
+            || (smokeDialogueGuestPresentationObserved
+                && (!host || (smokeDialogueTalkerStatsObserved
+                    && smokeDialogueSkillCheckExecuted
+                    && smokeDialogueStatWinnerObserved))))
+        && (host ? counts.scriptProcedures > 0
+                && (guestProposer || counts.randomDraws > 0)
+                 : counts.scriptProcedures == 0 && counts.randomDraws == 0);
+    std::fprintf(stderr,
+        "Dialogue smoke result role=%s rounds=%d tie=%d quest=%d stats=%d skill=%d stat_winner=%d phase=%d scripts=%u event=%llu.\n",
+        host ? "host" : "guest", smokeDialogueRounds,
+        smokeDialogueTieObserved, sawQuest, smokeDialogueTalkerStatsObserved,
+        smokeDialogueSkillCheckExecuted, smokeDialogueStatWinnerObserved,
+        static_cast<int>(networkWorldPhase()), counts.scriptProcedures,
+        static_cast<unsigned long long>(host ? lobby.latestAuthoritativeEvent().value
+                                             : lobby.lastAppliedEvent().value));
+    if (!passed) {
+        setStatus("MULTIPLAYER DIALOGUE SMOKE FAILED: BRANCH OR QUEST REPLICATION");
+        return false;
+    }
+    smokeScenario = SmokeScenario::CombatScriptStatus;
+    bool combatPassed = runLiveCombatTurnSmoke(sessionId, false);
+    smokeScenario = guestProposer ? SmokeScenario::DialogueGuest : SmokeScenario::Dialogue;
+    if (!combatPassed) {
+        setStatus("MULTIPLAYER DIALOGUE SMOKE FAILED: COMBAT TRANSITION");
+        return false;
+    }
     std::fprintf(stdout,
-        "MULTIPLAYER_SMOKE_TEST_PASS role=%s session=%llu command=%s phase=%u event=%llu owners=%s digest=%llu scripts=%u attacks=%u rng=%u\n",
+        "MULTIPLAYER_SMOKE_TEST_PASS role=%s session=%llu command=%s rounds=%d tie=1 quest=shared combat=transitioned scripts=%u\n",
         host ? "host" : "guest",
         static_cast<unsigned long long>(sessionId.value),
-        smokeScenarioName(),
-        snapshot.phaseRevision,
-        static_cast<unsigned long long>(snapshot.lastIncludedEvent.value),
-        host ? "host-authoritative" : observedOwners.c_str(),
-        static_cast<unsigned long long>(digest.digest.overall),
-        counts.scriptProcedures, counts.combatAttacks, counts.randomDraws);
+        smokeScenarioName(), smokeDialogueRounds, counts.scriptProcedures);
     std::fflush(stdout);
     return true;
 }
@@ -2360,10 +2669,17 @@ bool networkRuntimeRunSmokeTest()
     sheet.name = launchOptions.mode == NetworkLaunchMode::Host ? "Smoke Host" : "Smoke Guest";
     sheet.primaryStats = { 5, 5, 5, 5, 5, 5, 10 };
     sheet.taggedSkills = { SKILL_SMALL_GUNS, SKILL_FIRST_AID, SKILL_SPEECH };
+    if (smokeScenario == SmokeScenario::DialogueGuest) {
+        if (launchOptions.mode == NetworkLaunchMode::Host) {
+            sheet.taggedSkills = { SKILL_SMALL_GUNS, SKILL_FIRST_AID, SKILL_REPAIR };
+        } else {
+            sheet.primaryStats = { 5, 5, 5, 5, 8, 5, 7 };
+        }
+    }
 
     bool submitted = false;
     auto deadline = std::chrono::steady_clock::now()
-        + std::chrono::seconds(smokeRestInterrupt ? 60 : 25);
+        + std::chrono::seconds(smokeRestInterrupt || isDialogueSmokeScenario() ? 90 : 25);
     while (std::chrono::steady_clock::now() < deadline) {
         networkRuntimeBackgroundProcess();
         if (lobbyStarted && !submitted && lobby.state() == NetworkLobbyState::Waiting) {
@@ -2379,6 +2695,7 @@ bool networkRuntimeRunSmokeTest()
 
         if (lobbyStarted && lobby.state() == NetworkLobbyState::Ready) {
             if ((smokeScenario == SmokeScenario::WorldMapTravel
+                    || isDialogueSmokeScenario()
                     || smokeScenario == SmokeScenario::CombatTurn
                     || smokeScenario == SmokeScenario::CombatAttack
                     || smokeScenario == SmokeScenario::CombatMove
@@ -2422,6 +2739,10 @@ bool networkRuntimeRunSmokeTest()
 
             if (smokeScenario == SmokeScenario::WorldMapTravel) {
                 if (runLiveWorldMapTravelSmoke(bootstrap.sessionId())) return true;
+                break;
+            }
+            if (isDialogueSmokeScenario()) {
+                if (runLiveDialogueSmoke(bootstrap.sessionId())) return true;
                 break;
             }
             if (smokeScenario == SmokeScenario::CombatTurn
@@ -4373,6 +4694,112 @@ bool networkRuntimeRequestSharedModal(SharedModalKind kind, bool open)
     return launchOptions.mode == NetworkLaunchMode::Host
         ? submitHostCommand(SharedModalCommand { kind, open })
         : lobby.sendLocalSharedModal(kind, open, networkWorldPhase(), networkWorldPhaseRevision());
+}
+
+bool networkRuntimeHandleLocalTalk(Object* target)
+{
+    if (!networkRuntimeIsGuestReplica()) return false;
+    std::optional<EntityId> targetId = networkWorldFindEntity(target);
+    if (!targetId.has_value()
+        || !networkRuntimeSubmitLocalTalk(*targetId)) {
+        char message[] = "Move closer to the NPC before starting shared dialogue.";
+        display_print(message);
+    }
+    return true;
+}
+
+bool networkRuntimeSubmitLocalTalk(EntityId targetId)
+{
+    if (!networkWorldActive() || !isValid(targetId)
+        || networkWorldPhase() != SessionPhase::Exploration) return false;
+    return launchOptions.mode == NetworkLaunchMode::Host
+        ? submitHostCommand(TalkCommand { targetId })
+        : lobby.sendLocalTalk(targetId, networkWorldPhaseRevision());
+}
+
+bool networkRuntimeBeginDialogue()
+{
+    if (!networkWorldActive()) return true;
+    if (launchOptions.mode != NetworkLaunchMode::Host) return false;
+    if (networkWorldPhase() == SessionPhase::Dialogue) return true;
+    return networkRuntimeRequestSharedModal(SharedModalKind::Dialogue, true);
+}
+
+void networkRuntimeEndDialogue()
+{
+    if (launchOptions.mode == NetworkLaunchMode::Host && networkWorldActive()
+        && networkWorldPhase() == SessionPhase::Dialogue) {
+        networkWorldEndDialogue();
+    }
+}
+
+bool networkRuntimeSubmitDialogueVote(std::uint64_t revision, std::uint8_t option)
+{
+    if (!networkWorldActive() || networkWorldPhase() != SessionPhase::Dialogue) return false;
+    return launchOptions.mode == NetworkLaunchMode::Host
+        ? submitHostCommand(DialogueVoteCommand { revision, option })
+        : lobby.sendLocalDialogueVote(revision, option, networkWorldPhaseRevision());
+}
+
+void networkRuntimeObserveDialogueDecision(std::uint64_t revision, std::uint8_t option)
+{
+    if (!isDialogueSmokeScenario()) return;
+    const auto* presentation = networkWorldDialoguePresentation();
+    if (presentation == nullptr || presentation->revision != revision) return;
+    const auto& ballots = networkWorldDialogueBallots();
+    if (ballots.size() != 2 || !ballots[0].option.has_value()
+        || !ballots[1].option.has_value()
+        || ballots[0].option == ballots[1].option) return;
+    smokeDialogueTieObserved = true;
+    if (smokeScenario == SmokeScenario::DialogueGuest) {
+        for (const DialogueBallot& ballot : ballots) {
+            if (ballot.playerId == kGuestPlayerId && ballot.option == option) {
+                smokeDialogueStatWinnerObserved = true;
+            }
+        }
+    }
+    std::fprintf(stderr, "Dialogue smoke resolved revision=%llu option=%u.\n",
+        static_cast<unsigned long long>(revision), option);
+}
+
+void networkRuntimeProcessPendingTalk()
+{
+    if (launchOptions.mode != NetworkLaunchMode::Host || !networkWorldActive()) return;
+    EntityId actorId;
+    EntityId targetId;
+    if (!networkWorldTakePendingTalk(actorId, targetId)) return;
+    Object* actor = networkWorldFindObject(actorId);
+    Object* target = networkWorldFindObject(targetId);
+    PlayerCharacterState* player = playerStateForActor(actor);
+    if (actor == nullptr || target == nullptr || player == nullptr) {
+        networkWorldEndDialogue();
+        return;
+    }
+    ScopedActingPlayerContext acting(*player, actor);
+    ScopedLocalPlayerBinding binding(actor);
+    if (smokeScenario == SmokeScenario::DialogueGuest
+        && player->id == kGuestPlayerId) {
+        int guestIntelligence = stat_level(actor, STAT_INTELLIGENCE);
+        int guestSpeech = skill_level(actor, SKILL_SPEECH);
+        Object* hostActor = networkWorldPlayerActor(kHostPlayerId);
+        PlayerCharacterState* hostPlayer = playerStateForActor(hostActor);
+        if (hostActor != nullptr && hostPlayer != nullptr) {
+            ScopedActingPlayerContext hostActing(*hostPlayer, hostActor);
+            smokeDialogueTalkerStatsObserved = guestIntelligence
+                    > stat_level(hostActor, STAT_INTELLIGENCE)
+                && guestSpeech > skill_level(hostActor, SKILL_SPEECH);
+        }
+        if (smokeDialogueTalkerStatsObserved
+            && actingPlayerActorOr(obj_dude) == actor) {
+            int margin = 0;
+            (void)skill_result(actor, SKILL_SPEECH, 0, &margin);
+            smokeDialogueSkillCheckExecuted = true;
+        }
+    }
+    gdialog_enter(target, 1);
+    if (networkWorldPhase() == SessionPhase::Dialogue) {
+        networkWorldEndDialogue();
+    }
 }
 
 bool networkRuntimeSubmitLocalWorldMapRoute(std::int32_t targetX, std::int32_t targetY, bool clear)

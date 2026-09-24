@@ -23,6 +23,7 @@
 #include "game/elevator.h"
 #include "game/game.h"
 #include "game/game_vars.h"
+#include "game/gdialog.h"
 #include "game/intface.h"
 #include "game/inventry.h"
 #include "game/item.h"
@@ -30,6 +31,7 @@
 #include "game/map_defs.h"
 #include "game/object.h"
 #include "game/party.h"
+#include "game/pipboy.h"
 #include "game/perk.h"
 #include "game/protinst.h"
 #include "game/proto.h"
@@ -41,6 +43,7 @@
 #include "game/worldmap.h"
 #include "multiplayer/acting_player_context.h"
 #include "multiplayer/combat_turn_controller.h"
+#include "multiplayer/dialogue_vote_controller.h"
 #include "multiplayer/local_player_context.h"
 #include "multiplayer/local_session.h"
 #include "multiplayer/presentation_bridge.h"
@@ -77,6 +80,19 @@ struct PendingPickup {
 };
 std::unordered_map<EntityId, PendingPickup, EntityIdHash> pendingPickups;
 std::deque<GameEvent> deferredEvents;
+DialogueVoteController dialogueVotes;
+std::optional<DialoguePresentationEvent> dialoguePresentation;
+struct PendingTalk {
+    EntityId actorId;
+    EntityId targetId;
+    CommandSequence causedBy;
+};
+std::optional<PendingTalk> pendingTalk;
+CommandSequence dialogueCause;
+std::uint64_t nextDialogueRevision = 1;
+std::deque<SharedActivityEntry> sharedActivity;
+std::uint64_t nextSharedActivityId = 1;
+std::uint32_t observedFirstVisits = 0;
 
 std::unordered_map<Object*, Object*> activeLootTargets;
 struct ActiveSharedModal {
@@ -84,6 +100,37 @@ struct ActiveSharedModal {
     SharedModalKind kind = SharedModalKind::Dialogue;
 };
 std::optional<ActiveSharedModal> activeSharedModal;
+extern NetworkLaunchMode worldMode;
+void publishSharedActivity(SharedActivityKind kind, std::int32_t subject,
+    std::int32_t value, const std::string& text)
+{
+    if (worldMode != NetworkLaunchMode::Host || !session.isActive()
+        || text.empty()) return;
+    PlayerId sourceId;
+    if (const PlayerCharacterState* acting = actingPlayerState()) {
+        sourceId = acting->id;
+    } else if (activeSharedModal.has_value()
+        && activeSharedModal->kind == SharedModalKind::Dialogue) {
+        if (const PlayerCharacterState* talker = session.players().findByActor(
+                activeSharedModal->actorId)) sourceId = talker->id;
+    }
+    const PlayerCharacterState* source = session.players().find(sourceId);
+    SharedActivityEntry entry;
+    entry.id = nextSharedActivityId++;
+    entry.sourceId = sourceId;
+    entry.sourceName = source != nullptr ? source->name : "World";
+    if (entry.sourceName.size() > 32) entry.sourceName.resize(32);
+    entry.kind = kind;
+    entry.subject = subject;
+    entry.value = value;
+    entry.text = text.substr(0, 160);
+    sharedActivity.push_back(entry);
+    if (sharedActivity.size() > 64) sharedActivity.pop_front();
+    deferredEvents.push_back(GameEvent { {},
+        dialogueCause.value != 0 ? dialogueCause : CommandSequence { UINT64_MAX },
+        SharedActivityPublishedEvent {
+            session.playerActorId(kHostPlayerId), std::move(entry) } });
+}
 EntityId approvedWorldMapProposerActorId;
 CommandSequence approvedWorldMapProposalSequence;
 std::optional<std::pair<std::int32_t, std::int32_t>> selectedWorldMapRoute;
@@ -621,6 +668,8 @@ bool applyActorAndCritterState(const WorldSnapshot& snapshot)
     for (const ActorSnapshot& actorState : snapshot.actors) {
         Object* actor = session.entities().findObject(actorState.entityId);
         if (session.players().setBuild(actorState.ownerId, actorState.build) != PlayerStateError::None) {
+            std::fprintf(stderr, "Snapshot actor build failed id=%u owner=%u.\n",
+                actorState.entityId.value, actorState.ownerId.value);
             return false;
         }
         Rect dirtyRect {};
@@ -628,12 +677,17 @@ bool applyActorAndCritterState(const WorldSnapshot& snapshot)
         if (actor->tile != actorState.tile || actor->elevation != actorState.elevation) {
             register_clear(actor);
             if (obj_move_to_tile(actor, actorState.tile, actorState.elevation, &dirtyRect) == -1) {
+                std::fprintf(stderr, "Snapshot actor move failed id=%u from=%d to=%d elev=%d.\n",
+                    actorState.entityId.value, actor->tile, actorState.tile,
+                    actorState.elevation);
                 return false;
             }
             dirty = true;
         }
         if (actor->rotation != actorState.rotation) {
             if (obj_set_rotation(actor, actorState.rotation, &dirtyRect) == -1) {
+                std::fprintf(stderr, "Snapshot actor rotation failed id=%u.\n",
+                    actorState.entityId.value);
                 return false;
             }
             dirty = true;
@@ -641,6 +695,8 @@ bool applyActorAndCritterState(const WorldSnapshot& snapshot)
         if (!applySharedObjectPresentation(actor, actorState.fid,
                 actorState.frame, actorState.objectFlags,
                 actorState.lightDistance, actorState.lightIntensity)) {
+            std::fprintf(stderr, "Snapshot actor presentation failed id=%u.\n",
+                actorState.entityId.value);
             return false;
         }
         // A replica applies the host's selected death and animation state; it
@@ -662,6 +718,9 @@ bool applyActorAndCritterState(const WorldSnapshot& snapshot)
         if (critter->tile != critterState.tile || critter->elevation != critterState.elevation) {
             register_clear(critter);
             if (obj_move_to_tile(critter, critterState.tile, critterState.elevation, &dirtyRect) == -1) {
+                std::fprintf(stderr, "Snapshot critter move failed id=%u from=%d to=%d elev=%d.\n",
+                    critterState.entityId.value, critter->tile, critterState.tile,
+                    critterState.elevation);
                 return false;
             }
             dirty = true;
@@ -966,6 +1025,11 @@ bool loadSharedMap(int map)
     reservedPickupTargets.clear();
     pendingPickups.clear();
     deferredEvents.clear();
+    dialogueVotes.clear();
+    dialoguePresentation.reset();
+    pendingTalk.reset();
+    dialogueCause = {};
+    nextDialogueRevision = 1;
     activeLootTargets.clear();
     activeSharedModal.reset();
     approvedWorldMapProposerActorId = {};
@@ -1909,6 +1973,42 @@ public:
         return execution;
     }
 
+    CommandExecutionStatus requestTalk(Object* actor, Object* target,
+        const TalkCommand& command) override
+    {
+        if (worldMode != NetworkLaunchMode::Host || actor == nullptr
+            || target == nullptr || target->sid == -1 || isInCombat()
+            || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER
+            || actor->elevation != target->elevation || obj_dist(actor, target) >= 9
+            || activeSharedModal.has_value() || pendingTalk.has_value()
+            || session.phase() != SessionPhase::Exploration) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        std::optional<EntityId> actorId = session.entities().findEntity(actor);
+        if (!actorId.has_value()
+            || session.transitionTo(SessionPhase::Dialogue) != LocalSessionError::None) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        activeSharedModal = ActiveSharedModal { *actorId, SharedModalKind::Dialogue };
+        pendingTalk = PendingTalk { *actorId, command.targetId, {} };
+        dialogueVotes.clear();
+        dialoguePresentation.reset();
+        return CommandExecutionStatus::Applied;
+    }
+
+    CommandExecutionStatus dialogueVote(Object* actor, PlayerId playerId,
+        const DialogueVoteCommand& command) override
+    {
+        if (worldMode != NetworkLaunchMode::Host || actor == nullptr
+            || session.phase() != SessionPhase::Dialogue
+            || !activeSharedModal.has_value()
+            || activeSharedModal->kind != SharedModalKind::Dialogue
+            || !dialogueVotes.vote(playerId, command.revision, command.option)) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        return CommandExecutionStatus::Applied;
+    }
+
     SharedModalExecution setSharedModal(Object* actor, const SharedModalCommand& command) override
     {
         SharedModalExecution execution;
@@ -2205,6 +2305,11 @@ bool registerWorldObjects()
     reservedPickupTargets.clear();
     pendingPickups.clear();
     deferredEvents.clear();
+    dialogueVotes.clear();
+    dialoguePresentation.reset();
+    pendingTalk.reset();
+    dialogueCause = {};
+    nextDialogueRevision = 1;
     activeLootTargets.clear();
     activeSharedModal.reset();
     approvedWorldMapProposerActorId = {};
@@ -2458,6 +2563,9 @@ bool networkWorldEnter(NetworkLaunchMode mode,
 
     intface_redraw();
     commandProcessor.reset();
+    WorldMapState initialMap;
+    worldmap_capture_state(initialMap);
+    observedFirstVisits = static_cast<std::uint32_t>(initialMap.firstVisits);
     return true;
 }
 
@@ -2792,6 +2900,10 @@ bool networkWorldApplyPeerSharedModal(const SharedModalStateChangedEvent& modal)
     }
     if (!modal.open) {
         activeSharedModal.reset();
+        if (modal.kind == SharedModalKind::Dialogue) {
+            dialoguePresentation.reset();
+            dialogueVotes.clear();
+        }
     }
     return true;
 }
@@ -5504,6 +5616,25 @@ AuthoritativeCommandResult networkWorldProcessCommand(const GameCommand& command
     }
 
     AuthoritativeCommandResult result = commandProcessor.process(command, session, commandExecutor);
+    if (result.result.status == CommandStatus::Accepted && !result.replayed
+        && result.event.has_value()) {
+        if (std::holds_alternative<DialogueRequestedEvent>(result.event->payload)) {
+            if (pendingTalk.has_value()) pendingTalk->causedBy = command.sequence;
+            dialogueCause = command.sequence;
+        } else if (const auto* modal = std::get_if<SharedModalStateChangedEvent>(
+                       &result.event->payload);
+            modal != nullptr && modal->kind == SharedModalKind::Dialogue) {
+            if (modal->open) {
+                dialogueCause = command.sequence;
+                dialogueVotes.clear();
+                dialoguePresentation.reset();
+            } else {
+                dialogueVotes.clear();
+                dialoguePresentation.reset();
+                dialogueCause = {};
+            }
+        }
+    }
     if (result.result.status == CommandStatus::Accepted
         && !result.replayed
         && result.event.has_value()
@@ -5538,6 +5669,271 @@ std::optional<GameEvent> networkWorldTakeDeferredEvent()
     GameEvent event = std::move(deferredEvents.front());
     deferredEvents.pop_front();
     return event;
+}
+
+bool networkWorldTakePendingTalk(EntityId& actorId, EntityId& targetId)
+{
+    if (worldMode != NetworkLaunchMode::Host || !pendingTalk.has_value()) return false;
+    actorId = pendingTalk->actorId;
+    targetId = pendingTalk->targetId;
+    pendingTalk.reset();
+    return true;
+}
+
+bool networkWorldPublishDialogue(const std::string& reply,
+    const std::vector<std::string>& options)
+{
+    if (worldMode != NetworkLaunchMode::Host || !activeSharedModal.has_value()
+        || activeSharedModal->kind != SharedModalKind::Dialogue
+        || session.phase() != SessionPhase::Dialogue
+        || dialogueCause.value == 0 || reply.empty() || reply.size() > 899
+        || options.empty() || options.size() > kMaximumDialogueOptions) return false;
+    for (const std::string& option : options) {
+        if (option.empty() || option.size() > 899) return false;
+    }
+    Object* target = dialog_target;
+    std::optional<EntityId> targetId = session.entities().findEntity(target);
+    PlayerCharacterState* talker = session.players().findByActor(activeSharedModal->actorId);
+    if (!targetId.has_value() || talker == nullptr) return false;
+    DialoguePresentationEvent presentation {
+        activeSharedModal->actorId, *targetId, nextDialogueRevision++,
+        static_cast<std::uint8_t>(DialogueVotingPolicy::MajorityStatsRandomTie),
+        reply, options,
+    };
+    if (!dialogueVotes.begin(presentation.revision, talker->id,
+            kHostPlayerId, session.players().playerIds(),
+            static_cast<std::uint8_t>(options.size()),
+            DialogueVotingPolicy::MajorityStatsRandomTie,
+            combatClockMilliseconds() + 60000)) {
+        return false;
+    }
+    for (const DialogueBallot& ballot : dialogueVotes.ballots()) {
+        Object* voter = networkWorldPlayerActor(ballot.playerId);
+        PlayerCharacterState* voterState = session.players().find(ballot.playerId);
+        if (voter == nullptr || voterState == nullptr) return false;
+        ScopedActingPlayerContext acting(*voterState, voter);
+        if (!dialogueVotes.setTieBreakStats(ballot.playerId,
+                stat_level(voter, STAT_CHARISMA),
+                stat_level(voter, STAT_INTELLIGENCE))) return false;
+    }
+    dialoguePresentation = presentation;
+    deferredEvents.push_back(GameEvent { {}, dialogueCause, std::move(presentation) });
+    return true;
+}
+
+std::optional<std::uint8_t> networkWorldResolveDialogue()
+{
+    if (worldMode != NetworkLaunchMode::Host || !dialogueVotes.active()) return std::nullopt;
+    std::uint64_t now = combatClockMilliseconds();
+    std::optional<std::uint8_t> selected = dialogueVotes.resolve(now);
+    if (!selected.has_value() && dialogueVotes.needsRandomTie()) {
+        selected = dialogueVotes.resolve(now,
+            static_cast<std::uint32_t>(roll_random(0,
+                static_cast<int>(dialogueVotes.randomTieOptionCount() - 1))));
+    }
+    return selected;
+}
+
+void networkWorldConsumeDialogueChoice()
+{
+    dialogueVotes.clear();
+    dialoguePresentation.reset();
+}
+
+const DialoguePresentationEvent* networkWorldDialoguePresentation()
+{
+    return dialoguePresentation.has_value() ? &*dialoguePresentation : nullptr;
+}
+
+const std::vector<DialogueBallot>& networkWorldDialogueBallots()
+{
+    return dialogueVotes.ballots();
+}
+
+std::string networkWorldDialoguePlayerName(PlayerId playerId)
+{
+    const PlayerCharacterState* player = session.players().find(playerId);
+    return player != nullptr ? player->name : std::string();
+}
+
+void networkWorldDialogueSetConnected(PlayerId playerId, bool connected)
+{
+    if (worldMode == NetworkLaunchMode::Host) {
+        dialogueVotes.setConnected(playerId, connected);
+    }
+}
+
+void networkWorldRecordQuestActivity(int globalVar, int value)
+{
+    if (worldMode != NetworkLaunchMode::Host || !session.isActive()) return;
+    int messageId = pipboy_quest_message_id_for_global(globalVar);
+    if (messageId == 0) return;
+    publishSharedActivity(SharedActivityKind::Quest, messageId, value,
+        value > 1 ? "Quest progressed" : value > 0 ? "Quest updated" : "Quest status changed");
+}
+
+void networkWorldObserveWorldMapDiscoveries()
+{
+    if (worldMode != NetworkLaunchMode::Host || !session.isActive()) return;
+    WorldMapState map;
+    worldmap_capture_state(map);
+    std::uint32_t visits = static_cast<std::uint32_t>(map.firstVisits);
+    std::uint32_t newVisits = visits & ~observedFirstVisits;
+    observedFirstVisits = visits;
+    for (int town = 0; town < 12; town++) {
+        if ((newVisits & (1u << town)) != 0) {
+            publishSharedActivity(SharedActivityKind::Discovery, town, 1,
+                "New location discovered");
+        }
+    }
+}
+
+bool networkWorldApplyPeerSharedActivity(const SharedActivityPublishedEvent& event)
+{
+    if (worldMode != NetworkLaunchMode::Join || !session.isActive()
+        || event.entry.id == 0 || event.entry.sourceName.empty()
+        || event.entry.sourceName.size() > 32
+        || event.entry.text.empty() || event.entry.text.size() > 160) return false;
+    if (!sharedActivity.empty() && event.entry.id <= sharedActivity.back().id) {
+        if (event.entry.id < sharedActivity.front().id) {
+            return true; // This already fell outside the bounded replay window.
+        }
+        auto found = std::find_if(sharedActivity.begin(), sharedActivity.end(),
+            [&](const SharedActivityEntry& entry) {
+                return entry.id == event.entry.id;
+            });
+        return found != sharedActivity.end()
+            && found->sourceId == event.entry.sourceId
+            && found->sourceName == event.entry.sourceName
+            && found->kind == event.entry.kind
+            && found->subject == event.entry.subject
+            && found->value == event.entry.value
+            && found->text == event.entry.text;
+    }
+    sharedActivity.push_back(event.entry);
+    if (sharedActivity.size() > 64) sharedActivity.pop_front();
+    nextSharedActivityId = event.entry.id + 1;
+    return true;
+}
+
+std::vector<SharedActivityEntry> networkWorldSharedActivity()
+{
+    return { sharedActivity.begin(), sharedActivity.end() };
+}
+
+std::vector<EntityId> networkWorldDialogueSmokeTargets()
+{
+    std::vector<EntityId> targets;
+    Object* host = networkWorldPlayerActor(kHostPlayerId);
+    if (!session.isActive() || host == nullptr) return targets;
+    for (const auto& entry : worldCritters) {
+        Object* critter = entry.second;
+        if (critter != nullptr && critter->sid != -1
+            && critter_get_hits(critter) > 0 && critter->tile >= 0) {
+            targets.push_back(entry.first);
+        }
+    }
+    std::sort(targets.begin(), targets.end(), [&](EntityId a, EntityId b) {
+        Object* left = session.entities().findObject(a);
+        Object* right = session.entities().findObject(b);
+        int leftDistance = left != nullptr ? obj_dist(host, left) : 100000;
+        int rightDistance = right != nullptr ? obj_dist(host, right) : 100000;
+        return leftDistance != rightDistance
+            ? leftDistance < rightDistance : a.value < b.value;
+    });
+    return targets;
+}
+
+bool networkWorldMovePartyNearDialogueTarget(EntityId targetId)
+{
+    if (worldMode != NetworkLaunchMode::Host
+        || session.phase() != SessionPhase::Exploration) return false;
+    Object* target = session.entities().findObject(targetId);
+    Object* host = networkWorldPlayerActor(kHostPlayerId);
+    Object* guest = networkWorldPlayerActor(kGuestPlayerId);
+    if (target == nullptr || host == nullptr || guest == nullptr) return false;
+    std::vector<int> tiles;
+    for (int distance = 1; distance <= 2; distance++) {
+        for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+            int tile = tile_num_in_direction(target->tile, rotation, distance);
+            if (hexGridTileIsValid(tile)
+                && obj_blocking_at(target, tile, target->elevation) == nullptr) {
+                tiles.push_back(tile);
+            }
+        }
+    }
+    for (int first : tiles) {
+        if (obj_move_to_tile(host, first, target->elevation, nullptr) == -1) continue;
+        for (int second : tiles) {
+            if (second != first
+                && obj_blocking_at(guest, second, target->elevation) == nullptr
+                && obj_move_to_tile(guest, second, target->elevation, nullptr) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool networkWorldEndDialogue()
+{
+    if (worldMode != NetworkLaunchMode::Host || !activeSharedModal.has_value()
+        || activeSharedModal->kind != SharedModalKind::Dialogue
+        || session.phase() != SessionPhase::Dialogue
+        || dialogueCause.value == 0
+        || session.transitionTo(SessionPhase::Exploration) != LocalSessionError::None) {
+        return false;
+    }
+    deferredEvents.push_back(GameEvent { {}, dialogueCause,
+        SharedModalStateChangedEvent { activeSharedModal->actorId,
+            SharedModalKind::Dialogue, false, SessionPhase::Exploration,
+            session.phaseRevision() } });
+    activeSharedModal.reset();
+    pendingTalk.reset();
+    dialoguePresentation.reset();
+    dialogueVotes.clear();
+    dialogueCause = {};
+    return true;
+}
+
+bool networkWorldApplyPeerDialogueRequested(const DialogueRequestedEvent& event)
+{
+    return networkWorldApplyPeerSharedModal(SharedModalStateChangedEvent {
+        event.actorId, SharedModalKind::Dialogue, true,
+        SessionPhase::Dialogue, event.phaseRevision });
+}
+
+bool networkWorldApplyPeerDialogueVote(const DialogueVoteRecordedEvent& event)
+{
+    PlayerCharacterState* player = session.players().findByActor(event.actorId);
+    return player != nullptr
+        && dialogueVotes.vote(player->id, event.revision, event.option);
+}
+
+bool networkWorldApplyPeerDialoguePresentation(const DialoguePresentationEvent& event)
+{
+    if (dialoguePresentation.has_value()
+        && event.revision == dialoguePresentation->revision) {
+        return event.actorId == dialoguePresentation->actorId
+            && event.targetId == dialoguePresentation->targetId
+            && event.policy == dialoguePresentation->policy
+            && event.reply == dialoguePresentation->reply
+            && event.options == dialoguePresentation->options;
+    }
+    if (worldMode != NetworkLaunchMode::Join || !activeSharedModal.has_value()
+        || activeSharedModal->kind != SharedModalKind::Dialogue
+        || activeSharedModal->actorId != event.actorId
+        || session.entities().findObject(event.targetId) == nullptr
+        || (dialoguePresentation.has_value()
+            && event.revision <= dialoguePresentation->revision)) return false;
+    PlayerCharacterState* talker = session.players().findByActor(event.actorId);
+    if (talker == nullptr || !dialogueVotes.begin(event.revision, talker->id,
+            kHostPlayerId, session.players().playerIds(),
+            static_cast<std::uint8_t>(event.options.size()),
+            static_cast<DialogueVotingPolicy>(event.policy),
+            combatClockMilliseconds() + 60000)) return false;
+    dialoguePresentation = event;
+    return true;
 }
 
 void networkWorldCancelPendingWorldMapProposal()
@@ -5769,6 +6165,8 @@ bool networkWorldFinishWorldMapTravel(WorldMapArrivalKind kind, int specialEncou
     std::optional<WorldMapArrivedEvent> arrival = completeWorldMapTravel(kind, specialEncounter, forcedMap);
     if (!arrival.has_value()) return false;
     deferredEvents.push_back(GameEvent { {}, causedBy, std::move(*arrival) });
+    publishSharedActivity(SharedActivityKind::WorldOutcome, forcedMap,
+        static_cast<std::int32_t>(kind), "World-map travel ended");
     return true;
 }
 
@@ -5787,6 +6185,14 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
         captured.combatFreeMove = combat_free_move;
     }
     captured.gameTime = game_time();
+    captured.sharedActivity.assign(sharedActivity.begin(), sharedActivity.end());
+    if (captured.phase == SessionPhase::Dialogue
+        && activeSharedModal.has_value()
+        && activeSharedModal->kind == SharedModalKind::Dialogue) {
+        captured.dialogueActorId = activeSharedModal->actorId;
+        captured.dialoguePresentation = dialoguePresentation;
+        captured.dialogueBallots = dialogueVotes.ballots();
+    }
     worldmap_capture_state(captured.worldMap);
     worldmap_capture_travel_progress(captured.worldMapTravel.progress);
     if (pendingWorldMapProposal.has_value()) {
@@ -6166,6 +6572,42 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
         combatTurns.stop();
     }
     combat_free_move = snapshot.combatFreeMove;
+    sharedActivity.assign(snapshot.sharedActivity.begin(), snapshot.sharedActivity.end());
+    nextSharedActivityId = sharedActivity.empty()
+        ? 1 : sharedActivity.back().id + 1;
+    if (snapshot.phase == SessionPhase::Dialogue) {
+        activeSharedModal = ActiveSharedModal {
+            snapshot.dialogueActorId, SharedModalKind::Dialogue };
+        dialoguePresentation = snapshot.dialoguePresentation;
+        dialogueVotes.clear();
+        if (snapshot.dialoguePresentation.has_value()) {
+            std::vector<PlayerId> eligible;
+            eligible.reserve(snapshot.dialogueBallots.size());
+            for (const DialogueBallot& ballot : snapshot.dialogueBallots) {
+                eligible.push_back(ballot.playerId);
+            }
+            PlayerCharacterState* talker = session.players().findByActor(
+                snapshot.dialogueActorId);
+            if (talker == nullptr || !dialogueVotes.begin(
+                    snapshot.dialoguePresentation->revision, talker->id,
+                    kHostPlayerId, eligible,
+                    static_cast<std::uint8_t>(snapshot.dialoguePresentation->options.size()),
+                    static_cast<DialogueVotingPolicy>(snapshot.dialoguePresentation->policy),
+                    combatClockMilliseconds() + 60000)) return false;
+            for (const DialogueBallot& ballot : snapshot.dialogueBallots) {
+                if (ballot.option.has_value()) {
+                    dialogueVotes.vote(ballot.playerId,
+                        snapshot.dialoguePresentation->revision, *ballot.option);
+                }
+                if (!ballot.connected) {
+                    dialogueVotes.setConnected(ballot.playerId, false);
+                }
+            }
+        }
+    } else {
+        dialoguePresentation.reset();
+        dialogueVotes.clear();
+    }
     Object* localActor = localPlayerActor();
     if (localActor == nullptr
         || (map_elevation != localActor->elevation && map_set_elevation(localActor->elevation) != 0)) {
@@ -6582,6 +7024,14 @@ void networkWorldLeave()
     reservedPickupTargets.clear();
     pendingPickups.clear();
     deferredEvents.clear();
+    sharedActivity.clear();
+    nextSharedActivityId = 1;
+    observedFirstVisits = 0;
+    dialogueVotes.clear();
+    dialoguePresentation.reset();
+    pendingTalk.reset();
+    dialogueCause = {};
+    nextDialogueRevision = 1;
     activeLootTargets.clear();
     activeSharedModal.reset();
     approvedWorldMapProposerActorId = {};

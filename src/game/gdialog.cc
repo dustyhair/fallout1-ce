@@ -6,6 +6,7 @@
 #include <string.h>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "agent_journal.h"
 #include "game/actions.h"
@@ -34,6 +35,8 @@
 #include "int/dialog.h"
 #include "int/window.h"
 #include "multiplayer/network_runtime.h"
+#include "multiplayer/network_world.h"
+#include "multiplayer/acting_player_context.h"
 #include "platform_compat.h"
 #include "plib/color/color.h"
 #include "plib/gnw/button.h"
@@ -168,6 +171,10 @@ static void gDialogProcessHighlight(int index);
 static void gDialogProcessUnHighlight(int index);
 static void gDialogProcessReply();
 static void gDialogProcessUpdate();
+static void gdialogLoadReplicaPresentation(const multiplayer::DialoguePresentationEvent& presentation);
+static std::string gdialogVoteSignature();
+static bool gdialogRefreshingVotes = false;
+static std::uint64_t gdialogShownRevision = 0;
 static void gdialogQueueTts(const char* text, int speakerListId, bool playerVoice, int gender, bool fallbackOnly = false);
 static bool gdialogStartRecordedSpeech(const char* audioFileName);
 static void gdialogFinishRecordedSpeech();
@@ -632,7 +639,7 @@ void gdialog_enter(Object* target, int a2)
         return;
     }
 
-    if (multiplayer::networkRuntimeBlockUnsupportedSharedModal(multiplayer::SharedModalKind::Dialogue)) {
+    if (multiplayer::networkRuntimeIsGuestReplica()) {
         return;
     }
 
@@ -640,10 +647,11 @@ void gdialog_enter(Object* target, int a2)
         return;
     }
 
+    Object* talker = multiplayer::actingPlayerActorOr(obj_dude);
     if (PID_TYPE(target->pid) != OBJ_TYPE_ITEM && SID_TYPE(target->sid) != SCRIPT_TYPE_SPATIAL) {
         MessageListItem messageListItem;
 
-        if (make_path_func(obj_dude, obj_dude->tile, target->tile, NULL, 0, obj_sight_blocking_at) == 0) {
+        if (make_path_func(talker, talker->tile, target->tile, NULL, 0, obj_sight_blocking_at) == 0) {
             // You can't see there.
             messageListItem.num = 660;
             if (message_search(&proto_main_msg_file, &messageListItem)) {
@@ -658,7 +666,7 @@ void gdialog_enter(Object* target, int a2)
             return;
         }
 
-        if (tile_dist(obj_dude->tile, target->tile) > 12) {
+        if (tile_dist(talker->tile, target->tile) > 12) {
             // Too far away.
             messageListItem.num = 661;
             if (message_search(&proto_main_msg_file, &messageListItem)) {
@@ -674,9 +682,13 @@ void gdialog_enter(Object* target, int a2)
         }
     }
 
+    if (!multiplayer::networkRuntimeBeginDialogue()) {
+        return;
+    }
+
     gdCenterTile = tile_center_tile;
     gdBarterMod = 0;
-    gdPlayerTile = obj_dude->tile;
+    gdPlayerTile = talker->tile;
     map_disable_bk_processes();
 
     dialog_state_fix = 1;
@@ -693,6 +705,7 @@ void gdialog_enter(Object* target, int a2)
         map_enable_bk_processes();
         scr_exec_map_update_scripts();
         dialog_state_fix = 0;
+        multiplayer::networkRuntimeEndDialogue();
         return;
     }
 
@@ -701,6 +714,7 @@ void gdialog_enter(Object* target, int a2)
         map_enable_bk_processes();
         scr_exec_map_update_scripts();
         dialog_state_fix = 0;
+        multiplayer::networkRuntimeEndDialogue();
         return;
     }
 
@@ -731,7 +745,7 @@ void gdialog_enter(Object* target, int a2)
     gdialog_state = 0;
     dialogue_state = 0;
 
-    int tile = obj_dude->tile;
+    int tile = talker->tile;
     if (gdPlayerTile != tile) {
         gdCenterTile = tile;
     }
@@ -744,6 +758,31 @@ void gdialog_enter(Object* target, int a2)
     scr_exec_map_update_scripts();
 
     dialog_state_fix = 0;
+    multiplayer::networkRuntimeEndDialogue();
+}
+
+void gdialog_multiplayer_guest_process()
+{
+    if (!multiplayer::networkRuntimeIsGuestReplica()
+        || multiplayer::networkWorldPhase() != multiplayer::SessionPhase::Dialogue
+        || gdialog_state != 0) return;
+    const auto* presentation = multiplayer::networkWorldDialoguePresentation();
+    if (presentation == nullptr) return;
+    dialog_target = multiplayer::networkWorldFindObject(presentation->targetId);
+    if (dialog_target == nullptr) return;
+    gdPlayerTile = obj_dude->tile;
+    gdCenterTile = tile_center_tile;
+    map_disable_bk_processes();
+    dialog_state_fix = 1;
+    gdialogShownRevision = presentation->revision;
+    if (scr_dialogue_init(-1, 0) == 0) {
+        gDialogStart();
+        gdialogLoadReplicaPresentation(*presentation);
+        gDialogGo();
+        scr_dialogue_exit();
+    }
+    dialog_state_fix = 0;
+    map_enable_bk_processes();
 }
 
 // 0x43E0A0
@@ -1376,6 +1415,42 @@ int gDialogSayMessage()
 }
 
 // 0x43EBD8
+static void gdialogLoadReplicaPresentation(
+    const multiplayer::DialoguePresentationEvent& presentation)
+{
+    gDialogProcessCleanup();
+    dialogBlock.program = nullptr;
+    dialogBlock.replyMessageListId = -4;
+    dialogBlock.replyMessageId = -4;
+    dialogBlock.offset = 0;
+    snprintf(dialogBlock.replyText, sizeof(dialogBlock.replyText), "%s",
+        presentation.reply.c_str());
+    gdNumOptions = static_cast<int>(presentation.options.size());
+    for (int index = 0; index < gdNumOptions; index++) {
+        GameDialogOptionEntry& option = dialogBlock.options[index];
+        option.messageListId = -4;
+        option.messageId = -4;
+        option.reaction = GAME_DIALOG_REACTION_NEUTRAL;
+        option.proc = 0;
+        option.btn = -1;
+        snprintf(option.text, sizeof(option.text), "%s",
+            presentation.options[index].c_str());
+    }
+}
+
+static std::string gdialogVoteSignature()
+{
+    const auto* presentation = multiplayer::networkWorldDialoguePresentation();
+    if (presentation == nullptr) return {};
+    std::string signature = std::to_string(presentation->revision);
+    for (const auto& ballot : multiplayer::networkWorldDialogueBallots()) {
+        signature += ballot.connected ? 'c' : 'd';
+        signature += ballot.option.has_value()
+            ? static_cast<char>('0' + *ballot.option) : '-';
+    }
+    return signature;
+}
+
 static int gDialogProcess()
 {
     if (gdReenterLevel == 0) {
@@ -1387,6 +1462,7 @@ static int gDialogProcess()
     gdReenterLevel += 1;
 
     gDialogProcessUpdate();
+    std::string shownVotes = gdialogVoteSignature();
 
     int v18 = 0;
     if (dialogBlock.offset != 0) {
@@ -1404,6 +1480,54 @@ static int gDialogProcess()
         gdialogUpdateSpeechQueue();
 
         int keyCode = get_input();
+
+        bool sharedDialogue = multiplayer::networkWorldActive()
+            && multiplayer::networkWorldPhase() == multiplayer::SessionPhase::Dialogue;
+        if (multiplayer::networkRuntimeIsGuestReplica() && !sharedDialogue) {
+            break;
+        }
+        if (sharedDialogue) {
+            const auto* presentation = multiplayer::networkWorldDialoguePresentation();
+            if (multiplayer::networkRuntimeIsGuestReplica()
+                && presentation != nullptr
+                && presentation->revision != gdialogShownRevision) {
+                gdialogLoadReplicaPresentation(*presentation);
+                gdialogShownRevision = presentation->revision;
+                gdialogRefreshingVotes = true;
+                gDialogProcessUpdate();
+                gdialogRefreshingVotes = false;
+                pageCount = 0;
+                pageIndex = 0;
+                gdReplyTooBig = 0;
+            }
+            std::string votes = gdialogVoteSignature();
+            if (!votes.empty() && votes != shownVotes && presentation != nullptr) {
+                gDialogProcessCleanup();
+                gdialogRefreshingVotes = true;
+                gDialogProcessUpdate();
+                gdialogRefreshingVotes = false;
+                shownVotes = votes;
+            }
+            if (!multiplayer::networkRuntimeIsGuestReplica()) {
+                std::optional<std::uint8_t> selected =
+                    multiplayer::networkWorldResolveDialogue();
+                if (selected.has_value()) {
+                    if (presentation != nullptr) {
+                        multiplayer::networkRuntimeObserveDialogueDecision(
+                            presentation->revision, *selected);
+                    }
+                    multiplayer::networkWorldConsumeDialogueChoice();
+                    pageCount = 0;
+                    pageIndex = 0;
+                    gdReplyTooBig = 0;
+                    if (gDialogProcessChoice(*selected) == -1) break;
+                    shownVotes.clear();
+                    tick = get_time();
+                    v18 = dialogBlock.offset != 0;
+                    continue;
+                }
+            }
+        }
 
         convertMouseWheelToArrowKey(&keyCode);
 
@@ -1438,9 +1562,9 @@ static int gDialogProcess()
 
             if (dialogue_switch_mode == 6) {
                 about_loop();
-            } else if (keyCode == KEY_LOWERCASE_B) {
+            } else if (!sharedDialogue && keyCode == KEY_LOWERCASE_B) {
                 talk_to_pressed_barter(-1, -1);
-            } else if (keyCode == KEY_LOWERCASE_A) {
+            } else if (!sharedDialogue && keyCode == KEY_LOWERCASE_A) {
                 talk_to_pressed_about(-1, -1);
             }
         }
@@ -1498,9 +1622,19 @@ static int gDialogProcess()
                 gDialogProcessHighlight(option);
             } else if (keyCode >= 1300 && keyCode <= 1330) {
                 gDialogProcessUnHighlight(keyCode - 1300);
-            } else if (keyCode >= 48 && keyCode <= 57) {
+            } else if ((keyCode >= 48 && keyCode <= 57)
+                || (sharedDialogue && keyCode >= 49
+                    && keyCode < 49 + gdNumOptions)) {
                 int option = keyCode - 49;
-                if (option < gdNumOptions) {
+                if (option >= 0 && option < gdNumOptions) {
+                    if (sharedDialogue) {
+                        const auto* presentation = multiplayer::networkWorldDialoguePresentation();
+                        if (presentation != nullptr) {
+                            multiplayer::networkRuntimeSubmitDialogueVote(
+                                presentation->revision, static_cast<std::uint8_t>(option));
+                        }
+                        continue;
+                    }
                     pageCount = 0;
                     pageIndex = 0;
                     pageOffsets[0] = 0;
@@ -1586,7 +1720,7 @@ static int gDialogProcessChoice(int a1)
         gdialogQueueTts(dialogOptionEntry->text,
             speakerListId,
             true,
-            stat_level(obj_dude, STAT_GENDER));
+            stat_level(multiplayer::actingPlayerActorOr(obj_dude), STAT_GENDER));
     }
 
     if (dialogOptionEntry->messageListId == -4) {
@@ -1961,7 +2095,7 @@ static void gDialogProcessUpdate()
             if (index == 0) {
                 // Go on
                 messageListItem.num = 655;
-                if (stat_level(obj_dude, STAT_INTELLIGENCE) < 4) {
+                if (stat_level(multiplayer::actingPlayerActorOr(obj_dude), STAT_INTELLIGENCE) < 4) {
                     if (message_search(&proto_main_msg_file, &messageListItem)) {
                         strcpy(dialogOptionEntry->text, messageListItem.text);
                     } else {
@@ -1981,6 +2115,24 @@ static void gDialogProcessUpdate()
             } else {
                 debug_printf("\nError...can't find message!");
                 return;
+            }
+        }
+
+        if (gdialogRefreshingVotes) {
+            const auto* presentation = multiplayer::networkWorldDialoguePresentation();
+            if (presentation != nullptr
+                && index < static_cast<int>(presentation->options.size())) {
+                std::string label = presentation->options[index];
+                std::string voters;
+                for (const auto& ballot : multiplayer::networkWorldDialogueBallots()) {
+                    if (ballot.option.has_value() && *ballot.option == index) {
+                        if (!voters.empty()) voters += ", ";
+                        voters += multiplayer::networkWorldDialoguePlayerName(ballot.playerId);
+                    }
+                }
+                if (!voters.empty()) label += " [" + voters + "]";
+                snprintf(dialogOptionEntry->text, sizeof(dialogOptionEntry->text),
+                    "%s", label.c_str());
             }
         }
 
@@ -2037,6 +2189,15 @@ static void gDialogProcessUpdate()
     win_draw(gReplyWin);
     win_draw(gOptionWin);
     gdialogUpdateSpeechQueue();
+    if (!gdialogRefreshingVotes && multiplayer::networkWorldActive()
+        && !multiplayer::networkRuntimeIsGuestReplica()
+        && multiplayer::networkWorldPhase() == multiplayer::SessionPhase::Dialogue) {
+        std::vector<std::string> options;
+        for (int index = 0; index < gdNumOptions; index++) {
+            options.emplace_back(dialogBlock.options[index].text);
+        }
+        multiplayer::networkWorldPublishDialogue(dialogBlock.replyText, options);
+    }
 }
 
 // 0x43F8D4
@@ -2682,7 +2843,8 @@ static void gdialog_review_display(int win, int origin)
             colorTable[768] | 0x2000000);
 
         if (dialogReviewEntry->optionMessageListId != -3) {
-            snprintf(name, sizeof(name), "%s:", object_name(obj_dude));
+            snprintf(name, sizeof(name), "%s:",
+                object_name(multiplayer::actingPlayerActorOr(obj_dude)));
             win_print(win, name, 180, 88, y, colorTable[21140] | 0x2000000);
             entriesRect.uly += v20;
 

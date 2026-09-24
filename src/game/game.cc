@@ -46,6 +46,7 @@
 #include "game/version.h"
 #include "game/worldmap.h"
 #include "multiplayer/developer_local_session.h"
+#include "multiplayer/network_world.h"
 #include "tts.h"
 #include "int/movie.h"
 #include "int/window.h"
@@ -969,7 +970,11 @@ int game_set_global_var(int var, int value)
         return -1;
     }
 
+    int oldValue = game_global_vars[var];
     game_global_vars[var] = value;
+    if (oldValue != value) {
+        multiplayer::networkWorldRecordQuestActivity(var, value);
+    }
 
     return 0;
 }

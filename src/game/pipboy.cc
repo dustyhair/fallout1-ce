@@ -1,8 +1,11 @@
 #include "game/pipboy.h"
 
 #include <ctype.h>
+#include <algorithm>
 #include <stdio.h>
 #include <string.h>
+#include <string>
+#include <vector>
 
 #include "game/automap.h"
 #include "game/bmpdlog.h"
@@ -25,6 +28,8 @@
 #include "game/wordwrap.h"
 #include "game/worldmap.h"
 #include "multiplayer/network_runtime.h"
+#include "multiplayer/network_world.h"
+#include "multiplayer/local_player_context.h"
 #include "platform_compat.h"
 #include "plib/color/color.h"
 #include "plib/gnw/button.h"
@@ -197,6 +202,9 @@ static void PipAlarm(int a1);
 static void DrawAlarmText(int a1);
 static void DrawAlrmHitPnts();
 static void NewFuncDsply();
+static void DrawSharedActivity(int page);
+static bool sharedActivityMode = false;
+static int sharedActivityPage = 0;
 static void AddHotLines(int start, int count, bool add_back_button);
 static void NixHotLines();
 static bool TimedRest(int hours, int minutes, int kind);
@@ -405,6 +413,19 @@ static short sthreads[QUEST_LOCATION_COUNT][QUEST_PER_LOCATION_COUNT] = {
     },
 };
 
+int pipboy_quest_message_id_for_global(int globalVar)
+{
+    if (globalVar <= 0) return 0;
+    for (int location = 0; location < QUEST_LOCATION_COUNT; location++) {
+        for (int quest = 0; quest < QUEST_PER_LOCATION_COUNT; quest++) {
+            if (sthreads[location][quest] == globalVar) {
+                return 701 + 10 * location + quest;
+            }
+        }
+    }
+    return 0;
+}
+
 // 0x507300
 static HolidayDescription SpclDate[HOLIDAY_COUNT] = {
     { 1, 1, 100 },
@@ -543,16 +564,27 @@ int pipboy(int intent)
         return -1;
     }
     pipboyOpen = true;
+    sharedActivityMode = false;
+    sharedActivityPage = 0;
 
     mouseGetPositionInWindow(pip_win, &old_mouse_x, &old_mouse_y);
     wait_time = get_time();
     int shownRestMinutes = multiplayer::networkRuntimePendingRestMinutes();
     std::string shownRestProposer = multiplayer::networkRuntimePendingRestProposerName();
+    std::uint64_t shownActivityId = 0;
 
     while (true) {
         sharedFpsLimiter.mark();
 
         int keyCode = get_input();
+        if (sharedActivityMode) {
+            auto entries = multiplayer::networkWorldSharedActivity();
+            std::uint64_t latestId = entries.empty() ? 0 : entries.back().id;
+            if (latestId != shownActivityId) {
+                shownActivityId = latestId;
+                DrawSharedActivity(sharedActivityPage);
+            }
+        }
 
         int pendingRestMinutes = multiplayer::networkRuntimePendingRestMinutes();
         std::string pendingRestProposer = multiplayer::networkRuntimePendingRestProposerName();
@@ -597,15 +629,28 @@ int pipboy(int intent)
             break;
         }
 
-        if (keyCode == KEY_F12) {
+        if ((keyCode == KEY_LOWERCASE_F || keyCode == KEY_UPPERCASE_F)
+            && crnt_func == 0 && multiplayer::networkWorldActive()) {
+            sharedActivityMode = !sharedActivityMode;
+            sharedActivityPage = 0;
+            if (sharedActivityMode) DrawSharedActivity(sharedActivityPage);
+            else PipStatus(1024);
+        } else if (sharedActivityMode && keyCode == KEY_PAGE_DOWN) {
+            sharedActivityPage++;
+            DrawSharedActivity(sharedActivityPage);
+        } else if (sharedActivityMode && keyCode == KEY_PAGE_UP) {
+            if (sharedActivityPage > 0) sharedActivityPage--;
+            DrawSharedActivity(sharedActivityPage);
+        } else if (keyCode == KEY_F12) {
             dump_screen();
         } else if (keyCode >= 500 && keyCode <= 504) {
+            sharedActivityMode = false;
             crnt_func = keyCode - 500;
             PipFnctn[crnt_func](1024);
         } else if (keyCode >= 505 && keyCode <= 527) {
-            PipFnctn[crnt_func](keyCode - 506);
+            if (!sharedActivityMode) PipFnctn[crnt_func](keyCode - 506);
         } else if (keyCode == 528) {
-            PipFnctn[crnt_func](1025);
+            if (!sharedActivityMode) PipFnctn[crnt_func](1025);
         } else if (keyCode == KEY_PAGE_DOWN) {
             PipFnctn[crnt_func](1026);
         } else if (keyCode == KEY_PAGE_UP) {
@@ -1017,6 +1062,11 @@ static void PipStatus(int a1)
         }
 
         holocount = ListHoloDiskTitles(-1);
+
+        if (multiplayer::networkWorldActive()) {
+            cursor_line = bottom_line;
+            pip_print("F: Shared party activity", 0, colorTable[32747]);
+        }
 
         win_draw_rect(pip_win, &pip_rect);
         AddHotLines(2, statcount + holocount + 1, false);
@@ -1999,6 +2049,68 @@ static void DrawAlarmText(int a1)
         cursor_line++;
     }
 
+    win_draw_rect(pip_win, &pip_rect);
+}
+
+// 0x489124
+static void DrawSharedActivity(int page)
+{
+    NixHotLines();
+    buf_to_buf(pipbmp[PIPBOY_FRM_BACKGROUND]
+            + PIPBOY_WINDOW_WIDTH * PIPBOY_WINDOW_CONTENT_VIEW_Y
+            + PIPBOY_WINDOW_CONTENT_VIEW_X,
+        PIPBOY_WINDOW_CONTENT_VIEW_WIDTH,
+        PIPBOY_WINDOW_CONTENT_VIEW_HEIGHT,
+        PIPBOY_WINDOW_WIDTH,
+        scrn_buf + PIPBOY_WINDOW_WIDTH * PIPBOY_WINDOW_CONTENT_VIEW_Y
+            + PIPBOY_WINDOW_CONTENT_VIEW_X,
+        PIPBOY_WINDOW_WIDTH);
+    cursor_line = 0;
+    pip_print("SHARED PARTY ACTIVITY", PIPBOY_TEXT_ALIGNMENT_CENTER
+            | PIPBOY_TEXT_STYLE_UNDERLINE, colorTable[992]);
+    std::vector<multiplayer::SharedActivityEntry> entries =
+        multiplayer::networkWorldSharedActivity();
+    int perPage = std::max(1, (bottom_line - 4) / 3);
+    int maxPage = entries.empty() ? 0
+        : static_cast<int>((entries.size() - 1) / perPage);
+    sharedActivityPage = std::max(0, std::min(page, maxPage));
+    cursor_line = 2;
+    if (entries.empty()) {
+        pip_print("No shared updates yet.", 0, colorTable[992]);
+    }
+    for (int index = sharedActivityPage * perPage;
+         index < static_cast<int>(entries.size())
+            && index < (sharedActivityPage + 1) * perPage;
+         index++) {
+        const auto& entry = entries[entries.size() - 1 - index];
+        std::string label = "[Shared] " + entry.sourceName + ": " + entry.text;
+        while (label.size() > 1 && text_width(label.c_str()) > 340) {
+            label.pop_back();
+        }
+        int color = entry.sourceId == multiplayer::localPlayerId()
+            ? colorTable[32747] : colorTable[992];
+        pip_print(label.c_str(), 0, color);
+        std::string detail;
+        if (entry.kind == multiplayer::SharedActivityKind::Quest) {
+            detail = getmsg(&pipboy_message_file, &pipmesg, entry.subject);
+        } else if (entry.kind == multiplayer::SharedActivityKind::Discovery
+            && entry.subject >= 0 && entry.subject < QUEST_LOCATION_COUNT) {
+            detail = getmsg(&pipboy_message_file, &pipmesg,
+                700 + 10 * entry.subject);
+        } else if (entry.kind == multiplayer::SharedActivityKind::WorldOutcome) {
+            detail = "The party's journey continues.";
+        }
+        while (detail.size() > 1 && text_width(detail.c_str()) > 340) {
+            detail.pop_back();
+        }
+        pip_print(detail.c_str(), 0, colorTable[992]);
+        cursor_line++;
+    }
+    cursor_line = bottom_line;
+    std::string footer = "F: Status   PgUp/PgDn   "
+        + std::to_string(sharedActivityPage + 1) + "/"
+        + std::to_string(maxPage + 1);
+    pip_print(footer.c_str(), 0, colorTable[992]);
     win_draw_rect(pip_win, &pip_rect);
 }
 

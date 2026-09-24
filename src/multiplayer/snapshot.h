@@ -4,17 +4,20 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include "game/worldmap.h"
 #include "multiplayer/player_character_state.h"
+#include "multiplayer/dialogue_vote_controller.h"
 #include "multiplayer/types.h"
 
 namespace fallout {
 namespace multiplayer {
 
 constexpr std::uint32_t kSnapshotMagic = 0x46434D53;
-constexpr std::uint16_t kSnapshotVersion = 15;
+constexpr std::uint16_t kSnapshotVersion = 17;
 constexpr std::size_t kSnapshotHeaderSize = 28;
 constexpr std::size_t kMaxSnapshotPayloadSize = 512 * 1024;
 constexpr std::size_t kMaxSnapshotActors = 16;
@@ -148,6 +151,10 @@ struct WorldSnapshot {
     std::vector<std::int32_t> mapGlobalVariables;
     std::vector<std::int32_t> mapLocalVariables;
     std::vector<TimedEventSnapshot> timedEvents;
+    EntityId dialogueActorId;
+    std::optional<DialoguePresentationEvent> dialoguePresentation;
+    std::vector<DialogueBallot> dialogueBallots;
+    std::vector<SharedActivityEntry> sharedActivity;
 };
 
 enum class SnapshotError {
@@ -183,6 +190,7 @@ enum class SnapshotError {
     InvalidWorldMapState,
     InvalidWorldMapTravelState,
     InvalidCombatState,
+    InvalidDialogueState,
 };
 
 struct SnapshotDecodeResult {

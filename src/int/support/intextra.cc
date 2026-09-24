@@ -840,7 +840,7 @@ static void op_target_obj(Program* program)
 // 0x44C948
 static void op_dude_obj(Program* program)
 {
-    programStackPushPointer(program, obj_dude);
+    programStackPushPointer(program, multiplayer::actingPlayerActorOr(obj_dude));
 }
 
 // NOTE: The implementation is the same as in [op_target_obj].

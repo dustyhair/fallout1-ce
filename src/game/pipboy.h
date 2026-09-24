@@ -17,6 +17,7 @@ typedef void(PipboyRenderProc)(int a1);
 
 int pipboy(int intent);
 bool pipboy_is_open();
+int pipboy_quest_message_id_for_global(int globalVar);
 void pip_init();
 int save_pipboy(DB_FILE* stream);
 int load_pipboy(DB_FILE* stream);

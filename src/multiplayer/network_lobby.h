@@ -84,6 +84,8 @@ public:
         std::uint32_t phaseRevision);
     bool sendLocalEndTurn(std::uint64_t turnRevision, std::uint32_t phaseRevision);
     bool sendLocalSharedModal(SharedModalKind kind, bool open, SessionPhase currentPhase, std::uint32_t phaseRevision = 1);
+    bool sendLocalTalk(EntityId targetId, std::uint32_t phaseRevision);
+    bool sendLocalDialogueVote(std::uint64_t revision, std::uint8_t option, std::uint32_t phaseRevision);
     bool sendLocalWorldMapRoute(const WorldMapRouteCommand& route, std::uint32_t phaseRevision = 1);
     bool sendLocalInventoryTransfer(EntityId sourceId,
         EntityId destinationId,

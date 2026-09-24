@@ -143,6 +143,14 @@ public:
     {
         return {};
     }
+    virtual CommandExecutionStatus requestTalk(Object*, Object*, const TalkCommand&)
+    {
+        return CommandExecutionStatus::InvalidAction;
+    }
+    virtual CommandExecutionStatus dialogueVote(Object*, PlayerId, const DialogueVoteCommand&)
+    {
+        return CommandExecutionStatus::InvalidAction;
+    }
     virtual CommandExecutionStatus setWorldMapRoute(Object*, const WorldMapRouteCommand&)
     {
         return CommandExecutionStatus::InvalidAction;

@@ -50,9 +50,11 @@ These are explicit follow-up work, not reasons to overload `obj_dude`:
   Sneak's live success result and periodic queue behavior still use legacy
   process-wide state. Independent multiplayer Sneak activation needs an
   actor-owned runtime state and semantic command.
-- Dialogue execution and voting remain Phase 5. The talker-dependent stat and
-  reaction seams are ready, but shared dialogue is still blocked by the modal
-  phase guard.
+- Shared dialogue now executes its option procedure only on the host in the
+  scoped talker's context. Guests render replicated reply/options and ballots;
+  the default majority tie-break uses each eligible player's scoped Charisma
+  and Intelligence, with host RNG only for an exact stat tie. The remaining
+  durable save/load boundary belongs to Phase 6.
 - Shared cross-map elevator and ordinary-exit boundaries preserve
   `obj_dude` as the local story actor and recreate and rebind the remote actor.
   Typed-stair cross-map travel uses that bridge but still needs a dedicated

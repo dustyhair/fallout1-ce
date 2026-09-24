@@ -1815,6 +1815,9 @@ int action_talk_to(Object* a1, Object* a2)
     if (FID_TYPE(a2->fid) != OBJ_TYPE_CRITTER) {
         return -1;
     }
+    if (multiplayer::networkRuntimeHandleLocalTalk(a2)) {
+        return 0;
+    }
 
     int anim = FID_ANIM_TYPE(obj_dude->fid);
     if (anim == ANIM_WALK || anim == ANIM_RUNNING) {

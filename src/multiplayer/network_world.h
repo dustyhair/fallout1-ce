@@ -9,6 +9,7 @@
 #include "game/worldmap.h"
 #include "multiplayer/character_lobby.h"
 #include "multiplayer/command_processor.h"
+#include "multiplayer/dialogue_vote_controller.h"
 #include "multiplayer/network_bootstrap.h"
 #include "multiplayer/snapshot.h"
 
@@ -71,6 +72,25 @@ bool networkWorldBeginLocalPickup(Object* target);
 void networkWorldFinishPickup(Object* target, bool succeeded);
 AuthoritativeCommandResult networkWorldProcessCommand(const GameCommand& command);
 std::optional<GameEvent> networkWorldTakeDeferredEvent();
+bool networkWorldTakePendingTalk(EntityId& actorId, EntityId& targetId);
+bool networkWorldPublishDialogue(const std::string& reply,
+    const std::vector<std::string>& options);
+std::optional<std::uint8_t> networkWorldResolveDialogue();
+void networkWorldConsumeDialogueChoice();
+const DialoguePresentationEvent* networkWorldDialoguePresentation();
+const std::vector<DialogueBallot>& networkWorldDialogueBallots();
+std::string networkWorldDialoguePlayerName(PlayerId playerId);
+void networkWorldDialogueSetConnected(PlayerId playerId, bool connected);
+void networkWorldRecordQuestActivity(int globalVar, int value);
+void networkWorldObserveWorldMapDiscoveries();
+bool networkWorldApplyPeerSharedActivity(const SharedActivityPublishedEvent& event);
+std::vector<SharedActivityEntry> networkWorldSharedActivity();
+std::vector<EntityId> networkWorldDialogueSmokeTargets();
+bool networkWorldMovePartyNearDialogueTarget(EntityId targetId);
+bool networkWorldEndDialogue();
+bool networkWorldApplyPeerDialogueRequested(const DialogueRequestedEvent& event);
+bool networkWorldApplyPeerDialogueVote(const DialogueVoteRecordedEvent& event);
+bool networkWorldApplyPeerDialoguePresentation(const DialoguePresentationEvent& event);
 void networkWorldCancelPendingWorldMapProposal();
 void networkWorldHostTakeOverWorldMapTravel();
 bool networkWorldSynchronizeEnginePhase();

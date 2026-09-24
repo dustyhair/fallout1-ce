@@ -48,6 +48,8 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
         ? SessionPhase::Combat
         : std::holds_alternative<WorldMapRouteCommand>(command.payload)
         ? SessionPhase::Transition
+        : std::holds_alternative<DialogueVoteCommand>(command.payload)
+        ? SessionPhase::Dialogue
         : modal != nullptr && modal->kind == SharedModalKind::WorldMap && !modal->open
         ? session.phase()
         : modal != nullptr && !modal->open
@@ -101,6 +103,8 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     const CombatFaceCommand* combatFace = std::get_if<CombatFaceCommand>(&command.payload);
     const EndTurnCommand* endTurn = std::get_if<EndTurnCommand>(&command.payload);
     const WorldMapRouteCommand* worldMapRoute = std::get_if<WorldMapRouteCommand>(&command.payload);
+    const TalkCommand* talk = std::get_if<TalkCommand>(&command.payload);
+    const DialogueVoteCommand* dialogueVote = std::get_if<DialogueVoteCommand>(&command.payload);
     Object* target = nullptr;
     EntityId targetId;
     bool hasTarget = false;
@@ -113,6 +117,13 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     } else if (loot != nullptr) {
         targetId = loot->targetId;
         hasTarget = true;
+    } else if (talk != nullptr) {
+        targetId = talk->targetId;
+        hasTarget = true;
+    } else if (dialogueVote != nullptr) {
+        if (dialogueVote->revision == 0 || dialogueVote->option >= kMaximumDialogueOptions) {
+            return rejectAndRemember(CommandRejection::Malformed);
+        }
     } else if (skill != nullptr) {
         if (!isValid(skill->skill)) {
             return rejectAndRemember(CommandRejection::Malformed);
@@ -229,6 +240,14 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
         } else if (loot != nullptr) {
             executionStatus = executor.loot(actor, target);
             event.payload = LootStartedEvent { command.actorId, loot->targetId };
+        } else if (talk != nullptr) {
+            executionStatus = executor.requestTalk(actor, target, *talk);
+            event.payload = DialogueRequestedEvent {
+                command.actorId, talk->targetId, session.phaseRevision() };
+        } else if (dialogueVote != nullptr) {
+            executionStatus = executor.dialogueVote(actor, command.playerId, *dialogueVote);
+            event.payload = DialogueVoteRecordedEvent {
+                command.actorId, dialogueVote->revision, dialogueVote->option };
         } else if (skill != nullptr) {
             executionStatus = executor.useSkill(actor, target, *skill);
             event.payload = SkillUseStartedEvent { command.actorId, skill->targetId, skill->skill };

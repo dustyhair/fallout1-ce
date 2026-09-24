@@ -426,6 +426,20 @@ bool agentControlParseCommand(const std::string& line,
         }
         return true;
     }
+    if (verb == "game_talk") {
+        command.type = AgentControlCommandType::GameTalk;
+        return parseEntityId(input, command, error);
+    }
+    if (verb == "game_vote") {
+        command.type = AgentControlCommandType::GameVote;
+        if (!(input >> command.dialogueRevision >> command.dialogueOption)
+            || hasTrailingInput(input) || command.dialogueRevision == 0
+            || command.dialogueOption < 1 || command.dialogueOption > 30) {
+            error = "expected: game_vote <revision> <option 1-30>";
+            return false;
+        }
+        return true;
+    }
     if (verb == "game_give") {
         command.type = AgentControlCommandType::GameGive;
         return parseGive(input, command, error);
@@ -470,6 +484,10 @@ const char* agentControlCommandTypeName(AgentControlCommandType type)
         return "game_stairs";
     case AgentControlCommandType::GameRest:
         return "game_rest";
+    case AgentControlCommandType::GameTalk:
+        return "game_talk";
+    case AgentControlCommandType::GameVote:
+        return "game_vote";
     case AgentControlCommandType::GameGive:
         return "game_give";
     case AgentControlCommandType::GameAttack:

@@ -17,6 +17,7 @@
 #include "multiplayer/command_processor.h"
 #include "multiplayer/connection_handshake.h"
 #include "multiplayer/content_manifest.h"
+#include "multiplayer/dialogue_vote_controller.h"
 #include "multiplayer/entity_registry.h"
 #include "multiplayer/gameplay_wire.h"
 #include "multiplayer/local_session.h"
@@ -3702,7 +3703,7 @@ void testSnapshotRoundTripAndRecovery()
                                                         + PC_TRAIT_MAX
                                                         + 4)
         * sizeof(std::uint32_t);
-    expect(packet.size() == kSnapshotHeaderSize + 48 + 2 * (68 + characterBuildWireSize) + 68 + 12 + 48 + 2 * 56 + 6 * 4 + 2 * 36 + 31 * 29 + 15 * 7 + 6 * 4 + 20 + 14 * 4 + 32,
+    expect(packet.size() == kSnapshotHeaderSize + 48 + 2 * (68 + characterBuildWireSize) + 68 + 12 + 48 + 2 * 56 + 6 * 4 + 2 * 36 + 31 * 29 + 15 * 7 + 6 * 4 + 20 + 14 * 4 + 32 + 8 + 4,
         "snapshot packet declares a fixed-width payload");
     expect(packet[0] == 'F' && packet[1] == 'C' && packet[2] == 'M' && packet[3] == 'S', "snapshot magic uses network byte order");
 
@@ -4145,6 +4146,207 @@ void testNetworkSessionRecoveryPrimitives()
         "snapshot queue overflow requires a fresh snapshot instead of dropping newer events");
 }
 
+void testDialogueVotingPolicies()
+{
+    DialogueVoteController votes;
+    std::vector<PlayerId> threePlayers { PlayerId { 3 }, kGuestPlayerId, kHostPlayerId };
+    expect(votes.begin(7, kGuestPlayerId, kHostPlayerId, threePlayers, 3,
+               DialogueVotingPolicy::MajorityHostTie, 1000),
+        "three-player dialogue starts with a bounded deterministic roster");
+    expect(votes.ballots().size() == 3
+            && votes.ballots()[0].playerId == kHostPlayerId
+            && votes.ballots()[2].playerId == PlayerId { 3 },
+        "dialogue ballot ordering is independent of registration order");
+    expect(!votes.vote(PlayerId { 4 }, 7, 1)
+            && !votes.vote(kGuestPlayerId, 6, 1)
+            && !votes.vote(kGuestPlayerId, 7, 3),
+        "unknown players, stale rounds, and invalid options cannot vote");
+    expect(votes.vote(kGuestPlayerId, 7, 1)
+            && votes.vote(PlayerId { 3 }, 7, 1)
+            && votes.resolve(10) == std::optional<std::uint8_t> { 1 },
+        "a three-player majority resolves without waiting for the minority");
+    expect(!votes.vote(kHostPlayerId, 7, 2),
+        "a resolved choice cannot be changed or executed twice");
+
+    expect(votes.begin(8, kGuestPlayerId, kHostPlayerId,
+               { kHostPlayerId, kGuestPlayerId }, 2,
+               DialogueVotingPolicy::MajorityHostTie, 1000)
+            && votes.vote(kGuestPlayerId, 8, 1)
+            && votes.vote(kHostPlayerId, 8, 0)
+            && votes.resolve(10) == std::optional<std::uint8_t> { 0 },
+        "the host breaks a two-player majority tie");
+    expect(votes.begin(9, kGuestPlayerId, kHostPlayerId,
+               { kHostPlayerId, kGuestPlayerId }, 2,
+               DialogueVotingPolicy::TalkerDecides, 1000)
+            && votes.vote(kGuestPlayerId, 9, 1)
+            && !votes.resolve(10).has_value()
+            && votes.vote(kHostPlayerId, 9, 0)
+            && votes.resolve(10) == std::optional<std::uint8_t> { 1 },
+        "the talker decides only after seeing the other player's vote");
+    expect(votes.begin(10, kGuestPlayerId, kHostPlayerId,
+               { kHostPlayerId, kGuestPlayerId }, 2,
+               DialogueVotingPolicy::TalkerDecides, 1000)
+            && votes.vote(kGuestPlayerId, 10, 1)
+            && votes.setConnected(kHostPlayerId, false)
+            && votes.resolve(10) == std::optional<std::uint8_t> { 1 },
+        "a disconnected voter abstains without shrinking the frozen roster");
+    expect(votes.begin(11, kGuestPlayerId, kHostPlayerId,
+               { kHostPlayerId, kGuestPlayerId }, 2,
+               DialogueVotingPolicy::HostDecides, 1000)
+            && votes.vote(kGuestPlayerId, 11, 1)
+            && !votes.resolve(10).has_value()
+            && votes.vote(kHostPlayerId, 11, 0)
+            && votes.resolve(10) == std::optional<std::uint8_t> { 0 },
+        "host-authority policy ignores the guest's preferred option");
+    expect(votes.begin(12, kGuestPlayerId, kHostPlayerId,
+               { kHostPlayerId, kGuestPlayerId }, 2,
+               DialogueVotingPolicy::TalkerDecides, 1000)
+            && votes.vote(kHostPlayerId, 12, 1)
+            && votes.resolve(1000) == std::optional<std::uint8_t> { 1 },
+        "timeout treats a missing talker ballot as an abstention and uses the host vote");
+
+    expect(votes.begin(13, kGuestPlayerId, kHostPlayerId,
+               { kHostPlayerId, kGuestPlayerId }, 2,
+               DialogueVotingPolicy::MajorityStatsRandomTie, 1000)
+            && votes.setTieBreakStats(kHostPlayerId, 5, 9)
+            && votes.setTieBreakStats(kGuestPlayerId, 7, 2)
+            && votes.vote(kHostPlayerId, 13, 0)
+            && votes.vote(kGuestPlayerId, 13, 1)
+            && votes.resolve(10) == std::optional<std::uint8_t> { 1 },
+        "charisma wins a split dialogue vote before intelligence");
+    expect(votes.begin(14, kGuestPlayerId, kHostPlayerId,
+               { kHostPlayerId, kGuestPlayerId }, 2,
+               DialogueVotingPolicy::MajorityStatsRandomTie, 1000)
+            && votes.setTieBreakStats(kHostPlayerId, 7, 5)
+            && votes.setTieBreakStats(kGuestPlayerId, 7, 8)
+            && votes.vote(kHostPlayerId, 14, 0)
+            && votes.vote(kGuestPlayerId, 14, 1)
+            && votes.resolve(10) == std::optional<std::uint8_t> { 1 },
+        "intelligence wins when tied voters have equal charisma");
+    expect(votes.begin(15, kGuestPlayerId, kHostPlayerId,
+               { kHostPlayerId, kGuestPlayerId }, 2,
+               DialogueVotingPolicy::MajorityStatsRandomTie, 1000)
+            && votes.setTieBreakStats(kHostPlayerId, 7, 8)
+            && votes.setTieBreakStats(kGuestPlayerId, 7, 8)
+            && votes.vote(kHostPlayerId, 15, 0)
+            && votes.vote(kGuestPlayerId, 15, 1)
+            && !votes.resolve(10).has_value()
+            && votes.needsRandomTie()
+            && votes.randomTieOptionCount() == 2
+            && votes.resolve(10, 1) == std::optional<std::uint8_t> { 1 }
+            && !votes.needsRandomTie(),
+        "an exact stat tie needs one caller-provided host random draw");
+    expect(votes.begin(16, kGuestPlayerId, kHostPlayerId,
+               { kHostPlayerId, kGuestPlayerId, PlayerId { 3 } }, 2,
+               DialogueVotingPolicy::MajorityStatsRandomTie, 1000)
+            && votes.vote(kHostPlayerId, 16, 0)
+            && votes.vote(kGuestPlayerId, 16, 1)
+            && votes.vote(PlayerId { 3 }, 16, 1)
+            && votes.resolve(10) == std::optional<std::uint8_t> { 1 },
+        "three-player majority outranks all individual tie-break stats");
+}
+
+void testDialogueAndActivityWireRecovery()
+{
+    GameCommand vote;
+    vote.sequence = CommandSequence { 3 };
+    vote.playerId = kGuestPlayerId;
+    vote.actorId = EntityId { 2 };
+    vote.expectedPhase = SessionPhase::Dialogue;
+    vote.expectedPhaseRevision = 8;
+    vote.payload = DialogueVoteCommand { 42, 1 };
+    ProtocolEnvelope envelope = gameplayEnvelope(201);
+    expect(encodeGameCommand(vote, envelope) == GameplayWireError::None,
+        "dialogue vote command encodes");
+    auto decodedVote = decodeGameCommand(envelope);
+    expect(decodedVote && std::get<DialogueVoteCommand>(decodedVote.command.payload).revision == 42
+            && std::get<DialogueVoteCommand>(decodedVote.command.payload).option == 1,
+        "revision-keyed dialogue vote round trips");
+    std::get<DialogueVoteCommand>(vote.payload).option = kMaximumDialogueOptions;
+    expect(encodeGameCommand(vote, envelope) == GameplayWireError::InvalidModal,
+        "dialogue vote rejects an invalid option");
+
+    GameEvent presentationEvent { EventSequence { 51 }, CommandSequence { 3 },
+        DialoguePresentationEvent { EntityId { 2 }, EntityId { 12 }, 42, 1,
+            "Tell me about the vault.", { "Ask about the chip", "Leave" } } };
+    expect(encodeGameEvent(presentationEvent, envelope) == GameplayWireError::None,
+        "dialogue presentation event encodes");
+    auto decodedPresentation = decodeGameEvent(envelope);
+    const auto* presentation = decodedPresentation
+        ? std::get_if<DialoguePresentationEvent>(&decodedPresentation.event.payload)
+        : nullptr;
+    expect(presentation != nullptr && presentation->reply == "Tell me about the vault."
+            && presentation->options.size() == 2
+            && presentation->options[1] == "Leave",
+        "reply and options survive the authoritative event wire");
+    envelope.payload[36] = 5;
+    expect(decodeGameEvent(envelope).error == GameplayWireError::InvalidModal,
+        "unknown dialogue voting policies are rejected on decode");
+    envelope.payload[36] = 1;
+    envelope.payload.pop_back();
+    expect(decodeGameEvent(envelope).error == GameplayWireError::InvalidLength,
+        "truncated dialogue text is rejected before indexing it");
+
+    SharedActivityEntry activity { 9, kGuestPlayerId, "Guest",
+        SharedActivityKind::Quest, 733, 2, "Quest progressed" };
+    GameEvent activityEvent { EventSequence { 52 }, CommandSequence { 3 },
+        SharedActivityPublishedEvent { EntityId { 1 }, activity } };
+    expect(encodeGameEvent(activityEvent, envelope) == GameplayWireError::None,
+        "attributed Pip-Boy activity event encodes");
+    auto decodedActivity = decodeGameEvent(envelope);
+    const auto* activityPayload = decodedActivity
+        ? std::get_if<SharedActivityPublishedEvent>(&decodedActivity.event.payload)
+        : nullptr;
+    expect(activityPayload != nullptr && activityPayload->entry.id == 9
+            && activityPayload->entry.sourceId == kGuestPlayerId
+            && activityPayload->entry.sourceName == "Guest"
+            && activityPayload->entry.subject == 733,
+        "shared activity keeps identity, source, and quest key over the wire");
+
+    WorldSnapshot snapshot = sampleSnapshot();
+    snapshot.phase = SessionPhase::Dialogue;
+    snapshot.dialogueActorId = EntityId { 2 };
+    snapshot.dialoguePresentation = std::get<DialoguePresentationEvent>(presentationEvent.payload);
+    snapshot.dialogueBallots = {
+        DialogueBallot { kHostPlayerId, std::uint8_t { 0 }, true },
+        DialogueBallot { kGuestPlayerId, std::uint8_t { 1 }, true },
+    };
+    snapshot.sharedActivity.push_back(activity);
+    std::vector<std::uint8_t> packet;
+    expect(encodeSnapshot(snapshot, packet) == SnapshotError::None,
+        "in-flight dialogue and feed encode in a reconnect snapshot");
+    auto decoded = decodeSnapshot(packet);
+    expect(decoded && decoded.snapshot.dialoguePresentation.has_value()
+            && decoded.snapshot.dialoguePresentation->revision == 42
+            && decoded.snapshot.dialogueBallots.size() == 2
+            && decoded.snapshot.dialogueBallots[1].option == std::uint8_t { 1 }
+            && decoded.snapshot.sharedActivity.size() == 1
+            && decoded.snapshot.sharedActivity[0].sourceName == "Guest",
+        "reconnect restores options, visible votes, and ordered activity");
+    snapshot.sharedActivity.push_back(SharedActivityEntry {
+        10, PlayerId { 3 }, "Third", SharedActivityKind::Discovery,
+        4, 1, "New location discovered" });
+    snapshot.sharedActivity.push_back(SharedActivityEntry {
+        11, PlayerId {}, "World", SharedActivityKind::WorldOutcome,
+        7, 1, "World-map travel ended" });
+    expect(encodeSnapshot(snapshot, packet) == SnapshotError::None,
+        "three-player and system activity remains valid in one ordered replay");
+    decoded = decodeSnapshot(packet);
+    expect(decoded && decoded.snapshot.sharedActivity.size() == 3
+            && decoded.snapshot.sharedActivity[0].id == 9
+            && decoded.snapshot.sharedActivity[0].sourceId == kGuestPlayerId
+            && decoded.snapshot.sharedActivity[1].id == 10
+            && decoded.snapshot.sharedActivity[1].sourceId == PlayerId { 3 }
+            && decoded.snapshot.sharedActivity[2].id == 11
+            && decoded.snapshot.sharedActivity[2].sourceId == PlayerId {}
+            && decoded.snapshot.sharedActivity[2].sourceName == "World",
+        "reconnect preserves feed order, third-player identity, and neutral source");
+    WorldSnapshot duplicate = snapshot;
+    duplicate.sharedActivity.push_back(snapshot.sharedActivity.back());
+    expect(validateSnapshot(duplicate) == SnapshotError::InvalidDialogueState,
+        "snapshot rejects duplicate activity identities");
+}
+
 } // namespace
 } // namespace multiplayer
 } // namespace fallout
@@ -4153,6 +4355,8 @@ int main()
 {
     fallout::multiplayer::testCoreTypes();
     fallout::multiplayer::testCombatTurnController();
+    fallout::multiplayer::testDialogueVotingPolicies();
+    fallout::multiplayer::testDialogueAndActivityWireRecovery();
     fallout::multiplayer::testEntityRegistry();
     fallout::multiplayer::testEntityRegistryAcrossEngineLifecycles();
     fallout::multiplayer::testPlayerCharacterStateStore();

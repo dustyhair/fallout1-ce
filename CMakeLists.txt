@@ -42,6 +42,8 @@ add_library(fallout-multiplayer-core STATIC
     "src/multiplayer/combat_turn_controller.h"
     "src/multiplayer/connection_handshake.cc"
     "src/multiplayer/connection_handshake.h"
+    "src/multiplayer/dialogue_vote_controller.cc"
+    "src/multiplayer/dialogue_vote_controller.h"
     "src/multiplayer/content_manifest.cc"
     "src/multiplayer/content_manifest.h"
     "src/multiplayer/command_processor.cc"

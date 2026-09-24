@@ -2,6 +2,7 @@
 #define FALLOUT_AGENT_JOURNAL_H_
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -66,6 +67,30 @@ struct AgentJournalWorldState {
     int pendingRestMinutes = 0;
     std::uint32_t pendingRestProposerId = 0;
     std::string pendingRestProposerName;
+    struct Dialogue {
+        std::uint64_t revision = 0;
+        std::uint32_t talkerPlayerId = 0;
+        std::uint64_t targetId = 0;
+        std::string reply;
+        std::vector<std::string> options;
+        struct Vote {
+            std::uint32_t playerId = 0;
+            int option = 0; // One-based; zero means abstaining.
+            bool connected = false;
+        };
+        std::vector<Vote> votes;
+    };
+    std::optional<Dialogue> dialogue;
+    struct SharedActivity {
+        std::uint64_t id = 0;
+        std::uint32_t sourcePlayerId = 0;
+        std::string sourceName;
+        std::string kind;
+        int subject = 0;
+        int value = 0;
+        std::string text;
+    };
+    std::vector<SharedActivity> sharedActivity;
     AgentJournalActorState host;
     AgentJournalActorState guest;
     std::vector<AgentJournalInventoryItemState> localInventory;
