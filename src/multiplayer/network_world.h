@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "game/engine_execution_probe.h"
+#include "game/worldmap.h"
 #include "multiplayer/character_lobby.h"
 #include "multiplayer/command_processor.h"
 #include "multiplayer/network_bootstrap.h"
@@ -78,6 +79,7 @@ std::optional<EntityId> networkWorldReadyLocalExitGrid();
 bool networkWorldSharedModalActive();
 bool networkWorldLocalWorldMapController();
 std::optional<std::pair<std::int32_t, std::int32_t>> networkWorldSelectedWorldMapRoute();
+WorldMapTravelStepResult networkWorldAdvanceWorldMapTravel();
 bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot& snapshot);
 bool networkWorldApplySnapshot(const WorldSnapshot& snapshot);
 bool networkWorldCaptureAuthoritativeState(EventSequence lastIncludedEvent, WorldSnapshot& snapshot);

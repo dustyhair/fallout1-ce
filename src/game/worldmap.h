@@ -166,8 +166,9 @@ void worldmap_capture_state(WorldMapState& state);
 bool worldmap_apply_state(const WorldMapState& state);
 
 // A host-only, headless travel step. This deliberately stops before any map
-// load or world-map movie; callers must publish the resulting world state and
-// resolve interruptions before advancing again.
+// load or world-map movie. Multiplayer gameplay must use
+// networkWorldAdvanceWorldMapTravel so remote player healing is also applied;
+// callers must publish the resulting state and resolve interruptions.
 enum class WorldMapTravelStepStatus {
     Invalid,
     Moving,

@@ -29,9 +29,11 @@
 #include "game/map_defs.h"
 #include "game/object.h"
 #include "game/party.h"
+#include "game/perk.h"
 #include "game/protinst.h"
 #include "game/proto.h"
 #include "game/queue.h"
+#include "game/roll.h"
 #include "game/scripts.h"
 #include "game/stat.h"
 #include "game/tile.h"
@@ -41,6 +43,7 @@
 #include "multiplayer/local_session.h"
 #include "multiplayer/presentation_bridge.h"
 #include "plib/gnw/debug.h"
+#include "plib/gnw/memory.h"
 
 namespace fallout {
 namespace multiplayer {
@@ -717,6 +720,17 @@ bool sharedPlayersHealed()
     return true;
 }
 
+void healRemotePlayersForHours(int hours)
+{
+    int healingPeriods = hours / 3;
+    for (PlayerId playerId : session.players().playerIds()) {
+        Object* player = session.entities().findObject(session.playerActorId(playerId));
+        if (player != nullptr && player != obj_dude && !isPartyMember(player)) {
+            critter_adjust_hits(player, healingPeriods * stat_level(player, STAT_HEALING_RATE));
+        }
+    }
+}
+
 // True means rest stopped before its requested goal, including an interrupting
 // queue event or a safety bound. The final clock and all effects still publish.
 bool advanceSharedRest(int minutes, bool untilHealed)
@@ -762,12 +776,7 @@ bool advanceSharedRest(int minutes, bool untilHealed)
         }
         if (game_time() >= nextHealingTime) {
             partyMemberRestingHeal(3);
-            for (PlayerId playerId : session.players().playerIds()) {
-                Object* player = session.entities().findObject(session.playerActorId(playerId));
-                if (player != nullptr && player != obj_dude) {
-                    critter_adjust_hits(player, stat_level(player, STAT_HEALING_RATE));
-                }
-            }
+            healRemotePlayersForHours(3);
             nextHealingTime += 3 * GAME_TIME_TICKS_PER_HOUR;
         }
     }
@@ -3933,6 +3942,117 @@ bool networkWorldRunSharedModalSmokeTest()
         game_global_vars[GVAR_VATS_COUNTDOWN] = savedVatsCountdown;
         game_global_vars[GVAR_COUNTDOWN_TO_DESTRUCTION] = savedMasterCountdown;
     }
+    bool hostTravelRules = true;
+    if (worldMode == NetworkLaunchMode::Host) {
+        int savedVaultWater = game_global_vars[GVAR_VAULT_WATER];
+        int savedWaterChip = game_global_vars[GVAR_FIND_WATER_CHIP];
+        int savedVatsCountdown = game_global_vars[GVAR_VATS_COUNTDOWN];
+        int savedMasterCountdown = game_global_vars[GVAR_COUNTDOWN_TO_DESTRUCTION];
+        game_global_vars[GVAR_VAULT_WATER] = 1;
+        game_global_vars[GVAR_VATS_COUNTDOWN] = 0;
+        game_global_vars[GVAR_COUNTDOWN_TO_DESTRUCTION] = 0;
+
+        Object* remotePlayer = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+        int remoteStartingHits = remotePlayer != nullptr ? critter_get_hits(remotePlayer) : 0;
+        WorldMapState dayFixture = startingWorldMap;
+        dayFixture.x = 1325;
+        dayFixture.y = 325; // City terrain; the first two pixels cost no clock time.
+        hostTravelRules = remotePlayer != nullptr
+            && remoteStartingHits > 1
+            && stat_level(remotePlayer, STAT_HEALING_RATE) > 0
+            && worldmap_apply_state(dayFixture)
+            && worldmap_authoritative_travel_begin(725, 616);
+        WorldMapTravelProgress dayProgress;
+        worldmap_capture_travel_progress(dayProgress);
+        dayProgress.miles = dayProgress.dayLength - 1;
+        dayProgress.timeAdder = 0;
+        hostTravelRules = hostTravelRules
+            && dayProgress.active
+            && worldmap_apply_travel_progress(dayProgress);
+        if (remotePlayer != nullptr && remoteStartingHits > 1) {
+            critter_adjust_hits(remotePlayer, -1);
+        }
+        // This cell's encounter threshold is 9. Find a deterministic seed
+        // whose first 3d6 roll trips it; no map is loaded by the stepper.
+        int encounterSeed = 0;
+        for (int seed = 1; seed <= 1024; seed++) {
+            roll_set_seed(seed);
+            int chance = roll_random(1, 6) + roll_random(1, 6) + roll_random(1, 6);
+            if (chance < 9) {
+                encounterSeed = seed;
+                break;
+            }
+        }
+        WorldMapTravelStepResult encounterStep;
+        if (hostTravelRules && encounterSeed != 0) {
+            roll_set_seed(encounterSeed);
+            encounterStep = networkWorldAdvanceWorldMapTravel();
+        }
+        hostTravelRules = hostTravelRules
+            && encounterSeed != 0
+            && encounterStep.status == WorldMapTravelStepStatus::Encounter
+            && encounterStep.dayElapsed
+            && encounterStep.gameTime == startingWorldTime
+            && critter_get_hits(remotePlayer) == remoteStartingHits;
+        roll_set_seed(-1);
+        if (remotePlayer != nullptr) {
+            critter_adjust_hits(remotePlayer, remoteStartingHits - critter_get_hits(remotePlayer));
+        }
+        worldmap_authoritative_travel_cancel();
+        hostTravelRules = worldmap_apply_state(startingWorldMap) && hostTravelRules;
+
+        std::vector<QueueEventState> savedQueue;
+        bool queueCaptured = queue_capture_state(savedQueue);
+        WorldMapState queueFixture = startingWorldMap;
+        queueFixture.x = 1200;
+        queueFixture.y = 1200; // Coast terrain advances time on the first pixel.
+        bool queueStarted = queueCaptured
+            && worldmap_apply_state(queueFixture)
+            && worldmap_authoritative_travel_begin(725, 616);
+        auto* withdrawal = static_cast<WithdrawalEvent*>(mem_malloc(sizeof(WithdrawalEvent)));
+        bool queueAdded = false;
+        if (withdrawal != nullptr) {
+            *withdrawal = WithdrawalEvent { 0, 0, PERK_BUFFOUT_ADDICTION };
+            queueAdded = queue_add(1, obj_dude, withdrawal, EVENT_TYPE_WITHDRAWAL) != -1;
+            if (!queueAdded) mem_free(withdrawal);
+        }
+        WorldMapTravelStepResult queueStep;
+        if (queueStarted && queueAdded) {
+            queueStep = networkWorldAdvanceWorldMapTravel();
+        }
+        hostTravelRules = hostTravelRules
+            && queueStarted && queueAdded
+            && queueStep.status == WorldMapTravelStepStatus::QueueInterrupted
+            && queueStep.gameTime == startingWorldTime + 1
+            && !queueStep.dayElapsed;
+        worldmap_authoritative_travel_cancel();
+        bool queueRestored = queueCaptured && queue_replace_state(savedQueue);
+        set_game_time(startingWorldTime);
+        hostTravelRules = queueRestored
+            && worldmap_apply_state(startingWorldMap)
+            && hostTravelRules;
+
+        game_global_vars[GVAR_VAULT_WATER] = 0;
+        game_global_vars[GVAR_FIND_WATER_CHIP] = 0;
+        bool worldEventStarted = worldmap_apply_state(queueFixture)
+            && worldmap_authoritative_travel_begin(725, 616);
+        WorldMapTravelStepResult worldEventStep;
+        if (worldEventStarted) {
+            worldEventStep = networkWorldAdvanceWorldMapTravel();
+        }
+        hostTravelRules = hostTravelRules
+            && worldEventStarted
+            && worldEventStep.status == WorldMapTravelStepStatus::WorldEventPending
+            && worldEventStep.x == queueFixture.x
+            && worldEventStep.y == queueFixture.y
+            && worldEventStep.gameTime == startingWorldTime;
+        worldmap_authoritative_travel_cancel();
+        hostTravelRules = worldmap_apply_state(startingWorldMap) && hostTravelRules;
+        game_global_vars[GVAR_VAULT_WATER] = savedVaultWater;
+        game_global_vars[GVAR_FIND_WATER_CHIP] = savedWaterChip;
+        game_global_vars[GVAR_VATS_COUNTDOWN] = savedVatsCountdown;
+        game_global_vars[GVAR_COUNTDOWN_TO_DESTRUCTION] = savedMasterCountdown;
+    }
     GameCommand unauthorizedRoute = route;
     unauthorizedRoute.playerId = kHostPlayerId;
     unauthorizedRoute.actorId = session.playerActorId(kHostPlayerId);
@@ -4105,7 +4225,8 @@ bool networkWorldRunSharedModalSmokeTest()
         && !networkWorldSharedModalActive();
 
     commandProcessor.reset();
-    return invalidTravelTargetRejected && travelStepperGuarded && hostTravelProgressRoundTrip
+    return invalidTravelTargetRejected && travelStepperGuarded
+        && hostTravelProgressRoundTrip && hostTravelRules
         && travelWaitsForConsent && proposerRetainsControl && proposerCanRoute
         && onlyProposerCanRoute && proposerCanClearRoute && onlyProposerCanClose
         && proposerCanCancel && hostCanProposeAndRoute && routeHasNoWorldEffects
@@ -4710,6 +4831,31 @@ bool networkWorldLocalWorldMapController()
 std::optional<std::pair<std::int32_t, std::int32_t>> networkWorldSelectedWorldMapRoute()
 {
     return selectedWorldMapRoute;
+}
+
+WorldMapTravelStepResult networkWorldAdvanceWorldMapTravel()
+{
+    WorldMapTravelStepResult invalid;
+    if (worldMode != NetworkLaunchMode::Host
+        || !session.isActive()
+        || session.phase() != SessionPhase::Transition
+        || !activeSharedModal.has_value()
+        || activeSharedModal->kind != SharedModalKind::WorldMap
+        || !selectedWorldMapRoute.has_value()) {
+        return invalid;
+    }
+    WorldMapTravelProgress progress;
+    worldmap_capture_travel_progress(progress);
+    if (!progress.active
+        || progress.targetX != selectedWorldMapRoute->first
+        || progress.targetY != selectedWorldMapRoute->second) {
+        return invalid;
+    }
+    WorldMapTravelStepResult result = worldmap_authoritative_travel_step();
+    if (result.dayElapsed) {
+        healRemotePlayersForHours(24);
+    }
+    return result;
 }
 
 bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot& snapshot)
