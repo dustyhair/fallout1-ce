@@ -24,7 +24,7 @@ Passing `--multiplayer-smoke-scenario=transfer` creates the same seven-cap guest
 
 Passing `--multiplayer-smoke-scenario=skill` places the guest beside the same registered door and submits Traps through the real skill command. The host runs the asynchronous skill action under the guest character context; the guest applies only the ordered presentation boundary. Both processes then require the same complete authoritative state digest and replay the skill event after reconnect.
 
-Passing `--multiplayer-smoke-scenario=scenery` selects a registered non-door scenery object, preferring one with a script, and submits Science through the same skill path. After the host action completes, the fixture changes one shared scenery flag only on the host. The version 9 checkpoint must repair that flag and converge the complete scenery section on the guest without guest-side rule execution.
+Passing `--multiplayer-smoke-scenario=scenery` selects a registered non-door scenery object, preferring one with a script, and submits Science through the same skill path. After the host action completes, the fixture changes one shared scenery flag only on the host. The version 10 checkpoint must repair that flag and converge the complete scenery section on the guest without guest-side rule execution.
 
 Passing `--multiplayer-smoke-scenario=container` places the guest beside a registered ground container and submits Lockpick. The fixture changes one shared container flag only on the host, and the checkpoint must converge the complete item section—including container art/frame, flags, and light—before authenticated replay.
 
@@ -51,6 +51,8 @@ Passing `--multiplayer-smoke-scenario=rest` loads `SHADYW.MAP`. The host first s
 With `until_morning`, `--multiplayer-smoke-rest-interrupt` schedules a host-only withdrawal queue event one minute into rest. Both peers must report an interrupted completion at the same earlier clock time and still converge and replay the authoritative state.
 
 This hook makes the two-process path runnable under Xvfb:
+
+`--multiplayer-smoke-worldmap-state` with the default movement scenario changes the persistent world-map grid, a known town entrance, and special-encounter history only on the host. The version 10 checkpoint must repair all three on the guest and converge the dedicated world-map digest section, including after authenticated replay. It does not yet enable world-map travel.
 
 ```text
 fallout-ce --multiplayer-host=45455 --multiplayer-smoke-test

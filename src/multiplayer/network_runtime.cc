@@ -38,6 +38,7 @@
 #include "game/stat.h"
 #include "game/textobj.h"
 #include "game/tile.h"
+#include "game/worldmap.h"
 #include "multiplayer/character_build_bridge.h"
 #include "multiplayer/content_manifest.h"
 #include "multiplayer/gameplay_wire.h"
@@ -91,6 +92,7 @@ enum class SmokeScenario {
 SmokeScenario smokeScenario = SmokeScenario::Movement;
 int smokeRestMinutes = 10;
 bool smokeRestInterrupt = false;
+bool smokeWorldMapState = false;
 
 const char* smokeScenarioName()
 {
@@ -1169,6 +1171,7 @@ bool networkRuntimeConfigure(int argc, char** argv)
     smokeScenario = SmokeScenario::Movement;
     smokeRestMinutes = 10;
     smokeRestInterrupt = false;
+    smokeWorldMapState = false;
     for (int index = 1; index < argc; index++) {
         if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-test") == 0) {
             smokeTestEnabled = true;
@@ -1204,6 +1207,8 @@ bool networkRuntimeConfigure(int argc, char** argv)
             smokeScenario = SmokeScenario::Rest;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-rest-interrupt") == 0) {
             smokeRestInterrupt = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-worldmap-state") == 0) {
+            smokeWorldMapState = true;
         } else if (argv[index] != nullptr
             && std::strncmp(argv[index], "--multiplayer-smoke-rest-minutes=", 33) == 0) {
             char* end = nullptr;
@@ -1238,6 +1243,10 @@ bool networkRuntimeConfigure(int argc, char** argv)
     if (smokeRestInterrupt && (smokeScenario != SmokeScenario::Rest
             || smokeRestMinutes != kRestUntilMorning)) {
         std::fprintf(stderr, "The rest interruption fixture requires rest until_morning.\n");
+        return false;
+    }
+    if (smokeWorldMapState && smokeScenario != SmokeScenario::Movement) {
+        std::fprintf(stderr, "The world-map state fixture requires the movement scenario.\n");
         return false;
     }
     pendingLocalSheet.reset();
@@ -1362,6 +1371,15 @@ bool networkRuntimeRunSmokeTest()
             std::optional<ExitGridSmokeFixture> exitGridFixture;
             std::optional<SceneryTransitionSmokeFixture> sceneryTransitionFixture;
             int restStartingGameTime = game_time();
+            WorldMapState initialWorldMap;
+            worldmap_capture_state(initialWorldMap);
+            auto worldMapStateMatchesFixture = [&](const WorldMapState& state) {
+                return !smokeWorldMapState
+                    || (state.specialEncounters == (initialWorldMap.specialEncounters ^ 1)
+                        && state.grid[42] == (initialWorldMap.grid[42] == 0 ? 1 : 0)
+                        && state.knownTownEntrances[4]
+                            == (initialWorldMap.knownTownEntrances[4] == 0 ? 1 : 0));
+            };
             if (smokeScenario == SmokeScenario::Rest && smokeRestInterrupt
                 && launchOptions.mode == NetworkLaunchMode::Host) {
                 // Fallout's withdrawal handler returns nonzero for the story
@@ -1830,6 +1848,8 @@ bool networkRuntimeRunSmokeTest()
                                 SnapshotDigestResult actualDigest = computeSnapshotDigest(localState);
                                 stateConverged = expectedDigest && actualDigest
                                     && expectedDigest.digest == actualDigest.digest;
+                                stateConverged = stateConverged
+                                    && worldMapStateMatchesFixture(localState.worldMap);
                                 if (stateConverged && smokeScenario == SmokeScenario::Quest) {
                                     stateConverged = networkWorldVerifyQuestSmokeTest(*questFixture);
                                 } else if (stateConverged && smokeScenario == SmokeScenario::Elevation) {
@@ -2049,6 +2069,14 @@ bool networkRuntimeRunSmokeTest()
                     if (!objectMutated) {
                         setStatus("MULTIPLAYER SMOKE TEST FAILED: OBJECT MUTATION FIXTURE");
                     }
+                    if (smokeWorldMapState) {
+                        WorldMapState changedWorldMap = initialWorldMap;
+                        changedWorldMap.specialEncounters ^= 1;
+                        changedWorldMap.grid[42] = changedWorldMap.grid[42] == 0 ? 1 : 0;
+                        changedWorldMap.knownTownEntrances[4]
+                            = changedWorldMap.knownTownEntrances[4] == 0 ? 1 : 0;
+                        objectMutated = objectMutated && worldmap_apply_state(changedWorldMap);
+                    }
                     if (smokeScenario == SmokeScenario::Door && outcome.event.has_value()) {
                         auto* door = std::get_if<DoorUseStartedEvent>(&outcome.event->payload);
                         if (door != nullptr && scenarioTarget != nullptr) {
@@ -2103,7 +2131,8 @@ bool networkRuntimeRunSmokeTest()
                         && restCompleted
                         && objectMutated
                         && authoritativeEvents.size() == scenarioFinalEventSequence.value
-                        && networkWorldCaptureAuthoritativeState(scenarioFinalEventSequence, state);
+                        && networkWorldCaptureAuthoritativeState(scenarioFinalEventSequence, state)
+                        && worldMapStateMatchesFixture(state.worldMap);
                     SnapshotError snapshotError = captured
                         ? encodeSnapshot(state, statePayload)
                         : SnapshotError::None;

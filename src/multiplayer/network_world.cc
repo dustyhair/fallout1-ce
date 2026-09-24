@@ -79,6 +79,35 @@ struct PendingRestProposal {
     std::unordered_set<PlayerId, PlayerIdHash> readyPlayers;
 };
 std::optional<PendingRestProposal> pendingRestProposal;
+
+bool allConnectedPlayersReady(const std::unordered_set<PlayerId, PlayerIdHash>& readyPlayers)
+{
+    if (session.players().size() == 0) {
+        return false;
+    }
+    for (PlayerId playerId : session.players().playerIds()) {
+        if (readyPlayers.find(playerId) == readyPlayers.end()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool allConnectedPlayersNear(int tile, int elevation, int radius)
+{
+    if (!hexGridTileIsValid(tile) || !elevationIsValid(elevation)
+        || session.players().size() == 0) {
+        return false;
+    }
+    for (PlayerId playerId : session.players().playerIds()) {
+        Object* actor = session.entities().findObject(session.playerActorId(playerId));
+        if (actor == nullptr || actor->elevation != elevation
+            || tile_dist(actor->tile, tile) > radius) {
+            return false;
+        }
+    }
+    return true;
+}
 constexpr auto kRestProposalLifetime = std::chrono::seconds(90);
 NetworkLaunchMode worldMode = NetworkLaunchMode::Disabled;
 EntityId expectedSplitEntityId;
@@ -886,7 +915,8 @@ public:
             || !elevationIsValid(destinationElevation)
             || !hexGridTileIsValid(destinationTile)
             || (destinationMap == map_data.field_34 && destinationElevation == actor->elevation)
-            || (destinationMap != map_data.field_34 && !companionJoins)) {
+            || (destinationMap != map_data.field_34
+                && !allConnectedPlayersNear(sourceTile, actor->elevation, 4))) {
             return execution;
         }
 
@@ -994,8 +1024,7 @@ public:
             || target == nullptr
             || actor->tile != target->tile
             || actor->elevation != target->elevation
-            || companion->elevation != target->elevation
-            || tile_dist(companion->tile, target->tile) > 4
+            || !allConnectedPlayersNear(target->tile, target->elevation, 4)
             || !exitGridDestination(target,
                 destinationMap,
                 destinationTile,
@@ -1072,8 +1101,7 @@ public:
             || session.phase() != SessionPhase::Exploration) {
             return execution;
         }
-        bool companionReady = companion->elevation == target->elevation
-            && tile_dist(companion->tile, target->tile) <= 4;
+        bool companionReady = allConnectedPlayersNear(target->tile, target->elevation, 4);
         int sourceMap = map_data.field_34;
         int declaredDestinationMap = sceneryType == SCENERY_TYPE_STAIRS
             ? target->data.scenery.stairs.destinationMap
@@ -1263,7 +1291,7 @@ public:
             }
             pendingRestProposal->readyPlayers.insert(player->id);
             pendingRestProposal->expiresAt = now + kRestProposalLifetime;
-            if (pendingRestProposal->readyPlayers.size() == session.players().size()) {
+            if (allConnectedPlayersReady(pendingRestProposal->readyPlayers)) {
                 if (session.transitionTo(SessionPhase::Transition) != LocalSessionError::None) {
                     return execution;
                 }
@@ -4139,6 +4167,7 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
     captured.phase = session.phase();
     captured.phaseRevision = session.phaseRevision();
     captured.gameTime = game_time();
+    worldmap_capture_state(captured.worldMap);
     for (PlayerId playerId : { kHostPlayerId, kGuestPlayerId }) {
         EntityId actorId = session.playerActorId(playerId);
         Object* actor = session.entities().findObject(actorId);
@@ -4560,6 +4589,10 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
     }
     applyVariableState(snapshot);
     set_game_time(snapshot.gameTime);
+    if (!worldmap_apply_state(snapshot.worldMap)) {
+        std::fprintf(stderr, "Multiplayer snapshot failed world-map state application.\n");
+        return false;
+    }
     if (!applyTimedEvents(snapshot)) {
         std::fprintf(stderr, "Multiplayer snapshot failed timed-event application.\n");
         return false;

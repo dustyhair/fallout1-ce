@@ -933,6 +933,47 @@ int load_world_map(DB_FILE* stream)
     return 0;
 }
 
+void worldmap_capture_state(WorldMapState& state)
+{
+    static_assert(sizeof(WorldGrid) == 31 * 29);
+    static_assert(sizeof(TwnSelKnwFlag) == 15 * 7);
+    memcpy(state.grid.data(), WorldGrid, sizeof(WorldGrid));
+    memcpy(state.knownTownEntrances.data(), TwnSelKnwFlag, sizeof(TwnSelKnwFlag));
+    state.firstVisits = first_visit_flag;
+    state.specialEncounters = encounter_specials;
+    state.town = our_town;
+    state.section = our_section;
+    state.x = world_xpos;
+    state.y = world_ypos;
+}
+
+bool worldmap_apply_state(const WorldMapState& state)
+{
+    if (state.firstVisits < 0 || state.firstVisits > 0xFFF
+        || state.specialEncounters < 0 || state.specialEncounters > 0x3F
+        || state.town < 0 || state.town >= TOWN_COUNT
+        || state.section < 0 || state.section >= 7
+        || state.x < 0 || state.x >= 1400
+        || state.y < 0 || state.y >= 1500) {
+        return false;
+    }
+    for (std::uint8_t value : state.grid) {
+        if (value > 2) return false;
+    }
+    for (std::uint8_t value : state.knownTownEntrances) {
+        if (value > 1) return false;
+    }
+    memcpy(WorldGrid, state.grid.data(), sizeof(WorldGrid));
+    memcpy(TwnSelKnwFlag, state.knownTownEntrances.data(), sizeof(TwnSelKnwFlag));
+    first_visit_flag = state.firstVisits;
+    encounter_specials = state.specialEncounters;
+    our_town = state.town;
+    our_section = state.section;
+    world_xpos = state.x;
+    world_ypos = state.y;
+    return true;
+}
+
 // NOTE: It's the biggest function in Fallout 1 and Fallout 2 containing more
 // than 9000 instructions.
 //

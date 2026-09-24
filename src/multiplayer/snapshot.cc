@@ -22,6 +22,7 @@ constexpr std::size_t kDoorSnapshotSize = 12;
 constexpr std::size_t kScenerySnapshotSize = 48;
 constexpr std::size_t kItemSnapshotSize = 56;
 constexpr std::size_t kTimedEventSnapshotSize = 36;
+constexpr std::size_t kWorldMapSnapshotSize = 31 * 29 + 15 * 7 + 6 * sizeof(std::uint32_t);
 constexpr std::size_t kSnapshotProtectedOffset = 20;
 constexpr std::uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
 constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
@@ -51,6 +52,18 @@ void appendUint64(std::vector<std::uint8_t>& bytes, std::uint64_t value)
     for (int shift = 56; shift >= 0; shift -= 8) {
         bytes.push_back(static_cast<std::uint8_t>((value >> shift) & 0xFF));
     }
+}
+
+void appendWorldMap(std::vector<std::uint8_t>& bytes, const WorldMapState& state)
+{
+    bytes.insert(bytes.end(), state.grid.begin(), state.grid.end());
+    bytes.insert(bytes.end(), state.knownTownEntrances.begin(), state.knownTownEntrances.end());
+    appendUint32(bytes, static_cast<std::uint32_t>(state.firstVisits));
+    appendUint32(bytes, static_cast<std::uint32_t>(state.specialEncounters));
+    appendUint32(bytes, static_cast<std::uint32_t>(state.town));
+    appendUint32(bytes, static_cast<std::uint32_t>(state.section));
+    appendUint32(bytes, static_cast<std::uint32_t>(state.x));
+    appendUint32(bytes, static_cast<std::uint32_t>(state.y));
 }
 
 std::uint8_t readUint8(const std::vector<std::uint8_t>& bytes, std::size_t& offset)
@@ -345,6 +358,17 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
     if (snapshot.timedEvents.size() > kMaxSnapshotTimedEvents) {
         return SnapshotError::TooManyTimedEvents;
     }
+    const WorldMapState& worldMap = snapshot.worldMap;
+    if (worldMap.firstVisits < 0 || worldMap.firstVisits > 0xFFF
+        || worldMap.specialEncounters < 0 || worldMap.specialEncounters > 0x3F
+        || worldMap.town < 0 || worldMap.town >= TOWN_COUNT
+        || worldMap.section < 0 || worldMap.section >= 7
+        || worldMap.x < 0 || worldMap.x >= 1400
+        || worldMap.y < 0 || worldMap.y >= 1500
+        || std::any_of(worldMap.grid.begin(), worldMap.grid.end(), [](std::uint8_t value) { return value > 2; })
+        || std::any_of(worldMap.knownTownEntrances.begin(), worldMap.knownTownEntrances.end(), [](std::uint8_t value) { return value > 1; })) {
+        return SnapshotError::InvalidWorldMapState;
+    }
 
     std::unordered_set<std::uint32_t> entityIds;
     std::unordered_set<std::uint32_t> playerIds;
@@ -474,7 +498,8 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
               + snapshot.mapGlobalVariables.size()
               + snapshot.mapLocalVariables.size())
             * sizeof(std::uint32_t)
-        + snapshot.timedEvents.size() * kTimedEventSnapshotSize;
+        + snapshot.timedEvents.size() * kTimedEventSnapshotSize
+        + kWorldMapSnapshotSize;
     if (payloadSize > kMaxSnapshotPayloadSize) {
         return SnapshotError::PayloadTooLarge;
     }
@@ -502,7 +527,8 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
               + canonical.mapGlobalVariables.size()
               + canonical.mapLocalVariables.size())
             * sizeof(std::uint32_t)
-        + canonical.timedEvents.size() * kTimedEventSnapshotSize);
+        + canonical.timedEvents.size() * kTimedEventSnapshotSize
+        + kWorldMapSnapshotSize);
 
     appendUint8(payload, static_cast<std::uint8_t>(canonical.phase));
     appendUint8(payload, 0);
@@ -539,6 +565,7 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
     for (const TimedEventSnapshot& event : canonical.timedEvents) {
         appendTimedEvent(payload, event);
     }
+    appendWorldMap(payload, canonical.worldMap);
 
     std::vector<std::uint8_t> protectedBytes;
     protectedBytes.reserve(sizeof(std::uint64_t) + payload.size());
@@ -664,7 +691,8 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
               + static_cast<std::size_t>(mapGlobalCount)
               + static_cast<std::size_t>(mapLocalCount))
             * sizeof(std::uint32_t)
-        + static_cast<std::size_t>(timedEventCount) * kTimedEventSnapshotSize;
+        + static_cast<std::size_t>(timedEventCount) * kTimedEventSnapshotSize
+        + kWorldMapSnapshotSize;
     if (payloadSize < expectedPayloadSize) {
         result.error = SnapshotError::TruncatedPayload;
         return result;
@@ -786,6 +814,17 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
         }
         result.snapshot.timedEvents.push_back(event);
     }
+    WorldMapState& worldMap = result.snapshot.worldMap;
+    std::copy_n(packet.begin() + offset, worldMap.grid.size(), worldMap.grid.begin());
+    offset += worldMap.grid.size();
+    std::copy_n(packet.begin() + offset, worldMap.knownTownEntrances.size(), worldMap.knownTownEntrances.begin());
+    offset += worldMap.knownTownEntrances.size();
+    worldMap.firstVisits = static_cast<std::int32_t>(readUint32(packet, offset));
+    worldMap.specialEncounters = static_cast<std::int32_t>(readUint32(packet, offset));
+    worldMap.town = static_cast<std::int32_t>(readUint32(packet, offset));
+    worldMap.section = static_cast<std::int32_t>(readUint32(packet, offset));
+    worldMap.x = static_cast<std::int32_t>(readUint32(packet, offset));
+    worldMap.y = static_cast<std::int32_t>(readUint32(packet, offset));
 
     result.error = validateSnapshot(result.snapshot);
     if (result.error == SnapshotError::None) {
@@ -866,6 +905,11 @@ SnapshotDigestResult computeSnapshotDigest(const WorldSnapshot& snapshot)
     }
     result.digest.timedEvents = digestBytes(timedEventBytes);
 
+    std::vector<std::uint8_t> worldMapBytes;
+    worldMapBytes.reserve(kWorldMapSnapshotSize);
+    appendWorldMap(worldMapBytes, canonical.worldMap);
+    result.digest.worldMap = digestBytes(worldMapBytes);
+
     std::vector<std::uint8_t> overallBytes;
     appendUint64(overallBytes, result.digest.session);
     appendUint64(overallBytes, result.digest.actors);
@@ -876,6 +920,7 @@ SnapshotDigestResult computeSnapshotDigest(const WorldSnapshot& snapshot)
     appendUint64(overallBytes, result.digest.globals);
     appendUint64(overallBytes, result.digest.mapVariables);
     appendUint64(overallBytes, result.digest.timedEvents);
+    appendUint64(overallBytes, result.digest.worldMap);
     result.digest.overall = digestBytes(overallBytes);
     return result;
 }
@@ -908,6 +953,9 @@ SnapshotSection firstDivergentSection(const SectionedStateDigest& expected, cons
     }
     if (expected.timedEvents != actual.timedEvents) {
         return SnapshotSection::TimedEvents;
+    }
+    if (expected.worldMap != actual.worldMap) {
+        return SnapshotSection::WorldMap;
     }
     return SnapshotSection::None;
 }

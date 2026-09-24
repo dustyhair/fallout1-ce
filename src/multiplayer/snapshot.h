@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "game/worldmap.h"
 #include "multiplayer/player_character_state.h"
 #include "multiplayer/types.h"
 
@@ -13,7 +14,7 @@ namespace fallout {
 namespace multiplayer {
 
 constexpr std::uint32_t kSnapshotMagic = 0x46434D53;
-constexpr std::uint16_t kSnapshotVersion = 9;
+constexpr std::uint16_t kSnapshotVersion = 10;
 constexpr std::size_t kSnapshotHeaderSize = 28;
 constexpr std::size_t kMaxSnapshotPayloadSize = 512 * 1024;
 constexpr std::size_t kMaxSnapshotActors = 16;
@@ -101,6 +102,7 @@ struct WorldSnapshot {
     SessionPhase phase = SessionPhase::Lobby;
     std::uint32_t phaseRevision = 0;
     std::int32_t gameTime = 1;
+    WorldMapState worldMap;
     std::vector<ActorSnapshot> actors;
     std::vector<CritterSnapshot> critters;
     std::vector<DoorSnapshot> doors;
@@ -142,6 +144,7 @@ enum class SnapshotError {
     InvalidSceneryState,
     InvalidItemState,
     InvalidTimedEventState,
+    InvalidWorldMapState,
 };
 
 struct SnapshotDecodeResult {
@@ -165,6 +168,7 @@ enum class SnapshotSection {
     Globals,
     MapVariables,
     TimedEvents,
+    WorldMap,
 };
 
 struct SectionedStateDigest {
@@ -177,6 +181,7 @@ struct SectionedStateDigest {
     std::uint64_t globals = 0;
     std::uint64_t mapVariables = 0;
     std::uint64_t timedEvents = 0;
+    std::uint64_t worldMap = 0;
     std::uint64_t overall = 0;
 };
 
@@ -191,6 +196,7 @@ constexpr bool operator==(const SectionedStateDigest& lhs, const SectionedStateD
         && lhs.globals == rhs.globals
         && lhs.mapVariables == rhs.mapVariables
         && lhs.timedEvents == rhs.timedEvents
+        && lhs.worldMap == rhs.worldMap
         && lhs.overall == rhs.overall;
 }
 

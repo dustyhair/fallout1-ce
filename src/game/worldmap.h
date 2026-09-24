@@ -1,6 +1,9 @@
 #ifndef FALLOUT_GAME_WORLDMAP_H_
 #define FALLOUT_GAME_WORLDMAP_H_
 
+#include <array>
+#include <cstdint>
+
 #include "plib/db/db.h"
 
 namespace fallout {
@@ -145,6 +148,22 @@ typedef struct WorldMapContext {
     short town;
     short section;
 } WorldMapContext;
+
+// Persistent world-map/encounter state. The arrays match the save-game data;
+// transient UI buffers and travel-animation counters are deliberately absent.
+struct WorldMapState {
+    std::array<std::uint8_t, 31 * 29> grid {};
+    std::array<std::uint8_t, 15 * 7> knownTownEntrances {};
+    std::int32_t firstVisits = 0;
+    std::int32_t specialEncounters = 0;
+    std::int32_t town = 0;
+    std::int32_t section = 0;
+    std::int32_t x = 0;
+    std::int32_t y = 0;
+};
+
+void worldmap_capture_state(WorldMapState& state);
+bool worldmap_apply_state(const WorldMapState& state);
 
 extern int world_win;
 extern int our_section;

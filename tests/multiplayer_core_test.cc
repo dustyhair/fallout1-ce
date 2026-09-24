@@ -87,6 +87,14 @@ WorldSnapshot sampleSnapshot()
     snapshot.phase = SessionPhase::Exploration;
     snapshot.phaseRevision = 7;
     snapshot.gameTime = 302400;
+    snapshot.worldMap.firstVisits = 5;
+    snapshot.worldMap.specialEncounters = 2;
+    snapshot.worldMap.town = TOWN_SHADY_SANDS;
+    snapshot.worldMap.section = 1;
+    snapshot.worldMap.x = 1075;
+    snapshot.worldMap.y = 75;
+    snapshot.worldMap.grid[42] = 2;
+    snapshot.worldMap.knownTownEntrances[14] = 1;
     snapshot.actors = {
         ActorSnapshot { EntityId { 2 }, kGuestPlayerId, 20102, 0, 3, 28 },
         ActorSnapshot { EntityId { 1 }, kHostPlayerId, 20100, 0, 1, 34 },
@@ -3037,7 +3045,7 @@ void testSnapshotRoundTripAndRecovery()
                                                         + PC_TRAIT_MAX
                                                         + 4)
         * sizeof(std::uint32_t);
-    expect(packet.size() == kSnapshotHeaderSize + 48 + 2 * (32 + characterBuildWireSize) + 36 + 12 + 48 + 2 * 56 + 6 * 4 + 2 * 36,
+    expect(packet.size() == kSnapshotHeaderSize + 48 + 2 * (32 + characterBuildWireSize) + 36 + 12 + 48 + 2 * 56 + 6 * 4 + 2 * 36 + 31 * 29 + 15 * 7 + 6 * 4,
         "snapshot packet declares a fixed-width payload");
     expect(packet[0] == 'F' && packet[1] == 'C' && packet[2] == 'M' && packet[3] == 'S', "snapshot magic uses network byte order");
 
@@ -3048,6 +3056,11 @@ void testSnapshotRoundTripAndRecovery()
             && decoded.snapshot.phaseRevision == 7
             && decoded.snapshot.gameTime == 302400,
         "snapshot keeps session phase and authoritative world time");
+    expect(decoded.snapshot.worldMap.specialEncounters == 2
+            && decoded.snapshot.worldMap.x == 1075
+            && decoded.snapshot.worldMap.grid[42] == 2
+            && decoded.snapshot.worldMap.knownTownEntrances[14] == 1,
+        "snapshot keeps authoritative world-map discovery and encounter history");
     expect(decoded.snapshot.actors.size() == 2 && decoded.snapshot.actors[0].entityId == EntityId { 1 }, "decoded actors use canonical entity order");
     expect(decoded.snapshot.actors[1].tile == 20102 && decoded.snapshot.actors[1].hitPoints == 28, "snapshot keeps guest actor state");
     expect(decoded.snapshot.actors[0].build.experience == 125
@@ -3154,6 +3167,16 @@ void testSnapshotRoundTripAndRecovery()
     SnapshotDigestResult timedEventDriftDigest = computeSnapshotDigest(timedEventDrift);
     expect(firstDivergentSection(authoritativeDigest.digest, timedEventDriftDigest.digest) == SnapshotSection::TimedEvents,
         "timed-event drift reports the timed-event section");
+
+    WorldSnapshot worldMapDrift = decoded.snapshot;
+    worldMapDrift.worldMap.specialEncounters ^= 1;
+    SnapshotDigestResult worldMapDriftDigest = computeSnapshotDigest(worldMapDrift);
+    expect(firstDivergentSection(authoritativeDigest.digest, worldMapDriftDigest.digest) == SnapshotSection::WorldMap,
+        "encounter-history drift reports the world-map section");
+    WorldSnapshot invalidWorldMap = decoded.snapshot;
+    invalidWorldMap.worldMap.grid[42] = 3;
+    expect(validateSnapshot(invalidWorldMap) == SnapshotError::InvalidWorldMapState,
+        "snapshot rejects an invalid world-map discovery cell");
 
     SnapshotReplica replica;
     expect(replica.apply(actorDrift) == SnapshotError::None, "replica accepts locally drifted state");
