@@ -2980,7 +2980,7 @@ bool networkRuntimeGiveItemToPlayer(EntityId destinationActorId, EntityId itemId
 
 bool networkRuntimeRequestSharedModal(SharedModalKind kind, bool open)
 {
-    if (!networkWorldActive() || !isValid(kind)) {
+    if (!networkWorldActive() || !isValid(kind) || kind == SharedModalKind::WorldMap) {
         return false;
     }
     if ((open && networkWorldPhase() != SessionPhase::Exploration)

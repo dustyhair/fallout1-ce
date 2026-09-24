@@ -1329,7 +1329,10 @@ public:
     {
         SharedModalExecution execution;
         std::optional<EntityId> actorId = session.entities().findEntity(actor);
-        if (!actorId.has_value() || !isValid(command.kind)) {
+        // World-map travel needs unanimous consent and a separate proposer
+        // controller. A generic modal-open command would bypass both.
+        if (!actorId.has_value() || !isValid(command.kind)
+            || command.kind == SharedModalKind::WorldMap) {
             return execution;
         }
 
@@ -3596,6 +3599,13 @@ bool networkWorldRunSharedModalSmokeTest()
     open.actorId = actorId;
     open.expectedPhase = SessionPhase::Exploration;
     open.expectedPhaseRevision = session.phaseRevision();
+    GameCommand unapprovedTravel = open;
+    unapprovedTravel.payload = SharedModalCommand { SharedModalKind::WorldMap, true };
+    AuthoritativeCommandResult travelResult = networkWorldProcessCommand(unapprovedTravel);
+    bool travelBlocked = travelResult.result.rejection == CommandRejection::InvalidAction
+        && !travelResult.event.has_value()
+        && session.phase() == SessionPhase::Exploration;
+    commandProcessor.reset();
     open.payload = SharedModalCommand { SharedModalKind::Dialogue, true };
     AuthoritativeCommandResult opened = networkWorldProcessCommand(open);
     const auto* openedEvent = opened.event.has_value()
@@ -3634,7 +3644,7 @@ bool networkWorldRunSharedModalSmokeTest()
         && !networkWorldSharedModalActive();
 
     commandProcessor.reset();
-    return openPassed && blockPassed && closePassed;
+    return travelBlocked && openPassed && blockPassed && closePassed;
 }
 
 bool networkWorldBeginLocalLoot(Object* target)
