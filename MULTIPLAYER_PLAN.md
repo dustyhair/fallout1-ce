@@ -54,6 +54,48 @@ Periodic snapshots repair missed or incorrectly applied state. They are also the
 
 These limits remove several hard synchronization problems without weakening the core co-op experience.
 
+### Future player-count expansion guardrails
+
+The first release remains exactly two players. Do not expand the live socket,
+lobby, or UI scope while the authoritative gameplay path is still being built.
+However, unfinished systems should avoid adding new assumptions that make a
+later three-or-more-player refactor harder than necessary:
+
+- Model participants internally as a bounded, deterministically ordered roster
+  keyed by `PlayerId`. A two-entry roster is still the only accepted runtime
+  configuration until the later expansion milestone.
+- Key ownership, command sequencing, reconnect state, readiness, votes, timeout
+  policy, and snapshot progress by `PlayerId`, not by a new host/guest boolean or
+  a second pair of named fields. Host authority and story-actor status remain
+  explicit roles rather than implied array positions.
+- Represent effects that can concern every player as bounded collections or as
+  one ordered per-player effect. Sort encoded collections by `PlayerId`, declare
+  a maximum count in the protocol version, and reject duplicates and unknown
+  participants. Never add an unbounded wire collection.
+- Treat `localPlayerActor()` as one actor plus a collection of remote actors.
+  Preserve stable player and actor identity when any remote actor is recreated;
+  do not generalize by introducing `peerActor2`, `peerActor3`, and similar
+  globals.
+- Define readiness against an immutable participant set captured at the start
+  of an operation. Cross-map travel and shared time advances require every
+  connected participant in that set; same-map elevators may move only the
+  nearby subset. Disconnect and timeout policies must say whether a participant
+  is removed, treated as not ready, or handled by host takeover.
+- Keep bilateral operations, such as a direct trade, explicitly keyed by two
+  participant IDs while allowing other roster members to exist. Party-wide
+  policies, such as XP, cap distribution, loot priority, and dialogue voting,
+  iterate the eligible roster rather than naming the guest.
+- New headless controllers that aggregate player state must include a synthetic
+  three-player test even though end-to-end engine and socket scenarios remain
+  two-process until the expansion milestone.
+
+Existing two-player shapes are accepted implementation debt, not patterns to
+copy. The known conversion points are `LocalSession`'s host/guest actor and
+transport members, the single `peerActor` world bridge, the two-slot character
+lobby and native lobby UI, host/guest placement fields in elevator events, the
+two-player save sidecar, and two-process runtime test orchestration. Keep this
+list current when a remaining phase discovers another pair-shaped boundary.
+
 ### Session state and safe points
 
 Make session phase explicit:
@@ -353,7 +395,9 @@ Current implementation status:
 3. [x] Route semantic verbs through the same multiplayer runtime handlers and command processor used by human input.
 4. [x] Add semantic direct-inventory gift, item-on-target, and same-map elevator verbs using the same authoritative paths as human input; dialogue and combat verbs remain pending their authoritative controllers.
 5. [x] Add deterministic two-process exploration scenarios and structured completion assertions. Installed-data fixtures cover guest movement, scripted-door use, deferred pickup completion, loot initiation, a split cap gift, targeted skills, item-on-target quest completion, non-door scenery state, container state, and same-map elevation travel, with full section-digest convergence and authenticated event replay.
-6. [ ] Add an optional Laya or LLM controller above the deterministic semantic interface.
+6. [ ] Add an optional Laya or LLM controller above the deterministic semantic
+   interface. Its decision state names the controlled `PlayerId` and exposes a
+   bounded player roster instead of host/guest-only observation fields.
 
 Exit condition: an automated local client can observe the journal, control one player through validated semantic commands, and complete the supported exploration command set without bypassing multiplayer authority.
 
@@ -380,18 +424,25 @@ Exit condition: two players can complete a small non-combat quest together on on
 - [ ] Add synchronized ordinary exits and stairs on top of the cross-map transition bridge.
 - [ ] Add synchronized rest with an authoritative time advance and queued-event processing boundary.
 - Add world-map travel while preserving one authoritative world clock and encounter state.
-- [ ] Require both-player readiness for exits, rest, and world-map transitions, with an explicit host timeout policy where appropriate. Same-map elevators remain independently usable, with proximity-based shared rides.
-- Verify entity rebinding, guest inventory persistence, queued events, and state hashes across every transition boundary.
+- [ ] Require readiness from every connected participant for exits, rest, and world-map transitions—both players in the MVP—with an explicit host timeout policy where appropriate. Same-map elevators remain independently usable, with proximity-based shared rides.
+- Verify entity rebinding, every remote-player inventory, queued events, and state hashes across every transition boundary.
+- [ ] Put transition readiness and destination placement behind roster-shaped
+  helpers. The current elevator wire event may retain its version 13 host/guest
+  fields, but ordinary exits, rest, and world-map code must not add another
+  independent pair-shaped readiness or placement model.
 
 Exit condition: two players can complete a small non-combat quest together, change maps and elevations, travel on the world map, and remain synchronized.
 
 ### Phase 4A: combat controller and turn ownership
 
 - Transition into and out of the authoritative Combat phase and replicate the phase revision.
-- Classify every combatant as host-controlled, guest-controlled, or host AI.
+- Classify every combatant by an owning `PlayerId` or as host AI.
 - Give engine input only to the peer that owns the active actor; never pass a player-owned actor to `combat_ai`.
 - Add semantic end-turn, timeout, disconnect/pass, and optional host-takeover policies.
 - Keep the guest combat simulation passive: it renders host-selected results but does not advance AI, scripts, rolls, damage, ammo, or death checks.
+- Key player-controlled turns, deadlines, disconnect handling, and optional
+  takeover by the active actor's owning `PlayerId`. The controller must not use
+  a host-turn/guest-turn enum; include a three-player headless initiative test.
 
 Exit condition: initiative advances through host, guest, and AI actors in the same order on both views, and an out-of-turn command cannot mutate state.
 
@@ -400,6 +451,9 @@ Exit condition: initiative advances through host, guest, and AI actors in the sa
 - Replicate movement, attack, item, reload, stance, and end-turn commands and their complete host-selected results.
 - Add shared XP and progression events.
 - Cover death, knockout, fleeing, elevation changes, and combat triggered by scripts.
+- Encode combat ownership and results by actor/player identity, and track
+  recovery acknowledgement per participant so another player's reconnect does
+  not stall or rewind the authoritative turn.
 
 Do not enable live attack commands merely because their wire format exists. The runtime must reject them until Phase 4A ownership and complete authoritative combat effects are in place.
 
@@ -411,6 +465,11 @@ Exit condition: a complete encounter survives save, load, and guest reconnection
 - Add voting policies and visible votes.
 - Execute one authoritative option procedure.
 - Apply talker stats to dialogue checks while preserving canonical story state.
+- Store votes as a bounded `PlayerId`-keyed collection captured from the
+  dialogue's eligible participant set. Define majority, ties, abstentions,
+  disconnects, host authority, and talker authority for any roster size, then
+  cover a three-player majority in headless tests while retaining two-process
+  engine scenarios.
 
 Exit condition: the players can complete branching dialogue with a tie, a skill check, a quest update, and a combat transition.
 
@@ -420,6 +479,12 @@ Exit condition: the players can complete branching dialogue with a tie, a skill 
 - Add cap splitting and alternating loot priority.
 - Finish the multiplayer save sidecar and recovery saves.
 - Handle missing guests, replaced characters, and incompatible save versions.
+- Keep direct trades bilateral and revisioned by the two named participants,
+  while cap distribution, loot priority, save records, reconnect slots, and
+  character replacement operate over a deterministically ordered roster.
+- Version the sidecar so the existing two-player representation can migrate to
+  a bounded repeated-player representation without changing `SAVE.DAT` or
+  silently reassigning player IDs.
 
 Exit condition: a two-player session can be stopped, loaded later, and resumed without duplicating or losing items.
 
@@ -431,8 +496,44 @@ Exit condition: a two-player session can be stopped, loaded later, and resumed w
 - Maintain a representative Fallout compatibility campaign covering major script patterns, companions, scripted combat, inventory-heavy interactions, elevators, encounters, timed events, and ending-critical state.
 - Make multiplayer and its networking dependencies optional at build time without changing the single-player binary path when disabled.
 - Document hosting, ports, firewall behavior, compatibility rules, and known limitations.
+- Audit the completed phases against the player-count expansion guardrails and
+  update the known pair-shaped debt list before freezing the first-release
+  protocol and sidecar formats.
 
 Exit condition: the compatibility campaign completes without unresolved authoritative-state divergence, save corruption, item duplication/loss, or single-player regression.
+
+### Post-MVP milestone: more than two players
+
+This milestone begins only after the two-player compatibility campaign is
+stable. Supporting a third or fourth guest should be the same architecture
+change with a different configured maximum; the eventual product limit remains
+a separate decision:
+
+- Replace the remaining `LocalSession`, lobby, world, and sidecar host/guest
+  members with the bounded player roster and a local-player ID.
+- Let the authoritative host accept multiple authenticated client connections;
+  maintain command deduplication, send queues, acknowledgement cursors,
+  reconnect credentials, snapshot transfer, and failure state independently for
+  each player, while keeping one session-wide ordered event journal.
+- Broadcast authoritative results to every connected replica and retain journal
+  entries until every required recipient has acknowledged them or fallen back
+  to snapshot recovery. One slow client must not block command processing for
+  the others indefinitely.
+- Replace pair-shaped transition and presentation payloads, including version
+  13 elevator placements, with bounded `PlayerId`-keyed collections in a new
+  protocol version. Add explicit migration/rejection behavior for older peers.
+- Generalize remote-actor creation, map-load rebinding, local presentation,
+  party XP, loot priority, dialogue votes, combat ownership, and recovery saves
+  without changing the canonical story actor exposed as `dude_obj`.
+- Add three-player, four-player, and configured-maximum headless, loopback, real
+  socket, installed-data, disconnect/reconnect, transition, combat, dialogue,
+  trade, and save/load scenarios. Verify per-client authority suppression and
+  complete section-digest convergence after every recovery boundary.
+
+Exit condition: the same authoritative session passes the compatibility
+campaign with three players, four players, and the configured maximum—including
+independent client failure and reconnect—without introducing a separate
+gameplay rules path.
 
 ## First implementation series
 
@@ -496,6 +597,9 @@ High-value automated cases include:
 - A scripted interaction executing exactly once on the host and zero times on the guest.
 - A combat result consuming RNG once on the host and applying explicit values on the guest.
 - Agent runs with no LLM configured, proving deterministic scenarios do not depend on model availability.
+- Synthetic three-player readiness, initiative, voting, party reward, and loot
+  rotation tests for every new roster-shaped controller, even while the live
+  runtime is restricted to two players.
 
 Add a debug state hash for maps, global variables, objects, inventories, combat state, and player metadata. Compare the host hash with the guest's last applied snapshot during development. A mismatch should report the first divergent section rather than one opaque checksum.
 
