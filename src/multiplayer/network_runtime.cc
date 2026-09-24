@@ -72,6 +72,7 @@ std::string runtimeStatus;
 bool backgroundProcessRegistered = false;
 bool lobbyStarted = false;
 bool smokeTestEnabled = false;
+std::optional<PlayerId> announcedWorldMapProposer;
 enum class SmokeScenario {
     Movement,
     Door,
@@ -1212,6 +1213,7 @@ bool networkRuntimeConfigure(int argc, char** argv)
     smokeWorldMapTown = false;
     smokeWorldMapEncounter = false;
     smokeWorldMapQueue = false;
+    announcedWorldMapProposer.reset();
     for (int index = 1; index < argc; index++) {
         if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-test") == 0) {
             smokeTestEnabled = true;
@@ -2865,7 +2867,6 @@ bool networkRuntimeHandleGameChatInput(int keyCode)
     // A world-map proposal is an explicit consent request, not a local map
     // open. Keep the prompt in the ordinary game loop so both peers can answer
     // while exploration is still running.
-    static std::optional<PlayerId> announcedWorldMapProposer;
     std::optional<PlayerId> proposer = networkWorldPendingWorldMapProposer();
     PlayerId localPlayerId = launchOptions.mode == NetworkLaunchMode::Host
         ? kHostPlayerId
@@ -3795,6 +3796,7 @@ void networkRuntimeStop()
     pendingLocalExitGrid.reset();
     nextAuthoritativeState = {};
     nextAgentWorldReport = {};
+    announcedWorldMapProposer.reset();
 }
 
 } // namespace multiplayer
