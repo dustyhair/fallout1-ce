@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <deque>
+#include <limits>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -23,6 +25,7 @@
 #include "game/map.h"
 #include "game/map_defs.h"
 #include "game/object.h"
+#include "game/party.h"
 #include "game/protinst.h"
 #include "game/proto.h"
 #include "game/queue.h"
@@ -65,6 +68,16 @@ bool itemDropInProgress = false;
 bool itemUseInProgress = false;
 bool scriptedSceneryTransitionInProgress = false;
 std::optional<MapTransition> capturedSceneryMapTransition;
+struct PendingRestProposal {
+    std::int32_t minutes = 0;
+    PlayerId proposer;
+    int map = -1;
+    std::uint32_t phaseRevision = 0;
+    std::chrono::steady_clock::time_point expiresAt;
+    std::unordered_set<PlayerId, PlayerIdHash> readyPlayers;
+};
+std::optional<PendingRestProposal> pendingRestProposal;
+constexpr auto kRestProposalLifetime = std::chrono::seconds(90);
 NetworkLaunchMode worldMode = NetworkLaunchMode::Disabled;
 EntityId expectedSplitEntityId;
 EntityId lastSplitEntityId;
@@ -622,6 +635,48 @@ bool loadSharedMap(int map)
     return true;
 }
 
+// Advance through each due queue boundary on the host only. The replica gets
+// the resulting world clock and all rule effects from the authoritative state.
+void advanceSharedRest(int minutes)
+{
+    constexpr int kTicksPerMinute = GAME_TIME_TICKS_PER_HOUR / 60;
+    int endTime = game_time() + minutes * kTicksPerMinute;
+    int nextHealingTime = game_time() + 3 * GAME_TIME_TICKS_PER_HOUR;
+    constexpr int kMaximumRestQueueBoundaries = 65536;
+    int boundaries = 0;
+    while (game_time() < endTime && boundaries++ < kMaximumRestQueueBoundaries) {
+        int nextTime = endTime;
+        int nextEventTime = queue_next_time();
+        if (nextEventTime > 0 && nextEventTime < nextTime) {
+            nextTime = std::max(game_time(), nextEventTime);
+        }
+        nextTime = std::min(nextTime, nextHealingTime);
+        set_game_time(nextTime);
+        if (nextEventTime > 0 && nextEventTime <= game_time()) {
+            int queueResult = queue_process();
+            if (queueResult != 0 || game_user_wants_to_quit != 0) {
+                std::fprintf(stderr,
+                    "Multiplayer rest interrupted by queue at time=%d result=%d quit=%d.\n",
+                    game_time(), queueResult, game_user_wants_to_quit);
+                break;
+            }
+        }
+        if (game_time() >= nextHealingTime) {
+            partyMemberRestingHeal(3);
+            for (PlayerId playerId : session.players().playerIds()) {
+                Object* player = session.entities().findObject(session.playerActorId(playerId));
+                if (player != nullptr && player != obj_dude) {
+                    critter_adjust_hits(player, stat_level(player, STAT_HEALING_RATE));
+                }
+            }
+            nextHealingTime += 3 * GAME_TIME_TICKS_PER_HOUR;
+        }
+    }
+    if (boundaries >= kMaximumRestQueueBoundaries) {
+        std::fprintf(stderr, "Multiplayer rest stopped at the queue boundary limit, time=%d.\n", game_time());
+    }
+}
+
 class NetworkCommandExecutor : public CommandExecutor {
 public:
     CommandExecutionStatus move(Object* actor, const MoveCommand& command) override
@@ -1083,6 +1138,81 @@ public:
                 playerActor->rotation,
             });
         }
+        execution.phaseRevision = session.phaseRevision();
+        return execution;
+    }
+
+    RestExecution rest(Object* actor, const RestCommand& command) override
+    {
+        RestExecution execution;
+        std::optional<EntityId> actorId = session.entities().findEntity(actor);
+        PlayerCharacterState* player = actorId.has_value()
+            ? session.players().findByActor(*actorId)
+            : nullptr;
+        if (actor == nullptr
+            || player == nullptr
+            || isInCombat()
+            || activeSharedModal.has_value()
+            || session.phase() != SessionPhase::Exploration
+            || !isValidRestMinutes(command.minutes)) {
+            return execution;
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        if (pendingRestProposal.has_value()
+            && (pendingRestProposal->expiresAt <= now
+                || pendingRestProposal->map != map_data.field_34
+                || pendingRestProposal->phaseRevision != session.phaseRevision())) {
+            pendingRestProposal.reset();
+        }
+        if (command.minutes == 0) {
+            if (!pendingRestProposal.has_value()
+                || pendingRestProposal->readyPlayers.erase(player->id) == 0) {
+                return execution;
+            }
+            if (pendingRestProposal->proposer == player->id
+                || pendingRestProposal->readyPlayers.empty()) {
+                pendingRestProposal.reset();
+            }
+        } else {
+            if (game_time() <= 0
+                || game_time() > std::numeric_limits<int>::max()
+                        - command.minutes * (GAME_TIME_TICKS_PER_HOUR / 60)) {
+                return execution;
+            }
+            for (PlayerId participantId : session.players().playerIds()) {
+                Object* participant = session.entities().findObject(session.playerActorId(participantId));
+                if (participant == nullptr || !critter_can_actor_rest(participant)) {
+                    return execution;
+                }
+            }
+            if (!pendingRestProposal.has_value()
+                || pendingRestProposal->minutes != command.minutes) {
+                pendingRestProposal = PendingRestProposal {
+                    command.minutes,
+                    player->id,
+                    map_data.field_34,
+                    session.phaseRevision(),
+                    now + kRestProposalLifetime,
+                    {},
+                };
+            }
+            pendingRestProposal->readyPlayers.insert(player->id);
+            pendingRestProposal->expiresAt = now + kRestProposalLifetime;
+            if (pendingRestProposal->readyPlayers.size() == session.players().size()) {
+                if (session.transitionTo(SessionPhase::Transition) != LocalSessionError::None) {
+                    return execution;
+                }
+                pendingRestProposal.reset();
+                advanceSharedRest(command.minutes);
+                if (session.transitionTo(SessionPhase::Exploration) != LocalSessionError::None) {
+                    return execution;
+                }
+                execution.completed = true;
+            }
+        }
+        execution.status = CommandExecutionStatus::Applied;
+        execution.gameTime = game_time();
         execution.phaseRevision = session.phaseRevision();
         return execution;
     }
@@ -2000,6 +2130,96 @@ bool networkWorldApplyPeerSceneryTransition(const SceneryTransitionedEvent& tran
         && map_set_elevation(localActor->elevation) == 0
         && (!mapChanged || registerWorldObjects())
         && session.applyAuthoritativePhase(SessionPhase::Exploration, transition.phaseRevision) == LocalSessionError::None;
+}
+
+bool networkWorldApplyPeerRest(const RestStateChangedEvent& rest)
+{
+    PlayerCharacterState* player = session.players().findByActor(rest.actorId);
+    if (!session.isActive()
+        || player == nullptr
+        || !isValidRestMinutes(rest.minutes)
+        || rest.gameTime <= 0) {
+        return false;
+    }
+    if (rest.completed) {
+        if (rest.minutes == 0
+            || rest.phaseRevision < 2
+            || rest.gameTime < game_time()
+            || session.applyAuthoritativePhase(SessionPhase::Transition, rest.phaseRevision - 1) != LocalSessionError::None) {
+            return false;
+        }
+        pendingRestProposal.reset();
+        set_game_time(rest.gameTime);
+        return session.applyAuthoritativePhase(SessionPhase::Exploration, rest.phaseRevision) == LocalSessionError::None;
+    }
+    if (rest.phaseRevision != session.phaseRevision()
+        || session.phase() != SessionPhase::Exploration) {
+        return false;
+    }
+    if (rest.minutes == 0) {
+        if (pendingRestProposal.has_value()) {
+            pendingRestProposal->readyPlayers.erase(player->id);
+            if (pendingRestProposal->proposer == player->id
+                || pendingRestProposal->readyPlayers.empty()) {
+                pendingRestProposal.reset();
+            }
+        }
+    } else {
+        if (!pendingRestProposal.has_value()
+            || pendingRestProposal->minutes != rest.minutes) {
+            pendingRestProposal = PendingRestProposal {
+                rest.minutes,
+                player->id,
+                map_data.field_34,
+                session.phaseRevision(),
+                std::chrono::steady_clock::now() + kRestProposalLifetime,
+                {},
+            };
+        }
+        pendingRestProposal->readyPlayers.insert(player->id);
+    }
+    return true;
+}
+
+int networkWorldPendingRestMinutes()
+{
+    if (!pendingRestProposal.has_value()
+        || pendingRestProposal->expiresAt <= std::chrono::steady_clock::now()
+        || pendingRestProposal->map != map_data.field_34
+        || pendingRestProposal->phaseRevision != session.phaseRevision()) {
+        return 0;
+    }
+    return pendingRestProposal->minutes;
+}
+
+std::string networkWorldPendingRestProposerName()
+{
+    if (networkWorldPendingRestMinutes() == 0) {
+        return {};
+    }
+    const PlayerCharacterState* player = session.players().find(pendingRestProposal->proposer);
+    return player != nullptr ? player->name : std::string {};
+}
+
+bool networkWorldLocalRestProposal()
+{
+    PlayerId localPlayerId = worldMode == NetworkLaunchMode::Host
+        ? kHostPlayerId
+        : kGuestPlayerId;
+    return networkWorldPendingRestMinutes() != 0
+        && pendingRestProposal->proposer == localPlayerId;
+}
+
+PlayerId networkWorldPendingRestProposer()
+{
+    return networkWorldPendingRestMinutes() != 0
+        ? pendingRestProposal->proposer
+        : PlayerId {};
+}
+
+void networkWorldClearRestProposal()
+{
+    pendingRestProposal.reset();
 }
 
 bool networkWorldCaptureScriptedMapTransition(const MapTransition& transition)
@@ -4167,6 +4387,7 @@ void networkWorldLeave()
     itemUseInProgress = false;
     scriptedSceneryTransitionInProgress = false;
     capturedSceneryMapTransition.reset();
+    pendingRestProposal.reset();
     expectedSplitEntityId = {};
     lastSplitEntityId = {};
     worldMode = NetworkLaunchMode::Disabled;

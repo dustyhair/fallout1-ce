@@ -63,6 +63,9 @@ struct AgentJournalWorldState {
     std::string phase;
     bool connected = false;
     bool combat = false;
+    int pendingRestMinutes = 0;
+    std::uint32_t pendingRestProposerId = 0;
+    std::string pendingRestProposerName;
     AgentJournalActorState host;
     AgentJournalActorState guest;
     std::vector<AgentJournalInventoryItemState> localInventory;

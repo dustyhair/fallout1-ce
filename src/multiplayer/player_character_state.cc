@@ -1,5 +1,6 @@
 #include "multiplayer/player_character_state.h"
 
+#include <algorithm>
 #include <utility>
 
 namespace fallout {
@@ -110,6 +111,19 @@ bool PlayerCharacterStateStore::bindingsMatch(const EntityRegistry& entities) co
         }
     }
     return true;
+}
+
+std::vector<PlayerId> PlayerCharacterStateStore::playerIds() const
+{
+    std::vector<PlayerId> ids;
+    ids.reserve(_players.size());
+    for (const auto& entry : _players) {
+        ids.push_back(entry.first);
+    }
+    std::sort(ids.begin(), ids.end(), [](PlayerId lhs, PlayerId rhs) {
+        return lhs.value < rhs.value;
+    });
+    return ids;
 }
 
 std::size_t PlayerCharacterStateStore::size() const

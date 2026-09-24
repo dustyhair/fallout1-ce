@@ -7,10 +7,12 @@
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "agent_journal.h"
@@ -26,10 +28,12 @@
 #include "game/mainmenu.h"
 #include "game/map.h"
 #include "game/object.h"
+#include "game/pipboy.h"
 #include "game/protinst.h"
 #include "game/proto.h"
 #include "game/proto_types.h"
 #include "game/queue.h"
+#include "game/scripts.h"
 #include "game/textobj.h"
 #include "game/tile.h"
 #include "multiplayer/character_build_bridge.h"
@@ -78,8 +82,10 @@ enum class SmokeScenario {
     MapTransition,
     ExitGrid,
     Stairs,
+    Rest,
 };
 SmokeScenario smokeScenario = SmokeScenario::Movement;
+int smokeRestMinutes = 10;
 
 const char* smokeScenarioName()
 {
@@ -110,6 +116,8 @@ const char* smokeScenarioName()
         return "exit-grid";
     case SmokeScenario::Stairs:
         return "stairs";
+    case SmokeScenario::Rest:
+        return "rest";
     }
     return "unknown";
 }
@@ -122,6 +130,8 @@ EventSequence reconnectLastApplied;
 std::uint64_t nextHostCommandSequence = 1;
 std::chrono::steady_clock::time_point nextAuthoritativeState;
 std::chrono::steady_clock::time_point nextAgentWorldReport;
+std::optional<std::int32_t> pendingLocalRestRequest;
+std::optional<GameCommand> deferredPeerRestCommand;
 
 bool queueEventStatesEqual(const std::vector<QueueEventState>& lhs, const std::vector<QueueEventState>& rhs)
 {
@@ -651,6 +661,9 @@ void reportAgentWorldState()
     state.phase = phaseLabel(networkWorldPhase());
     state.connected = networkRuntimeConnected();
     state.combat = isInCombat();
+    state.pendingRestMinutes = networkWorldPendingRestMinutes();
+    state.pendingRestProposerId = networkWorldPendingRestProposer().value;
+    state.pendingRestProposerName = networkWorldPendingRestProposerName();
     state.host = actorJournalState(kHostPlayerId, hostIsLocal);
     state.guest = actorJournalState(kGuestPlayerId, !hostIsLocal);
     Object* hostActor = networkWorldPlayerActor(kHostPlayerId);
@@ -918,12 +931,20 @@ void networkRuntimeBackgroundProcess()
     if (lobby.state() == NetworkLobbyState::Disconnected) {
         pendingLocalItemDrop.reset();
         pendingLocalExitGrid.reset();
+        pendingLocalRestRequest.reset();
+        deferredPeerRestCommand.reset();
+        networkWorldClearRestProposal();
     }
     if (networkWorldActive()) {
         presentPendingGameChatMessages();
         if (launchOptions.mode == NetworkLaunchMode::Host) {
             if (!networkWorldSynchronizeEnginePhase()) {
                 debug_printf("Multiplayer session phase could not follow the engine phase.\n");
+            }
+            if (!pipboy_is_open() && pendingLocalRestRequest.has_value()) {
+                std::int32_t minutes = *pendingLocalRestRequest;
+                pendingLocalRestRequest.reset();
+                submitHostCommand(RestCommand { minutes });
             }
             while (std::optional<GameEvent> event = networkWorldTakeDeferredEvent()) {
                 if (!lobby.publishDeferredEvent(std::move(*event))) {
@@ -946,7 +967,13 @@ void networkRuntimeBackgroundProcess()
                     pendingRecoveryRequest.reset();
                 }
             }
-            while (std::optional<GameCommand> command = lobby.takePeerCommand()) {
+            while (std::optional<GameCommand> command = deferredPeerRestCommand.has_value()
+                    ? std::exchange(deferredPeerRestCommand, std::nullopt)
+                    : lobby.takePeerCommand()) {
+                if (pipboy_is_open() && std::holds_alternative<RestCommand>(command->payload)) {
+                    deferredPeerRestCommand = std::move(*command);
+                    break;
+                }
                 AuthoritativeCommandResult outcome = networkWorldProcessCommand(*command);
                 if (!lobby.sendCommandOutcome(std::move(outcome))) {
                     debug_printf("Multiplayer command outcome could not be sent.\n");
@@ -1020,6 +1047,8 @@ void networkRuntimeBackgroundProcess()
                 applied = networkWorldApplyPeerExitGrid(*exitGrid);
             } else if (const auto* transition = std::get_if<SceneryTransitionedEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerSceneryTransition(*transition);
+            } else if (const auto* rest = std::get_if<RestStateChangedEvent>(&event->payload)) {
+                applied = networkWorldApplyPeerRest(*rest);
             } else if (const auto* modal = std::get_if<SharedModalStateChangedEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerSharedModal(*modal);
             } else if (const auto* transfer = std::get_if<InventoryTransferredEvent>(&event->payload)) {
@@ -1112,6 +1141,7 @@ bool networkRuntimeConfigure(int argc, char** argv)
     launchOptions = result.options;
     smokeTestEnabled = false;
     smokeScenario = SmokeScenario::Movement;
+    smokeRestMinutes = 10;
     for (int index = 1; index < argc; index++) {
         if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-test") == 0) {
             smokeTestEnabled = true;
@@ -1139,6 +1169,20 @@ bool networkRuntimeConfigure(int argc, char** argv)
             smokeScenario = SmokeScenario::ExitGrid;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=stairs") == 0) {
             smokeScenario = SmokeScenario::Stairs;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=rest") == 0) {
+            smokeScenario = SmokeScenario::Rest;
+        } else if (argv[index] != nullptr
+            && std::strncmp(argv[index], "--multiplayer-smoke-rest-minutes=", 33) == 0) {
+            char* end = nullptr;
+            long minutes = std::strtol(argv[index] + 33, &end, 10);
+            if (end == argv[index] + 33 || *end != '\0'
+                || minutes < 0 || minutes > 360
+                || !isValidRestMinutes(static_cast<int>(minutes))
+                || minutes == 0) {
+                std::fprintf(stderr, "Invalid --multiplayer-smoke-rest-minutes value.\n");
+                return false;
+            }
+            smokeRestMinutes = static_cast<int>(minutes);
         }
     }
     if (smokeTestEnabled && launchOptions.mode == NetworkLaunchMode::Disabled) {
@@ -1149,6 +1193,8 @@ bool networkRuntimeConfigure(int argc, char** argv)
     pendingRecoveryRequest.reset();
     pendingLocalItemDrop.reset();
     pendingLocalExitGrid.reset();
+    pendingLocalRestRequest.reset();
+    deferredPeerRestCommand.reset();
     discardReconnectTransport();
     reconnectLastApplied = {};
     nextHostCommandSequence = 1;
@@ -1168,7 +1214,7 @@ bool networkRuntimeSmokeTestEnabled()
 
 const char* networkRuntimeSmokeTestMap()
 {
-    if (smokeScenario == SmokeScenario::Quest) {
+    if (smokeScenario == SmokeScenario::Quest || smokeScenario == SmokeScenario::Rest) {
         return "ShadyW.map";
     }
     if (smokeScenario == SmokeScenario::Elevation) {
@@ -1259,6 +1305,35 @@ bool networkRuntimeRunSmokeTest()
             std::optional<MapTransitionSmokeFixture> mapTransitionFixture;
             std::optional<ExitGridSmokeFixture> exitGridFixture;
             std::optional<SceneryTransitionSmokeFixture> sceneryTransitionFixture;
+            int restStartingGameTime = game_time();
+            int restCompletionGameTime = 0;
+            int restHostInitialHits = 0;
+            int restGuestInitialHits = 0;
+            if (smokeScenario == SmokeScenario::Rest && smokeRestMinutes >= 180) {
+                Object* restHost = networkWorldPlayerActor(kHostPlayerId);
+                Object* restGuest = networkWorldPlayerActor(kGuestPlayerId);
+                if (restHost == nullptr || restGuest == nullptr
+                    || critter_get_hits(restHost) <= 3
+                    || critter_get_hits(restGuest) <= 3) {
+                    setStatus("MULTIPLAYER SMOKE TEST FAILED: REST HEALING FIXTURE");
+                    break;
+                }
+                critter_adjust_hits(restHost, -3);
+                critter_adjust_hits(restGuest, -3);
+                restHostInitialHits = critter_get_hits(restHost);
+                restGuestInitialHits = critter_get_hits(restGuest);
+            }
+            auto restHealed = [&]() {
+                if (smokeRestMinutes < 180) {
+                    return true;
+                }
+                Object* restHost = networkWorldPlayerActor(kHostPlayerId);
+                Object* restGuest = networkWorldPlayerActor(kGuestPlayerId);
+                return restHost != nullptr
+                    && restGuest != nullptr
+                    && critter_get_hits(restHost) > restHostInitialHits
+                    && critter_get_hits(restGuest) > restGuestInitialHits;
+            };
             if (smokeScenario == SmokeScenario::Door) {
                 scenarioTargetId = networkWorldPrepareDoorSmokeTest();
                 scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
@@ -1329,6 +1404,7 @@ bool networkRuntimeRunSmokeTest()
                     && smokeScenario != SmokeScenario::MapTransition
                     && smokeScenario != SmokeScenario::ExitGrid
                     && smokeScenario != SmokeScenario::Stairs
+                    && smokeScenario != SmokeScenario::Rest
                     && !scenarioTargetId.has_value())
                 || (smokeScenario == SmokeScenario::Elevation && !elevatorFixture.has_value())
                 || (smokeScenario == SmokeScenario::MapTransition && !mapTransitionFixture.has_value())
@@ -1393,18 +1469,43 @@ bool networkRuntimeRunSmokeTest()
             case SmokeScenario::Stairs:
                 scenarioCommand.payload = SceneryTransitionCommand { sceneryTransitionFixture->transitionId };
                 break;
+            case SmokeScenario::Rest:
+                scenarioCommand.payload = RestCommand { smokeRestMinutes };
+                break;
             }
             if (!scenarioCommandReady) {
                 break;
             }
             EventSequence scenarioFinalEventSequence {
-                smokeScenario == SmokeScenario::Pickup ? 2ULL : 1ULL
+                smokeScenario == SmokeScenario::Pickup || smokeScenario == SmokeScenario::Rest ? 2ULL : 1ULL
             };
 
             bool gameplayPassed = false;
             std::vector<GameEvent> authoritativeEvents;
-            if (smokeScenario == SmokeScenario::Quest || smokeScenario == SmokeScenario::Stairs) {
+            if (smokeScenario == SmokeScenario::Quest || smokeScenario == SmokeScenario::Stairs || smokeScenario == SmokeScenario::Rest) {
                 engineExecutionProbeBegin();
+            }
+            if (smokeScenario == SmokeScenario::Rest && launchOptions.mode == NetworkLaunchMode::Host) {
+                GameCommand hostProposal;
+                hostProposal.sequence.value = 1;
+                hostProposal.playerId = kHostPlayerId;
+                hostProposal.actorId = EntityId { kHostPlayerId.value };
+                hostProposal.expectedPhase = SessionPhase::Exploration;
+                hostProposal.expectedPhaseRevision = networkWorldPhaseRevision();
+                hostProposal.payload = RestCommand { smokeRestMinutes };
+                AuthoritativeCommandResult proposal = networkWorldProcessCommand(hostProposal);
+                const auto* proposed = proposal.event.has_value()
+                    ? std::get_if<RestStateChangedEvent>(&proposal.event->payload)
+                    : nullptr;
+                if (proposal.result.status != CommandStatus::Accepted
+                    || proposed == nullptr
+                    || proposed->completed
+                    || game_time() != restStartingGameTime
+                    || networkWorldPendingRestMinutes() != smokeRestMinutes) {
+                    setStatus("MULTIPLAYER SMOKE TEST FAILED: REST PROPOSAL ADVANCED TIME");
+                    break;
+                }
+                authoritativeEvents.push_back(*proposal.event);
             }
             if (launchOptions.mode == NetworkLaunchMode::Join) {
                 ProtocolEnvelope commandEnvelope;
@@ -1436,13 +1537,38 @@ bool networkRuntimeRunSmokeTest()
                             receivedResult = result
                                 && result.result.commandSequence == scenarioCommand.sequence
                                 && result.result.status == CommandStatus::Accepted
-                                && result.result.firstEventSequence == EventSequence { 1 }
+                                && result.result.firstEventSequence == EventSequence { smokeScenario == SmokeScenario::Rest ? 2ULL : 1ULL }
                                 && result.result.eventCount == 1;
                         } else if (decoded.envelope.kind == MessageKind::Event) {
                             GameEventDecodeResult event = decodeGameEvent(decoded.envelope);
                             bool eventApplied = false;
                             EventSequence expectedEventSequence { receivedEventCount + 1 };
-                            if (event
+                            if (event && smokeScenario == SmokeScenario::Rest
+                                && event.event.sequence == expectedEventSequence) {
+                                const auto* rest = std::get_if<RestStateChangedEvent>(&event.event.payload);
+                                if (receivedEventCount == 0) {
+                                    eventApplied = rest != nullptr
+                                        && event.event.causedBy == CommandSequence { 1 }
+                                        && rest->actorId == EntityId { kHostPlayerId.value }
+                                        && rest->minutes == smokeRestMinutes
+                                        && !rest->completed
+                                        && networkWorldApplyPeerRest(*rest)
+                                        && networkWorldPendingRestMinutes() == smokeRestMinutes
+                                        && game_time() == restStartingGameTime;
+                                } else {
+                                    eventApplied = rest != nullptr
+                                        && event.event.causedBy == scenarioCommand.sequence
+                                        && rest->actorId == scenarioCommand.actorId
+                                        && rest->minutes == smokeRestMinutes
+                                        && rest->completed
+                                        && networkWorldApplyPeerRest(*rest)
+                                        && networkWorldPendingRestMinutes() == 0
+                                        && game_time() == rest->gameTime;
+                                    if (eventApplied) {
+                                        restCompletionGameTime = rest->gameTime;
+                                    }
+                                }
+                            } else if (event
                                 && event.event.sequence == expectedEventSequence
                                 && event.event.causedBy == scenarioCommand.sequence
                                 && smokeScenario == SmokeScenario::Door) {
@@ -1613,6 +1739,12 @@ bool networkRuntimeRunSmokeTest()
                                     stateConverged = networkWorldVerifyExitGridSmokeTest(*exitGridFixture);
                                 } else if (stateConverged && smokeScenario == SmokeScenario::Stairs) {
                                     stateConverged = networkWorldVerifySceneryTransitionSmokeTest(*sceneryTransitionFixture);
+                                } else if (stateConverged && smokeScenario == SmokeScenario::Rest) {
+                                    stateConverged = restCompletionGameTime >= restStartingGameTime + smokeRestMinutes * 600
+                                        && game_time() == restCompletionGameTime
+                                        && networkWorldPendingRestMinutes() == 0
+                                        && networkWorldPhase() == SessionPhase::Exploration
+                                        && restHealed();
                                 }
                             }
                             if (!stateConverged) {
@@ -1719,6 +1851,9 @@ bool networkRuntimeRunSmokeTest()
                                 const auto* transition = std::get_if<SceneryTransitionCommand>(&command.command.payload);
                                 payloadMatches = transition != nullptr
                                     && transition->transitionId == sceneryTransitionFixture->transitionId;
+                            } else if (smokeScenario == SmokeScenario::Rest) {
+                                const auto* rest = std::get_if<RestCommand>(&command.command.payload);
+                                payloadMatches = rest != nullptr && rest->minutes == smokeRestMinutes;
                             } else {
                                 const auto* movement = std::get_if<MoveCommand>(&command.command.payload);
                                 payloadMatches = movement != nullptr
@@ -1783,6 +1918,11 @@ bool networkRuntimeRunSmokeTest()
                             return networkWorldVerifyExitGridSmokeTest(*exitGridFixture);
                         case SmokeScenario::Stairs:
                             return networkWorldVerifySceneryTransitionSmokeTest(*sceneryTransitionFixture);
+                        case SmokeScenario::Rest:
+                            return game_time() >= restStartingGameTime + smokeRestMinutes * 600
+                                && networkWorldPendingRestMinutes() == 0
+                                && networkWorldPhase() == SessionPhase::Exploration
+                                && restHealed();
                         }
                         return false;
                     };
@@ -1814,6 +1954,12 @@ bool networkRuntimeRunSmokeTest()
                         }
                     }
                     if (outcome.event.has_value()) {
+                        if (smokeScenario == SmokeScenario::Rest) {
+                            const auto* rest = std::get_if<RestStateChangedEvent>(&outcome.event->payload);
+                            if (rest != nullptr && rest->completed) {
+                                restCompletionGameTime = rest->gameTime;
+                            }
+                        }
                         authoritativeEvents.push_back(*outcome.event);
                     }
                     if (pickupCompletion.has_value()) {
@@ -1835,6 +1981,12 @@ bool networkRuntimeRunSmokeTest()
                         || networkWorldVerifyExitGridSmokeTest(*exitGridFixture);
                     bool sceneryTransitionCompleted = smokeScenario != SmokeScenario::Stairs
                         || networkWorldVerifySceneryTransitionSmokeTest(*sceneryTransitionFixture);
+                    bool restCompleted = smokeScenario != SmokeScenario::Rest
+                        || (restCompletionGameTime >= restStartingGameTime + smokeRestMinutes * 600
+                            && game_time() == restCompletionGameTime
+                            && networkWorldPendingRestMinutes() == 0
+                            && networkWorldPhase() == SessionPhase::Exploration
+                            && restHealed());
                     bool captured = accepted
                         && scenarioCompleted
                         && questCompleted
@@ -1842,6 +1994,7 @@ bool networkRuntimeRunSmokeTest()
                         && mapTransitionCompleted
                         && exitGridCompleted
                         && sceneryTransitionCompleted
+                        && restCompleted
                         && objectMutated
                         && authoritativeEvents.size() == scenarioFinalEventSequence.value
                         && networkWorldCaptureAuthoritativeState(scenarioFinalEventSequence, state);
@@ -1858,6 +2011,22 @@ bool networkRuntimeRunSmokeTest()
                             captured ? 1 : 0,
                             captured ? static_cast<int>(snapshotError) : -1,
                             static_cast<int>(outcome.result.rejection));
+                        if (smokeScenario == SmokeScenario::Rest) {
+                            Object* restHost = networkWorldPlayerActor(kHostPlayerId);
+                            Object* restGuest = networkWorldPlayerActor(kGuestPlayerId);
+                            std::fprintf(stderr,
+                                "Multiplayer rest: time=%d start=%d expected_delta=%d event_time=%d pending=%d phase=%d host_hp=%d/%d guest_hp=%d/%d.\n",
+                                game_time(),
+                                restStartingGameTime,
+                                smokeRestMinutes * 600,
+                                restCompletionGameTime,
+                                networkWorldPendingRestMinutes(),
+                                static_cast<int>(networkWorldPhase()),
+                                restHost != nullptr ? critter_get_hits(restHost) : -1,
+                                restHostInitialHits,
+                                restGuest != nullptr ? critter_get_hits(restGuest) : -1,
+                                restGuestInitialHits);
+                        }
                     }
 
                     ProtocolEnvelope resultEnvelope;
@@ -1899,10 +2068,11 @@ bool networkRuntimeRunSmokeTest()
 
             EngineExecutionProbeCounts scenarioProbeCounts;
             bool scenarioAuthorityPassed = true;
-            if (smokeScenario == SmokeScenario::Quest || smokeScenario == SmokeScenario::Stairs) {
+            if (smokeScenario == SmokeScenario::Quest || smokeScenario == SmokeScenario::Stairs || smokeScenario == SmokeScenario::Rest) {
                 scenarioProbeCounts = engineExecutionProbeEnd();
                 scenarioAuthorityPassed = launchOptions.mode == NetworkLaunchMode::Host
-                    ? scenarioProbeCounts.scriptProcedures > 0 && scenarioProbeCounts.combatAttacks == 0
+                    ? (smokeScenario == SmokeScenario::Rest || scenarioProbeCounts.scriptProcedures > 0)
+                        && scenarioProbeCounts.combatAttacks == 0
                     : scenarioProbeCounts.scriptProcedures == 0
                         && scenarioProbeCounts.combatAttacks == 0
                         && scenarioProbeCounts.randomDraws == 0;
@@ -1917,7 +2087,7 @@ bool networkRuntimeRunSmokeTest()
                 break;
             }
 
-            if (smokeScenario == SmokeScenario::Quest || smokeScenario == SmokeScenario::Stairs) {
+            if (smokeScenario == SmokeScenario::Quest || smokeScenario == SmokeScenario::Stairs || smokeScenario == SmokeScenario::Rest) {
                 authorityProbeCounts = scenarioProbeCounts;
             } else if (smokeScenario == SmokeScenario::Elevation
                 || smokeScenario == SmokeScenario::MapTransition
@@ -2564,6 +2734,43 @@ bool networkRuntimeSubmitLocalSceneryTransition(EntityId transitionId)
     return launchOptions.mode == NetworkLaunchMode::Host
         ? submitHostCommand(SceneryTransitionCommand { transitionId })
         : lobby.sendLocalSceneryTransition(transitionId, networkWorldPhaseRevision());
+}
+
+bool networkRuntimeSubmitLocalRest(std::int32_t minutes)
+{
+    if (!networkWorldActive()
+        || lobby.state() != NetworkLobbyState::Ready
+        || networkWorldPhase() != SessionPhase::Exploration
+        || !isValidRestMinutes(minutes)) {
+        return false;
+    }
+    if (launchOptions.mode == NetworkLaunchMode::Host && pipboy_is_open()) {
+        pendingLocalRestRequest = minutes;
+        return true;
+    }
+    return launchOptions.mode == NetworkLaunchMode::Host
+        ? submitHostCommand(RestCommand { minutes })
+        : lobby.sendLocalRest(minutes, networkWorldPhaseRevision());
+}
+
+bool networkRuntimeSharedRestEnabled()
+{
+    return networkWorldActive();
+}
+
+std::int32_t networkRuntimePendingRestMinutes()
+{
+    return networkWorldActive() ? networkWorldPendingRestMinutes() : 0;
+}
+
+std::string networkRuntimePendingRestProposerName()
+{
+    return networkWorldActive() ? networkWorldPendingRestProposerName() : std::string {};
+}
+
+bool networkRuntimeLocalRestProposal()
+{
+    return networkWorldActive() && networkWorldLocalRestProposal();
 }
 
 bool networkRuntimeHandleLocalAttack(Object* target, int hitMode, int hitLocation)

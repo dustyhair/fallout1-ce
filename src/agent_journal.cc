@@ -281,7 +281,16 @@ void agentJournalWriteWorldState(const AgentJournalWorldState& state)
            << ",\"phase\":" << jsonString(state.phase.c_str())
            << ",\"connected\":" << booleanValue(state.connected)
            << ",\"combat\":" << booleanValue(state.combat)
-           << ",\"host\":" << actorJson(state.host)
+           << ",\"pending_rest\":";
+    if (state.pendingRestMinutes > 0) {
+        fields << "{\"minutes\":" << state.pendingRestMinutes
+               << ",\"proposer_player_id\":" << state.pendingRestProposerId
+               << ",\"proposer_name\":" << jsonString(state.pendingRestProposerName.c_str())
+               << '}';
+    } else {
+        fields << "null";
+    }
+    fields << ",\"host\":" << actorJson(state.host)
            << ",\"guest\":" << actorJson(state.guest)
            << ",\"local_inventory\":[";
     for (std::size_t index = 0; index < state.localInventory.size(); index++) {

@@ -99,6 +99,16 @@ int main()
             && command.entityId == 83,
         "parses an authoritative stairs or ladder entity")
         && passed;
+    passed = expect(parse("55 game_rest 180", command)
+            && command.type == fallout::AgentControlCommandType::GameRest
+            && command.restMinutes == 180,
+        "parses a fixed-duration rest proposal or approval")
+        && passed;
+    passed = expect(parse("56 game_rest cancel", command)
+            && command.type == fallout::AgentControlCommandType::GameRest
+            && command.restMinutes == 0,
+        "parses rest consent withdrawal")
+        && passed;
     passed = expect(!parse("0 click 10 10", command), "rejects command id zero") && passed;
     passed = expect(!parse("52 click -1 10", command), "rejects negative coordinates") && passed;
     passed = expect(!parse("53 key definitely-not-a-key", command), "rejects an unknown key") && passed;
@@ -112,6 +122,7 @@ int main()
     passed = expect(!parse("61 game_elevator 8 5", command), "rejects an unavailable elevator level") && passed;
     passed = expect(!parse("62 game_exit 0", command), "rejects an invalid exit-grid entity") && passed;
     passed = expect(!parse("63 game_stairs 0", command), "rejects an invalid stairs or ladder entity") && passed;
+    passed = expect(!parse("64 game_rest 17", command), "rejects an unsupported rest duration") && passed;
 
     return passed ? 0 : 1;
 }

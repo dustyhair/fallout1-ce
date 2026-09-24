@@ -104,6 +104,7 @@ int critter_wake_up(Object* obj, void* data);
 int critter_wake_clear(Object* obj, void* data);
 int critter_set_who_hit_me(Object* critter, Object* who_hit_me);
 bool critter_can_obj_dude_rest();
+bool critter_can_actor_rest(Object* actor);
 int critter_compute_ap_from_distance(Object* critter, int distance);
 
 } // namespace fallout

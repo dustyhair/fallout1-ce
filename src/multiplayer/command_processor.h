@@ -66,6 +66,13 @@ struct ExitGridExecution {
 
 using SceneryTransitionExecution = ExitGridExecution;
 
+struct RestExecution {
+    CommandExecutionStatus status = CommandExecutionStatus::InvalidAction;
+    bool completed = false;
+    std::int32_t gameTime = 0;
+    std::uint32_t phaseRevision = 0;
+};
+
 class CommandExecutor {
 public:
     virtual ~CommandExecutor() = default;
@@ -92,6 +99,10 @@ public:
         return {};
     }
     virtual SceneryTransitionExecution useSceneryTransition(Object*, Object*, const SceneryTransitionCommand&)
+    {
+        return {};
+    }
+    virtual RestExecution rest(Object*, const RestCommand&)
     {
         return {};
     }

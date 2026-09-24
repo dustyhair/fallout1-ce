@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
 
 #include "multiplayer/character_lobby.h"
 #include "multiplayer/network_bootstrap.h"
@@ -49,6 +50,11 @@ bool networkRuntimeHandleLocalItemUse(Object* actor, Object* item, Object* targe
 bool networkRuntimeSubmitLocalElevator(std::int32_t elevatorType, std::int32_t destinationLevel);
 bool networkRuntimeSubmitLocalExitGrid(EntityId exitId);
 bool networkRuntimeSubmitLocalSceneryTransition(EntityId transitionId);
+bool networkRuntimeSubmitLocalRest(std::int32_t minutes);
+bool networkRuntimeSharedRestEnabled();
+std::int32_t networkRuntimePendingRestMinutes();
+std::string networkRuntimePendingRestProposerName();
+bool networkRuntimeLocalRestProposal();
 bool networkRuntimeHandleLocalAttack(Object* target, int hitMode, int hitLocation);
 bool networkRuntimeGiveItemToPlayer(EntityId destinationActorId, EntityId itemId, std::uint32_t quantity);
 bool networkRuntimeRequestSharedModal(SharedModalKind kind, bool open);

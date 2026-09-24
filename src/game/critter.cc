@@ -1193,8 +1193,11 @@ int critter_set_who_hit_me(Object* critter, Object* who_hit_me)
 }
 
 // 0x428C1C
-bool critter_can_obj_dude_rest()
+bool critter_can_actor_rest(Object* actor)
 {
+    if (actor == nullptr) {
+        return false;
+    }
     int map_idx;
     int check_team;
     int can_rest;
@@ -1216,7 +1219,7 @@ bool critter_can_obj_dude_rest()
         check_team = false;
         break;
     default:
-        if (map_idx == MAP_HALLDED && map_elevation != 0) {
+        if (map_idx == MAP_HALLDED && actor->elevation != 0) {
             check_team = false;
         } else {
             switch (xlate_mapidx_to_town(map_idx)) {
@@ -1237,18 +1240,18 @@ bool critter_can_obj_dude_rest()
 
     can_rest = true;
 
-    critters_count = obj_create_list(-1, map_elevation, OBJ_TYPE_CRITTER, &critters);
+    critters_count = obj_create_list(-1, actor->elevation, OBJ_TYPE_CRITTER, &critters);
     for (index = 0; index < critters_count; index++) {
         critter = critters[index];
         if ((critter->data.critter.combat.results & DAM_DEAD) == 0) {
-            if (critter != obj_dude) {
-                if (critter->data.critter.combat.whoHitMe == obj_dude) {
+            if (critter != actor) {
+                if (critter->data.critter.combat.whoHitMe == actor) {
                     can_rest = false;
                     break;
                 }
 
                 if (check_team) {
-                    if (critter->data.critter.combat.team != obj_dude->data.critter.combat.team) {
+                    if (critter->data.critter.combat.team != actor->data.critter.combat.team) {
                         can_rest = false;
                         break;
                     }
@@ -1262,6 +1265,11 @@ bool critter_can_obj_dude_rest()
     }
 
     return can_rest;
+}
+
+bool critter_can_obj_dude_rest()
+{
+    return critter_can_actor_rest(obj_dude);
 }
 
 // 0x428D28

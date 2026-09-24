@@ -327,6 +327,27 @@ bool agentControlParseCommand(const std::string& line,
         command.type = AgentControlCommandType::GameStairs;
         return parseEntityId(input, command, error);
     }
+    if (verb == "game_rest") {
+        command.type = AgentControlCommandType::GameRest;
+        std::string duration;
+        if (!(input >> duration) || hasTrailingInput(input)) {
+            error = "expected: game_rest <10|30|60|120|180|240|300|360|cancel>";
+            return false;
+        }
+        if (duration == "cancel") {
+            command.restMinutes = 0;
+            return true;
+        }
+        std::istringstream value(duration);
+        if (!(value >> command.restMinutes) || hasTrailingInput(value)
+            || !(command.restMinutes == 10 || command.restMinutes == 30
+                || (command.restMinutes >= 60 && command.restMinutes <= 360
+                    && command.restMinutes % 60 == 0))) {
+            error = "game_rest requires a supported fixed duration in minutes or cancel";
+            return false;
+        }
+        return true;
+    }
     if (verb == "game_give") {
         command.type = AgentControlCommandType::GameGive;
         return parseGive(input, command, error);
@@ -369,6 +390,8 @@ const char* agentControlCommandTypeName(AgentControlCommandType type)
         return "game_exit";
     case AgentControlCommandType::GameStairs:
         return "game_stairs";
+    case AgentControlCommandType::GameRest:
+        return "game_rest";
     case AgentControlCommandType::GameGive:
         return "game_give";
     }

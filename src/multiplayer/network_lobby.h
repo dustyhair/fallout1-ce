@@ -70,6 +70,7 @@ public:
     bool sendLocalElevator(std::int32_t elevatorType, std::int32_t destinationLevel, std::uint32_t phaseRevision = 1);
     bool sendLocalExitGrid(EntityId exitId, std::uint32_t phaseRevision = 1);
     bool sendLocalSceneryTransition(EntityId transitionId, std::uint32_t phaseRevision = 1);
+    bool sendLocalRest(std::int32_t minutes, std::uint32_t phaseRevision = 1);
     bool sendLocalAttack(EntityId targetId, std::int32_t hitMode, std::int32_t hitLocation, std::uint32_t phaseRevision = 1);
     bool sendLocalSharedModal(SharedModalKind kind, bool open, std::uint32_t phaseRevision = 1);
     bool sendLocalInventoryTransfer(EntityId sourceId,

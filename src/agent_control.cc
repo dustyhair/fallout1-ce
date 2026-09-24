@@ -222,6 +222,13 @@ void executeCommand(const AgentControlCommand& command)
             agentJournalWriteAgentCommand(command.id, commandName, "rejected", "stairs or ladder is unavailable for this player");
         }
         return;
+    case AgentControlCommandType::GameRest:
+        if (multiplayer::networkRuntimeSubmitLocalRest(command.restMinutes)) {
+            agentJournalWriteAgentCommand(command.id, commandName, "accepted", "rest proposal, approval, or withdrawal submitted");
+        } else {
+            agentJournalWriteAgentCommand(command.id, commandName, "rejected", "rest is unavailable or invalid");
+        }
+        return;
     case AgentControlCommandType::GameGive:
         if (multiplayer::networkRuntimeGiveItemToPlayer(
                 multiplayer::EntityId { command.destinationEntityId },

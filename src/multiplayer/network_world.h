@@ -2,6 +2,7 @@
 #define FALLOUT_MULTIPLAYER_NETWORK_WORLD_H_
 
 #include <optional>
+#include <string>
 
 #include "game/engine_execution_probe.h"
 #include "multiplayer/character_lobby.h"
@@ -37,6 +38,12 @@ bool networkWorldApplyPeerItemUse(const ItemUseStartedEvent& itemUse);
 bool networkWorldApplyPeerElevator(const ElevatorTransitionedEvent& elevator);
 bool networkWorldApplyPeerExitGrid(const ExitGridTransitionedEvent& exitGrid);
 bool networkWorldApplyPeerSceneryTransition(const SceneryTransitionedEvent& transition);
+bool networkWorldApplyPeerRest(const RestStateChangedEvent& rest);
+int networkWorldPendingRestMinutes();
+std::string networkWorldPendingRestProposerName();
+bool networkWorldLocalRestProposal();
+PlayerId networkWorldPendingRestProposer();
+void networkWorldClearRestProposal();
 bool networkWorldApplyPeerSharedModal(const SharedModalStateChangedEvent& modal);
 bool networkWorldApplyPeerAttack(const AttackStartedEvent& attack);
 bool networkWorldApplyInventoryTransfer(const InventoryTransferredEvent& transfer, bool reverse = false);

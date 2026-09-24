@@ -528,6 +528,12 @@ static unsigned char holo_flag;
 
 // 0x662CA6
 static unsigned char stat_flag;
+static bool pipboyOpen = false;
+
+bool pipboy_is_open()
+{
+    return pipboyOpen;
+}
 
 // 0x486A80
 int pipboy(int intent)
@@ -536,14 +542,31 @@ int pipboy(int intent)
     if (intent == -1) {
         return -1;
     }
+    pipboyOpen = true;
 
     mouseGetPositionInWindow(pip_win, &old_mouse_x, &old_mouse_y);
     wait_time = get_time();
+    int shownRestMinutes = multiplayer::networkRuntimePendingRestMinutes();
+    std::string shownRestProposer = multiplayer::networkRuntimePendingRestProposerName();
 
     while (true) {
         sharedFpsLimiter.mark();
 
         int keyCode = get_input();
+
+        int pendingRestMinutes = multiplayer::networkRuntimePendingRestMinutes();
+        std::string pendingRestProposer = multiplayer::networkRuntimePendingRestProposerName();
+        if (crnt_func == 4
+            && (pendingRestMinutes != shownRestMinutes
+                || pendingRestProposer != shownRestProposer)) {
+            DrawAlarmText(0);
+            pip_num(game_time_hour(), 4, PIPBOY_WINDOW_TIME_X, PIPBOY_WINDOW_TIME_Y);
+            pip_date();
+            pip_note();
+            win_draw(pip_win);
+        }
+        shownRestMinutes = pendingRestMinutes;
+        shownRestProposer = pendingRestProposer;
 
         if (intent == PIPBOY_OPEN_INTENT_REST) {
             keyCode = 504;
@@ -598,6 +621,7 @@ int pipboy(int intent)
     }
 
     EndPipboy();
+    pipboyOpen = false;
 
     return 0;
 }
@@ -1814,11 +1838,6 @@ static int ListArchive(int a1)
 // 0x488E94
 static void PipAlarm(int a1)
 {
-    if (multiplayer::networkRuntimeBlockUnsupportedSharedModal(multiplayer::SharedModalKind::Rest)) {
-        gsound_play_sfx_file("iisxxxx1");
-        return;
-    }
-
     if (a1 == 1024) {
         if (critter_can_obj_dude_rest()) {
             NixHotLines();
@@ -1832,6 +1851,28 @@ static void PipAlarm(int a1)
             dialog_out(text, NULL, 0, 192, 135, colorTable[32328], 0, colorTable[32328], DIALOG_BOX_LARGE);
         }
     } else if (a1 >= 4 && a1 <= 17) {
+        if (multiplayer::networkRuntimeSharedRestEnabled()) {
+            int option = a1 - 4;
+            int minutes = option == PIPBOY_REST_DURATION_TEN_MINUTES ? 10
+                : option == PIPBOY_REST_DURATION_THIRTY_MINUTES      ? 30
+                : option >= PIPBOY_REST_DURATION_ONE_HOUR
+                    && option <= PIPBOY_REST_DURATION_SIX_HOURS      ? (option - 1) * 60
+                                                                   : 0;
+            int requestMinutes = minutes != 0
+                    && minutes == multiplayer::networkRuntimePendingRestMinutes()
+                    && multiplayer::networkRuntimeLocalRestProposal()
+                ? 0
+                : minutes;
+            if (minutes == 0 || !multiplayer::networkRuntimeSubmitLocalRest(requestMinutes)) {
+                gsound_play_sfx_file("iisxxxx1");
+            } else {
+                gsound_play_sfx_file("ib1p1xx1");
+                // Return to the game loop before any queued-event scripts run.
+                proc_bail_flag = 1;
+            }
+            DrawAlarmText(0);
+            return;
+        }
         gsound_play_sfx_file("ib1p1xx1");
 
         DrawAlarmText(a1 - 3);
@@ -1905,6 +1946,23 @@ static void DrawAlarmText(int a1)
     text = getmsg(&pipboy_message_file, &pipmesg, 300);
     pip_print(text, PIPBOY_TEXT_ALIGNMENT_CENTER | PIPBOY_TEXT_STYLE_UNDERLINE, colorTable[992]);
 
+    int proposedMinutes = multiplayer::networkRuntimePendingRestMinutes();
+    if (proposedMinutes > 0) {
+        std::string proposer = multiplayer::networkRuntimePendingRestProposerName();
+        char proposalText[96];
+        if (multiplayer::networkRuntimeLocalRestProposal()) {
+            snprintf(proposalText, sizeof(proposalText), "Your rest request - click red time to cancel");
+        } else {
+            snprintf(proposalText, sizeof(proposalText), "%.20s proposes rest - select red time", proposer.c_str());
+        }
+        cursor_line = 2;
+        pip_print(proposalText, 0, colorTable[32747]);
+    }
+    if (multiplayer::networkRuntimeSharedRestEnabled()) {
+        cursor_line = 3;
+        pip_print("Co-op: fixed-duration rest only", 0, colorTable[992]);
+    }
+
     if (bottom_line >= 5) {
         cursor_line = 5;
     }
@@ -1918,7 +1976,13 @@ static void DrawAlarmText(int a1)
         // ...
         // 315 - Rest until party is healed
         text = getmsg(&pipboy_message_file, &pipmesg, 302 + option - 1);
-        int color = option == a1 ? colorTable[32747] : colorTable[992];
+        int optionMinutes = option == 1 ? 10
+            : option == 2             ? 30
+            : option >= 3 && option <= 8 ? (option - 2) * 60
+                                        : 0;
+        int color = option == a1 || (optionMinutes != 0 && optionMinutes == proposedMinutes)
+            ? colorTable[32747]
+            : colorTable[992];
 
         pip_print(text, 0, color);
 

@@ -22,6 +22,7 @@ enum class AgentControlCommandType {
     GameElevator,
     GameExit,
     GameStairs,
+    GameRest,
     GameGive,
 };
 
@@ -37,6 +38,7 @@ struct AgentControlCommand {
     int skill = -1;
     int elevatorType = -1;
     int elevatorLevel = -1;
+    int restMinutes = 0;
     std::uint32_t entityId = 0;
     std::uint32_t itemEntityId = 0;
     std::uint32_t destinationEntityId = 0;

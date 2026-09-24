@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "game/perk_defs.h"
 #include "game/skill_defs.h"
@@ -94,6 +95,7 @@ public:
     const PlayerCharacterState* findByActor(EntityId actorId) const;
 
     bool bindingsMatch(const EntityRegistry& entities) const;
+    std::vector<PlayerId> playerIds() const;
     std::size_t size() const;
     void clear();
 

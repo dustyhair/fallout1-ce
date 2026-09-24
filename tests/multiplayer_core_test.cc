@@ -291,6 +291,7 @@ void testPlayerCharacterStateStore()
     guestState.build.level = 2;
     expect(players.registerPlayer(guestState, registry) == PlayerStateError::None, "guest player state registers");
     expect(players.size() == 2 && players.bindingsMatch(registry), "player states match registry ownership");
+    expect(players.playerIds() == std::vector<PlayerId> { kHostPlayerId, kGuestPlayerId }, "player IDs enumerate deterministically");
     expect(players.find(kHostPlayerId)->build != players.find(kGuestPlayerId)->build, "host and guest retain distinct character builds");
     expect(players.findByActor(guest.entityId) == players.find(kGuestPlayerId), "player state resolves from actor identity");
 
@@ -308,6 +309,20 @@ void testPlayerCharacterStateStore()
     expect(registry.rebindObject(guest.entityId, asGameObject(replacementGuest)) == EntityRegistryError::None, "guest object can be replaced beneath player state");
     expect(players.bindingsMatch(registry), "player binding survives object pointer replacement");
     expect(players.find(kGuestPlayerId)->build == updatedGuestBuild, "character build survives object pointer replacement");
+
+    TestObject thirdActor;
+    PlayerId thirdPlayerId { 3 };
+    EntityRegistrationResult third = registry.registerObject(asGameObject(thirdActor), thirdPlayerId);
+    PlayerCharacterState thirdState;
+    thirdState.id = thirdPlayerId;
+    thirdState.actorId = third.entityId;
+    expect(static_cast<bool>(third)
+            && players.registerPlayer(thirdState, registry) == PlayerStateError::None,
+        "third player state registers");
+    expect(players.playerIds() == std::vector<PlayerId> { kHostPlayerId, kGuestPlayerId, thirdPlayerId },
+        "player IDs include a third participant in stable order");
+    expect(players.unregisterPlayer(thirdPlayerId) == PlayerStateError::None,
+        "third player state can be removed");
 
     expect(players.unregisterPlayer(kGuestPlayerId) == PlayerStateError::None, "guest player state can be removed");
     expect(players.findByActor(guest.entityId) == nullptr, "removed actor binding no longer resolves");
@@ -756,6 +771,7 @@ void testGameplayWireFormat()
         GameCommand { CommandSequence { 12 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, ElevatorCommand { 8, 1 } },
         GameCommand { CommandSequence { 13 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, ExitGridCommand { EntityId { 46 } } },
         GameCommand { CommandSequence { 14 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, SceneryTransitionCommand { EntityId { 47 } } },
+        GameCommand { CommandSequence { 15 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, RestCommand { 180 } },
     };
 
     for (std::size_t index = 0; index < commands.size(); index++) {
@@ -967,6 +983,20 @@ void testGameplayWireFormat()
     expect(sceneryTransition != nullptr && sceneryTransition->transitionId == EntityId { 47 },
         "scenery-transition command round trips its registered object identity");
 
+    ProtocolEnvelope restEnvelope = gameplayEnvelope(96);
+    expect(encodeGameCommand(commands[14], restEnvelope) == GameplayWireError::None,
+        "rest consent command encodes");
+    GameCommandDecodeResult decodedRest = decodeGameCommand(restEnvelope);
+    const RestCommand* rest = decodedRest
+        ? std::get_if<RestCommand>(&decodedRest.command.payload)
+        : nullptr;
+    expect(rest != nullptr && rest->minutes == 180,
+        "rest consent duration round trips");
+    GameCommand invalidRest = commands[14];
+    std::get<RestCommand>(invalidRest.payload).minutes = 17;
+    expect(encodeGameCommand(invalidRest, restEnvelope) == GameplayWireError::InvalidMove,
+        "rest command rejects unsupported durations");
+
     CommandResult accepted;
     accepted.commandSequence.value = 1;
     accepted.status = CommandStatus::Accepted;
@@ -1030,6 +1060,8 @@ void testGameplayWireFormat()
             },
             9,
         } },
+        GameEvent { EventSequence { 22 }, CommandSequence { 15 }, RestStateChangedEvent { EntityId { 20 }, 180, false, 123456, 9 } },
+        GameEvent { EventSequence { 23 }, CommandSequence { 16 }, RestStateChangedEvent { EntityId { 10 }, 180, true, 231456, 11 } },
     };
     for (std::size_t index = 0; index < events.size(); index++) {
         ProtocolEnvelope envelope = gameplayEnvelope(30 + index);
@@ -1227,6 +1259,21 @@ void testGameplayWireFormat()
             && sceneryTransitionEvent->placements.size() == 2
             && sceneryTransitionEvent->placements[1].elevation == 1,
         "scenery-transition event round trips player-keyed independent placements");
+
+    ProtocolEnvelope restEventEnvelope = gameplayEnvelope(97);
+    expect(encodeGameEvent(events[16], restEventEnvelope) == GameplayWireError::None,
+        "completed rest event encodes");
+    GameEventDecodeResult decodedRestEvent = decodeGameEvent(restEventEnvelope);
+    const RestStateChangedEvent* completedRest = decodedRestEvent
+        ? std::get_if<RestStateChangedEvent>(&decodedRestEvent.event.payload)
+        : nullptr;
+    expect(completedRest != nullptr
+            && completedRest->actorId == EntityId { 10 }
+            && completedRest->minutes == 180
+            && completedRest->completed
+            && completedRest->gameTime == 231456
+            && completedRest->phaseRevision == 11,
+        "completed rest event round trips final world time and phase");
 
     ProtocolEnvelope skillEventEnvelope = gameplayEnvelope(48);
     encodeGameEvent(events[10], skillEventEnvelope);
@@ -2299,6 +2346,15 @@ public:
         };
     }
 
+    RestExecution rest(Object* actor, const RestCommand& command) override
+    {
+        restCalls++;
+        lastActor = actor;
+        lastRest = command;
+        recordContext();
+        return RestExecution { nextStatus, true, 231456, 9 };
+    }
+
     CommandExecutionStatus attack(Object* actor, Object* target, const AttackCommand& command) override
     {
         attackCalls++;
@@ -2402,6 +2458,7 @@ public:
     int elevatorCalls = 0;
     int exitGridCalls = 0;
     int sceneryTransitionCalls = 0;
+    int restCalls = 0;
     int attackCalls = 0;
     int modalCalls = 0;
     int transferCalls = 0;
@@ -2422,6 +2479,7 @@ public:
     ElevatorCommand lastElevator;
     ExitGridCommand lastExitGrid;
     SceneryTransitionCommand lastSceneryTransition;
+    RestCommand lastRest;
     SharedModalCommand lastModal;
     LocalSession* modalSession = nullptr;
     Object* activeModalActor = nullptr;
@@ -2663,6 +2721,33 @@ void testAuthoritativeCommandProcessing()
             && sceneryTransitionEvent->placements[1].elevation == 1
             && sceneryTransitionEvent->phaseRevision == 9,
         "host resolves scenery-transition targets and emits player-keyed placements");
+
+    CommandProcessor restProcessor;
+    GameCommand requestRest;
+    requestRest.sequence.value = 1;
+    requestRest.playerId = kGuestPlayerId;
+    requestRest.actorId = session.playerActorId(kGuestPlayerId);
+    requestRest.expectedPhase = SessionPhase::Exploration;
+    requestRest.expectedPhaseRevision = session.phaseRevision();
+    requestRest.payload = RestCommand { 180 };
+    AuthoritativeCommandResult requestedRest = restProcessor.process(requestRest, session, executor);
+    const RestStateChangedEvent* restEvent = requestedRest.event.has_value()
+        ? std::get_if<RestStateChangedEvent>(&requestedRest.event->payload)
+        : nullptr;
+    expect(requestedRest.result.status == CommandStatus::Accepted
+            && executor.restCalls == 1
+            && executor.lastRest.minutes == 180
+            && executor.lastActingPlayerId == kGuestPlayerId
+            && restEvent != nullptr
+            && restEvent->completed
+            && restEvent->gameTime == 231456,
+        "rest consent routes through the acting-player context and emits authoritative completion");
+    requestRest.sequence.value = 2;
+    std::get<RestCommand>(requestRest.payload).minutes = 17;
+    AuthoritativeCommandResult invalidRest = restProcessor.process(requestRest, session, executor);
+    expect(invalidRest.result.rejection == CommandRejection::Malformed
+            && executor.restCalls == 1,
+        "rest rejects unsupported durations before invoking the engine");
 
     GameCommand pickup;
     pickup.sequence.value = 2;

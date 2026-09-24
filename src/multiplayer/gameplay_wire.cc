@@ -22,6 +22,7 @@ enum class CommandType : std::uint8_t {
     Elevator = 12,
     ExitGrid = 13,
     SceneryTransition = 14,
+    Rest = 15,
 };
 
 enum class EventType : std::uint8_t {
@@ -40,6 +41,7 @@ enum class EventType : std::uint8_t {
     ElevatorTransitioned = 13,
     ExitGridTransitioned = 14,
     SceneryTransitioned = 15,
+    RestStateChanged = 16,
 };
 
 constexpr std::size_t kCommandHeaderSize = 28;
@@ -69,6 +71,7 @@ constexpr std::size_t kSkillEventSize = kEventHeaderSize + 12;
 constexpr std::size_t kItemUseEventSize = kEventHeaderSize + 12;
 constexpr std::size_t kElevatorEventSize = kEventHeaderSize + 40;
 constexpr std::size_t kExitGridEventBaseSize = kEventHeaderSize + 20;
+constexpr std::size_t kRestEventSize = kEventHeaderSize + 20;
 constexpr std::size_t kTransitionPlacementSize = 20;
 constexpr std::int32_t kAttackHitModeCount = 20;
 constexpr std::int32_t kAttackHitLocationCount = 9;
@@ -316,6 +319,11 @@ GameplayWireError validateCommand(const GameCommand& command)
         return isValid(transition->transitionId)
             ? GameplayWireError::None
             : GameplayWireError::InvalidEntityId;
+    }
+    if (const auto* rest = std::get_if<RestCommand>(&command.payload)) {
+        return isValidRestMinutes(rest->minutes)
+            ? GameplayWireError::None
+            : GameplayWireError::InvalidMove;
     }
 
     EntityId targetId;
@@ -578,6 +586,15 @@ GameplayWireError validateEvent(const GameEvent& event)
             ? GameplayWireError::None
             : GameplayWireError::InvalidMove;
     }
+    if (const auto* rest = std::get_if<RestStateChangedEvent>(&event.payload)) {
+        return isValid(rest->actorId)
+                && isValidRestMinutes(rest->minutes)
+                && (!rest->completed || rest->minutes != 0)
+                && rest->gameTime > 0
+                && rest->phaseRevision > 0
+            ? GameplayWireError::None
+            : GameplayWireError::InvalidMove;
+    }
 
     EntityId actorId;
     EntityId targetId;
@@ -693,6 +710,9 @@ GameplayWireError encodeGameCommand(const GameCommand& command, ProtocolEnvelope
     } else if (const auto* transition = std::get_if<SceneryTransitionCommand>(&command.payload)) {
         appendCommandHeader(command, CommandType::SceneryTransition, envelope.payload);
         appendUInt32(envelope.payload, transition->transitionId.value);
+    } else if (const auto* rest = std::get_if<RestCommand>(&command.payload)) {
+        appendCommandHeader(command, CommandType::Rest, envelope.payload);
+        appendInt32(envelope.payload, rest->minutes);
     } else {
         const auto* attack = std::get_if<AttackCommand>(&command.payload);
         appendCommandHeader(command, CommandType::Attack, envelope.payload);
@@ -872,6 +892,13 @@ GameCommandDecodeResult decodeGameCommand(const ProtocolEnvelope& envelope)
         result.command.payload = SceneryTransitionCommand {
             EntityId { readUInt32(envelope.payload, 28) },
         };
+        break;
+    case CommandType::Rest:
+        if (envelope.payload.size() != kTargetCommandSize) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.command.payload = RestCommand { readInt32(envelope.payload, 28) };
         break;
     default:
         result.error = GameplayWireError::UnknownPayloadType;
@@ -1059,6 +1086,13 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
             appendInt32(envelope.payload, placement.elevation);
             appendInt32(envelope.payload, placement.rotation);
         }
+    } else if (const auto* rest = std::get_if<RestStateChangedEvent>(&event.payload)) {
+        appendEventHeader(event, EventType::RestStateChanged, envelope.payload);
+        appendUInt32(envelope.payload, rest->actorId.value);
+        appendInt32(envelope.payload, rest->minutes);
+        appendUInt32(envelope.payload, rest->completed ? 1 : 0);
+        appendInt32(envelope.payload, rest->gameTime);
+        appendUInt32(envelope.payload, rest->phaseRevision);
     } else {
         const auto* attack = std::get_if<AttackStartedEvent>(&event.payload);
         appendEventHeader(event, EventType::AttackStarted, envelope.payload);
@@ -1346,6 +1380,20 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
         result.event.payload = std::move(transition);
         break;
     }
+    case EventType::RestStateChanged:
+        if (envelope.payload.size() != kRestEventSize
+            || readUInt32(envelope.payload, 28) > 1) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.event.payload = RestStateChangedEvent {
+            EntityId { readUInt32(envelope.payload, 20) },
+            readInt32(envelope.payload, 24),
+            readUInt32(envelope.payload, 28) != 0,
+            readInt32(envelope.payload, 32),
+            readUInt32(envelope.payload, 36),
+        };
+        break;
     default:
         result.error = GameplayWireError::UnknownPayloadType;
         return result;

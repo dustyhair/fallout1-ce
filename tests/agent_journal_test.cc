@@ -75,6 +75,10 @@ int main(int argc, char** argv)
     state.visibleInteractables.push_back(door);
     fallout::agentJournalWriteWorldState(state);
     fallout::agentJournalWriteWorldState(state);
+    state.pendingRestMinutes = 30;
+    state.pendingRestProposerId = 2;
+    state.pendingRestProposerName = "Max";
+    fallout::agentJournalWriteWorldState(state);
     state.guest.rotation = 2;
     fallout::agentJournalWriteWorldState(state);
     fallout::agentJournalWriteWorldExit();
@@ -85,7 +89,7 @@ int main(int argc, char** argv)
     for (std::string line; std::getline(input, line);) {
         lines.push_back(std::move(line));
     }
-    passed = expect(lines.size() == 8, "journal suppresses duplicate world states") && passed;
+    passed = expect(lines.size() == 9, "journal suppresses duplicate world states") && passed;
     passed = expect(lines.size() > 1
             && lines[1].find("Vault \\\"door\\\"\\nopened") != std::string::npos,
         "journal JSON-escapes display text")
@@ -113,7 +117,13 @@ int main(int argc, char** argv)
             && lines[4].find("\"locked\":true") != std::string::npos,
         "journal records structured actors, enemies, and interactable targets")
         && passed;
-    passed = expect(lines.size() > 7 && lines[7].find("\"event\":\"session_end\"") != std::string::npos,
+    passed = expect(lines.size() > 5
+            && lines[5].find("\"pending_rest\":{\"minutes\":30") != std::string::npos
+            && lines[5].find("\"proposer_player_id\":2") != std::string::npos
+            && lines[5].find("\"proposer_name\":\"Max\"") != std::string::npos,
+        "journal attributes a pending rest proposal to its player")
+        && passed;
+    passed = expect(lines.size() > 8 && lines[8].find("\"event\":\"session_end\"") != std::string::npos,
         "journal closes with a session boundary")
         && passed;
     return passed ? 0 : 1;

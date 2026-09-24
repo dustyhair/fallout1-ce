@@ -82,6 +82,7 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     const ElevatorCommand* elevator = std::get_if<ElevatorCommand>(&command.payload);
     const ExitGridCommand* exitGrid = std::get_if<ExitGridCommand>(&command.payload);
     const SceneryTransitionCommand* sceneryTransition = std::get_if<SceneryTransitionCommand>(&command.payload);
+    const RestCommand* rest = std::get_if<RestCommand>(&command.payload);
     const InventoryTransferCommand* transfer = std::get_if<InventoryTransferCommand>(&command.payload);
     const ItemDropCommand* drop = std::get_if<ItemDropCommand>(&command.payload);
     const AttackCommand* attack = std::get_if<AttackCommand>(&command.payload);
@@ -125,6 +126,10 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
         }
         targetId = sceneryTransition->transitionId;
         hasTarget = true;
+    } else if (rest != nullptr) {
+        if (!isValidRestMinutes(rest->minutes)) {
+            return rejectAndRemember(CommandRejection::Malformed);
+        }
     } else if (attack != nullptr) {
         targetId = attack->targetId;
         hasTarget = true;
@@ -247,6 +252,16 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
                 transitionExecution.map,
                 std::move(transitionExecution.placements),
                 transitionExecution.phaseRevision,
+            };
+        } else if (rest != nullptr) {
+            RestExecution restExecution = executor.rest(actor, *rest);
+            executionStatus = restExecution.status;
+            event.payload = RestStateChangedEvent {
+                command.actorId,
+                rest->minutes,
+                restExecution.completed,
+                restExecution.gameTime,
+                restExecution.phaseRevision,
             };
         } else if (attack != nullptr) {
             executionStatus = executor.attack(actor, target, *attack);

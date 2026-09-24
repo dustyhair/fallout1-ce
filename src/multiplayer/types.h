@@ -208,6 +208,17 @@ struct SceneryTransitionCommand {
     EntityId transitionId;
 };
 
+// Zero withdraws consent. The first slice supports Pip-Boy's fixed durations.
+struct RestCommand {
+    std::int32_t minutes = 0;
+};
+
+constexpr bool isValidRestMinutes(std::int32_t minutes)
+{
+    return minutes == 0 || minutes == 10 || minutes == 30
+        || (minutes >= 60 && minutes <= 360 && minutes % 60 == 0);
+}
+
 struct ItemDescriptor {
     std::int32_t pid = -1;
     std::int32_t extendedFlags = 0;
@@ -248,7 +259,7 @@ struct SharedModalCommand {
     bool open = false;
 };
 
-using GameCommandPayload = std::variant<MoveCommand, FaceCommand, InteractCommand, PickupCommand, LootCommand, UseSkillCommand, UseItemOnCommand, ElevatorCommand, ExitGridCommand, SceneryTransitionCommand, InventoryTransferCommand, ItemDropCommand, AttackCommand, SharedModalCommand>;
+using GameCommandPayload = std::variant<MoveCommand, FaceCommand, InteractCommand, PickupCommand, LootCommand, UseSkillCommand, UseItemOnCommand, ElevatorCommand, ExitGridCommand, SceneryTransitionCommand, RestCommand, InventoryTransferCommand, ItemDropCommand, AttackCommand, SharedModalCommand>;
 
 struct GameCommand {
     CommandSequence sequence;
@@ -377,6 +388,14 @@ struct SceneryTransitionedEvent {
     std::uint32_t phaseRevision = 0;
 };
 
+struct RestStateChangedEvent {
+    EntityId actorId;
+    std::int32_t minutes = 0;
+    bool completed = false;
+    std::int32_t gameTime = 0;
+    std::uint32_t phaseRevision = 0;
+};
+
 struct InventoryTransferredEvent {
     EntityId actorId;
     EntityId sourceId;
@@ -415,7 +434,7 @@ struct SharedModalStateChangedEvent {
     std::uint32_t phaseRevision = 0;
 };
 
-using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, ItemPickupCompletedEvent, LootStartedEvent, SkillUseStartedEvent, ItemUseStartedEvent, ElevatorTransitionedEvent, ExitGridTransitionedEvent, SceneryTransitionedEvent, InventoryTransferredEvent, ItemDroppedEvent, AttackStartedEvent, SharedModalStateChangedEvent>;
+using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, ItemPickupCompletedEvent, LootStartedEvent, SkillUseStartedEvent, ItemUseStartedEvent, ElevatorTransitionedEvent, ExitGridTransitionedEvent, SceneryTransitionedEvent, RestStateChangedEvent, InventoryTransferredEvent, ItemDroppedEvent, AttackStartedEvent, SharedModalStateChangedEvent>;
 
 struct GameEvent {
     EventSequence sequence;
