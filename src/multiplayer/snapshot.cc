@@ -23,6 +23,7 @@ constexpr std::size_t kScenerySnapshotSize = 48;
 constexpr std::size_t kItemSnapshotSize = 56;
 constexpr std::size_t kTimedEventSnapshotSize = 36;
 constexpr std::size_t kWorldMapSnapshotSize = 31 * 29 + 15 * 7 + 6 * sizeof(std::uint32_t);
+constexpr std::size_t kWorldMapTravelSnapshotSize = 20;
 constexpr std::size_t kSnapshotProtectedOffset = 20;
 constexpr std::uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
 constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
@@ -64,6 +65,15 @@ void appendWorldMap(std::vector<std::uint8_t>& bytes, const WorldMapState& state
     appendUint32(bytes, static_cast<std::uint32_t>(state.section));
     appendUint32(bytes, static_cast<std::uint32_t>(state.x));
     appendUint32(bytes, static_cast<std::uint32_t>(state.y));
+}
+
+void appendWorldMapTravel(std::vector<std::uint8_t>& bytes, const WorldMapTravelSnapshot& state)
+{
+    appendUint32(bytes, state.proposerActorId.value);
+    appendUint32(bytes, state.controllerActorId.value);
+    appendUint32(bytes, static_cast<std::uint32_t>(state.stage));
+    appendUint32(bytes, static_cast<std::uint32_t>(state.targetX));
+    appendUint32(bytes, static_cast<std::uint32_t>(state.targetY));
 }
 
 std::uint8_t readUint8(const std::vector<std::uint8_t>& bytes, std::size_t& offset)
@@ -369,6 +379,31 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
         || std::any_of(worldMap.knownTownEntrances.begin(), worldMap.knownTownEntrances.end(), [](std::uint8_t value) { return value > 1; })) {
         return SnapshotError::InvalidWorldMapState;
     }
+    const WorldMapTravelSnapshot& travel = snapshot.worldMapTravel;
+    bool noRoute = travel.targetX == -1 && travel.targetY == -1;
+    bool validRoute = isValid(WorldMapRouteCommand { travel.targetX, travel.targetY, false });
+    auto isPlayerActor = [&](EntityId actorId) {
+        return std::any_of(snapshot.actors.begin(), snapshot.actors.end(), [&](const ActorSnapshot& actor) {
+            return actor.entityId == actorId;
+        });
+    };
+    if ((travel.stage == WorldMapTravelStage::None
+            && (isValid(travel.proposerActorId) || isValid(travel.controllerActorId) || !noRoute))
+        || (travel.stage == WorldMapTravelStage::Proposed
+            && (snapshot.phase != SessionPhase::Exploration
+                || !isPlayerActor(travel.proposerActorId)
+                || travel.controllerActorId != travel.proposerActorId
+                || !noRoute))
+        || (travel.stage == WorldMapTravelStage::Approved
+            && (snapshot.phase != SessionPhase::Transition
+                || !isPlayerActor(travel.proposerActorId)
+                || !isPlayerActor(travel.controllerActorId)
+                || (!noRoute && !validRoute)))
+        || (travel.stage != WorldMapTravelStage::None
+            && travel.stage != WorldMapTravelStage::Proposed
+            && travel.stage != WorldMapTravelStage::Approved)) {
+        return SnapshotError::InvalidWorldMapTravelState;
+    }
 
     std::unordered_set<std::uint32_t> entityIds;
     std::unordered_set<std::uint32_t> playerIds;
@@ -528,7 +563,8 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
               + canonical.mapLocalVariables.size())
             * sizeof(std::uint32_t)
         + canonical.timedEvents.size() * kTimedEventSnapshotSize
-        + kWorldMapSnapshotSize);
+        + kWorldMapSnapshotSize
+        + kWorldMapTravelSnapshotSize);
 
     appendUint8(payload, static_cast<std::uint8_t>(canonical.phase));
     appendUint8(payload, 0);
@@ -566,6 +602,7 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
         appendTimedEvent(payload, event);
     }
     appendWorldMap(payload, canonical.worldMap);
+    appendWorldMapTravel(payload, canonical.worldMapTravel);
 
     std::vector<std::uint8_t> protectedBytes;
     protectedBytes.reserve(sizeof(std::uint64_t) + payload.size());
@@ -692,7 +729,8 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
               + static_cast<std::size_t>(mapLocalCount))
             * sizeof(std::uint32_t)
         + static_cast<std::size_t>(timedEventCount) * kTimedEventSnapshotSize
-        + kWorldMapSnapshotSize;
+        + kWorldMapSnapshotSize
+        + kWorldMapTravelSnapshotSize;
     if (payloadSize < expectedPayloadSize) {
         result.error = SnapshotError::TruncatedPayload;
         return result;
@@ -825,6 +863,12 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
     worldMap.section = static_cast<std::int32_t>(readUint32(packet, offset));
     worldMap.x = static_cast<std::int32_t>(readUint32(packet, offset));
     worldMap.y = static_cast<std::int32_t>(readUint32(packet, offset));
+    WorldMapTravelSnapshot& travel = result.snapshot.worldMapTravel;
+    travel.proposerActorId.value = readUint32(packet, offset);
+    travel.controllerActorId.value = readUint32(packet, offset);
+    travel.stage = static_cast<WorldMapTravelStage>(readUint32(packet, offset));
+    travel.targetX = static_cast<std::int32_t>(readUint32(packet, offset));
+    travel.targetY = static_cast<std::int32_t>(readUint32(packet, offset));
 
     result.error = validateSnapshot(result.snapshot);
     if (result.error == SnapshotError::None) {
@@ -906,8 +950,9 @@ SnapshotDigestResult computeSnapshotDigest(const WorldSnapshot& snapshot)
     result.digest.timedEvents = digestBytes(timedEventBytes);
 
     std::vector<std::uint8_t> worldMapBytes;
-    worldMapBytes.reserve(kWorldMapSnapshotSize);
+    worldMapBytes.reserve(kWorldMapSnapshotSize + kWorldMapTravelSnapshotSize);
     appendWorldMap(worldMapBytes, canonical.worldMap);
+    appendWorldMapTravel(worldMapBytes, canonical.worldMapTravel);
     result.digest.worldMap = digestBytes(worldMapBytes);
 
     std::vector<std::uint8_t> overallBytes;

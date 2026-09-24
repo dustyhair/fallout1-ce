@@ -14,7 +14,7 @@ namespace fallout {
 namespace multiplayer {
 
 constexpr std::uint32_t kSnapshotMagic = 0x46434D53;
-constexpr std::uint16_t kSnapshotVersion = 10;
+constexpr std::uint16_t kSnapshotVersion = 11;
 constexpr std::size_t kSnapshotHeaderSize = 28;
 constexpr std::size_t kMaxSnapshotPayloadSize = 512 * 1024;
 constexpr std::size_t kMaxSnapshotActors = 16;
@@ -96,6 +96,20 @@ struct TimedEventSnapshot {
     std::array<std::int32_t, kMaxTimedEventPayloadValues> payload {};
 };
 
+enum class WorldMapTravelStage : std::uint32_t {
+    None = 0,
+    Proposed = 1,
+    Approved = 2,
+};
+
+struct WorldMapTravelSnapshot {
+    EntityId proposerActorId;
+    EntityId controllerActorId;
+    WorldMapTravelStage stage = WorldMapTravelStage::None;
+    std::int32_t targetX = -1;
+    std::int32_t targetY = -1;
+};
+
 struct WorldSnapshot {
     std::uint16_t version = kSnapshotVersion;
     EventSequence lastIncludedEvent;
@@ -103,6 +117,7 @@ struct WorldSnapshot {
     std::uint32_t phaseRevision = 0;
     std::int32_t gameTime = 1;
     WorldMapState worldMap;
+    WorldMapTravelSnapshot worldMapTravel;
     std::vector<ActorSnapshot> actors;
     std::vector<CritterSnapshot> critters;
     std::vector<DoorSnapshot> doors;
@@ -145,6 +160,7 @@ enum class SnapshotError {
     InvalidItemState,
     InvalidTimedEventState,
     InvalidWorldMapState,
+    InvalidWorldMapTravelState,
 };
 
 struct SnapshotDecodeResult {

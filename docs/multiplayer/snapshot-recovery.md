@@ -1,6 +1,6 @@
 # Snapshot recovery
 
-Snapshot version 10 contains the state needed to recover the live two-player experiment:
+Snapshot version 11 contains the state needed to recover the live two-player experiment:
 
 - Session phase, phase revision, authoritative world time, and last included event sequence.
 - Player actor identity, owner, tile, elevation, rotation, hit points, and complete progressing character build.
@@ -11,6 +11,7 @@ Snapshot version 10 contains the state needed to recover the live two-player exp
 - The indexed game-global, map-global, and map-local arrays visible to scripts.
 - The ordered timed-event queue, including absolute trigger time, stable owner identity, and bounded type-specific payload.
 - Persistent world-map position, discovered grid and town entrances, visited cities, and special-encounter history. The host remains the only authority for encounter rolls.
+- Shared world-map travel planning stage, original proposer, current controller, and optional approved route target. If a guest controller disconnects during an approved trip, the host keeps the target and takes control; a reconnecting guest recovers that ownership instead of automatically taking it back.
 
 The wire format uses fixed-width big-endian fields. Its 28-byte header carries the format version, payload length, snapshot checksum, and last included event. The checksum covers the event sequence and payload. Decoders reject unknown versions, payloads over 512 KiB, invalid counts, duplicate entity IDs, malformed state, truncation, trailing bytes, and checksum failures. Shared object flags deliberately omit process-local discovery/selection and object-lifetime bits.
 
@@ -18,7 +19,7 @@ Actors, including their character builds, critters, doors, non-door scenery, and
 
 ## Sectioned digest
 
-The diagnostic digest has ten sections in comparison order:
+The diagnostic digest has ten sections in comparison order. World-map travel planning state belongs to `WorldMap`:
 
 1. `Session`
 2. `Actors`

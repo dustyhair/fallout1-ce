@@ -3078,7 +3078,7 @@ void testSnapshotRoundTripAndRecovery()
                                                         + PC_TRAIT_MAX
                                                         + 4)
         * sizeof(std::uint32_t);
-    expect(packet.size() == kSnapshotHeaderSize + 48 + 2 * (32 + characterBuildWireSize) + 36 + 12 + 48 + 2 * 56 + 6 * 4 + 2 * 36 + 31 * 29 + 15 * 7 + 6 * 4,
+    expect(packet.size() == kSnapshotHeaderSize + 48 + 2 * (32 + characterBuildWireSize) + 36 + 12 + 48 + 2 * 56 + 6 * 4 + 2 * 36 + 31 * 29 + 15 * 7 + 6 * 4 + 20,
         "snapshot packet declares a fixed-width payload");
     expect(packet[0] == 'F' && packet[1] == 'C' && packet[2] == 'M' && packet[3] == 'S', "snapshot magic uses network byte order");
 
@@ -3210,6 +3210,36 @@ void testSnapshotRoundTripAndRecovery()
     invalidWorldMap.worldMap.grid[42] = 3;
     expect(validateSnapshot(invalidWorldMap) == SnapshotError::InvalidWorldMapState,
         "snapshot rejects an invalid world-map discovery cell");
+    WorldSnapshot proposedTravel = decoded.snapshot;
+    proposedTravel.worldMapTravel = WorldMapTravelSnapshot {
+        EntityId { 2 }, EntityId { 2 }, WorldMapTravelStage::Proposed, -1, -1
+    };
+    std::vector<std::uint8_t> planningPacket;
+    expect(encodeSnapshot(proposedTravel, planningPacket) == SnapshotError::None
+            && decodeSnapshot(planningPacket).snapshot.worldMapTravel.proposerActorId == EntityId { 2 },
+        "snapshot recovers a pending guest-proposed world-map trip");
+    WorldSnapshot approvedTravel = proposedTravel;
+    approvedTravel.phase = SessionPhase::Transition;
+    approvedTravel.worldMapTravel.stage = WorldMapTravelStage::Approved;
+    approvedTravel.worldMapTravel.targetX = 512;
+    approvedTravel.worldMapTravel.targetY = 824;
+    expect(encodeSnapshot(approvedTravel, planningPacket) == SnapshotError::None
+            && decodeSnapshot(planningPacket).snapshot.worldMapTravel.targetY == 824,
+        "snapshot recovers the approved controller and selected route");
+    approvedTravel.worldMapTravel.controllerActorId = EntityId { 1 };
+    expect(encodeSnapshot(approvedTravel, planningPacket) == SnapshotError::None
+            && decodeSnapshot(planningPacket).snapshot.worldMapTravel.controllerActorId == EntityId { 1 }
+            && decodeSnapshot(planningPacket).snapshot.worldMapTravel.proposerActorId == EntityId { 2 },
+        "snapshot preserves a guest proposal after host takeover");
+    WorldSnapshot routeDrift = approvedTravel;
+    routeDrift.worldMapTravel.targetX = 513;
+    SnapshotDigestResult travelDigest = computeSnapshotDigest(approvedTravel);
+    SnapshotDigestResult routeDriftDigest = computeSnapshotDigest(routeDrift);
+    expect(firstDivergentSection(travelDigest.digest, routeDriftDigest.digest) == SnapshotSection::WorldMap,
+        "travel-controller drift reports the world-map section");
+    approvedTravel.worldMapTravel.targetX = kWorldMapWidth;
+    expect(validateSnapshot(approvedTravel) == SnapshotError::InvalidWorldMapTravelState,
+        "snapshot rejects an out-of-bounds travel target");
 
     SnapshotReplica replica;
     expect(replica.apply(actorDrift) == SnapshotError::None, "replica accepts locally drifted state");

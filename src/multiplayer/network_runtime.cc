@@ -966,6 +966,7 @@ void networkRuntimeBackgroundProcess()
         networkWorldClearRestProposal();
         if (launchOptions.mode == NetworkLaunchMode::Host) {
             networkWorldCancelPendingWorldMapProposal();
+            networkWorldHostTakeOverWorldMapTravel();
         }
     }
     if (networkWorldActive()) {

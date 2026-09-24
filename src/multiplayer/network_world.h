@@ -70,6 +70,7 @@ void networkWorldFinishPickup(Object* target, bool succeeded);
 AuthoritativeCommandResult networkWorldProcessCommand(const GameCommand& command);
 std::optional<GameEvent> networkWorldTakeDeferredEvent();
 void networkWorldCancelPendingWorldMapProposal();
+void networkWorldHostTakeOverWorldMapTravel();
 bool networkWorldSynchronizeEnginePhase();
 SessionPhase networkWorldPhase();
 std::uint32_t networkWorldPhaseRevision();
