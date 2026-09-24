@@ -1,7 +1,9 @@
 #include "game/worldmap.h"
 
+#include <algorithm>
 #include <assert.h>
 #include <limits>
+#include <optional>
 #include <stdio.h>
 #include <string.h>
 
@@ -22,6 +24,7 @@
 #include "game/gsound.h"
 #include "game/intface.h"
 #include "game/item.h"
+#include "game/map.h"
 #include "game/map_defs.h"
 #include "game/message.h"
 #include "game/object.h"
@@ -38,6 +41,7 @@
 #include "game/tile.h"
 #include "game/worldmap_walkmask.h"
 #include "multiplayer/network_runtime.h"
+#include "multiplayer/network_world.h"
 #include "platform_compat.h"
 #include "plib/color/color.h"
 #include "plib/db/db.h"
@@ -94,7 +98,8 @@ typedef struct TownHotSpotEntry {
 } TownHotSpotEntry;
 
 static void UpdVisualArea();
-static int CheckEvents();
+static int CheckEvents(bool multiplayerMode = false);
+static bool multiplayerForceVaultArrival = false;
 static int LoadTownMap(const char* filename, int map_idx);
 static void TargetTown(int city);
 static int InitWorldMapData();
@@ -1197,12 +1202,176 @@ WorldMapTravelStepResult worldmap_authoritative_travel_step()
                 : WorldMapTravelStepStatus::Moving);
 }
 
+void worldmap_multiplayer_open()
+{
+    using namespace multiplayer;
+    if (!networkWorldWorldMapTravelApproved() || InitWorldMapData() == -1) {
+        return;
+    }
+
+    bool mapBackgroundWasEnabled = map_disable_bk_processes();
+    cycle_disable();
+    intface_hide();
+    gmouse_set_cursor(MOUSE_CURSOR_ARROW);
+    gsound_background_play_level_music("03WRLDMP", 12);
+
+    WorldMapState initialPosition;
+    worldmap_capture_state(initialPosition);
+    int viewportX = std::clamp(initialPosition.x - 247, 0, VIEWPORT_MAX_X);
+    int viewportY = std::clamp(initialPosition.y - 242, 0, VIEWPORT_MAX_Y);
+    bool followParty = true;
+    std::optional<WorldMapArrivalKind> arrivalKind;
+    int specialEncounter = 0;
+    while (networkWorldWorldMapTravelApproved() && game_user_wants_to_quit == 0) {
+        sharedFpsLimiter.mark();
+        int input = get_input(); // pumps the lobby and authoritative snapshots
+        if (!networkWorldWorldMapTravelApproved()) break;
+
+        WorldMapState position;
+        worldmap_capture_state(position);
+        if (networkRuntimeMode() == NetworkLaunchMode::Host
+            && networkWorldSelectedWorldMapRoute().has_value()) {
+            WorldMapTravelStepResult step = networkWorldAdvanceWorldMapTravel();
+            if (step.status == WorldMapTravelStepStatus::Arrived) {
+                if (InCity(step.x, step.y) >= 0) {
+                    arrivalKind = WorldMapArrivalKind::City;
+                    break;
+                }
+                if (networkWorldLocalWorldMapController()) {
+                    networkRuntimeSubmitLocalWorldMapRoute(-1, -1, true);
+                }
+            } else if (step.status == WorldMapTravelStepStatus::Encounter) {
+                arrivalKind = WorldMapArrivalKind::Encounter;
+                specialEncounter = step.specialEncounter;
+                break;
+            } else if (step.status == WorldMapTravelStepStatus::WorldEventPending) {
+                multiplayerForceVaultArrival = false;
+                int eventResult = CheckEvents(true);
+                if (eventResult < 0) break;
+                if (game_user_wants_to_quit != 0) {
+                    arrivalKind = WorldMapArrivalKind::Fatal;
+                    break;
+                }
+                if (multiplayerForceVaultArrival) {
+                    arrivalKind = WorldMapArrivalKind::Interrupted;
+                    break;
+                }
+            } else if (step.status == WorldMapTravelStepStatus::QueueInterrupted) {
+                arrivalKind = WorldMapArrivalKind::Interrupted;
+                break;
+            } else if (step.status == WorldMapTravelStepStatus::Blocked) {
+                if (networkWorldLocalWorldMapController()) {
+                    networkRuntimeSubmitLocalWorldMapRoute(-1, -1, true);
+                }
+            }
+            worldmap_capture_state(position);
+        }
+
+        bool controller = networkWorldLocalWorldMapController();
+        if (controller && input == KEY_ESCAPE) {
+            networkRuntimeRequestSharedModal(SharedModalKind::WorldMap, false);
+        } else if (controller && input >= 500 && input < 500 + TOWN_COUNT) {
+            int city = input - 500;
+            if ((first_visit_flag & (1 << city)) != 0) {
+                networkRuntimeSubmitLocalWorldMapRoute(
+                    50 * city_location[city].column + 25,
+                    50 * city_location[city].row + 25);
+            }
+        } else if (controller && (mouse_get_buttons() & MOUSE_EVENT_LEFT_BUTTON_UP) != 0) {
+            int mouseX = 0;
+            int mouseY = 0;
+            mouseGetPositionInWindow(world_win, &mouseX, &mouseY);
+            if (mouseX >= 22 && mouseX < 472 && mouseY >= 21 && mouseY < 463) {
+                int targetX = viewportX + mouseX - 22;
+                int targetY = viewportY + mouseY - 21;
+                if (abs(targetX - position.x) <= 10 && abs(targetY - position.y) <= 10) {
+                    networkRuntimeRequestSharedModal(SharedModalKind::WorldMap, false);
+                } else {
+                    networkRuntimeSubmitLocalWorldMapRoute(targetX, targetY);
+                }
+            }
+        }
+
+        switch (input) {
+        case KEY_ARROW_LEFT: viewportX = std::max(0, viewportX - 20); followParty = false; break;
+        case KEY_ARROW_RIGHT: viewportX = std::min(VIEWPORT_MAX_X, viewportX + 20); followParty = false; break;
+        case KEY_ARROW_UP: viewportY = std::max(0, viewportY - 20); followParty = false; break;
+        case KEY_ARROW_DOWN: viewportY = std::min(VIEWPORT_MAX_Y, viewportY + 20); followParty = false; break;
+        case KEY_HOME:
+        case KEY_UPPERCASE_C:
+        case KEY_LOWERCASE_C: followParty = true; break;
+        default: break;
+        }
+        if (followParty) {
+            viewportX = std::clamp(position.x - 247, 0, VIEWPORT_MAX_X);
+            viewportY = std::clamp(position.y - 242, 0, VIEWPORT_MAX_Y);
+        }
+
+        buf_to_buf(wmapbmp[WORLDMAP_FRM_WORLDMAP]
+                + WM_WORLDMAP_WIDTH * viewportY + viewportX,
+            450, 442, WM_WORLDMAP_WIDTH,
+            world_buf + WM_WINDOW_WIDTH * 21 + 22, WM_WINDOW_WIDTH);
+        block_map(viewportX, viewportY, world_buf);
+        trans_buf_to_buf(wmapbmp[WORLDMAP_FRM_BOX],
+            WM_WINDOW_WIDTH, WM_WINDOW_HEIGHT, WM_WINDOW_WIDTH,
+            world_buf, WM_WINDOW_WIDTH);
+        DrawTownLabels(wmapbmp[WORLDMAP_FRM_LABELS], world_buf);
+        int markerX = position.x - viewportX + 20;
+        int markerY = position.y - viewportY + 19;
+        if (markerX >= 22 && markerX < 467 && markerY >= 21 && markerY < 458) {
+            trans_buf_to_buf(wmapbmp[WORLDMAP_FRM_LOCATION_MARKER],
+                LOCATION_MARKER_WIDTH, LOCATION_MARKER_HEIGHT,
+                LOCATION_MARKER_WIDTH,
+                world_buf + WM_WINDOW_WIDTH * markerY + markerX,
+                WM_WINDOW_WIDTH);
+        }
+        if (auto route = networkWorldSelectedWorldMapRoute()) {
+            markerX = route->first - viewportX + 17;
+            markerY = route->second - viewportY + 16;
+            if (markerX >= 22 && markerX < 461 && markerY >= 21 && markerY < 452) {
+                trans_buf_to_buf(wmapbmp[WORLDMAP_FRM_DESTINATION_MARKER_BRIGHT],
+                    DESTINATION_MARKER_WIDTH, DESTINATION_MARKER_HEIGHT,
+                    DESTINATION_MARKER_WIDTH,
+                    world_buf + WM_WINDOW_WIDTH * markerY + markerX,
+                    WM_WINDOW_WIDTH);
+            }
+        }
+        DrawMapTime(0);
+        const char* controls = controller ? "Click route  Esc land" : "Watching party route";
+        text_to_buf(world_buf + WM_WINDOW_WIDTH * 455 + 480,
+            controls, 155, WM_WINDOW_WIDTH, colorTable[992]);
+        win_draw(world_win);
+        renderPresent();
+        sharedFpsLimiter.throttle();
+    }
+
+    UnInitWorldMapData();
+    KillWorldWin();
+    art_flush();
+    intface_show();
+    if (mapBackgroundWasEnabled) map_enable_bk_processes();
+    cycle_enable();
+    if (arrivalKind.has_value()) {
+        if (!networkWorldFinishWorldMapTravel(*arrivalKind, specialEncounter,
+                multiplayerForceVaultArrival ? MAP_V13ENT : -1)) {
+            debug_printf("Multiplayer world-map arrival could not load its destination.\n");
+        } else if (*arrivalKind == WorldMapArrivalKind::Fatal) {
+            networkRuntimeFlushWorldMapTerminalEvent();
+        }
+    }
+    multiplayerForceVaultArrival = false;
+}
+
 // NOTE: It's the biggest function in Fallout 1 and Fallout 2 containing more
 // than 9000 instructions.
 //
 // 0x4AA360
 int world_map(WorldMapContext ctx)
 {
+    if (multiplayer::networkWorldActive()) {
+        return multiplayer::networkRuntimeRequestSharedModal(
+            multiplayer::SharedModalKind::WorldMap, true) ? 0 : -1;
+    }
     if (multiplayer::networkRuntimeBlockUnsupportedSharedModal(multiplayer::SharedModalKind::WorldMap)) {
         return -1;
     }
@@ -2706,7 +2875,7 @@ static void UpdVisualArea()
 }
 
 // 0x4ACA5C
-static int CheckEvents()
+static int CheckEvents(bool multiplayerMode)
 {
     int rc = 0;
 
@@ -2729,7 +2898,9 @@ static int CheckEvents()
                     worldmap_script_jump(0, 0);
 
                     rc = 1;
-                    if (LoadTownMap(TownHotSpots[TOWN_VAULT_13][0].name, TownHotSpots[TOWN_VAULT_13][0].map_idx) == -1) {
+                    if (multiplayerMode) {
+                        multiplayerForceVaultArrival = true;
+                    } else if (LoadTownMap(TownHotSpots[TOWN_VAULT_13][0].name, TownHotSpots[TOWN_VAULT_13][0].map_idx) == -1) {
                         rc = -1;
                     }
                 }
@@ -2763,7 +2934,9 @@ static int CheckEvents()
                     worldmap_script_jump(0, 0);
 
                     rc = 1;
-                    if (LoadTownMap(TownHotSpots[TOWN_VAULT_13][0].name, TownHotSpots[TOWN_VAULT_13][0].map_idx) == -1) {
+                    if (multiplayerMode) {
+                        multiplayerForceVaultArrival = true;
+                    } else if (LoadTownMap(TownHotSpots[TOWN_VAULT_13][0].name, TownHotSpots[TOWN_VAULT_13][0].map_idx) == -1) {
                         rc = -1;
                     }
                 }
@@ -3030,7 +3203,9 @@ static int InitWorldMapData()
     }
 
     soundUpdate();
-    UpdateTownStatus();
+    if (!multiplayer::networkRuntimeIsGuestReplica()) {
+        UpdateTownStatus();
+    }
     text_font(101);
 
     bx_enable = disable_box_bar_win();
@@ -3137,6 +3312,57 @@ static int InCity(unsigned int x, unsigned int y)
     }
 
     return -1;
+}
+
+bool worldmap_multiplayer_choose_destination(bool encounter,
+    int specialEncounter,
+    bool enterCity,
+    int* map,
+    int* entranceIndex)
+{
+    if (multiplayer::networkRuntimeMode() != multiplayer::NetworkLaunchMode::Host
+        || map == nullptr || entranceIndex == nullptr
+        || world_xpos < 0 || world_xpos >= 1400
+        || world_ypos < 0 || world_ypos >= 1500) {
+        return false;
+    }
+
+    const char* name = nullptr;
+    int entry = 0;
+    int city = enterCity && !encounter ? InCity(world_xpos, world_ypos) : -1;
+    if (city >= 0 && city < TOWN_COUNT) {
+        const TownHotSpotEntry& entrance = TownHotSpots[city][0];
+        name = entrance.name;
+        entry = entrance.map_idx;
+        if (city == TOWN_CATHEDRAL && game_global_vars[GVAR_MASTER_BLOWN] != 0) {
+            name = "CHILDEAD.MAP";
+            entry = 0;
+        } else if (city == TOWN_MILITARY_BASE && game_global_vars[GVAR_VATS_BLOWN] != 0) {
+            name = "MBDEAD.MAP";
+            entry = 0;
+        }
+    } else if (encounter && specialEncounter > 0 && specialEncounter <= 6) {
+        game_global_vars[GVAR_WORLD_TERRAIN] = WorldEcounTable[world_ypos / 50][world_xpos / 50];
+        name = spcl_map_name[specialEncounter - 1];
+    } else {
+        int terrain = WorldTerraTable[world_ypos / 50][world_xpos / 50];
+        if (terrain < 0 || terrain >= 4) return false;
+        game_global_vars[GVAR_WORLD_TERRAIN] = WorldEcounTable[world_ypos / 50][world_xpos / 50];
+        int candidates[3];
+        int count = 0;
+        for (int index = 0; index < 3; index++) {
+            if (RandEnctNames[terrain][index] != nullptr) candidates[count++] = index;
+        }
+        if (count == 0) return false;
+        name = RandEnctNames[terrain][candidates[roll_random(0, count - 1)]];
+        entry = encounter ? 2 : 1;
+    }
+    if (name == nullptr || *name == '\0') return false;
+    int destination = map_match_map_name(name);
+    if (destination < 0) return false;
+    *map = destination;
+    *entranceIndex = entry;
+    return true;
 }
 
 // 0x4AD4E4
@@ -3620,7 +3846,9 @@ WorldMapContext town_map(WorldMapContext ctx)
         tbutntgl = 1;
     }
 
-    UpdateTownStatus();
+    if (!multiplayer::networkRuntimeIsGuestReplica()) {
+        UpdateTownStatus();
+    }
     tmap_sels_count = RegTMAPsels(world_win, ctx.town);
 
     // CE: Hide interface.
@@ -3982,6 +4210,9 @@ int worldmap_script_jump(int city, int a2)
             if (wmap_mile >= wmap_day) {
                 wmap_mile = 0;
                 partyMemberRestingHeal(24);
+                if (multiplayer::networkWorldActive()) {
+                    multiplayer::networkWorldHealRemotePlayersForTravelDay();
+                }
             }
         }
     }

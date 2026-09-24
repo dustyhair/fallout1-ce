@@ -52,7 +52,7 @@ With `until_morning`, `--multiplayer-smoke-rest-interrupt` schedules a host-only
 
 This hook makes the two-process path runnable under Xvfb:
 
-`--multiplayer-smoke-worldmap-state` with the default movement scenario changes the persistent world-map grid, a known town entrance, and special-encounter history only on the host. The version 10 checkpoint must repair all three on the guest and converge the dedicated world-map digest section, including after authenticated replay. It does not yet enable world-map travel.
+`--multiplayer-smoke-worldmap-state` with the default movement scenario changes the persistent world-map grid, a known town entrance, and special-encounter history only on the host. The version 12 checkpoint repairs all three on the guest and converges the dedicated world-map digest section, including after authenticated replay. Live world-map travel is also available: the proposer controls the route after the other player accepts, while the host advances time and encounters. The `worldmap-host`, `worldmap-guest`, `worldmap-town`, `worldmap-town-guest`, `worldmap-takeover`, `worldmap-encounter`, and `worldmap-queue` smoke scenarios exercise consent, route changes, map arrival, disconnect takeover, encounter spawning, timed interruption, snapshot convergence, and replay against installed game data.
 
 ```text
 fallout-ce --multiplayer-host=45455 --multiplayer-smoke-test

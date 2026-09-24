@@ -111,7 +111,8 @@ bool isSupportedLiveEvent(const GameEventPayload& payload)
         || std::holds_alternative<ItemDroppedEvent>(payload)
         || std::holds_alternative<AttackStartedEvent>(payload)
         || std::holds_alternative<SharedModalStateChangedEvent>(payload)
-        || std::holds_alternative<WorldMapRouteSelectedEvent>(payload);
+        || std::holds_alternative<WorldMapRouteSelectedEvent>(payload)
+        || std::holds_alternative<WorldMapArrivedEvent>(payload);
 }
 
 } // namespace

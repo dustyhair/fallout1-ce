@@ -26,6 +26,7 @@
 #include "int/export.h"
 #include "int/window.h"
 #include "multiplayer/network_runtime.h"
+#include "multiplayer/network_world.h"
 #include "platform_compat.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/gnw.h"
@@ -792,19 +793,27 @@ int scripts_check_state()
 
     if ((scriptState.requests & SCRIPT_REQUEST_TOWN_MAP) != 0) {
         scriptState.requests &= ~SCRIPT_REQUEST_TOWN_MAP;
-        ctx.state = 0;
-        ctx.town = 0;
-        world_map(ctx);
-        KillWorldWin();
+        if (multiplayer::networkWorldActive()) {
+            multiplayer::networkRuntimeRequestSharedModal(multiplayer::SharedModalKind::WorldMap, true);
+        } else {
+            ctx.state = 0;
+            ctx.town = 0;
+            world_map(ctx);
+            KillWorldWin();
+        }
     }
 
     if ((scriptState.requests & SCRIPT_REQUEST_WORLD_MAP) != 0) {
         scriptState.requests &= ~SCRIPT_REQUEST_WORLD_MAP;
-        ctx.state = 0;
-        ctx.town = our_town;
-        ctx = town_map(ctx);
-        world_map(ctx);
-        KillWorldWin();
+        if (multiplayer::networkWorldActive()) {
+            multiplayer::networkRuntimeRequestSharedModal(multiplayer::SharedModalKind::WorldMap, true);
+        } else {
+            ctx.state = 0;
+            ctx.town = our_town;
+            ctx = town_map(ctx);
+            world_map(ctx);
+            KillWorldWin();
+        }
     }
 
     if ((scriptState.requests & SCRIPT_REQUEST_ELEVATOR) != 0) {
@@ -909,6 +918,14 @@ int scripts_check_state()
     }
 
     return 0;
+}
+
+bool scripts_take_worldmap_request()
+{
+    constexpr int worldMapRequests = SCRIPT_REQUEST_TOWN_MAP | SCRIPT_REQUEST_WORLD_MAP;
+    bool requested = (scriptState.requests & worldMapRequests) != 0;
+    scriptState.requests &= ~worldMapRequests;
+    return requested;
 }
 
 // 0x4925C0

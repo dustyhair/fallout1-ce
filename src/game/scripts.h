@@ -158,6 +158,7 @@ int script_q_process(Object* obj, void* data);
 int scripts_clear_state();
 int scripts_clear_combat_requests(Script* script);
 int scripts_check_state();
+bool scripts_take_worldmap_request();
 int scripts_check_state_in_combat();
 int scripts_request_combat(STRUCT_664980* a1);
 void scripts_request_townmap();

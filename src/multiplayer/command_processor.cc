@@ -243,23 +243,43 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
         } else if (exitGrid != nullptr) {
             ExitGridExecution exitExecution = executor.useExitGrid(actor, target, *exitGrid);
             executionStatus = exitExecution.status;
-            event.payload = ExitGridTransitionedEvent {
-                command.actorId,
-                exitGrid->exitId,
-                exitExecution.map,
-                std::move(exitExecution.placements),
-                exitExecution.phaseRevision,
-            };
+            if (exitExecution.proposedWorldMap) {
+                event.payload = SharedModalStateChangedEvent {
+                    command.actorId,
+                    SharedModalKind::WorldMap,
+                    true,
+                    SessionPhase::Exploration,
+                    exitExecution.phaseRevision,
+                };
+            } else {
+                event.payload = ExitGridTransitionedEvent {
+                    command.actorId,
+                    exitGrid->exitId,
+                    exitExecution.map,
+                    std::move(exitExecution.placements),
+                    exitExecution.phaseRevision,
+                };
+            }
         } else if (sceneryTransition != nullptr) {
             SceneryTransitionExecution transitionExecution = executor.useSceneryTransition(actor, target, *sceneryTransition);
             executionStatus = transitionExecution.status;
-            event.payload = SceneryTransitionedEvent {
-                command.actorId,
-                sceneryTransition->transitionId,
-                transitionExecution.map,
-                std::move(transitionExecution.placements),
-                transitionExecution.phaseRevision,
-            };
+            if (transitionExecution.proposedWorldMap) {
+                event.payload = SharedModalStateChangedEvent {
+                    command.actorId,
+                    SharedModalKind::WorldMap,
+                    true,
+                    SessionPhase::Exploration,
+                    transitionExecution.phaseRevision,
+                };
+            } else {
+                event.payload = SceneryTransitionedEvent {
+                    command.actorId,
+                    sceneryTransition->transitionId,
+                    transitionExecution.map,
+                    std::move(transitionExecution.placements),
+                    transitionExecution.phaseRevision,
+                };
+            }
         } else if (rest != nullptr) {
             RestExecution restExecution = executor.rest(actor, *rest);
             executionStatus = restExecution.status;
@@ -277,13 +297,17 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
         } else if (modal != nullptr) {
             SharedModalExecution modalExecution = executor.setSharedModal(actor, *modal);
             executionStatus = modalExecution.status;
-            event.payload = SharedModalStateChangedEvent {
-                isValid(modalExecution.actorId) ? modalExecution.actorId : command.actorId,
-                modal->kind,
-                modal->open,
-                modalExecution.phase,
-                modalExecution.phaseRevision,
-            };
+            if (modalExecution.arrival.has_value()) {
+                event.payload = std::move(*modalExecution.arrival);
+            } else {
+                event.payload = SharedModalStateChangedEvent {
+                    isValid(modalExecution.actorId) ? modalExecution.actorId : command.actorId,
+                    modal->kind,
+                    modal->open,
+                    modalExecution.phase,
+                    modalExecution.phaseRevision,
+                };
+            }
         } else if (worldMapRoute != nullptr) {
             executionStatus = executor.setWorldMapRoute(actor, *worldMapRoute);
             event.payload = WorldMapRouteSelectedEvent {

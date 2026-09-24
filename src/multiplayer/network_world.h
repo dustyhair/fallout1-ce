@@ -39,6 +39,7 @@ bool networkWorldApplyPeerSkillUse(const SkillUseStartedEvent& skillUse);
 bool networkWorldApplyPeerItemUse(const ItemUseStartedEvent& itemUse);
 bool networkWorldApplyPeerElevator(const ElevatorTransitionedEvent& elevator);
 bool networkWorldApplyPeerExitGrid(const ExitGridTransitionedEvent& exitGrid);
+bool networkWorldApplyPeerWorldMapArrival(const WorldMapArrivedEvent& arrival);
 bool networkWorldApplyPeerSceneryTransition(const SceneryTransitionedEvent& transition);
 bool networkWorldApplyPeerRest(const RestStateChangedEvent& rest);
 int networkWorldPendingRestMinutes();
@@ -76,10 +77,18 @@ bool networkWorldSynchronizeEnginePhase();
 SessionPhase networkWorldPhase();
 std::uint32_t networkWorldPhaseRevision();
 std::optional<EntityId> networkWorldReadyLocalExitGrid();
+bool networkWorldIsWorldMapExitGrid(EntityId exitId);
 bool networkWorldSharedModalActive();
 bool networkWorldLocalWorldMapController();
+std::optional<PlayerId> networkWorldPendingWorldMapProposer();
+bool networkWorldWorldMapTravelApproved();
 std::optional<std::pair<std::int32_t, std::int32_t>> networkWorldSelectedWorldMapRoute();
 WorldMapTravelStepResult networkWorldAdvanceWorldMapTravel();
+bool networkWorldFinishWorldMapTravel(WorldMapArrivalKind kind,
+    int specialEncounter = 0,
+    int forcedMap = -1);
+bool networkWorldWorldMapDeparted();
+void networkWorldHealRemotePlayersForTravelDay();
 bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot& snapshot);
 bool networkWorldApplySnapshot(const WorldSnapshot& snapshot);
 bool networkWorldCaptureAuthoritativeState(EventSequence lastIncludedEvent, WorldSnapshot& snapshot);

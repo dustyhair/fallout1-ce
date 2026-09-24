@@ -1256,6 +1256,48 @@ void testGameplayWireFormat()
     expect(encodeGameEvent(routeEvent, modalEventEnvelope) == GameplayWireError::None
             && std::get<WorldMapRouteSelectedEvent>(decodeGameEvent(modalEventEnvelope).event.payload).targetX == 1399,
         "world-map route event round trips the host-approved destination");
+    GameEvent arrivalEvent {
+        EventSequence { 32 },
+        CommandSequence { 10 },
+        WorldMapArrivedEvent {
+            EntityId { 20 },
+            26,
+            2,
+            {
+                PlayerTransitionPlacement { kHostPlayerId, EntityId { 20 }, 20100, 0, 2 },
+                PlayerTransitionPlacement { kGuestPlayerId, EntityId { 21 }, 20101, 0, 2 },
+            },
+            5, 725, 616, 123456, WorldMapArrivalKind::Encounter,
+        },
+    };
+    ProtocolEnvelope arrivalEnvelope = gameplayEnvelope(49);
+    GameEventDecodeResult decodedArrival;
+    expect(encodeGameEvent(arrivalEvent, arrivalEnvelope) == GameplayWireError::None
+            && (decodedArrival = decodeGameEvent(arrivalEnvelope)),
+        "world-map arrival event encodes and decodes");
+    const auto* arrival = std::get_if<WorldMapArrivedEvent>(&decodedArrival.event.payload);
+    expect(arrival != nullptr && arrival->map == 26
+            && arrival->entranceIndex == 2
+            && arrival->worldX == 725 && arrival->worldY == 616
+            && arrival->gameTime == 123456
+            && arrival->kind == WorldMapArrivalKind::Encounter
+            && arrival->placements.size() == 2
+            && arrival->placements[1].actorId == EntityId { 21 },
+        "world-map arrival carries the map, clock, and player-keyed placements");
+    GameEvent duplicateArrival = arrivalEvent;
+    std::get<WorldMapArrivedEvent>(duplicateArrival.payload).placements[1].playerId = kHostPlayerId;
+    expect(encodeGameEvent(duplicateArrival, arrivalEnvelope) == GameplayWireError::InvalidMove,
+        "world-map arrival rejects duplicate player placements");
+    GameEvent fatalArrival = arrivalEvent;
+    std::get<WorldMapArrivedEvent>(fatalArrival.payload).kind = WorldMapArrivalKind::Fatal;
+    std::get<WorldMapArrivedEvent>(fatalArrival.payload).entranceIndex = 0;
+    expect(encodeGameEvent(fatalArrival, arrivalEnvelope) == GameplayWireError::None
+            && std::get<WorldMapArrivedEvent>(decodeGameEvent(arrivalEnvelope).event.payload).kind
+                == WorldMapArrivalKind::Fatal,
+        "fatal world-map event survives the arrival wire format");
+    std::get<WorldMapArrivedEvent>(fatalArrival.payload).entranceIndex = 33;
+    expect(encodeGameEvent(fatalArrival, arrivalEnvelope) == GameplayWireError::InvalidMove,
+        "world-map arrival rejects an invalid entrance index");
 
     ProtocolEnvelope elevatorEventEnvelope = gameplayEnvelope(48);
     encodeGameEvent(events[12], elevatorEventEnvelope);

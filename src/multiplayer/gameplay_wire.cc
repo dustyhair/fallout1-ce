@@ -44,6 +44,7 @@ enum class EventType : std::uint8_t {
     SceneryTransitioned = 15,
     RestStateChanged = 16,
     WorldMapRouteSelected = 17,
+    WorldMapArrived = 18,
 };
 
 constexpr std::size_t kCommandHeaderSize = 28;
@@ -76,6 +77,7 @@ constexpr std::size_t kExitGridEventBaseSize = kEventHeaderSize + 20;
 constexpr std::size_t kRestEventSize = kEventHeaderSize + 24;
 constexpr std::size_t kWorldMapRouteCommandSize = kCommandHeaderSize + 12;
 constexpr std::size_t kWorldMapRouteEventSize = kEventHeaderSize + 16;
+constexpr std::size_t kWorldMapArrivalEventBaseSize = kEventHeaderSize + 36;
 constexpr std::size_t kTransitionPlacementSize = 20;
 constexpr std::int32_t kAttackHitModeCount = 20;
 constexpr std::int32_t kAttackHitLocationCount = 9;
@@ -568,6 +570,39 @@ GameplayWireError validateEvent(const GameEvent& event)
         return actingPlayerPresent
             ? GameplayWireError::None
             : GameplayWireError::InvalidMove;
+    }
+    if (const auto* arrival = std::get_if<WorldMapArrivedEvent>(&event.payload)) {
+        if (!isValid(arrival->actorId)
+            || arrival->map < 0
+            || arrival->entranceIndex < 0 || arrival->entranceIndex > 32
+            || arrival->phaseRevision < 2
+            || arrival->worldX < 0 || arrival->worldX >= 1400
+            || arrival->worldY < 0 || arrival->worldY >= 1500
+            || arrival->gameTime <= 0
+            || static_cast<std::uint8_t>(arrival->kind) > static_cast<std::uint8_t>(WorldMapArrivalKind::Fatal)
+            || arrival->placements.empty()
+            || arrival->placements.size() > kMaximumTransitionPlayers) {
+            return GameplayWireError::InvalidMove;
+        }
+        bool actingPlayerPresent = false;
+        for (std::size_t index = 0; index < arrival->placements.size(); index++) {
+            const PlayerTransitionPlacement& placement = arrival->placements[index];
+            if (!isValid(placement.playerId)
+                || !isValid(placement.actorId)
+                || placement.tile < 0
+                || placement.elevation < 0 || placement.elevation > 2
+                || placement.rotation < 0 || placement.rotation >= kActorRotationCount) {
+                return GameplayWireError::InvalidMove;
+            }
+            actingPlayerPresent = actingPlayerPresent || placement.actorId == arrival->actorId;
+            for (std::size_t previous = 0; previous < index; previous++) {
+                if (arrival->placements[previous].playerId == placement.playerId
+                    || arrival->placements[previous].actorId == placement.actorId) {
+                    return GameplayWireError::InvalidMove;
+                }
+            }
+        }
+        return actingPlayerPresent ? GameplayWireError::None : GameplayWireError::InvalidMove;
     }
     if (const auto* transition = std::get_if<SceneryTransitionedEvent>(&event.payload)) {
         if (!isValid(transition->actorId)
@@ -1117,6 +1152,24 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
             appendInt32(envelope.payload, placement.elevation);
             appendInt32(envelope.payload, placement.rotation);
         }
+    } else if (const auto* arrival = std::get_if<WorldMapArrivedEvent>(&event.payload)) {
+        appendEventHeader(event, EventType::WorldMapArrived, envelope.payload);
+        appendUInt32(envelope.payload, arrival->actorId.value);
+        appendInt32(envelope.payload, arrival->map);
+        appendUInt32(envelope.payload, arrival->phaseRevision);
+        appendInt32(envelope.payload, arrival->worldX);
+        appendInt32(envelope.payload, arrival->worldY);
+        appendInt32(envelope.payload, arrival->gameTime);
+        appendUInt32(envelope.payload, static_cast<std::uint32_t>(arrival->kind));
+        appendUInt32(envelope.payload, static_cast<std::uint32_t>(arrival->placements.size()));
+        appendInt32(envelope.payload, arrival->entranceIndex);
+        for (const PlayerTransitionPlacement& placement : arrival->placements) {
+            appendUInt32(envelope.payload, placement.playerId.value);
+            appendUInt32(envelope.payload, placement.actorId.value);
+            appendInt32(envelope.payload, placement.tile);
+            appendInt32(envelope.payload, placement.elevation);
+            appendInt32(envelope.payload, placement.rotation);
+        }
     } else if (const auto* transition = std::get_if<SceneryTransitionedEvent>(&event.payload)) {
         appendEventHeader(event, EventType::SceneryTransitioned, envelope.payload);
         appendUInt32(envelope.payload, transition->actorId.value);
@@ -1407,6 +1460,47 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
             });
         }
         result.event.payload = std::move(exitGrid);
+        break;
+    }
+    case EventType::WorldMapArrived: {
+        if (envelope.payload.size() < kWorldMapArrivalEventBaseSize) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        std::uint32_t placementCount = readUInt32(envelope.payload, 48);
+        if (placementCount == 0
+            || placementCount > kMaximumTransitionPlayers
+            || readInt32(envelope.payload, 52) < 0
+            || readInt32(envelope.payload, 52) > 32
+            || readUInt32(envelope.payload, 44)
+                > static_cast<std::uint32_t>(WorldMapArrivalKind::Fatal)
+            || envelope.payload.size() != kWorldMapArrivalEventBaseSize
+                    + static_cast<std::size_t>(placementCount) * kTransitionPlacementSize) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        WorldMapArrivedEvent arrival;
+        arrival.actorId = EntityId { readUInt32(envelope.payload, 20) };
+        arrival.map = readInt32(envelope.payload, 24);
+        arrival.phaseRevision = readUInt32(envelope.payload, 28);
+        arrival.worldX = readInt32(envelope.payload, 32);
+        arrival.worldY = readInt32(envelope.payload, 36);
+        arrival.gameTime = readInt32(envelope.payload, 40);
+        arrival.kind = static_cast<WorldMapArrivalKind>(readUInt32(envelope.payload, 44));
+        arrival.entranceIndex = readInt32(envelope.payload, 52);
+        arrival.placements.reserve(placementCount);
+        for (std::uint32_t index = 0; index < placementCount; index++) {
+            std::size_t offset = kWorldMapArrivalEventBaseSize
+                + static_cast<std::size_t>(index) * kTransitionPlacementSize;
+            arrival.placements.push_back(PlayerTransitionPlacement {
+                PlayerId { readUInt32(envelope.payload, offset) },
+                EntityId { readUInt32(envelope.payload, offset + 4) },
+                readInt32(envelope.payload, offset + 8),
+                readInt32(envelope.payload, offset + 12),
+                readInt32(envelope.payload, offset + 16),
+            });
+        }
+        result.event.payload = std::move(arrival);
         break;
     }
     case EventType::SceneryTransitioned: {

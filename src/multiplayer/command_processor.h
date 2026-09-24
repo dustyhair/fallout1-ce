@@ -44,6 +44,7 @@ struct SharedModalExecution {
     SessionPhase phase = SessionPhase::Exploration;
     std::uint32_t phaseRevision = 0;
     EntityId actorId;
+    std::optional<WorldMapArrivedEvent> arrival;
 };
 
 struct ElevatorExecution {
@@ -63,6 +64,7 @@ struct ExitGridExecution {
     std::int32_t map = -1;
     std::vector<PlayerTransitionPlacement> placements;
     std::uint32_t phaseRevision = 0;
+    bool proposedWorldMap = false;
 };
 
 using SceneryTransitionExecution = ExitGridExecution;

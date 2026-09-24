@@ -34,6 +34,7 @@
 #include "game/proto.h"
 #include "game/proto_types.h"
 #include "game/queue.h"
+#include "game/roll.h"
 #include "game/scripts.h"
 #include "game/stat.h"
 #include "game/textobj.h"
@@ -88,8 +89,14 @@ enum class SmokeScenario {
     TypedStairsIndependent,
     TypedStairsCrossMap,
     Rest,
+    WorldMapTravel,
 };
 SmokeScenario smokeScenario = SmokeScenario::Movement;
+bool smokeWorldMapGuestController = false;
+bool smokeWorldMapTakeover = false;
+bool smokeWorldMapTown = false;
+bool smokeWorldMapEncounter = false;
+bool smokeWorldMapQueue = false;
 int smokeRestMinutes = 10;
 bool smokeRestInterrupt = false;
 bool smokeWorldMapState = false;
@@ -129,6 +136,13 @@ const char* smokeScenarioName()
         return "typed-stairs-cross-map";
     case SmokeScenario::Rest:
         return "rest";
+    case SmokeScenario::WorldMapTravel:
+        return smokeWorldMapEncounter ? "worldmap-encounter"
+            : smokeWorldMapQueue ? "worldmap-queue"
+            : smokeWorldMapTown && smokeWorldMapGuestController ? "worldmap-town-guest"
+            : smokeWorldMapTown ? "worldmap-town"
+            : smokeWorldMapTakeover ? "worldmap-takeover"
+            : smokeWorldMapGuestController ? "worldmap-guest" : "worldmap-host";
     }
     return "unknown";
 }
@@ -1079,6 +1093,8 @@ void networkRuntimeBackgroundProcess()
                 applied = networkWorldApplyPeerElevator(*elevator);
             } else if (const auto* exitGrid = std::get_if<ExitGridTransitionedEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerExitGrid(*exitGrid);
+            } else if (const auto* arrival = std::get_if<WorldMapArrivedEvent>(&event->payload)) {
+                applied = networkWorldApplyPeerWorldMapArrival(*arrival);
             } else if (const auto* transition = std::get_if<SceneryTransitionedEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerSceneryTransition(*transition);
             } else if (const auto* rest = std::get_if<RestStateChangedEvent>(&event->payload)) {
@@ -1109,9 +1125,20 @@ void networkRuntimeBackgroundProcess()
             }
         }
         while (std::optional<WorldSnapshot> state = lobby.takeAuthoritativeState()) {
+            // The lobby drains ordered events before state packets. A state
+            // captured before a map-arrival event must not roll the freshly
+            // loaded destination back to its old transition phase.
+            if (state->lastIncludedEvent.value < lobby.lastAppliedEvent().value) {
+                continue;
+            }
             if (!networkWorldApplyAuthoritativeState(*state)) {
                 debug_printf("Multiplayer authoritative state could not be applied.\n");
             }
+        }
+        if (pendingLocalExitGrid.has_value()
+            && networkWorldPhase() == SessionPhase::Exploration
+            && networkWorldReadyLocalExitGrid() != pendingLocalExitGrid) {
+            pendingLocalExitGrid.reset();
         }
         if (!pendingLocalExitGrid.has_value()) {
             std::optional<EntityId> readyExit = networkWorldReadyLocalExitGrid();
@@ -1180,6 +1207,11 @@ bool networkRuntimeConfigure(int argc, char** argv)
     smokeRestMinutes = 10;
     smokeRestInterrupt = false;
     smokeWorldMapState = false;
+    smokeWorldMapGuestController = false;
+    smokeWorldMapTakeover = false;
+    smokeWorldMapTown = false;
+    smokeWorldMapEncounter = false;
+    smokeWorldMapQueue = false;
     for (int index = 1; index < argc; index++) {
         if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-test") == 0) {
             smokeTestEnabled = true;
@@ -1213,6 +1245,28 @@ bool networkRuntimeConfigure(int argc, char** argv)
             smokeScenario = SmokeScenario::TypedStairsCrossMap;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=rest") == 0) {
             smokeScenario = SmokeScenario::Rest;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=worldmap-host") == 0) {
+            smokeScenario = SmokeScenario::WorldMapTravel;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=worldmap-guest") == 0) {
+            smokeScenario = SmokeScenario::WorldMapTravel;
+            smokeWorldMapGuestController = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=worldmap-takeover") == 0) {
+            smokeScenario = SmokeScenario::WorldMapTravel;
+            smokeWorldMapGuestController = true;
+            smokeWorldMapTakeover = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=worldmap-town") == 0) {
+            smokeScenario = SmokeScenario::WorldMapTravel;
+            smokeWorldMapTown = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=worldmap-town-guest") == 0) {
+            smokeScenario = SmokeScenario::WorldMapTravel;
+            smokeWorldMapTown = true;
+            smokeWorldMapGuestController = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=worldmap-encounter") == 0) {
+            smokeScenario = SmokeScenario::WorldMapTravel;
+            smokeWorldMapEncounter = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=worldmap-queue") == 0) {
+            smokeScenario = SmokeScenario::WorldMapTravel;
+            smokeWorldMapQueue = true;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-rest-interrupt") == 0) {
             smokeRestInterrupt = true;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-worldmap-state") == 0) {
@@ -1301,6 +1355,276 @@ const char* networkRuntimeSmokeTestMap()
     return smokeScenario == SmokeScenario::ExitGrid ? "Vault13.map" : "V13Ent.map";
 }
 
+static bool runLiveWorldMapTravelSmoke(const SessionId sessionId)
+{
+    const int kStartX = smokeWorldMapQueue ? 1200 : smokeWorldMapTown ? 1072 : 1325;
+    const int kStartY = smokeWorldMapQueue ? 1200 : smokeWorldMapTown ? 75 : 325;
+    const int kFirstTargetX = kStartX + 3;
+    const int kFinalTargetX = kStartX + 4;
+    const int expectedMap = smokeWorldMapTown ? MAP_SHADYW
+        : smokeWorldMapEncounter || smokeWorldMapQueue ? -1 : MAP_CITY1;
+    PlayerId proposer = smokeWorldMapGuestController ? kGuestPlayerId : kHostPlayerId;
+    PlayerId local = launchOptions.mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
+    WorldMapState fixture;
+    worldmap_capture_state(fixture);
+    fixture.x = kStartX;
+    fixture.y = kStartY;
+    if (!worldmap_apply_state(fixture)) {
+        setStatus("MULTIPLAYER WORLD-MAP SMOKE FAILED: START POSITION");
+        return false;
+    }
+    if (launchOptions.mode == NetworkLaunchMode::Host) {
+        game_global_vars[GVAR_VAULT_WATER] = 1;
+        game_global_vars[GVAR_VATS_COUNTDOWN] = 0;
+        game_global_vars[GVAR_COUNTDOWN_TO_DESTRUCTION] = 0;
+    }
+
+    bool proposed = false;
+    bool accepted = false;
+    bool firstRoute = false;
+    bool changedRoute = false;
+    bool landed = false;
+    bool hostMoved = false;
+    bool reconnectRequested = false;
+    bool sawDisconnect = false;
+    bool reconnectObserved = false;
+    bool specialPrepared = false;
+    bool specialTriggered = false;
+    EventSequence disconnectedAt;
+    auto arrivedAt = std::chrono::steady_clock::time_point {};
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(35);
+    engineExecutionProbeBegin();
+    while (std::chrono::steady_clock::now() < deadline) {
+        networkRuntimeBackgroundProcess();
+        sawDisconnect = sawDisconnect || lobby.state() == NetworkLobbyState::Disconnected;
+        reconnectObserved = reconnectObserved
+            || (sawDisconnect && lobby.state() == NetworkLobbyState::Ready);
+        WorldMapState position;
+        worldmap_capture_state(position);
+
+        if (launchOptions.mode == NetworkLaunchMode::Join
+            && (!smokeWorldMapGuestController || smokeWorldMapTakeover)
+            && !reconnectRequested
+            && networkWorldWorldMapTravelApproved()
+            && ((smokeWorldMapEncounter || smokeWorldMapQueue)
+                ? networkWorldSelectedWorldMapRoute().has_value()
+                : position.x >= kFinalTargetX
+                    && networkWorldSelectedWorldMapRoute() == std::make_pair(kFinalTargetX, kStartY))) {
+            disconnectedAt = lobby.lastAppliedEvent();
+            reconnectRequested = lobby.disconnectForReconnect();
+            if (reconnectRequested) {
+                nextReconnectAttempt = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+            }
+        }
+
+        if (local == proposer && !proposed && networkWorldPhase() == SessionPhase::Exploration) {
+            proposed = networkRuntimeRequestSharedModal(SharedModalKind::WorldMap, true);
+        }
+        if (local != proposer && !accepted
+            && networkWorldPendingWorldMapProposer() == proposer) {
+            accepted = networkRuntimeRequestSharedModal(SharedModalKind::WorldMap, true);
+        }
+        if (networkWorldWorldMapTravelApproved()) {
+            if (local == proposer) {
+                if (!firstRoute) {
+                    firstRoute = networkRuntimeSubmitLocalWorldMapRoute(kFirstTargetX, kStartY);
+                } else if (!changedRoute && position.x > kStartX
+                    && !smokeWorldMapEncounter && !smokeWorldMapQueue) {
+                    changedRoute = networkRuntimeSubmitLocalWorldMapRoute(kFinalTargetX, kStartY);
+                } else if (!smokeWorldMapTakeover && !smokeWorldMapTown
+                    && !smokeWorldMapEncounter && !smokeWorldMapQueue
+                    && changedRoute && !landed && position.x >= kFinalTargetX
+                    && (smokeWorldMapGuestController
+                        || lobby.state() == NetworkLobbyState::Disconnected)) {
+                    landed = networkRuntimeRequestSharedModal(SharedModalKind::WorldMap, false);
+                }
+            }
+            if (smokeWorldMapTakeover
+                && launchOptions.mode == NetworkLaunchMode::Host
+                && !landed
+                && lobby.state() == NetworkLobbyState::Disconnected
+                && networkWorldLocalWorldMapController()
+                && networkWorldWorldMapDeparted()
+                && position.x >= kFinalTargetX) {
+                landed = networkRuntimeRequestSharedModal(SharedModalKind::WorldMap, false);
+            }
+            if (smokeWorldMapTown
+                && launchOptions.mode == NetworkLaunchMode::Host
+                && !landed
+                && position.x >= kFinalTargetX
+                && networkWorldSelectedWorldMapRoute() == std::make_pair(kFinalTargetX, kStartY)
+                && (smokeWorldMapGuestController
+                    || lobby.state() == NetworkLobbyState::Disconnected)) {
+                landed = networkWorldFinishWorldMapTravel(WorldMapArrivalKind::City);
+            }
+            if (launchOptions.mode == NetworkLaunchMode::Host
+                && networkWorldSelectedWorldMapRoute().has_value()) {
+                if ((smokeWorldMapEncounter || smokeWorldMapQueue)
+                    && lobby.state() != NetworkLobbyState::Disconnected) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    continue;
+                }
+                if ((smokeWorldMapEncounter || smokeWorldMapQueue) && !specialPrepared) {
+                    if (smokeWorldMapEncounter) {
+                        auto route = networkWorldSelectedWorldMapRoute();
+                        if (!route.has_value()
+                            || !worldmap_authoritative_travel_begin(route->first, route->second)) {
+                            break;
+                        }
+                        WorldMapTravelProgress progress;
+                        worldmap_capture_travel_progress(progress);
+                        progress.miles = progress.dayLength - 1;
+                        progress.timeAdder = 0;
+                        if (!worldmap_apply_travel_progress(progress)) break;
+                        int encounterSeed = 0;
+                        for (int seed = 1; seed <= 1024; seed++) {
+                            roll_set_seed(seed);
+                            int chance = roll_random(1, 6) + roll_random(1, 6) + roll_random(1, 6);
+                            if (chance < 9) { encounterSeed = seed; break; }
+                        }
+                        if (encounterSeed == 0) break;
+                        roll_set_seed(encounterSeed);
+                    }
+                    if (smokeWorldMapQueue) {
+                        auto* withdrawal = static_cast<WithdrawalEvent*>(mem_malloc(sizeof(WithdrawalEvent)));
+                        if (withdrawal == nullptr) break;
+                        *withdrawal = WithdrawalEvent { 0, 0, PERK_BUFFOUT_ADDICTION };
+                        if (queue_add(1, obj_dude, withdrawal, EVENT_TYPE_WITHDRAWAL) == -1) {
+                            mem_free(withdrawal);
+                            break;
+                        }
+                    }
+                    specialPrepared = true;
+                }
+                WorldMapTravelStepResult step = networkWorldAdvanceWorldMapTravel();
+                hostMoved = hostMoved || step.x > kStartX;
+                if ((smokeWorldMapEncounter && step.status == WorldMapTravelStepStatus::Encounter)
+                    || (smokeWorldMapQueue && step.status == WorldMapTravelStepStatus::QueueInterrupted)) {
+                    specialTriggered = true;
+                    landed = networkWorldFinishWorldMapTravel(
+                        smokeWorldMapEncounter ? WorldMapArrivalKind::Encounter
+                                               : WorldMapArrivalKind::Interrupted,
+                        step.specialEncounter);
+                    if (!landed) break;
+                    continue;
+                }
+                if (step.status != WorldMapTravelStepStatus::Moving
+                    && step.status != WorldMapTravelStepStatus::Arrived) {
+                    std::fprintf(stderr, "World-map smoke step stopped with status=%d at %d,%d.\n",
+                        static_cast<int>(step.status), step.x, step.y);
+                    break;
+                }
+            }
+        }
+
+        if (networkWorldPhase() == SessionPhase::Exploration
+            && (expectedMap < 0
+                ? map_data.field_34 != MAP_V13ENT && map_data.field_34 >= 0
+                : map_data.field_34 == expectedMap)
+            && (smokeWorldMapEncounter || smokeWorldMapQueue
+                ? position.x > kStartX && position.y == kStartY
+                : position.x == kFinalTargetX && position.y == kStartY)) {
+            if (launchOptions.mode == NetworkLaunchMode::Join
+                && ((smokeWorldMapGuestController && !smokeWorldMapTakeover)
+                    || smokeWorldMapEncounter || smokeWorldMapQueue)
+                && !reconnectRequested) {
+                disconnectedAt = lobby.lastAppliedEvent();
+                reconnectRequested = lobby.disconnectForReconnect();
+                if (reconnectRequested) {
+                    nextReconnectAttempt = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+                }
+            }
+            if (arrivedAt.time_since_epoch().count() == 0) {
+                arrivedAt = std::chrono::steady_clock::now();
+            }
+            if (reconnectObserved
+                && (launchOptions.mode == NetworkLaunchMode::Host
+                    || lobby.state() == NetworkLobbyState::Ready)
+                && std::chrono::steady_clock::now() - arrivedAt >= std::chrono::milliseconds(
+                    launchOptions.mode == NetworkLaunchMode::Host ? 2000 : 700)) {
+                break;
+            }
+        }
+        if (networkRuntimeFailed()) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EngineExecutionProbeCounts counts = engineExecutionProbeEnd();
+    WorldSnapshot snapshot;
+    SnapshotDigestResult digest;
+    WorldMapState finalPosition;
+    worldmap_capture_state(finalPosition);
+    bool passed = networkWorldPhase() == SessionPhase::Exploration
+        && (expectedMap < 0
+            ? map_data.field_34 != MAP_V13ENT && map_data.field_34 >= 0
+            : map_data.field_34 == expectedMap)
+        && (smokeWorldMapEncounter || smokeWorldMapQueue
+            ? finalPosition.x > kStartX && finalPosition.y == kStartY
+            : finalPosition.x == kFinalTargetX && finalPosition.y == kStartY)
+        && arrivedAt.time_since_epoch().count() != 0
+        && reconnectObserved
+        && (launchOptions.mode == NetworkLaunchMode::Host
+            || lobby.state() == NetworkLobbyState::Ready)
+        && (local != proposer
+            || (proposed && firstRoute
+                && ((smokeWorldMapEncounter || smokeWorldMapQueue) ? true : changedRoute)
+                && ((smokeWorldMapEncounter || smokeWorldMapQueue)
+                    ? (launchOptions.mode == NetworkLaunchMode::Host && specialTriggered && landed)
+                    : smokeWorldMapTakeover ? reconnectRequested
+                    : smokeWorldMapTown && launchOptions.mode == NetworkLaunchMode::Join
+                        ? reconnectRequested
+                        : landed)))
+        && (local == proposer || accepted)
+        && (!smokeWorldMapTakeover || launchOptions.mode != NetworkLaunchMode::Host || landed)
+        && (launchOptions.mode != NetworkLaunchMode::Join
+            || !reconnectRequested
+            || !(!smokeWorldMapGuestController || smokeWorldMapTakeover)
+            || lobby.lastAppliedEvent().value > disconnectedAt.value)
+        && (launchOptions.mode != NetworkLaunchMode::Host || hostMoved)
+        && (launchOptions.mode != NetworkLaunchMode::Join
+            || (counts.scriptProcedures == 0 && counts.combatAttacks == 0 && counts.randomDraws == 0))
+        && networkWorldCaptureAuthoritativeState(
+            launchOptions.mode == NetworkLaunchMode::Host
+                ? lobby.latestAuthoritativeEvent()
+                : lobby.lastAppliedEvent(), snapshot)
+        && (digest = computeSnapshotDigest(snapshot));
+    if (!passed) {
+        std::fprintf(stderr,
+            "World-map smoke state role=%s proposed=%d accepted=%d route=%d changed=%d landed=%d moved=%d phase=%d map=%d pos=%d,%d rules=%u/%u/%u.\n",
+            launchOptions.mode == NetworkLaunchMode::Host ? "host" : "guest",
+            proposed, accepted, firstRoute, changedRoute, landed, hostMoved,
+            static_cast<int>(networkWorldPhase()), map_data.field_34,
+            finalPosition.x, finalPosition.y,
+            counts.scriptProcedures, counts.combatAttacks, counts.randomDraws);
+        setStatus("MULTIPLAYER WORLD-MAP SMOKE FAILED: LIVE TRAVEL");
+        return false;
+    }
+    std::fprintf(stdout,
+        "MULTIPLAYER_SMOKE_TEST_PASS role=%s session=%llu command=%s map=%d world=%d,%d digest=%llu scripts=%u attacks=%u rng=%u\n",
+        launchOptions.mode == NetworkLaunchMode::Host ? "host" : "guest",
+        static_cast<unsigned long long>(sessionId.value),
+        smokeScenarioName(), map_data.field_34,
+        finalPosition.x, finalPosition.y,
+        static_cast<unsigned long long>(digest.digest.overall),
+        counts.scriptProcedures, counts.combatAttacks, counts.randomDraws);
+    std::fprintf(stdout,
+        "WORLD_MAP_DIGEST role=%s event=%llu phase=%u clock=%d session=%llu actors=%llu critters=%llu doors=%llu scenery=%llu items=%llu globals=%llu mapvars=%llu queue=%llu worldmap=%llu\n",
+        launchOptions.mode == NetworkLaunchMode::Host ? "host" : "guest",
+        static_cast<unsigned long long>(snapshot.lastIncludedEvent.value),
+        snapshot.phaseRevision, snapshot.gameTime,
+        static_cast<unsigned long long>(digest.digest.session),
+        static_cast<unsigned long long>(digest.digest.actors),
+        static_cast<unsigned long long>(digest.digest.critters),
+        static_cast<unsigned long long>(digest.digest.doors),
+        static_cast<unsigned long long>(digest.digest.scenery),
+        static_cast<unsigned long long>(digest.digest.items),
+        static_cast<unsigned long long>(digest.digest.globals),
+        static_cast<unsigned long long>(digest.digest.mapVariables),
+        static_cast<unsigned long long>(digest.digest.timedEvents),
+        static_cast<unsigned long long>(digest.digest.worldMap));
+    std::fflush(stdout);
+    return true;
+}
+
 bool networkRuntimeRunSmokeTest()
 {
     if (!smokeTestEnabled || launchOptions.mode == NetworkLaunchMode::Disabled) {
@@ -1334,6 +1658,15 @@ bool networkRuntimeRunSmokeTest()
         }
 
         if (lobbyStarted && lobby.state() == NetworkLobbyState::Ready) {
+            if (smokeScenario == SmokeScenario::WorldMapTravel && !lobby.startRequested()) {
+                if (launchOptions.mode == NetworkLaunchMode::Host
+                    && !networkRuntimeRequestStart()) {
+                    setStatus("MULTIPLAYER WORLD-MAP SMOKE FAILED: LOBBY START");
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
             const CharacterCreationSheet* peer = lobby.peerSheet();
             if (peer == nullptr) {
                 break;
@@ -1348,8 +1681,15 @@ bool networkRuntimeRunSmokeTest()
                 setStatus("MULTIPLAYER SMOKE TEST FAILED: SHARED MODAL CONTROLLER");
                 break;
             }
+            // Do not interpret the actors' spawn hex as a new exit-grid step.
+            pendingLocalExitGrid = networkWorldReadyLocalExitGrid();
             if (!networkWorldRunPartyExperienceSmokeTest()) {
                 setStatus("MULTIPLAYER SMOKE TEST FAILED: PARTY EXPERIENCE AUTHORITY");
+                break;
+            }
+
+            if (smokeScenario == SmokeScenario::WorldMapTravel) {
+                if (runLiveWorldMapTravelSmoke(bootstrap.sessionId())) return true;
                 break;
             }
 
@@ -1999,6 +2339,31 @@ bool networkRuntimeRunSmokeTest()
                             || command.command.actorId != scenarioCommand.actorId
                             || command.command.expectedPhase != scenarioCommand.expectedPhase
                             || command.command.expectedPhaseRevision != scenarioCommand.expectedPhaseRevision) {
+                            std::fprintf(stderr,
+                                "Smoke command mismatch: payload=%d type=%zu/%zu sequence=%llu/%llu player=%u/%u actor=%u/%u phase=%d/%d revision=%u/%u.\n",
+                                payloadMatches,
+                                command.command.payload.index(),
+                                scenarioCommand.payload.index(),
+                                static_cast<unsigned long long>(command.command.sequence.value),
+                                static_cast<unsigned long long>(scenarioCommand.sequence.value),
+                                command.command.playerId.value,
+                                scenarioCommand.playerId.value,
+                                command.command.actorId.value,
+                                scenarioCommand.actorId.value,
+                                static_cast<int>(command.command.expectedPhase),
+                                static_cast<int>(scenarioCommand.expectedPhase),
+                                command.command.expectedPhaseRevision,
+                                scenarioCommand.expectedPhaseRevision);
+                            if (const auto* receivedMove = std::get_if<MoveCommand>(&command.command.payload)) {
+                                const auto* expectedMove = std::get_if<MoveCommand>(&scenarioCommand.payload);
+                                if (expectedMove != nullptr) {
+                                    std::fprintf(stderr,
+                                        "Smoke move mismatch: tile=%d/%d elevation=%d/%d running=%d/%d.\n",
+                                        receivedMove->destinationTile, expectedMove->destinationTile,
+                                        receivedMove->elevation, expectedMove->elevation,
+                                        receivedMove->running, expectedMove->running);
+                                }
+                            }
                             setStatus("MULTIPLAYER SMOKE TEST FAILED: INVALID SCENARIO COMMAND");
                             break;
                         }
@@ -2493,7 +2858,41 @@ std::optional<LobbyChatMessage> networkRuntimeTakeChatMessage()
 
 bool networkRuntimeHandleGameChatInput(int keyCode)
 {
-    if (keyCode != KEY_RETURN || !networkWorldActive() || !networkRuntimeConnected()) {
+    if (!networkWorldActive() || !networkRuntimeConnected()) {
+        return false;
+    }
+
+    // A world-map proposal is an explicit consent request, not a local map
+    // open. Keep the prompt in the ordinary game loop so both peers can answer
+    // while exploration is still running.
+    static std::optional<PlayerId> announcedWorldMapProposer;
+    std::optional<PlayerId> proposer = networkWorldPendingWorldMapProposer();
+    PlayerId localPlayerId = launchOptions.mode == NetworkLaunchMode::Host
+        ? kHostPlayerId
+        : kGuestPlayerId;
+    if (proposer != announcedWorldMapProposer) {
+        announcedWorldMapProposer = proposer;
+        if (proposer.has_value()) {
+            std::string message = *proposer == localPlayerId
+                ? "World-map travel proposed. Waiting for the other player (N withdraws)."
+                : playerLabel(*proposer) + " proposes world-map travel. Y accepts; N declines.";
+            display_print(message.data());
+        }
+    }
+    if (proposer.has_value()
+        && (keyCode == KEY_UPPERCASE_Y || keyCode == KEY_LOWERCASE_Y
+            || keyCode == KEY_UPPERCASE_N || keyCode == KEY_LOWERCASE_N)) {
+        if (*proposer != localPlayerId
+            || keyCode == KEY_UPPERCASE_N || keyCode == KEY_LOWERCASE_N) {
+            bool accept = keyCode == KEY_UPPERCASE_Y || keyCode == KEY_LOWERCASE_Y;
+            if (!networkRuntimeRequestSharedModal(SharedModalKind::WorldMap, accept)) {
+                char failure[] = "World-map travel response could not be sent.";
+                display_print(failure);
+            }
+        }
+        return true;
+    }
+    if (keyCode != KEY_RETURN) {
         return false;
     }
 
@@ -2517,9 +2916,6 @@ bool networkRuntimeHandleGameChatInput(int keyCode)
         return true;
     }
 
-    PlayerId localPlayerId = launchOptions.mode == NetworkLaunchMode::Host
-        ? kHostPlayerId
-        : kGuestPlayerId;
     presentGameChatMessage(LobbyChatMessage { localPlayerId, std::move(text) }, "outgoing");
     return true;
 }
@@ -2675,7 +3071,7 @@ bool networkRuntimeEnterWorld()
     nextHostCommandSequence = 1;
     nextAuthoritativeState = {};
     nextAgentWorldReport = {};
-    pendingLocalExitGrid.reset();
+    pendingLocalExitGrid = networkWorldReadyLocalExitGrid();
     reportLobbyStatus();
     return true;
 }
@@ -2879,10 +3275,11 @@ bool networkRuntimeSubmitLocalExitGrid(EntityId exitId)
         || !isValid(exitId)) {
         return false;
     }
+    bool worldMapExit = networkWorldIsWorldMapExitGrid(exitId);
     bool submitted = launchOptions.mode == NetworkLaunchMode::Host
         ? submitHostCommand(ExitGridCommand { exitId })
         : lobby.sendLocalExitGrid(exitId, networkWorldPhaseRevision());
-    if (submitted && launchOptions.mode == NetworkLaunchMode::Join) {
+    if (submitted && (launchOptions.mode == NetworkLaunchMode::Join || worldMapExit)) {
         pendingLocalExitGrid = exitId;
     } else if (launchOptions.mode == NetworkLaunchMode::Host) {
         pendingLocalExitGrid.reset();
@@ -3030,6 +3427,15 @@ bool networkRuntimeSubmitLocalWorldMapRoute(std::int32_t targetX, std::int32_t t
     return launchOptions.mode == NetworkLaunchMode::Host
         ? submitHostCommand(route)
         : lobby.sendLocalWorldMapRoute(route, networkWorldPhaseRevision());
+}
+
+void networkRuntimeFlushWorldMapTerminalEvent()
+{
+    if (launchOptions.mode != NetworkLaunchMode::Host || !networkWorldActive()) return;
+    for (int attempt = 0; attempt < 20; attempt++) {
+        networkRuntimeBackgroundProcess();
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
 }
 
 bool networkRuntimeBlockUnsupportedSharedModal(SharedModalKind kind)

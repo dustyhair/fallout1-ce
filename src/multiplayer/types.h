@@ -432,6 +432,26 @@ struct ExitGridTransitionedEvent {
     std::uint32_t phaseRevision = 0;
 };
 
+enum class WorldMapArrivalKind : std::uint8_t {
+    City = 0,
+    Terrain = 1,
+    Encounter = 2,
+    Interrupted = 3,
+    Fatal = 4,
+};
+
+struct WorldMapArrivedEvent {
+    EntityId actorId;
+    std::int32_t map = -1;
+    std::int32_t entranceIndex = 0;
+    std::vector<PlayerTransitionPlacement> placements;
+    std::uint32_t phaseRevision = 0;
+    std::int32_t worldX = -1;
+    std::int32_t worldY = -1;
+    std::int32_t gameTime = 0;
+    WorldMapArrivalKind kind = WorldMapArrivalKind::Terrain;
+};
+
 struct SceneryTransitionedEvent {
     EntityId actorId;
     EntityId transitionId;
@@ -494,7 +514,7 @@ struct WorldMapRouteSelectedEvent {
     bool clear = false;
 };
 
-using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, ItemPickupCompletedEvent, LootStartedEvent, SkillUseStartedEvent, ItemUseStartedEvent, ElevatorTransitionedEvent, ExitGridTransitionedEvent, SceneryTransitionedEvent, RestStateChangedEvent, InventoryTransferredEvent, ItemDroppedEvent, AttackStartedEvent, SharedModalStateChangedEvent, WorldMapRouteSelectedEvent>;
+using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, ItemPickupCompletedEvent, LootStartedEvent, SkillUseStartedEvent, ItemUseStartedEvent, ElevatorTransitionedEvent, ExitGridTransitionedEvent, SceneryTransitionedEvent, RestStateChangedEvent, InventoryTransferredEvent, ItemDroppedEvent, AttackStartedEvent, SharedModalStateChangedEvent, WorldMapRouteSelectedEvent, WorldMapArrivedEvent>;
 
 struct GameEvent {
     EventSequence sequence;

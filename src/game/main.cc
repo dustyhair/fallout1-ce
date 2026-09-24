@@ -42,6 +42,7 @@
 #include "multiplayer/developer_local_session.h"
 #include "multiplayer/lobby_screen.h"
 #include "multiplayer/network_runtime.h"
+#include "multiplayer/network_world.h"
 #include "plib/color/color.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/gnw.h"
@@ -399,6 +400,10 @@ static void main_game_loop()
         multiplayer::developerLocalSessionEnsureStarted();
 
         int keyCode = get_input();
+        if (multiplayer::networkWorldWorldMapTravelApproved()) {
+            worldmap_multiplayer_open();
+            continue;
+        }
         bool multiplayerPaused = multiplayer::networkRuntimeWorldPaused();
         if (!multiplayer::networkRuntimeHandleGameChatInput(keyCode) && !multiplayerPaused) {
             game_handle_input(keyCode, false);
