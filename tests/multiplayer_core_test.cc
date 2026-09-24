@@ -925,6 +925,18 @@ void testGameplayWireFormat()
     expect(encodeGameCommand(travelProposal, modalEnvelope) == GameplayWireError::None
             && std::get<SharedModalCommand>(decodeGameCommand(modalEnvelope).command.payload).kind == SharedModalKind::WorldMap,
         "world-map consent uses an authenticated semantic command");
+    GameCommand routeCommand = commands[8];
+    routeCommand.expectedPhase = SessionPhase::Transition;
+    routeCommand.payload = WorldMapRouteCommand { 1399, 1499, false };
+    expect(encodeGameCommand(routeCommand, modalEnvelope) == GameplayWireError::None
+            && std::get<WorldMapRouteCommand>(decodeGameCommand(modalEnvelope).command.payload).targetY == 1499,
+        "world-map route command round trips bounded map coordinates");
+    std::get<WorldMapRouteCommand>(routeCommand.payload).targetX = 1400;
+    expect(encodeGameCommand(routeCommand, modalEnvelope) == GameplayWireError::InvalidMove,
+        "world-map route rejects an out-of-bounds destination");
+    routeCommand.payload = WorldMapRouteCommand { -1, -1, true };
+    expect(encodeGameCommand(routeCommand, modalEnvelope) == GameplayWireError::None,
+        "world-map route can explicitly clear the target");
 
     ProtocolEnvelope skillEnvelope = gameplayEnvelope(29);
     expect(encodeGameCommand(commands[9], skillEnvelope) == GameplayWireError::None,
@@ -1236,6 +1248,14 @@ void testGameplayWireFormat()
     expect(encodeGameEvent(travelProposalEvent, modalEventEnvelope) == GameplayWireError::None
             && std::get<SharedModalStateChangedEvent>(decodeGameEvent(modalEventEnvelope).event.payload).phase == SessionPhase::Exploration,
         "world-map proposal event preserves exploration until unanimous consent");
+    GameEvent routeEvent {
+        EventSequence { 31 },
+        CommandSequence { 10 },
+        WorldMapRouteSelectedEvent { EntityId { 20 }, 1399, 1499, false },
+    };
+    expect(encodeGameEvent(routeEvent, modalEventEnvelope) == GameplayWireError::None
+            && std::get<WorldMapRouteSelectedEvent>(decodeGameEvent(modalEventEnvelope).event.payload).targetX == 1399,
+        "world-map route event round trips the host-approved destination");
 
     ProtocolEnvelope elevatorEventEnvelope = gameplayEnvelope(48);
     encodeGameEvent(events[12], elevatorEventEnvelope);

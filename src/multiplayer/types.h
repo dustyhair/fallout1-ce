@@ -294,7 +294,24 @@ struct SharedModalCommand {
     bool open = false;
 };
 
-using GameCommandPayload = std::variant<MoveCommand, FaceCommand, InteractCommand, PickupCommand, LootCommand, UseSkillCommand, UseItemOnCommand, ElevatorCommand, ExitGridCommand, SceneryTransitionCommand, RestCommand, InventoryTransferCommand, ItemDropCommand, AttackCommand, SharedModalCommand>;
+constexpr std::int32_t kWorldMapWidth = 1400;
+constexpr std::int32_t kWorldMapHeight = 1500;
+
+struct WorldMapRouteCommand {
+    std::int32_t targetX = -1;
+    std::int32_t targetY = -1;
+    bool clear = false;
+};
+
+constexpr bool isValid(const WorldMapRouteCommand& route)
+{
+    return route.clear
+        ? route.targetX == -1 && route.targetY == -1
+        : route.targetX >= 0 && route.targetX < kWorldMapWidth
+            && route.targetY >= 0 && route.targetY < kWorldMapHeight;
+}
+
+using GameCommandPayload = std::variant<MoveCommand, FaceCommand, InteractCommand, PickupCommand, LootCommand, UseSkillCommand, UseItemOnCommand, ElevatorCommand, ExitGridCommand, SceneryTransitionCommand, RestCommand, InventoryTransferCommand, ItemDropCommand, AttackCommand, SharedModalCommand, WorldMapRouteCommand>;
 
 struct GameCommand {
     CommandSequence sequence;
@@ -470,7 +487,14 @@ struct SharedModalStateChangedEvent {
     std::uint32_t phaseRevision = 0;
 };
 
-using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, ItemPickupCompletedEvent, LootStartedEvent, SkillUseStartedEvent, ItemUseStartedEvent, ElevatorTransitionedEvent, ExitGridTransitionedEvent, SceneryTransitionedEvent, RestStateChangedEvent, InventoryTransferredEvent, ItemDroppedEvent, AttackStartedEvent, SharedModalStateChangedEvent>;
+struct WorldMapRouteSelectedEvent {
+    EntityId actorId;
+    std::int32_t targetX = -1;
+    std::int32_t targetY = -1;
+    bool clear = false;
+};
+
+using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, ItemPickupCompletedEvent, LootStartedEvent, SkillUseStartedEvent, ItemUseStartedEvent, ElevatorTransitionedEvent, ExitGridTransitionedEvent, SceneryTransitionedEvent, RestStateChangedEvent, InventoryTransferredEvent, ItemDroppedEvent, AttackStartedEvent, SharedModalStateChangedEvent, WorldMapRouteSelectedEvent>;
 
 struct GameEvent {
     EventSequence sequence;

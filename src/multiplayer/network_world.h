@@ -3,6 +3,7 @@
 
 #include <optional>
 #include <string>
+#include <utility>
 
 #include "game/engine_execution_probe.h"
 #include "multiplayer/character_lobby.h"
@@ -45,6 +46,7 @@ bool networkWorldLocalRestProposal();
 PlayerId networkWorldPendingRestProposer();
 void networkWorldClearRestProposal();
 bool networkWorldApplyPeerSharedModal(const SharedModalStateChangedEvent& modal);
+bool networkWorldApplyPeerWorldMapRoute(const WorldMapRouteSelectedEvent& route);
 bool networkWorldApplyPeerAttack(const AttackStartedEvent& attack);
 bool networkWorldApplyInventoryTransfer(const InventoryTransferredEvent& transfer, bool reverse = false);
 bool networkWorldApplyItemDrop(const ItemDroppedEvent& drop);
@@ -73,6 +75,8 @@ SessionPhase networkWorldPhase();
 std::uint32_t networkWorldPhaseRevision();
 std::optional<EntityId> networkWorldReadyLocalExitGrid();
 bool networkWorldSharedModalActive();
+bool networkWorldLocalWorldMapController();
+std::optional<std::pair<std::int32_t, std::int32_t>> networkWorldSelectedWorldMapRoute();
 bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot& snapshot);
 bool networkWorldApplySnapshot(const WorldSnapshot& snapshot);
 bool networkWorldCaptureAuthoritativeState(EventSequence lastIncludedEvent, WorldSnapshot& snapshot);

@@ -58,6 +58,7 @@ bool networkRuntimeLocalRestProposal();
 bool networkRuntimeHandleLocalAttack(Object* target, int hitMode, int hitLocation);
 bool networkRuntimeGiveItemToPlayer(EntityId destinationActorId, EntityId itemId, std::uint32_t quantity);
 bool networkRuntimeRequestSharedModal(SharedModalKind kind, bool open);
+bool networkRuntimeSubmitLocalWorldMapRoute(std::int32_t targetX, std::int32_t targetY, bool clear = false);
 bool networkRuntimeBlockUnsupportedSharedModal(SharedModalKind kind);
 bool networkRuntimeWorldPaused();
 bool networkRuntimeHandleLocalLootTargetChange(Object* target);

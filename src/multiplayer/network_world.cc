@@ -6,7 +6,9 @@
 #include <cstdio>
 #include <deque>
 #include <limits>
+#include <optional>
 #include <tuple>
+#include <utility>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -65,6 +67,7 @@ struct ActiveSharedModal {
     SharedModalKind kind = SharedModalKind::Dialogue;
 };
 std::optional<ActiveSharedModal> activeSharedModal;
+std::optional<std::pair<std::int32_t, std::int32_t>> selectedWorldMapRoute;
 struct PendingWorldMapProposal {
     EntityId proposerActorId;
     int map = -1;
@@ -663,6 +666,7 @@ bool loadSharedMap(int map)
     deferredEvents.clear();
     activeLootTargets.clear();
     activeSharedModal.reset();
+    selectedWorldMapRoute.reset();
     pendingWorldMapProposal.reset();
     peerActor = nullptr;
 
@@ -1385,6 +1389,7 @@ public:
                             pendingWorldMapProposal->proposerActorId,
                             SharedModalKind::WorldMap,
                         };
+                        selectedWorldMapRoute.reset();
                         pendingWorldMapProposal.reset();
                     }
                 }
@@ -1404,6 +1409,7 @@ public:
                 && session.phase() == SessionPhase::Transition
                 && session.transitionTo(SessionPhase::Exploration) == LocalSessionError::None) {
                 activeSharedModal.reset();
+                selectedWorldMapRoute.reset();
             } else {
                 return execution;
             }
@@ -1435,6 +1441,25 @@ public:
         execution.phase = session.phase();
         execution.phaseRevision = session.phaseRevision();
         return execution;
+    }
+
+    CommandExecutionStatus setWorldMapRoute(Object* actor, const WorldMapRouteCommand& command) override
+    {
+        std::optional<EntityId> actorId = session.entities().findEntity(actor);
+        if (!actorId.has_value()
+            || !activeSharedModal.has_value()
+            || activeSharedModal->kind != SharedModalKind::WorldMap
+            || activeSharedModal->actorId != *actorId
+            || session.phase() != SessionPhase::Transition
+            || !isValid(command)) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        if (command.clear) {
+            selectedWorldMapRoute.reset();
+        } else {
+            selectedWorldMapRoute = std::make_pair(command.targetX, command.targetY);
+        }
+        return CommandExecutionStatus::Applied;
     }
 
     InventoryTransferExecution transferInventory(Object* actor,
@@ -1591,6 +1616,7 @@ bool registerWorldObjects()
     deferredEvents.clear();
     activeLootTargets.clear();
     activeSharedModal.reset();
+    selectedWorldMapRoute.reset();
     pendingWorldMapProposal.reset();
     std::vector<Object*> doors;
     std::vector<Object*> scenery;
@@ -2101,6 +2127,7 @@ bool networkWorldApplyPeerSharedModal(const SharedModalStateChangedEvent& modal)
             }
             pendingWorldMapProposal.reset();
             activeSharedModal = ActiveSharedModal { modal.actorId, modal.kind };
+            selectedWorldMapRoute.reset();
             return true;
         }
         if (!modal.open && modal.phase == SessionPhase::Exploration) {
@@ -2117,6 +2144,7 @@ bool networkWorldApplyPeerSharedModal(const SharedModalStateChangedEvent& modal)
                 && activeSharedModal->kind == modal.kind
                 && session.applyAuthoritativePhase(modal.phase, modal.phaseRevision) == LocalSessionError::None) {
                 activeSharedModal.reset();
+                selectedWorldMapRoute.reset();
                 return true;
             }
             return !activeSharedModal.has_value()
@@ -2156,6 +2184,24 @@ bool networkWorldApplyPeerSharedModal(const SharedModalStateChangedEvent& modal)
     }
     if (!modal.open) {
         activeSharedModal.reset();
+    }
+    return true;
+}
+
+bool networkWorldApplyPeerWorldMapRoute(const WorldMapRouteSelectedEvent& route)
+{
+    if (!session.isActive()
+        || session.phase() != SessionPhase::Transition
+        || !activeSharedModal.has_value()
+        || activeSharedModal->kind != SharedModalKind::WorldMap
+        || activeSharedModal->actorId != route.actorId
+        || !isValid(WorldMapRouteCommand { route.targetX, route.targetY, route.clear })) {
+        return false;
+    }
+    if (route.clear) {
+        selectedWorldMapRoute.reset();
+    } else {
+        selectedWorldMapRoute = std::make_pair(route.targetX, route.targetY);
     }
     return true;
 }
@@ -3734,6 +3780,9 @@ bool networkWorldRunSharedModalSmokeTest()
         return false;
     }
     EntityId actorId = session.playerActorId(kGuestPlayerId);
+    int startingWorldTime = game_time();
+    WorldMapState startingWorldMap;
+    worldmap_capture_state(startingWorldMap);
     GameCommand open;
     open.sequence = CommandSequence { 1 };
     open.playerId = kGuestPlayerId;
@@ -3764,8 +3813,34 @@ bool networkWorldRunSharedModalSmokeTest()
         && travelReady->actorId == actorId
         && travelReady->phase == SessionPhase::Transition
         && networkWorldSharedModalActive();
+    GameCommand route = unapprovedTravel;
+    route.sequence = CommandSequence { 2 };
+    route.expectedPhase = SessionPhase::Transition;
+    route.expectedPhaseRevision = session.phaseRevision();
+    route.payload = WorldMapRouteCommand { 725, 616, false };
+    AuthoritativeCommandResult routed = networkWorldProcessCommand(route);
+    const auto* routeEvent = routed.event.has_value()
+        ? std::get_if<WorldMapRouteSelectedEvent>(&routed.event->payload)
+        : nullptr;
+    bool proposerCanRoute = routed.result.status == CommandStatus::Accepted
+        && routeEvent != nullptr
+        && routeEvent->actorId == actorId
+        && selectedWorldMapRoute == std::make_pair(725, 616);
+    GameCommand unauthorizedRoute = route;
+    unauthorizedRoute.playerId = kHostPlayerId;
+    unauthorizedRoute.actorId = session.playerActorId(kHostPlayerId);
+    unauthorizedRoute.sequence = CommandSequence { 2 };
+    AuthoritativeCommandResult unauthorizedRouteResult = networkWorldProcessCommand(unauthorizedRoute);
+    bool onlyProposerCanRoute = unauthorizedRouteResult.result.rejection == CommandRejection::InvalidAction
+        && !unauthorizedRouteResult.event.has_value()
+        && selectedWorldMapRoute == std::make_pair(725, 616);
+    route.sequence = CommandSequence { 3 };
+    route.payload = WorldMapRouteCommand { -1, -1, true };
+    AuthoritativeCommandResult clearedRoute = networkWorldProcessCommand(route);
+    bool proposerCanClearRoute = clearedRoute.result.status == CommandStatus::Accepted
+        && !selectedWorldMapRoute.has_value();
     GameCommand unauthorizedClose = approval;
-    unauthorizedClose.sequence = CommandSequence { 2 };
+    unauthorizedClose.sequence = CommandSequence { 3 };
     unauthorizedClose.expectedPhase = SessionPhase::Transition;
     unauthorizedClose.expectedPhaseRevision = session.phaseRevision();
     unauthorizedClose.payload = SharedModalCommand { SharedModalKind::WorldMap, false };
@@ -3773,7 +3848,7 @@ bool networkWorldRunSharedModalSmokeTest()
     bool onlyProposerCanClose = unauthorizedResult.result.rejection == CommandRejection::InvalidAction
         && !unauthorizedResult.event.has_value();
     GameCommand cancelTravel = unapprovedTravel;
-    cancelTravel.sequence = CommandSequence { 2 };
+    cancelTravel.sequence = CommandSequence { 4 };
     cancelTravel.expectedPhase = SessionPhase::Transition;
     cancelTravel.expectedPhaseRevision = session.phaseRevision();
     cancelTravel.payload = SharedModalCommand { SharedModalKind::WorldMap, false };
@@ -3781,6 +3856,46 @@ bool networkWorldRunSharedModalSmokeTest()
     bool proposerCanCancel = canceledTravel.result.status == CommandStatus::Accepted
         && session.phase() == SessionPhase::Exploration
         && !networkWorldSharedModalActive();
+    commandProcessor.reset();
+    GameCommand hostProposal = approval;
+    hostProposal.sequence = CommandSequence { 1 };
+    hostProposal.expectedPhase = SessionPhase::Exploration;
+    hostProposal.expectedPhaseRevision = session.phaseRevision();
+    AuthoritativeCommandResult hostProposed = networkWorldProcessCommand(hostProposal);
+    GameCommand guestApproval = unapprovedTravel;
+    guestApproval.sequence = CommandSequence { 1 };
+    guestApproval.expectedPhaseRevision = session.phaseRevision();
+    AuthoritativeCommandResult guestApproved = networkWorldProcessCommand(guestApproval);
+    const auto* hostReadyEvent = guestApproved.event.has_value()
+        ? std::get_if<SharedModalStateChangedEvent>(&guestApproved.event->payload)
+        : nullptr;
+    GameCommand hostRoute = hostProposal;
+    hostRoute.sequence = CommandSequence { 2 };
+    hostRoute.expectedPhase = SessionPhase::Transition;
+    hostRoute.expectedPhaseRevision = session.phaseRevision();
+    hostRoute.payload = WorldMapRouteCommand { 412, 830, false };
+    AuthoritativeCommandResult hostRouted = networkWorldProcessCommand(hostRoute);
+    bool hostCanProposeAndRoute = hostProposed.result.status == CommandStatus::Accepted
+        && guestApproved.result.status == CommandStatus::Accepted
+        && hostReadyEvent != nullptr
+        && hostReadyEvent->actorId == hostProposal.actorId
+        && hostRouted.result.status == CommandStatus::Accepted
+        && selectedWorldMapRoute == std::make_pair(412, 830);
+    GameCommand hostClose = hostProposal;
+    hostClose.sequence = CommandSequence { 3 };
+    hostClose.expectedPhase = SessionPhase::Transition;
+    hostClose.expectedPhaseRevision = session.phaseRevision();
+    hostClose.payload = SharedModalCommand { SharedModalKind::WorldMap, false };
+    AuthoritativeCommandResult hostClosed = networkWorldProcessCommand(hostClose);
+    bool routeHasNoWorldEffects = hostClosed.result.status == CommandStatus::Accepted
+        && game_time() == startingWorldTime
+        && !selectedWorldMapRoute.has_value();
+    WorldMapState finalWorldMap;
+    worldmap_capture_state(finalWorldMap);
+    routeHasNoWorldEffects = routeHasNoWorldEffects
+        && finalWorldMap.x == startingWorldMap.x
+        && finalWorldMap.y == startingWorldMap.y
+        && finalWorldMap.specialEncounters == startingWorldMap.specialEncounters;
     commandProcessor.reset();
     open.expectedPhaseRevision = session.phaseRevision();
     open.payload = SharedModalCommand { SharedModalKind::Dialogue, true };
@@ -3821,8 +3936,10 @@ bool networkWorldRunSharedModalSmokeTest()
         && !networkWorldSharedModalActive();
 
     commandProcessor.reset();
-    return travelWaitsForConsent && proposerRetainsControl && onlyProposerCanClose
-        && proposerCanCancel && openPassed && blockPassed && closePassed;
+    return travelWaitsForConsent && proposerRetainsControl && proposerCanRoute
+        && onlyProposerCanRoute && proposerCanClearRoute && onlyProposerCanClose
+        && proposerCanCancel && hostCanProposeAndRoute && routeHasNoWorldEffects
+        && openPassed && blockPassed && closePassed;
 }
 
 bool networkWorldBeginLocalLoot(Object* target)
@@ -4382,6 +4499,21 @@ bool networkWorldSharedModalActive()
         || session.phase() == SessionPhase::Transition;
 }
 
+bool networkWorldLocalWorldMapController()
+{
+    return session.isActive()
+        && session.phase() == SessionPhase::Transition
+        && activeSharedModal.has_value()
+        && activeSharedModal->kind == SharedModalKind::WorldMap
+        && activeSharedModal->actorId == session.playerActorId(
+            worldMode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId);
+}
+
+std::optional<std::pair<std::int32_t, std::int32_t>> networkWorldSelectedWorldMapRoute()
+{
+    return selectedWorldMapRoute;
+}
+
 bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot& snapshot)
 {
     if (!session.isActive()) {
@@ -4826,6 +4958,7 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
     if (activeSharedModal.has_value()
         && sharedModalPhase(activeSharedModal->kind) != snapshot.phase) {
         activeSharedModal.reset();
+        selectedWorldMapRoute.reset();
     }
     if (pendingWorldMapProposal.has_value()
         && (snapshot.phase != SessionPhase::Exploration
@@ -4883,6 +5016,7 @@ void networkWorldLeave()
     deferredEvents.clear();
     activeLootTargets.clear();
     activeSharedModal.reset();
+    selectedWorldMapRoute.reset();
     pendingWorldMapProposal.reset();
     itemDropInProgress = false;
     itemUseInProgress = false;

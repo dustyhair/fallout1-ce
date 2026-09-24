@@ -116,6 +116,10 @@ public:
     {
         return {};
     }
+    virtual CommandExecutionStatus setWorldMapRoute(Object*, const WorldMapRouteCommand&)
+    {
+        return CommandExecutionStatus::InvalidAction;
+    }
     virtual InventoryTransferExecution transferInventory(Object* actor,
         Object* source,
         Object* destination,

@@ -110,7 +110,8 @@ bool isSupportedLiveEvent(const GameEventPayload& payload)
         || std::holds_alternative<InventoryTransferredEvent>(payload)
         || std::holds_alternative<ItemDroppedEvent>(payload)
         || std::holds_alternative<AttackStartedEvent>(payload)
-        || std::holds_alternative<SharedModalStateChangedEvent>(payload);
+        || std::holds_alternative<SharedModalStateChangedEvent>(payload)
+        || std::holds_alternative<WorldMapRouteSelectedEvent>(payload);
 }
 
 } // namespace
@@ -294,6 +295,16 @@ bool NetworkLobby::sendLocalSharedModal(SharedModalKind kind, bool open, Session
         SharedModalCommand { kind, open },
         phaseRevision,
         kind == SharedModalKind::WorldMap && !open ? currentPhase : SessionPhase::Lobby);
+}
+
+bool NetworkLobby::sendLocalWorldMapRoute(const WorldMapRouteCommand& route, std::uint32_t phaseRevision)
+{
+    PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
+    return sendLocalAction(
+        WorldMapRouteSelectedEvent { EntityId { playerId.value }, route.targetX, route.targetY, route.clear },
+        route,
+        phaseRevision,
+        SessionPhase::Transition);
 }
 
 bool NetworkLobby::sendLocalInventoryTransfer(EntityId sourceId,

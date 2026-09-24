@@ -922,6 +922,8 @@ bool submitHostCommand(GameCommandPayload payload)
     command.actorId = EntityId { kHostPlayerId.value };
     command.expectedPhase = std::holds_alternative<AttackCommand>(payload)
         ? SessionPhase::Combat
+        : std::holds_alternative<WorldMapRouteCommand>(payload)
+        ? SessionPhase::Transition
         : std::holds_alternative<SharedModalCommand>(payload)
         ? networkWorldPhase()
         : SessionPhase::Exploration;
@@ -1082,6 +1084,8 @@ void networkRuntimeBackgroundProcess()
                 applied = networkWorldApplyPeerRest(*rest);
             } else if (const auto* modal = std::get_if<SharedModalStateChangedEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerSharedModal(*modal);
+            } else if (const auto* route = std::get_if<WorldMapRouteSelectedEvent>(&event->payload)) {
+                applied = networkWorldApplyPeerWorldMapRoute(*route);
             } else if (const auto* transfer = std::get_if<InventoryTransferredEvent>(&event->payload)) {
                 applied = networkWorldApplyInventoryTransfer(*transfer);
             } else if (const auto* drop = std::get_if<ItemDroppedEvent>(&event->payload)) {
@@ -2993,6 +2997,17 @@ bool networkRuntimeRequestSharedModal(SharedModalKind kind, bool open)
     return launchOptions.mode == NetworkLaunchMode::Host
         ? submitHostCommand(SharedModalCommand { kind, open })
         : lobby.sendLocalSharedModal(kind, open, networkWorldPhase(), networkWorldPhaseRevision());
+}
+
+bool networkRuntimeSubmitLocalWorldMapRoute(std::int32_t targetX, std::int32_t targetY, bool clear)
+{
+    WorldMapRouteCommand route { targetX, targetY, clear };
+    if (!networkWorldLocalWorldMapController() || !isValid(route)) {
+        return false;
+    }
+    return launchOptions.mode == NetworkLaunchMode::Host
+        ? submitHostCommand(route)
+        : lobby.sendLocalWorldMapRoute(route, networkWorldPhaseRevision());
 }
 
 bool networkRuntimeBlockUnsupportedSharedModal(SharedModalKind kind)

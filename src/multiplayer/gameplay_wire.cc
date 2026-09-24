@@ -23,6 +23,7 @@ enum class CommandType : std::uint8_t {
     ExitGrid = 13,
     SceneryTransition = 14,
     Rest = 15,
+    WorldMapRoute = 16,
 };
 
 enum class EventType : std::uint8_t {
@@ -42,6 +43,7 @@ enum class EventType : std::uint8_t {
     ExitGridTransitioned = 14,
     SceneryTransitioned = 15,
     RestStateChanged = 16,
+    WorldMapRouteSelected = 17,
 };
 
 constexpr std::size_t kCommandHeaderSize = 28;
@@ -72,6 +74,8 @@ constexpr std::size_t kItemUseEventSize = kEventHeaderSize + 12;
 constexpr std::size_t kElevatorEventSize = kEventHeaderSize + 40;
 constexpr std::size_t kExitGridEventBaseSize = kEventHeaderSize + 20;
 constexpr std::size_t kRestEventSize = kEventHeaderSize + 24;
+constexpr std::size_t kWorldMapRouteCommandSize = kCommandHeaderSize + 12;
+constexpr std::size_t kWorldMapRouteEventSize = kEventHeaderSize + 16;
 constexpr std::size_t kTransitionPlacementSize = 20;
 constexpr std::int32_t kAttackHitModeCount = 20;
 constexpr std::int32_t kAttackHitLocationCount = 9;
@@ -287,6 +291,9 @@ GameplayWireError validateCommand(const GameCommand& command)
             ? GameplayWireError::None
             : GameplayWireError::InvalidModal;
     }
+    if (const auto* route = std::get_if<WorldMapRouteCommand>(&command.payload)) {
+        return isValid(*route) ? GameplayWireError::None : GameplayWireError::InvalidMove;
+    }
     if (const auto* skill = std::get_if<UseSkillCommand>(&command.payload)) {
         if (!isValid(skill->targetId)) {
             return GameplayWireError::InvalidEntityId;
@@ -484,6 +491,12 @@ GameplayWireError validateEvent(const GameEvent& event)
                        && modal->phase == SessionPhase::Exploration))
             ? GameplayWireError::None
             : GameplayWireError::InvalidModal;
+    }
+    if (const auto* route = std::get_if<WorldMapRouteSelectedEvent>(&event.payload)) {
+        return isValid(route->actorId)
+                && isValid(WorldMapRouteCommand { route->targetX, route->targetY, route->clear })
+            ? GameplayWireError::None
+            : GameplayWireError::InvalidMove;
     }
     if (const auto* skill = std::get_if<SkillUseStartedEvent>(&event.payload)) {
         if (!isValid(skill->actorId) || !isValid(skill->targetId)) {
@@ -696,6 +709,12 @@ GameplayWireError encodeGameCommand(const GameCommand& command, ProtocolEnvelope
         envelope.payload.push_back(static_cast<std::uint8_t>(modal->kind));
         envelope.payload.push_back(modal->open ? 1 : 0);
         appendUInt16(envelope.payload, 0);
+    } else if (const auto* route = std::get_if<WorldMapRouteCommand>(&command.payload)) {
+        appendCommandHeader(command, CommandType::WorldMapRoute, envelope.payload);
+        appendInt32(envelope.payload, route->targetX);
+        appendInt32(envelope.payload, route->targetY);
+        envelope.payload.push_back(route->clear ? 1 : 0);
+        envelope.payload.insert(envelope.payload.end(), 3, 0);
     } else if (const auto* skill = std::get_if<UseSkillCommand>(&command.payload)) {
         appendCommandHeader(command, CommandType::UseSkill, envelope.payload);
         appendUInt32(envelope.payload, skill->targetId.value);
@@ -847,6 +866,21 @@ GameCommandDecodeResult decodeGameCommand(const ProtocolEnvelope& envelope)
         result.command.payload = SharedModalCommand {
             static_cast<SharedModalKind>(envelope.payload[28]),
             envelope.payload[29] != 0,
+        };
+        break;
+    case CommandType::WorldMapRoute:
+        if (envelope.payload.size() != kWorldMapRouteCommandSize
+            || envelope.payload[36] > 1
+            || envelope.payload[37] != 0
+            || envelope.payload[38] != 0
+            || envelope.payload[39] != 0) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.command.payload = WorldMapRouteCommand {
+            readInt32(envelope.payload, 28),
+            readInt32(envelope.payload, 32),
+            envelope.payload[36] != 0,
         };
         break;
     case CommandType::UseSkill:
@@ -1040,6 +1074,13 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
         envelope.payload.push_back(static_cast<std::uint8_t>(modal->phase));
         envelope.payload.push_back(0);
         appendUInt32(envelope.payload, modal->phaseRevision);
+    } else if (const auto* route = std::get_if<WorldMapRouteSelectedEvent>(&event.payload)) {
+        appendEventHeader(event, EventType::WorldMapRouteSelected, envelope.payload);
+        appendUInt32(envelope.payload, route->actorId.value);
+        appendInt32(envelope.payload, route->targetX);
+        appendInt32(envelope.payload, route->targetY);
+        envelope.payload.push_back(route->clear ? 1 : 0);
+        envelope.payload.insert(envelope.payload.end(), 3, 0);
     } else if (const auto* skill = std::get_if<SkillUseStartedEvent>(&event.payload)) {
         appendEventHeader(event, EventType::SkillUseStarted, envelope.payload);
         appendUInt32(envelope.payload, skill->actorId.value);
@@ -1277,6 +1318,22 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
             envelope.payload[25] != 0,
             static_cast<SessionPhase>(envelope.payload[26]),
             readUInt32(envelope.payload, 28),
+        };
+        break;
+    case EventType::WorldMapRouteSelected:
+        if (envelope.payload.size() != kWorldMapRouteEventSize
+            || envelope.payload[32] > 1
+            || envelope.payload[33] != 0
+            || envelope.payload[34] != 0
+            || envelope.payload[35] != 0) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.event.payload = WorldMapRouteSelectedEvent {
+            EntityId { readUInt32(envelope.payload, 20) },
+            readInt32(envelope.payload, 24),
+            readInt32(envelope.payload, 28),
+            envelope.payload[32] != 0,
         };
         break;
     case EventType::SkillUseStarted:

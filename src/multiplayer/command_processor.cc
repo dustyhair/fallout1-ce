@@ -41,6 +41,8 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     const SharedModalCommand* modal = std::get_if<SharedModalCommand>(&command.payload);
     SessionPhase requiredPhase = std::holds_alternative<AttackCommand>(command.payload)
         ? SessionPhase::Combat
+        : std::holds_alternative<WorldMapRouteCommand>(command.payload)
+        ? SessionPhase::Transition
         : modal != nullptr && modal->kind == SharedModalKind::WorldMap && !modal->open
         ? session.phase()
         : modal != nullptr && !modal->open
@@ -88,6 +90,7 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     const InventoryTransferCommand* transfer = std::get_if<InventoryTransferCommand>(&command.payload);
     const ItemDropCommand* drop = std::get_if<ItemDropCommand>(&command.payload);
     const AttackCommand* attack = std::get_if<AttackCommand>(&command.payload);
+    const WorldMapRouteCommand* worldMapRoute = std::get_if<WorldMapRouteCommand>(&command.payload);
     Object* target = nullptr;
     EntityId targetId;
     bool hasTarget = false;
@@ -135,6 +138,8 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     } else if (attack != nullptr) {
         targetId = attack->targetId;
         hasTarget = true;
+    } else if (worldMapRoute != nullptr && !isValid(*worldMapRoute)) {
+        return rejectAndRemember(CommandRejection::Malformed);
     }
     if (hasTarget) {
         target = session.entities().findObject(targetId);
@@ -278,6 +283,14 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
                 modal->open,
                 modalExecution.phase,
                 modalExecution.phaseRevision,
+            };
+        } else if (worldMapRoute != nullptr) {
+            executionStatus = executor.setWorldMapRoute(actor, *worldMapRoute);
+            event.payload = WorldMapRouteSelectedEvent {
+                command.actorId,
+                worldMapRoute->targetX,
+                worldMapRoute->targetY,
+                worldMapRoute->clear,
             };
         } else if (transfer != nullptr) {
             InventoryTransferExecution transferExecution = executor.transferInventory(actor,
