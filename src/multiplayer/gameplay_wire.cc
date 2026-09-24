@@ -21,6 +21,7 @@ enum class CommandType : std::uint8_t {
     UseItemOn = 11,
     Elevator = 12,
     ExitGrid = 13,
+    SceneryTransition = 14,
 };
 
 enum class EventType : std::uint8_t {
@@ -38,6 +39,7 @@ enum class EventType : std::uint8_t {
     ItemUseStarted = 12,
     ElevatorTransitioned = 13,
     ExitGridTransitioned = 14,
+    SceneryTransitioned = 15,
 };
 
 constexpr std::size_t kCommandHeaderSize = 28;
@@ -310,6 +312,11 @@ GameplayWireError validateCommand(const GameCommand& command)
             ? GameplayWireError::None
             : GameplayWireError::InvalidEntityId;
     }
+    if (const auto* transition = std::get_if<SceneryTransitionCommand>(&command.payload)) {
+        return isValid(transition->transitionId)
+            ? GameplayWireError::None
+            : GameplayWireError::InvalidEntityId;
+    }
 
     EntityId targetId;
     if (const auto* interact = std::get_if<InteractCommand>(&command.payload)) {
@@ -538,6 +545,39 @@ GameplayWireError validateEvent(const GameEvent& event)
             ? GameplayWireError::None
             : GameplayWireError::InvalidMove;
     }
+    if (const auto* transition = std::get_if<SceneryTransitionedEvent>(&event.payload)) {
+        if (!isValid(transition->actorId)
+            || !isValid(transition->transitionId)
+            || transition->map < 0
+            || transition->phaseRevision == 0
+            || transition->placements.empty()
+            || transition->placements.size() > kMaximumTransitionPlayers) {
+            return GameplayWireError::InvalidMove;
+        }
+        bool actingPlayerPresent = false;
+        for (std::size_t index = 0; index < transition->placements.size(); index++) {
+            const PlayerTransitionPlacement& placement = transition->placements[index];
+            if (!isValid(placement.playerId)
+                || !isValid(placement.actorId)
+                || placement.tile < 0
+                || placement.elevation < 0
+                || placement.elevation > 2
+                || placement.rotation < 0
+                || placement.rotation >= kActorRotationCount) {
+                return GameplayWireError::InvalidMove;
+            }
+            actingPlayerPresent = actingPlayerPresent || placement.actorId == transition->actorId;
+            for (std::size_t previous = 0; previous < index; previous++) {
+                if (transition->placements[previous].playerId == placement.playerId
+                    || transition->placements[previous].actorId == placement.actorId) {
+                    return GameplayWireError::InvalidMove;
+                }
+            }
+        }
+        return actingPlayerPresent
+            ? GameplayWireError::None
+            : GameplayWireError::InvalidMove;
+    }
 
     EntityId actorId;
     EntityId targetId;
@@ -650,6 +690,9 @@ GameplayWireError encodeGameCommand(const GameCommand& command, ProtocolEnvelope
     } else if (const auto* exitGrid = std::get_if<ExitGridCommand>(&command.payload)) {
         appendCommandHeader(command, CommandType::ExitGrid, envelope.payload);
         appendUInt32(envelope.payload, exitGrid->exitId.value);
+    } else if (const auto* transition = std::get_if<SceneryTransitionCommand>(&command.payload)) {
+        appendCommandHeader(command, CommandType::SceneryTransition, envelope.payload);
+        appendUInt32(envelope.payload, transition->transitionId.value);
     } else {
         const auto* attack = std::get_if<AttackCommand>(&command.payload);
         appendCommandHeader(command, CommandType::Attack, envelope.payload);
@@ -821,6 +864,15 @@ GameCommandDecodeResult decodeGameCommand(const ProtocolEnvelope& envelope)
             EntityId { readUInt32(envelope.payload, 28) },
         };
         break;
+    case CommandType::SceneryTransition:
+        if (envelope.payload.size() != kTargetCommandSize) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.command.payload = SceneryTransitionCommand {
+            EntityId { readUInt32(envelope.payload, 28) },
+        };
+        break;
     default:
         result.error = GameplayWireError::UnknownPayloadType;
         return result;
@@ -987,6 +1039,20 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
         appendUInt32(envelope.payload, exitGrid->phaseRevision);
         appendUInt32(envelope.payload, static_cast<std::uint32_t>(exitGrid->placements.size()));
         for (const PlayerTransitionPlacement& placement : exitGrid->placements) {
+            appendUInt32(envelope.payload, placement.playerId.value);
+            appendUInt32(envelope.payload, placement.actorId.value);
+            appendInt32(envelope.payload, placement.tile);
+            appendInt32(envelope.payload, placement.elevation);
+            appendInt32(envelope.payload, placement.rotation);
+        }
+    } else if (const auto* transition = std::get_if<SceneryTransitionedEvent>(&event.payload)) {
+        appendEventHeader(event, EventType::SceneryTransitioned, envelope.payload);
+        appendUInt32(envelope.payload, transition->actorId.value);
+        appendUInt32(envelope.payload, transition->transitionId.value);
+        appendInt32(envelope.payload, transition->map);
+        appendUInt32(envelope.payload, transition->phaseRevision);
+        appendUInt32(envelope.payload, static_cast<std::uint32_t>(transition->placements.size()));
+        for (const PlayerTransitionPlacement& placement : transition->placements) {
             appendUInt32(envelope.payload, placement.playerId.value);
             appendUInt32(envelope.payload, placement.actorId.value);
             appendInt32(envelope.payload, placement.tile);
@@ -1245,6 +1311,39 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
             });
         }
         result.event.payload = std::move(exitGrid);
+        break;
+    }
+    case EventType::SceneryTransitioned: {
+        if (envelope.payload.size() < kExitGridEventBaseSize) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        std::uint32_t placementCount = readUInt32(envelope.payload, 36);
+        if (placementCount == 0
+            || placementCount > kMaximumTransitionPlayers
+            || envelope.payload.size() != kExitGridEventBaseSize
+                    + static_cast<std::size_t>(placementCount) * kTransitionPlacementSize) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        SceneryTransitionedEvent transition;
+        transition.actorId = EntityId { readUInt32(envelope.payload, 20) };
+        transition.transitionId = EntityId { readUInt32(envelope.payload, 24) };
+        transition.map = readInt32(envelope.payload, 28);
+        transition.phaseRevision = readUInt32(envelope.payload, 32);
+        transition.placements.reserve(placementCount);
+        for (std::uint32_t index = 0; index < placementCount; index++) {
+            std::size_t offset = kExitGridEventBaseSize
+                + static_cast<std::size_t>(index) * kTransitionPlacementSize;
+            transition.placements.push_back(PlayerTransitionPlacement {
+                PlayerId { readUInt32(envelope.payload, offset) },
+                EntityId { readUInt32(envelope.payload, offset + 4) },
+                readInt32(envelope.payload, offset + 8),
+                readInt32(envelope.payload, offset + 12),
+                readInt32(envelope.payload, offset + 16),
+            });
+        }
+        result.event.payload = std::move(transition);
         break;
     }
     default:

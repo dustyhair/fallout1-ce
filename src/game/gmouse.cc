@@ -962,7 +962,8 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
                                 ? multiplayer::kGuestPlayerId
                                 : multiplayer::kHostPlayerId;
                             multiplayer::developerLocalSessionSubmitDoorUse(playerId, target);
-                        } else if (!multiplayer::networkRuntimeHandleLocalDoorUse(target)) {
+                        } else if (!multiplayer::networkRuntimeHandleLocalSceneryTransition(target)
+                            && !multiplayer::networkRuntimeHandleLocalDoorUse(target)) {
                             action_use_an_object(obj_dude, target);
                         }
                     } else {
@@ -1174,7 +1175,8 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
                                     ? multiplayer::kGuestPlayerId
                                     : multiplayer::kHostPlayerId;
                                 multiplayer::developerLocalSessionSubmitDoorUse(playerId, target);
-                            } else if (!multiplayer::networkRuntimeHandleLocalDoorUse(target)) {
+                            } else if (!multiplayer::networkRuntimeHandleLocalSceneryTransition(target)
+                                && !multiplayer::networkRuntimeHandleLocalDoorUse(target)) {
                                 action_use_an_object(obj_dude, target);
                             }
                             break;

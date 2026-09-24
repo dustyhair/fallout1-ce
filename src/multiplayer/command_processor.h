@@ -64,6 +64,8 @@ struct ExitGridExecution {
     std::uint32_t phaseRevision = 0;
 };
 
+using SceneryTransitionExecution = ExitGridExecution;
+
 class CommandExecutor {
 public:
     virtual ~CommandExecutor() = default;
@@ -86,6 +88,10 @@ public:
         return {};
     }
     virtual ExitGridExecution useExitGrid(Object*, Object*, const ExitGridCommand&)
+    {
+        return {};
+    }
+    virtual SceneryTransitionExecution useSceneryTransition(Object*, Object*, const SceneryTransitionCommand&)
     {
         return {};
     }

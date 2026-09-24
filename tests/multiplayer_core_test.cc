@@ -755,6 +755,7 @@ void testGameplayWireFormat()
         GameCommand { CommandSequence { 11 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, UseItemOnCommand { EntityId { 43 }, EntityId { 40 } } },
         GameCommand { CommandSequence { 12 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, ElevatorCommand { 8, 1 } },
         GameCommand { CommandSequence { 13 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, ExitGridCommand { EntityId { 46 } } },
+        GameCommand { CommandSequence { 14 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, SceneryTransitionCommand { EntityId { 47 } } },
     };
 
     for (std::size_t index = 0; index < commands.size(); index++) {
@@ -956,6 +957,16 @@ void testGameplayWireFormat()
     expect(encodeGameCommand(invalidExitGrid, exitGridEnvelope) == GameplayWireError::InvalidEntityId,
         "exit-grid command rejects an invalid source identity");
 
+    ProtocolEnvelope sceneryTransitionEnvelope = gameplayEnvelope(33);
+    expect(encodeGameCommand(commands[13], sceneryTransitionEnvelope) == GameplayWireError::None,
+        "scenery-transition command encodes");
+    GameCommandDecodeResult decodedSceneryTransition = decodeGameCommand(sceneryTransitionEnvelope);
+    const SceneryTransitionCommand* sceneryTransition = decodedSceneryTransition
+        ? std::get_if<SceneryTransitionCommand>(&decodedSceneryTransition.command.payload)
+        : nullptr;
+    expect(sceneryTransition != nullptr && sceneryTransition->transitionId == EntityId { 47 },
+        "scenery-transition command round trips its registered object identity");
+
     CommandResult accepted;
     accepted.commandSequence.value = 1;
     accepted.status = CommandStatus::Accepted;
@@ -1008,6 +1019,16 @@ void testGameplayWireFormat()
                 PlayerTransitionPlacement { kGuestPlayerId, EntityId { 20 }, 17090, 0, 0 },
             },
             7,
+        } },
+        GameEvent { EventSequence { 21 }, CommandSequence { 14 }, SceneryTransitionedEvent {
+            EntityId { 20 },
+            EntityId { 47 },
+            5,
+            {
+                PlayerTransitionPlacement { kHostPlayerId, EntityId { 10 }, 15483, 0, 5 },
+                PlayerTransitionPlacement { kGuestPlayerId, EntityId { 20 }, 17089, 1, 5 },
+            },
+            9,
         } },
     };
     for (std::size_t index = 0; index < events.size(); index++) {
@@ -1190,6 +1211,22 @@ void testGameplayWireFormat()
     std::get<ExitGridTransitionedEvent>(duplicateExitPlacement.payload).placements[1].playerId = kHostPlayerId;
     expect(encodeGameEvent(duplicateExitPlacement, exitGridEventEnvelope) == GameplayWireError::InvalidMove,
         "exit-grid event rejects duplicate roster participants");
+
+    ProtocolEnvelope sceneryTransitionEventEnvelope = gameplayEnvelope(51);
+    expect(encodeGameEvent(events[14], sceneryTransitionEventEnvelope) == GameplayWireError::None,
+        "scenery-transition event encodes its bounded placement roster");
+    GameEventDecodeResult decodedSceneryTransitionEvent = decodeGameEvent(sceneryTransitionEventEnvelope);
+    const SceneryTransitionedEvent* sceneryTransitionEvent = decodedSceneryTransitionEvent
+        ? std::get_if<SceneryTransitionedEvent>(&decodedSceneryTransitionEvent.event.payload)
+        : nullptr;
+    expect(sceneryTransitionEvent != nullptr
+            && sceneryTransitionEvent->actorId == EntityId { 20 }
+            && sceneryTransitionEvent->transitionId == EntityId { 47 }
+            && sceneryTransitionEvent->map == 5
+            && sceneryTransitionEvent->phaseRevision == 9
+            && sceneryTransitionEvent->placements.size() == 2
+            && sceneryTransitionEvent->placements[1].elevation == 1,
+        "scenery-transition event round trips player-keyed independent placements");
 
     ProtocolEnvelope skillEventEnvelope = gameplayEnvelope(48);
     encodeGameEvent(events[10], skillEventEnvelope);
@@ -2244,6 +2281,24 @@ public:
         };
     }
 
+    SceneryTransitionExecution useSceneryTransition(Object* actor, Object* target, const SceneryTransitionCommand& command) override
+    {
+        sceneryTransitionCalls++;
+        lastActor = actor;
+        lastTarget = target;
+        lastSceneryTransition = command;
+        recordContext();
+        return SceneryTransitionExecution {
+            nextStatus,
+            5,
+            {
+                PlayerTransitionPlacement { kHostPlayerId, EntityId { 1 }, 15483, 0, 5 },
+                PlayerTransitionPlacement { kGuestPlayerId, EntityId { 2 }, 17089, 1, 5 },
+            },
+            9,
+        };
+    }
+
     CommandExecutionStatus attack(Object* actor, Object* target, const AttackCommand& command) override
     {
         attackCalls++;
@@ -2346,6 +2401,7 @@ public:
     int itemUseCalls = 0;
     int elevatorCalls = 0;
     int exitGridCalls = 0;
+    int sceneryTransitionCalls = 0;
     int attackCalls = 0;
     int modalCalls = 0;
     int transferCalls = 0;
@@ -2365,6 +2421,7 @@ public:
     UseItemOnCommand lastItemUse;
     ElevatorCommand lastElevator;
     ExitGridCommand lastExitGrid;
+    SceneryTransitionCommand lastSceneryTransition;
     SharedModalCommand lastModal;
     LocalSession* modalSession = nullptr;
     Object* activeModalActor = nullptr;
@@ -2582,6 +2639,30 @@ void testAuthoritativeCommandProcessing()
             && executor.exitGridCalls == 1
             && !invalidExitGrid.event.has_value(),
         "command processor rejects an invalid exit-grid identity before engine execution");
+
+    CommandProcessor sceneryTransitionProcessor;
+    GameCommand useSceneryTransition;
+    useSceneryTransition.sequence.value = 1;
+    useSceneryTransition.playerId = kGuestPlayerId;
+    useSceneryTransition.actorId = session.playerActorId(kGuestPlayerId);
+    useSceneryTransition.expectedPhase = SessionPhase::Exploration;
+    useSceneryTransition.expectedPhaseRevision = session.phaseRevision();
+    useSceneryTransition.payload = SceneryTransitionCommand { registeredLootableCritter.entityId };
+    AuthoritativeCommandResult usedSceneryTransition = sceneryTransitionProcessor.process(useSceneryTransition, session, executor);
+    const SceneryTransitionedEvent* sceneryTransitionEvent = usedSceneryTransition.event.has_value()
+        ? std::get_if<SceneryTransitionedEvent>(&usedSceneryTransition.event->payload)
+        : nullptr;
+    expect(usedSceneryTransition.result.status == CommandStatus::Accepted
+            && executor.sceneryTransitionCalls == 1
+            && executor.lastActor == asGameObject(guestActor)
+            && executor.lastTarget == asGameObject(lootableCritter)
+            && executor.lastSceneryTransition.transitionId == registeredLootableCritter.entityId
+            && sceneryTransitionEvent != nullptr
+            && sceneryTransitionEvent->map == 5
+            && sceneryTransitionEvent->placements.size() == 2
+            && sceneryTransitionEvent->placements[1].elevation == 1
+            && sceneryTransitionEvent->phaseRevision == 9,
+        "host resolves scenery-transition targets and emits player-keyed placements");
 
     GameCommand pickup;
     pickup.sequence.value = 2;

@@ -323,6 +323,10 @@ bool agentControlParseCommand(const std::string& line,
         command.type = AgentControlCommandType::GameExit;
         return parseEntityId(input, command, error);
     }
+    if (verb == "game_stairs") {
+        command.type = AgentControlCommandType::GameStairs;
+        return parseEntityId(input, command, error);
+    }
     if (verb == "game_give") {
         command.type = AgentControlCommandType::GameGive;
         return parseGive(input, command, error);
@@ -363,6 +367,8 @@ const char* agentControlCommandTypeName(AgentControlCommandType type)
         return "game_elevator";
     case AgentControlCommandType::GameExit:
         return "game_exit";
+    case AgentControlCommandType::GameStairs:
+        return "game_stairs";
     case AgentControlCommandType::GameGive:
         return "game_give";
     }

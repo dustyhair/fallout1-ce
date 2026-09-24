@@ -214,6 +214,14 @@ void executeCommand(const AgentControlCommand& command)
             agentJournalWriteAgentCommand(command.id, commandName, "rejected", "exit grid is unavailable or the party is not ready");
         }
         return;
+    case AgentControlCommandType::GameStairs:
+        if (multiplayer::networkRuntimeSubmitLocalSceneryTransition(
+                multiplayer::EntityId { command.entityId })) {
+            agentJournalWriteAgentCommand(command.id, commandName, "accepted", "authoritative scenery transition submitted");
+        } else {
+            agentJournalWriteAgentCommand(command.id, commandName, "rejected", "stairs or ladder is unavailable for this player");
+        }
+        return;
     case AgentControlCommandType::GameGive:
         if (multiplayer::networkRuntimeGiveItemToPlayer(
                 multiplayer::EntityId { command.destinationEntityId },

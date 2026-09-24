@@ -38,6 +38,7 @@
 #include "game/worldmap.h"
 #include "int/dialog.h"
 #include "multiplayer/acting_player_context.h"
+#include "multiplayer/network_world.h"
 #include "multiplayer/presentation_bridge.h"
 #include "plib/color/color.h"
 #include "plib/gnw/debug.h"
@@ -542,6 +543,8 @@ static void op_move_to(Program* program)
     int elevation = programStackPopInteger(program);
     int tile = programStackPopInteger(program);
     Object* object = static_cast<Object*>(programStackPopPointer(program));
+
+    object = multiplayer::networkWorldScriptedSceneryTransitionActor(object);
 
     int newTile;
 
@@ -2751,6 +2754,7 @@ static void op_anim(Program* program)
     int frame = programStackPopInteger(program);
     int anim = programStackPopInteger(program);
     Object* obj = static_cast<Object*>(programStackPopPointer(program));
+    obj = multiplayer::networkWorldScriptedSceneryTransitionActor(obj);
 
     if (obj == NULL) {
         dbg_error(program, "anim", SCRIPT_ERROR_OBJECT_IS_NULL);

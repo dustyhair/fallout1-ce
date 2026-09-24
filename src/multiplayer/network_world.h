@@ -12,6 +12,7 @@
 namespace fallout {
 
 struct Object;
+struct MapTransition;
 
 namespace multiplayer {
 
@@ -35,6 +36,7 @@ bool networkWorldApplyPeerSkillUse(const SkillUseStartedEvent& skillUse);
 bool networkWorldApplyPeerItemUse(const ItemUseStartedEvent& itemUse);
 bool networkWorldApplyPeerElevator(const ElevatorTransitionedEvent& elevator);
 bool networkWorldApplyPeerExitGrid(const ExitGridTransitionedEvent& exitGrid);
+bool networkWorldApplyPeerSceneryTransition(const SceneryTransitionedEvent& transition);
 bool networkWorldApplyPeerSharedModal(const SharedModalStateChangedEvent& modal);
 bool networkWorldApplyPeerAttack(const AttackStartedEvent& attack);
 bool networkWorldApplyInventoryTransfer(const InventoryTransferredEvent& transfer, bool reverse = false);
@@ -45,6 +47,8 @@ bool networkWorldSetLocalLootTarget(Object* target);
 bool networkWorldIsLocalInventoryTransfer(Object* source, Object* destination);
 bool networkWorldIsLocalItemDrop(Object* source, Object* item);
 bool networkWorldItemUseInProgress();
+bool networkWorldCaptureScriptedMapTransition(const MapTransition& transition);
+Object* networkWorldScriptedSceneryTransitionActor(Object* requestedActor);
 void networkWorldHandleObjectDestroyed(Object* object);
 void networkWorldHandleItemReplacement(Object* removed, Object* replacement);
 void networkWorldHandleItemSplit(Object* original, Object* remainder);
@@ -119,6 +123,19 @@ struct ExitGridSmokeFixture {
 };
 std::optional<ExitGridSmokeFixture> networkWorldPrepareExitGridSmokeTest();
 bool networkWorldVerifyExitGridSmokeTest(const ExitGridSmokeFixture& fixture);
+struct SceneryTransitionSmokeFixture {
+    EntityId transitionId;
+    std::int32_t map = -1;
+    std::int32_t hostTile = -1;
+    std::int32_t hostElevation = -1;
+    std::int32_t hostRotation = 0;
+    std::int32_t guestStartingTile = -1;
+    std::int32_t guestStartingElevation = -1;
+    EntityId hostActorId;
+    EntityId guestActorId;
+};
+std::optional<SceneryTransitionSmokeFixture> networkWorldPrepareSceneryTransitionSmokeTest();
+bool networkWorldVerifySceneryTransitionSmokeTest(const SceneryTransitionSmokeFixture& fixture);
 bool networkWorldVerifyLootRangeSmokeTest(EntityId targetId);
 std::optional<EntityId> networkWorldPreparePlayerTransferSmokeTest();
 bool networkWorldVerifyPlayerTransferRangeSmokeTest(EntityId itemId);

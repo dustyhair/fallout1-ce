@@ -27,6 +27,7 @@
 #include "game/map.h"
 #include "game/object.h"
 #include "game/protinst.h"
+#include "game/proto.h"
 #include "game/proto_types.h"
 #include "game/queue.h"
 #include "game/textobj.h"
@@ -76,6 +77,7 @@ enum class SmokeScenario {
     Elevation,
     MapTransition,
     ExitGrid,
+    Stairs,
 };
 SmokeScenario smokeScenario = SmokeScenario::Movement;
 
@@ -106,6 +108,8 @@ const char* smokeScenarioName()
         return "map-transition";
     case SmokeScenario::ExitGrid:
         return "exit-grid";
+    case SmokeScenario::Stairs:
+        return "stairs";
     }
     return "unknown";
 }
@@ -568,6 +572,13 @@ std::vector<AgentJournalInteractableState> visibleInteractableJournalStates(Obje
             bool door = obj_is_a_portal(object);
             bool container = objectType == OBJ_TYPE_ITEM
                 && item_get_type(object) == ITEM_TYPE_CONTAINER;
+            int sceneryType = -1;
+            Proto* sceneryProto = nullptr;
+            bool sceneryTransition = objectType == OBJ_TYPE_SCENERY
+                && proto_ptr(object->pid, &sceneryProto) == 0
+                && ((sceneryType = sceneryProto->scenery.type) == SCENERY_TYPE_STAIRS
+                    || sceneryType == SCENERY_TYPE_LADDER_UP
+                    || sceneryType == SCENERY_TYPE_LADDER_DOWN);
             std::optional<EntityId> entityId = networkWorldFindEntity(object);
             if (!entityId.has_value()) {
                 continue;
@@ -581,9 +592,12 @@ std::vector<AgentJournalInteractableState> visibleInteractableJournalStates(Obje
             AgentJournalInteractableState state;
             state.entityId = entityId->value;
             state.pid = object->pid;
-            state.kind = exitGrid ? "exit" : door ? "door" : container ? "container"
-                                                   : objectType == OBJ_TYPE_SCENERY ? "scenery"
-                                                                                  : "item";
+            state.kind = exitGrid ? "exit" : sceneryTransition
+                    ? sceneryType == SCENERY_TYPE_STAIRS ? "stairs" : "ladder"
+                : door                                ? "door"
+                : container                           ? "container"
+                : objectType == OBJ_TYPE_SCENERY      ? "scenery"
+                                                      : "item";
             const char* name = object_name(object);
             state.name = name != nullptr ? name : "";
             state.tile = object->tile;
@@ -1004,6 +1018,8 @@ void networkRuntimeBackgroundProcess()
                 applied = networkWorldApplyPeerElevator(*elevator);
             } else if (const auto* exitGrid = std::get_if<ExitGridTransitionedEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerExitGrid(*exitGrid);
+            } else if (const auto* transition = std::get_if<SceneryTransitionedEvent>(&event->payload)) {
+                applied = networkWorldApplyPeerSceneryTransition(*transition);
             } else if (const auto* modal = std::get_if<SharedModalStateChangedEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerSharedModal(*modal);
             } else if (const auto* transfer = std::get_if<InventoryTransferredEvent>(&event->payload)) {
@@ -1121,6 +1137,8 @@ bool networkRuntimeConfigure(int argc, char** argv)
             smokeScenario = SmokeScenario::MapTransition;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=exit-grid") == 0) {
             smokeScenario = SmokeScenario::ExitGrid;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=stairs") == 0) {
+            smokeScenario = SmokeScenario::Stairs;
         }
     }
     if (smokeTestEnabled && launchOptions.mode == NetworkLaunchMode::Disabled) {
@@ -1158,6 +1176,9 @@ const char* networkRuntimeSmokeTestMap()
     }
     if (smokeScenario == SmokeScenario::MapTransition) {
         return "Brohd12.map";
+    }
+    if (smokeScenario == SmokeScenario::Stairs) {
+        return "WatrShd.map";
     }
     return smokeScenario == SmokeScenario::ExitGrid ? "Vault13.map" : "V13Ent.map";
 }
@@ -1237,6 +1258,7 @@ bool networkRuntimeRunSmokeTest()
             std::optional<ElevatorSmokeFixture> elevatorFixture;
             std::optional<MapTransitionSmokeFixture> mapTransitionFixture;
             std::optional<ExitGridSmokeFixture> exitGridFixture;
+            std::optional<SceneryTransitionSmokeFixture> sceneryTransitionFixture;
             if (smokeScenario == SmokeScenario::Door) {
                 scenarioTargetId = networkWorldPrepareDoorSmokeTest();
                 scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
@@ -1284,6 +1306,12 @@ bool networkRuntimeRunSmokeTest()
                     scenarioTargetId = exitGridFixture->exitId;
                 }
                 scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
+            } else if (smokeScenario == SmokeScenario::Stairs) {
+                sceneryTransitionFixture = networkWorldPrepareSceneryTransitionSmokeTest();
+                if (sceneryTransitionFixture.has_value()) {
+                    scenarioTargetId = sceneryTransitionFixture->transitionId;
+                }
+                scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
             } else if (scenarioActor != nullptr) {
                 for (int distance = 1; distance <= 4 && scenarioDestinationTile == -1; distance++) {
                     for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
@@ -1300,10 +1328,12 @@ bool networkRuntimeRunSmokeTest()
                     && smokeScenario != SmokeScenario::Elevation
                     && smokeScenario != SmokeScenario::MapTransition
                     && smokeScenario != SmokeScenario::ExitGrid
+                    && smokeScenario != SmokeScenario::Stairs
                     && !scenarioTargetId.has_value())
                 || (smokeScenario == SmokeScenario::Elevation && !elevatorFixture.has_value())
                 || (smokeScenario == SmokeScenario::MapTransition && !mapTransitionFixture.has_value())
                 || (smokeScenario == SmokeScenario::ExitGrid && !exitGridFixture.has_value())
+                || (smokeScenario == SmokeScenario::Stairs && !sceneryTransitionFixture.has_value())
                 || (smokeScenario == SmokeScenario::Movement && scenarioDestinationTile == -1)) {
                 setStatus("MULTIPLAYER SMOKE TEST FAILED: NO EXPLORATION FIXTURE");
                 break;
@@ -1360,6 +1390,9 @@ bool networkRuntimeRunSmokeTest()
             case SmokeScenario::ExitGrid:
                 scenarioCommand.payload = ExitGridCommand { exitGridFixture->exitId };
                 break;
+            case SmokeScenario::Stairs:
+                scenarioCommand.payload = SceneryTransitionCommand { sceneryTransitionFixture->transitionId };
+                break;
             }
             if (!scenarioCommandReady) {
                 break;
@@ -1370,7 +1403,7 @@ bool networkRuntimeRunSmokeTest()
 
             bool gameplayPassed = false;
             std::vector<GameEvent> authoritativeEvents;
-            if (smokeScenario == SmokeScenario::Quest) {
+            if (smokeScenario == SmokeScenario::Quest || smokeScenario == SmokeScenario::Stairs) {
                 engineExecutionProbeBegin();
             }
             if (launchOptions.mode == NetworkLaunchMode::Join) {
@@ -1540,6 +1573,16 @@ bool networkRuntimeRunSmokeTest()
                                     && exitGrid->map == exitGridFixture->destinationMap
                                     && exitGrid->placements.size() == 2
                                     && networkWorldApplyPeerExitGrid(*exitGrid);
+                            } else if (event && event.event.sequence == expectedEventSequence
+                                && event.event.causedBy == scenarioCommand.sequence
+                                && smokeScenario == SmokeScenario::Stairs) {
+                                const auto* transition = std::get_if<SceneryTransitionedEvent>(&event.event.payload);
+                                eventApplied = transition != nullptr
+                                    && transition->actorId == scenarioCommand.actorId
+                                    && transition->transitionId == sceneryTransitionFixture->transitionId
+                                    && transition->map == sceneryTransitionFixture->map
+                                    && transition->placements.size() == 2
+                                    && networkWorldApplyPeerSceneryTransition(*transition);
                             }
                             if (eventApplied) {
                                 receivedEventCount++;
@@ -1568,6 +1611,8 @@ bool networkRuntimeRunSmokeTest()
                                     stateConverged = networkWorldVerifyMapTransitionSmokeTest(*mapTransitionFixture);
                                 } else if (stateConverged && smokeScenario == SmokeScenario::ExitGrid) {
                                     stateConverged = networkWorldVerifyExitGridSmokeTest(*exitGridFixture);
+                                } else if (stateConverged && smokeScenario == SmokeScenario::Stairs) {
+                                    stateConverged = networkWorldVerifySceneryTransitionSmokeTest(*sceneryTransitionFixture);
                                 }
                             }
                             if (!stateConverged) {
@@ -1670,6 +1715,10 @@ bool networkRuntimeRunSmokeTest()
                                 const auto* exitGrid = std::get_if<ExitGridCommand>(&command.command.payload);
                                 payloadMatches = exitGrid != nullptr
                                     && exitGrid->exitId == exitGridFixture->exitId;
+                            } else if (smokeScenario == SmokeScenario::Stairs) {
+                                const auto* transition = std::get_if<SceneryTransitionCommand>(&command.command.payload);
+                                payloadMatches = transition != nullptr
+                                    && transition->transitionId == sceneryTransitionFixture->transitionId;
                             } else {
                                 const auto* movement = std::get_if<MoveCommand>(&command.command.payload);
                                 payloadMatches = movement != nullptr
@@ -1732,6 +1781,8 @@ bool networkRuntimeRunSmokeTest()
                             return networkWorldVerifyMapTransitionSmokeTest(*mapTransitionFixture);
                         case SmokeScenario::ExitGrid:
                             return networkWorldVerifyExitGridSmokeTest(*exitGridFixture);
+                        case SmokeScenario::Stairs:
+                            return networkWorldVerifySceneryTransitionSmokeTest(*sceneryTransitionFixture);
                         }
                         return false;
                     };
@@ -1782,12 +1833,15 @@ bool networkRuntimeRunSmokeTest()
                         || networkWorldVerifyMapTransitionSmokeTest(*mapTransitionFixture);
                     bool exitGridCompleted = smokeScenario != SmokeScenario::ExitGrid
                         || networkWorldVerifyExitGridSmokeTest(*exitGridFixture);
+                    bool sceneryTransitionCompleted = smokeScenario != SmokeScenario::Stairs
+                        || networkWorldVerifySceneryTransitionSmokeTest(*sceneryTransitionFixture);
                     bool captured = accepted
                         && scenarioCompleted
                         && questCompleted
                         && elevationCompleted
                         && mapTransitionCompleted
                         && exitGridCompleted
+                        && sceneryTransitionCompleted
                         && objectMutated
                         && authoritativeEvents.size() == scenarioFinalEventSequence.value
                         && networkWorldCaptureAuthoritativeState(scenarioFinalEventSequence, state);
@@ -1845,7 +1899,7 @@ bool networkRuntimeRunSmokeTest()
 
             EngineExecutionProbeCounts scenarioProbeCounts;
             bool scenarioAuthorityPassed = true;
-            if (smokeScenario == SmokeScenario::Quest) {
+            if (smokeScenario == SmokeScenario::Quest || smokeScenario == SmokeScenario::Stairs) {
                 scenarioProbeCounts = engineExecutionProbeEnd();
                 scenarioAuthorityPassed = launchOptions.mode == NetworkLaunchMode::Host
                     ? scenarioProbeCounts.scriptProcedures > 0 && scenarioProbeCounts.combatAttacks == 0
@@ -1857,13 +1911,13 @@ bool networkRuntimeRunSmokeTest()
             if (!gameplayPassed || !scenarioAuthorityPassed) {
                 if (runtimeStatus.find("SMOKE TEST FAILED") == std::string::npos) {
                     setStatus(!scenarioAuthorityPassed
-                            ? "MULTIPLAYER SMOKE TEST FAILED: QUEST AUTHORITY PROBE"
+                            ? "MULTIPLAYER SMOKE TEST FAILED: SCENARIO AUTHORITY PROBE"
                             : "MULTIPLAYER SMOKE TEST FAILED: GAMEPLAY WIRE EXCHANGE");
                 }
                 break;
             }
 
-            if (smokeScenario == SmokeScenario::Quest) {
+            if (smokeScenario == SmokeScenario::Quest || smokeScenario == SmokeScenario::Stairs) {
                 authorityProbeCounts = scenarioProbeCounts;
             } else if (smokeScenario == SmokeScenario::Elevation
                 || smokeScenario == SmokeScenario::MapTransition
@@ -2348,6 +2402,29 @@ bool networkRuntimeHandleLocalDoorUse(Object* target)
     return true;
 }
 
+bool networkRuntimeHandleLocalSceneryTransition(Object* target)
+{
+    if (!networkWorldActive() || target == nullptr || FID_TYPE(target->fid) != OBJ_TYPE_SCENERY) {
+        return false;
+    }
+    Proto* proto = nullptr;
+    if (proto_ptr(target->pid, &proto) == -1
+        || (proto->scenery.type != SCENERY_TYPE_STAIRS
+            && proto->scenery.type != SCENERY_TYPE_LADDER_UP
+            && proto->scenery.type != SCENERY_TYPE_LADDER_DOWN)) {
+        return false;
+    }
+    std::optional<EntityId> transitionId = networkWorldFindEntity(target);
+    if (!transitionId.has_value()) {
+        debug_printf("Multiplayer scenery transition is missing a shared entity ID.\n");
+        return true;
+    }
+    if (!networkRuntimeSubmitLocalSceneryTransition(*transitionId)) {
+        debug_printf("Multiplayer scenery transition command could not be submitted.\n");
+    }
+    return true;
+}
+
 bool networkRuntimeHandleLocalPickup(Object* target)
 {
     if (!networkWorldActive() || target == nullptr || FID_TYPE(target->fid) != OBJ_TYPE_ITEM) {
@@ -2475,6 +2552,18 @@ bool networkRuntimeSubmitLocalExitGrid(EntityId exitId)
         pendingLocalExitGrid.reset();
     }
     return submitted;
+}
+
+bool networkRuntimeSubmitLocalSceneryTransition(EntityId transitionId)
+{
+    if (!networkWorldActive()
+        || networkWorldPhase() != SessionPhase::Exploration
+        || !isValid(transitionId)) {
+        return false;
+    }
+    return launchOptions.mode == NetworkLaunchMode::Host
+        ? submitHostCommand(SceneryTransitionCommand { transitionId })
+        : lobby.sendLocalSceneryTransition(transitionId, networkWorldPhaseRevision());
 }
 
 bool networkRuntimeHandleLocalAttack(Object* target, int hitMode, int hitLocation)

@@ -105,6 +105,7 @@ bool isSupportedLiveEvent(const GameEventPayload& payload)
         || std::holds_alternative<ItemUseStartedEvent>(payload)
         || std::holds_alternative<ElevatorTransitionedEvent>(payload)
         || std::holds_alternative<ExitGridTransitionedEvent>(payload)
+        || std::holds_alternative<SceneryTransitionedEvent>(payload)
         || std::holds_alternative<InventoryTransferredEvent>(payload)
         || std::holds_alternative<ItemDroppedEvent>(payload)
         || std::holds_alternative<AttackStartedEvent>(payload)
@@ -243,6 +244,22 @@ bool NetworkLobby::sendLocalExitGrid(EntityId exitId, std::uint32_t phaseRevisio
             phaseRevision,
         },
         ExitGridCommand { exitId },
+        phaseRevision);
+}
+
+bool NetworkLobby::sendLocalSceneryTransition(EntityId transitionId, std::uint32_t phaseRevision)
+{
+    PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
+    EntityId actorId { playerId.value };
+    return sendLocalAction(
+        SceneryTransitionedEvent {
+            actorId,
+            transitionId,
+            0,
+            { PlayerTransitionPlacement { playerId, actorId, 0, 0, 0 } },
+            phaseRevision,
+        },
+        SceneryTransitionCommand { transitionId },
         phaseRevision);
 }
 

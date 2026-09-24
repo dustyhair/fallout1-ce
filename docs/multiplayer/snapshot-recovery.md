@@ -39,7 +39,7 @@ The headless recovery test creates a host snapshot with actors and distinct prog
 
 The item section tracks objects registered for live pickup and looting, including player or script-created items introduced through an authoritative transfer. Map-local variables cover the indexed local storage used by map scripts. Timed events encode the six integer values used by drug events, three used by withdrawal, two used by script and radiation events, and no payload for the remaining event types. Script events normalize their unused legacy owner pointer; every other owner-dependent event requires a registered `EntityId`. Unsupported payloads or missing owners fail closed. Interpreter stacks and program counters are not serialized because a network guest never resumes them. Full combat state and dialogue remain outside the recovery snapshot. Once a network guest enters the world, its interpreter background loop, direct script dispatcher, queued-event processor, and pending script requests are suppressed; only the host executes them, and snapshots correct the guest's world time and covered results.
 
-At a shared cross-map elevator or ordinary-exit boundary, Fallout's loader preserves only the
+At a shared cross-map elevator, ordinary-exit, or typed-stair boundary, Fallout's loader preserves only the
 process-local `obj_dude`. The multiplayer bridge detaches the remote actor's
 inventory before the load, recreates that actor afterward, rebinds its existing
 player and entity identity, restores its critter and inventory state, and then

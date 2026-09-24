@@ -31,6 +31,7 @@
 #include "game/textobj.h"
 #include "game/tile.h"
 #include "game/worldmap.h"
+#include "multiplayer/network_world.h"
 #include "platform_compat.h"
 #include "plib/color/color.h"
 #include "plib/gnw/debug.h"
@@ -1224,6 +1225,13 @@ static int map_age_dead_critters()
 int map_leave_map(MapTransition* transition)
 {
     if (transition == NULL) {
+        return -1;
+    }
+
+    if (multiplayer::networkWorldCaptureScriptedMapTransition(*transition)) {
+        return 0;
+    }
+    if (multiplayer::networkWorldActive()) {
         return -1;
     }
 

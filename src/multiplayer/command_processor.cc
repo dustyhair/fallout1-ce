@@ -81,6 +81,7 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     const UseItemOnCommand* itemUse = std::get_if<UseItemOnCommand>(&command.payload);
     const ElevatorCommand* elevator = std::get_if<ElevatorCommand>(&command.payload);
     const ExitGridCommand* exitGrid = std::get_if<ExitGridCommand>(&command.payload);
+    const SceneryTransitionCommand* sceneryTransition = std::get_if<SceneryTransitionCommand>(&command.payload);
     const InventoryTransferCommand* transfer = std::get_if<InventoryTransferCommand>(&command.payload);
     const ItemDropCommand* drop = std::get_if<ItemDropCommand>(&command.payload);
     const AttackCommand* attack = std::get_if<AttackCommand>(&command.payload);
@@ -117,6 +118,12 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
             return rejectAndRemember(CommandRejection::Malformed);
         }
         targetId = exitGrid->exitId;
+        hasTarget = true;
+    } else if (sceneryTransition != nullptr) {
+        if (!isValid(sceneryTransition->transitionId)) {
+            return rejectAndRemember(CommandRejection::Malformed);
+        }
+        targetId = sceneryTransition->transitionId;
         hasTarget = true;
     } else if (attack != nullptr) {
         targetId = attack->targetId;
@@ -230,6 +237,16 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
                 exitExecution.map,
                 std::move(exitExecution.placements),
                 exitExecution.phaseRevision,
+            };
+        } else if (sceneryTransition != nullptr) {
+            SceneryTransitionExecution transitionExecution = executor.useSceneryTransition(actor, target, *sceneryTransition);
+            executionStatus = transitionExecution.status;
+            event.payload = SceneryTransitionedEvent {
+                command.actorId,
+                sceneryTransition->transitionId,
+                transitionExecution.map,
+                std::move(transitionExecution.placements),
+                transitionExecution.phaseRevision,
             };
         } else if (attack != nullptr) {
             executionStatus = executor.attack(actor, target, *attack);

@@ -24,6 +24,7 @@
 #include "game/map_defs.h"
 #include "game/object.h"
 #include "game/protinst.h"
+#include "game/proto.h"
 #include "game/queue.h"
 #include "game/scripts.h"
 #include "game/stat.h"
@@ -62,6 +63,8 @@ std::optional<ActiveSharedModal> activeSharedModal;
 bool inventoryTransferInProgress = false;
 bool itemDropInProgress = false;
 bool itemUseInProgress = false;
+bool scriptedSceneryTransitionInProgress = false;
+std::optional<MapTransition> capturedSceneryMapTransition;
 NetworkLaunchMode worldMode = NetworkLaunchMode::Disabled;
 EntityId expectedSplitEntityId;
 EntityId lastSplitEntityId;
@@ -79,6 +82,21 @@ bool isExitGrid(const Object* object)
         && FID_TYPE(object->fid) == OBJ_TYPE_MISC
         && object->pid >= PROTO_ID_0x5000010
         && object->pid <= PROTO_ID_0x5000017;
+}
+
+bool sceneryTransitionType(const Object* object, int& sceneryType)
+{
+    if (object == nullptr || FID_TYPE(object->fid) != OBJ_TYPE_SCENERY) {
+        return false;
+    }
+    Proto* proto = nullptr;
+    if (proto_ptr(object->pid, &proto) == -1) {
+        return false;
+    }
+    sceneryType = proto->scenery.type;
+    return sceneryType == SCENERY_TYPE_STAIRS
+        || sceneryType == SCENERY_TYPE_LADDER_UP
+        || sceneryType == SCENERY_TYPE_LADDER_DOWN;
 }
 
 bool exitGridDestination(const Object* exitGrid,
@@ -908,6 +926,152 @@ public:
 
         execution.status = CommandExecutionStatus::Applied;
         execution.map = destinationMap;
+        for (PlayerId playerId : { kHostPlayerId, kGuestPlayerId }) {
+            EntityId actorId = session.playerActorId(playerId);
+            Object* playerActor = session.entities().findObject(actorId);
+            execution.placements.push_back(PlayerTransitionPlacement {
+                playerId,
+                actorId,
+                playerActor->tile,
+                playerActor->elevation,
+                playerActor->rotation,
+            });
+        }
+        execution.phaseRevision = session.phaseRevision();
+        return execution;
+    }
+
+    SceneryTransitionExecution useSceneryTransition(Object* actor,
+        Object* target,
+        const SceneryTransitionCommand&) override
+    {
+        SceneryTransitionExecution execution;
+        PlayerCharacterState* actingPlayer = session.players().findByActor(
+            session.entities().findEntity(actor).value_or(EntityId {}));
+        Object* host = session.entities().findObject(session.playerActorId(kHostPlayerId));
+        Object* guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+        Object* companion = actor == host ? guest : host;
+        int sceneryType = -1;
+        if (isInCombat()
+            || actor == nullptr
+            || actingPlayer == nullptr
+            || host == nullptr
+            || guest == nullptr
+            || companion == nullptr
+            || (actor != host && actor != guest)
+            || !sceneryTransitionType(target, sceneryType)
+            || actor->elevation != target->elevation
+            || tile_dist(actor->tile, target->tile) > 4
+            || session.phase() != SessionPhase::Exploration) {
+            return execution;
+        }
+        bool companionReady = companion->elevation == target->elevation
+            && tile_dist(companion->tile, target->tile) <= 4;
+        int sourceMap = map_data.field_34;
+        int declaredDestinationMap = sceneryType == SCENERY_TYPE_STAIRS
+            ? target->data.scenery.stairs.destinationMap
+            : sourceMap;
+        if (declaredDestinationMap > 0
+            && declaredDestinationMap != sourceMap
+            && !companionReady) {
+            return execution;
+        }
+
+        int oldHostTile = host->tile;
+        int oldHostElevation = host->elevation;
+        int oldHostRotation = host->rotation;
+        int oldGuestTile = guest->tile;
+        int oldGuestElevation = guest->elevation;
+        int oldGuestRotation = guest->rotation;
+        int oldMapElevation = map_elevation;
+        capturedSceneryMapTransition.reset();
+        scriptedSceneryTransitionInProgress = true;
+        int useResult = obj_use(actor, target);
+        scriptedSceneryTransitionInProgress = false;
+        std::optional<MapTransition> requestedTransition = capturedSceneryMapTransition;
+        capturedSceneryMapTransition.reset();
+        if (useResult == -1) {
+            return execution;
+        }
+
+        if (requestedTransition.has_value()) {
+            if (requestedTransition->map <= 0
+                || requestedTransition->map == sourceMap
+                || !companionReady
+                || session.transitionTo(SessionPhase::Transition) != LocalSessionError::None
+                || !loadSharedMap(requestedTransition->map)) {
+                return execution;
+            }
+            host = session.entities().findObject(session.playerActorId(kHostPlayerId));
+            guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+            Object* actingReplacement = session.entities().findObject(session.playerActorId(actingPlayer->id));
+            companion = actingReplacement == host ? guest : host;
+            int destinationTile = requestedTransition->tile;
+            int destinationElevation = requestedTransition->elevation;
+            int destinationRotation = requestedTransition->rotation;
+            if (!hexGridTileIsValid(destinationTile) || !elevationIsValid(destinationElevation)) {
+                destinationTile = host != nullptr ? host->tile : -1;
+                destinationElevation = host != nullptr ? host->elevation : -1;
+            }
+            if (destinationRotation < 0 || destinationRotation >= ROTATION_COUNT) {
+                destinationRotation = host != nullptr ? host->rotation : ROTATION_SE;
+            }
+            bool loaded = host != nullptr
+                && guest != nullptr
+                && actingReplacement != nullptr
+                && companion != nullptr
+                && map_data.field_34 == requestedTransition->map
+                && obj_attempt_placement(actingReplacement, destinationTile, destinationElevation, 0) != -1
+                && obj_attempt_placement(companion, destinationTile, destinationElevation, 2) != -1
+                && (host->elevation != guest->elevation || host->tile != guest->tile)
+                && obj_set_rotation(host, destinationRotation, nullptr) == 0
+                && obj_set_rotation(guest, destinationRotation, nullptr) == 0;
+            Object* localActor = localPlayerActor();
+            loaded = loaded
+                && localActor != nullptr
+                && map_set_elevation(localActor->elevation) == 0
+                && registerWorldObjects()
+                && session.transitionTo(SessionPhase::Exploration) == LocalSessionError::None;
+            if (!loaded) {
+                return execution;
+            }
+            execution.map = requestedTransition->map;
+        } else {
+            Object* independentCompanion = actor == host ? guest : host;
+            int companionTile = actor == host ? oldGuestTile : oldHostTile;
+            int companionElevation = actor == host ? oldGuestElevation : oldHostElevation;
+            int companionRotation = actor == host ? oldGuestRotation : oldHostRotation;
+            bool companionRestored = obj_move_to_tile(
+                                         independentCompanion,
+                                         companionTile,
+                                         companionElevation,
+                                         nullptr)
+                    != -1
+                && obj_set_rotation(independentCompanion, companionRotation, nullptr) == 0;
+            bool moved = actor->tile != (actor == host ? oldHostTile : oldGuestTile)
+                || actor->elevation != (actor == host ? oldHostElevation : oldGuestElevation);
+            Object* localActor = localPlayerActor();
+            bool applied = companionRestored
+                && moved
+                && localActor != nullptr
+                && (localActor->elevation == map_elevation || map_set_elevation(localActor->elevation) == 0)
+                && session.transitionTo(SessionPhase::Transition) == LocalSessionError::None
+                && session.transitionTo(SessionPhase::Exploration) == LocalSessionError::None;
+            if (!applied) {
+                obj_move_to_tile(host, oldHostTile, oldHostElevation, nullptr);
+                obj_move_to_tile(guest, oldGuestTile, oldGuestElevation, nullptr);
+                obj_set_rotation(host, oldHostRotation, nullptr);
+                obj_set_rotation(guest, oldGuestRotation, nullptr);
+                map_set_elevation(oldMapElevation);
+                if (session.phase() == SessionPhase::Transition) {
+                    session.transitionTo(SessionPhase::Exploration);
+                }
+                return execution;
+            }
+            execution.map = sourceMap;
+        }
+
+        execution.status = CommandExecutionStatus::Applied;
         for (PlayerId playerId : { kHostPlayerId, kGuestPlayerId }) {
             EntityId actorId = session.playerActorId(playerId);
             Object* playerActor = session.entities().findObject(actorId);
@@ -1798,6 +1962,66 @@ bool networkWorldApplyPeerExitGrid(const ExitGridTransitionedEvent& exitGrid)
     return applied;
 }
 
+bool networkWorldApplyPeerSceneryTransition(const SceneryTransitionedEvent& transition)
+{
+    Object* source = session.entities().findObject(transition.transitionId);
+    PlayerCharacterState* actingPlayer = session.players().findByActor(transition.actorId);
+    Object* actingActor = actingPlayer != nullptr
+        ? session.entities().findObject(actingPlayer->actorId)
+        : nullptr;
+    int sceneryType = -1;
+    bool mapChanged = transition.map != map_data.field_34;
+    if (!session.isActive()
+        || source == nullptr
+        || actingActor == nullptr
+        || !sceneryTransitionType(source, sceneryType)
+        || transition.phaseRevision < 2
+        || transition.placements.size() != session.players().size()
+        || session.applyAuthoritativePhase(SessionPhase::Transition, transition.phaseRevision - 1) != LocalSessionError::None
+        || (mapChanged && !loadSharedMap(transition.map))) {
+        return false;
+    }
+
+    std::unordered_set<PlayerId, PlayerIdHash> appliedPlayers;
+    for (const PlayerTransitionPlacement& placement : transition.placements) {
+        Object* actor = session.entities().findObject(placement.actorId);
+        if (session.playerActorId(placement.playerId) != placement.actorId
+            || actor == nullptr
+            || !appliedPlayers.insert(placement.playerId).second
+            || obj_move_to_tile(actor, placement.tile, placement.elevation, nullptr) == -1
+            || obj_set_rotation(actor, placement.rotation, nullptr) == -1) {
+            return false;
+        }
+    }
+
+    Object* localActor = localPlayerActor();
+    return appliedPlayers.size() == session.players().size()
+        && localActor != nullptr
+        && map_set_elevation(localActor->elevation) == 0
+        && (!mapChanged || registerWorldObjects())
+        && session.applyAuthoritativePhase(SessionPhase::Exploration, transition.phaseRevision) == LocalSessionError::None;
+}
+
+bool networkWorldCaptureScriptedMapTransition(const MapTransition& transition)
+{
+    if (!scriptedSceneryTransitionInProgress) {
+        return false;
+    }
+    // A script may request departure more than once. Keep the first request
+    // authoritative and prevent later requests from reaching local map state.
+    if (!capturedSceneryMapTransition.has_value()) {
+        capturedSceneryMapTransition = transition;
+    }
+    return true;
+}
+
+Object* networkWorldScriptedSceneryTransitionActor(Object* requestedActor)
+{
+    return scriptedSceneryTransitionInProgress && requestedActor == obj_dude
+        ? actingPlayerActorOr(requestedActor)
+        : requestedActor;
+}
+
 bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts)
 {
     counts = {};
@@ -2640,6 +2864,106 @@ bool networkWorldVerifyExitGridSmokeTest(const ExitGridSmokeFixture& fixture)
         && capsRegistered
         && item_caps_total(guest) == fixture.guestCaps
         && map_elevation == fixture.destinationElevation;
+}
+
+std::optional<SceneryTransitionSmokeFixture> networkWorldPrepareSceneryTransitionSmokeTest()
+{
+    if (!session.isActive()) {
+        return std::nullopt;
+    }
+    Object* host = session.entities().findObject(session.playerActorId(kHostPlayerId));
+    Object* guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+    if (host == nullptr || guest == nullptr) {
+        return std::nullopt;
+    }
+
+    anim_stop();
+    for (const auto& entry : worldScenery) {
+        Object* transition = entry.second;
+        int sceneryType = -1;
+        if (!sceneryTransitionType(transition, sceneryType)
+            || (sceneryType != SCENERY_TYPE_LADDER_UP
+                && sceneryType != SCENERY_TYPE_LADDER_DOWN)
+            || transition->sid == -1) {
+            continue;
+        }
+        bool guestPlaced = false;
+        for (int rotation = 0; rotation < ROTATION_COUNT && !guestPlaced; rotation++) {
+            int tile = tile_num_in_direction(transition->tile, rotation, 1);
+            guestPlaced = hexGridTileIsValid(tile)
+                && obj_blocking_at(guest, tile, transition->elevation) == nullptr
+                && obj_move_to_tile(guest, tile, transition->elevation, nullptr) == 0;
+        }
+        bool hostRemote = false;
+        for (int distance = 5; distance <= 8 && !hostRemote; distance++) {
+            for (int rotation = 0; rotation < ROTATION_COUNT && !hostRemote; rotation++) {
+                int tile = tile_num_in_direction(transition->tile, rotation, distance);
+                hostRemote = hexGridTileIsValid(tile)
+                    && obj_blocking_at(host, tile, transition->elevation) == nullptr
+                    && obj_move_to_tile(host, tile, transition->elevation, nullptr) == 0;
+            }
+        }
+        if (!guestPlaced
+            || !hostRemote
+            || obj_set_rotation(host, ROTATION_SE, nullptr) == -1
+            || obj_set_rotation(guest, ROTATION_SE, nullptr) == -1) {
+            continue;
+        }
+        return SceneryTransitionSmokeFixture {
+            entry.first,
+            map_data.field_34,
+            host->tile,
+            host->elevation,
+            host->rotation,
+            guest->tile,
+            guest->elevation,
+            session.playerActorId(kHostPlayerId),
+            session.playerActorId(kGuestPlayerId),
+        };
+    }
+    return std::nullopt;
+}
+
+bool networkWorldVerifySceneryTransitionSmokeTest(const SceneryTransitionSmokeFixture& fixture)
+{
+    Object* host = session.entities().findObject(fixture.hostActorId);
+    Object* guest = session.entities().findObject(fixture.guestActorId);
+    Object* localActor = localPlayerActor();
+    bool verified = session.isActive()
+        && session.playerActorId(kHostPlayerId) == fixture.hostActorId
+        && session.playerActorId(kGuestPlayerId) == fixture.guestActorId
+        && host != nullptr
+        && guest != nullptr
+        && localActor != nullptr
+        && map_data.field_34 == fixture.map
+        && session.phase() == SessionPhase::Exploration
+        && host->tile == fixture.hostTile
+        && host->elevation == fixture.hostElevation
+        && host->rotation == fixture.hostRotation
+        && (guest->tile != fixture.guestStartingTile
+            || guest->elevation != fixture.guestStartingElevation)
+        && (host->tile != guest->tile || host->elevation != guest->elevation)
+        && map_elevation == localActor->elevation;
+    if (!verified) {
+        std::fprintf(stderr,
+            "Multiplayer scenery transition fixture failed: map=%d/%d host=%d,%d,%d/%d,%d,%d guest=%d,%d/%d,%d local_elevation=%d/%d phase=%d.\n",
+            map_data.field_34,
+            fixture.map,
+            host != nullptr ? host->tile : -1,
+            host != nullptr ? host->elevation : -1,
+            host != nullptr ? host->rotation : -1,
+            fixture.hostTile,
+            fixture.hostElevation,
+            fixture.hostRotation,
+            guest != nullptr ? guest->tile : -1,
+            guest != nullptr ? guest->elevation : -1,
+            fixture.guestStartingTile,
+            fixture.guestStartingElevation,
+            map_elevation,
+            localActor != nullptr ? localActor->elevation : -1,
+            static_cast<int>(session.phase()));
+    }
+    return verified;
 }
 
 bool networkWorldVerifyLootRangeSmokeTest(EntityId targetId)
@@ -3841,6 +4165,8 @@ void networkWorldLeave()
     activeSharedModal.reset();
     itemDropInProgress = false;
     itemUseInProgress = false;
+    scriptedSceneryTransitionInProgress = false;
+    capturedSceneryMapTransition.reset();
     expectedSplitEntityId = {};
     lastSplitEntityId = {};
     worldMode = NetworkLaunchMode::Disabled;

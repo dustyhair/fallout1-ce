@@ -21,6 +21,7 @@ enum class AgentControlCommandType {
     GameUseItem,
     GameElevator,
     GameExit,
+    GameStairs,
     GameGive,
 };
 

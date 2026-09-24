@@ -53,10 +53,13 @@ These are explicit follow-up work, not reasons to overload `obj_dude`:
 - Dialogue execution and voting remain Phase 5. The talker-dependent stat and
   reaction seams are ready, but shared dialogue is still blocked by the modal
   phase guard.
-- Shared cross-map elevator and ordinary-exit boundaries now preserve
+- Shared cross-map elevator and ordinary-exit boundaries preserve
   `obj_dude` as the local story actor and recreate and rebind the remote actor.
-  Scenery stairs and ladders and world-map travel remain Phase 3B work and must
-  use that coordinated seam.
+  Typed-stair cross-map travel uses that bridge but still needs a dedicated
+  fixture. Same-map ladder scripts redirect legacy protagonist movement and
+  rotation to the scoped acting player while preserving every other player's
+  placement. World-map travel remains Phase 3B work and must use the
+  coordinated seam.
 - Combat-only animation, action-point, and equipment assumptions remain part
   of Phase 4 unless they are also reached by an exploration interaction.
 
