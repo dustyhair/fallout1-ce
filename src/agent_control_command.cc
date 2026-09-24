@@ -296,6 +296,73 @@ bool agentControlParseCommand(const std::string& line,
         }
         return true;
     }
+    if (verb == "game_attack") {
+        command.type = AgentControlCommandType::GameAttack;
+        if (!(input >> command.entityId >> command.hitMode)
+            || command.entityId == 0 || command.hitMode < 0
+            || command.hitMode >= 20 || command.hitMode == 6
+            || command.hitMode == 7) {
+            error = "expected: game_attack <target_id> <hit_mode_0_to_19> [location_0_to_8]";
+            return false;
+        }
+        std::string location;
+        if (input >> location) {
+            std::istringstream parsed(location);
+            if (!(parsed >> command.hitLocation) || hasTrailingInput(parsed)
+                || hasTrailingInput(input)) {
+                error = "game_attack requires one numeric location from 0 through 8";
+                return false;
+            }
+        }
+        if (command.hitLocation < 0 || command.hitLocation > 8) {
+            error = "game_attack location must be 0 through 8";
+            return false;
+        }
+        return true;
+    }
+    if (verb == "game_reload") {
+        command.type = AgentControlCommandType::GameReload;
+        std::string hand;
+        if (!(input >> command.entityId >> hand) || hasTrailingInput(input)
+            || command.entityId == 0 || (hand != "left" && hand != "right")) {
+            error = "expected: game_reload <weapon_id> <left|right>";
+            return false;
+        }
+        command.hitMode = hand == "left" ? 6 : 7;
+        return true;
+    }
+    if (verb == "game_combat_item") {
+        command.type = AgentControlCommandType::GameCombatItem;
+        std::uint64_t item = 0;
+        std::uint64_t target = 0;
+        std::string targetToken;
+        if (!(input >> item) || item == 0
+            || item > std::numeric_limits<std::uint32_t>::max()) {
+            error = "expected: game_combat_item <item_id> [target_id]";
+            return false;
+        }
+        if (input >> targetToken) {
+            std::istringstream parsed(targetToken);
+            if (!(parsed >> target) || hasTrailingInput(parsed)
+                || target == 0 || target == item
+                || target > std::numeric_limits<std::uint32_t>::max()
+                || hasTrailingInput(input)) {
+                error = "game_combat_item requires a distinct target entity ID";
+                return false;
+            }
+        }
+        command.entityId = static_cast<std::uint32_t>(item);
+        command.destinationEntityId = static_cast<std::uint32_t>(target);
+        return true;
+    }
+    if (verb == "game_end_turn") {
+        command.type = AgentControlCommandType::GameEndTurn;
+        if (hasTrailingInput(input)) {
+            error = "game_end_turn takes no arguments";
+            return false;
+        }
+        return true;
+    }
     if (verb == "game_door") {
         command.type = AgentControlCommandType::GameDoor;
         return parseEntityId(input, command, error);
@@ -405,6 +472,14 @@ const char* agentControlCommandTypeName(AgentControlCommandType type)
         return "game_rest";
     case AgentControlCommandType::GameGive:
         return "game_give";
+    case AgentControlCommandType::GameAttack:
+        return "game_attack";
+    case AgentControlCommandType::GameReload:
+        return "game_reload";
+    case AgentControlCommandType::GameCombatItem:
+        return "game_combat_item";
+    case AgentControlCommandType::GameEndTurn:
+        return "game_end_turn";
     }
     return "unknown";
 }

@@ -59,6 +59,34 @@ int main()
             && command.rotation == 5,
         "parses a semantic facing command")
         && passed;
+    passed = expect(parse("47 game_attack 82 0 8", command)
+            && command.type == fallout::AgentControlCommandType::GameAttack
+            && command.entityId == 82 && command.hitMode == 0
+            && command.hitLocation == 8,
+        "parses a semantic combat attack")
+        && passed;
+    passed = expect(!parse("47 game_attack 82 6", command)
+            && !parse("47 game_attack 82 0 bogus", command),
+        "rejects reload mode and malformed attack location")
+        && passed;
+    passed = expect(parse("47 game_reload 90 right", command)
+            && command.type == fallout::AgentControlCommandType::GameReload
+            && command.hitMode == 7,
+        "parses a semantic combat reload")
+        && passed;
+    passed = expect(parse("47 game_combat_item 91", command)
+            && command.type == fallout::AgentControlCommandType::GameCombatItem
+            && command.entityId == 91 && command.destinationEntityId == 0,
+        "parses a semantic combat item use")
+        && passed;
+    passed = expect(parse("47 game_combat_item 91 82", command)
+            && command.entityId == 91 && command.destinationEntityId == 82,
+        "parses a targeted combat item use")
+        && passed;
+    passed = expect(parse("47 game_end_turn", command)
+            && command.type == fallout::AgentControlCommandType::GameEndTurn,
+        "parses a semantic combat end turn")
+        && passed;
     passed = expect(parse("48 game_pickup 77", command)
             && command.type == fallout::AgentControlCommandType::GamePickup
             && command.entityId == 77,

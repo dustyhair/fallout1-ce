@@ -18,19 +18,18 @@ constexpr std::size_t kCharacterBuildValueCount = SAVEABLE_STAT_COUNT * 2
     + PC_TRAIT_MAX
     + 4;
 constexpr std::size_t kCharacterBuildSnapshotSize = kCharacterBuildValueCount * sizeof(std::uint32_t);
-constexpr std::size_t kActorSnapshotSize = 32 + kCharacterBuildSnapshotSize;
-constexpr std::size_t kCritterSnapshotSize = 36;
+constexpr std::size_t kActorSnapshotSize = 68 + kCharacterBuildSnapshotSize;
+constexpr std::size_t kCritterSnapshotSize = 68;
 constexpr std::size_t kDoorSnapshotSize = 12;
 constexpr std::size_t kScenerySnapshotSize = 48;
 constexpr std::size_t kItemSnapshotSize = 56;
 constexpr std::size_t kTimedEventSnapshotSize = 36;
 constexpr std::size_t kWorldMapSnapshotSize = 31 * 29 + 15 * 7 + 6 * sizeof(std::uint32_t);
 constexpr std::size_t kWorldMapTravelSnapshotSize = 20 + 14 * sizeof(std::uint32_t);
-constexpr std::size_t kCombatStateBaseSize = 28;
+constexpr std::size_t kCombatStateBaseSize = 32;
 constexpr std::size_t kSnapshotProtectedOffset = 20;
 constexpr std::uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
 constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
-constexpr std::uint32_t kSharedObjectFlagMask = 0xB70FF839;
 
 void appendUint8(std::vector<std::uint8_t>& bytes, std::uint8_t value)
 {
@@ -185,6 +184,15 @@ void appendActor(std::vector<std::uint8_t>& bytes, const ActorSnapshot& actor)
     appendUint32(bytes, static_cast<std::uint32_t>(actor.hitPoints));
     appendUint32(bytes, static_cast<std::uint32_t>(actor.actionPoints));
     appendUint32(bytes, static_cast<std::uint32_t>(actor.combatResults));
+    appendUint32(bytes, static_cast<std::uint32_t>(actor.fid));
+    appendUint32(bytes, static_cast<std::uint32_t>(actor.frame));
+    appendUint32(bytes, actor.objectFlags);
+    appendUint32(bytes, static_cast<std::uint32_t>(actor.lightDistance));
+    appendUint32(bytes, static_cast<std::uint32_t>(actor.lightIntensity));
+    appendUint32(bytes, static_cast<std::uint32_t>(actor.combatManeuver));
+    appendUint32(bytes, static_cast<std::uint32_t>(actor.damageLastTurn));
+    appendUint32(bytes, static_cast<std::uint32_t>(actor.team));
+    appendUint32(bytes, actor.whoHitMeId.value);
     for (std::int32_t value : actor.build.baseStats) {
         appendUint32(bytes, static_cast<std::uint32_t>(value));
     }
@@ -301,6 +309,14 @@ void appendCritter(std::vector<std::uint8_t>& bytes, const CritterSnapshot& crit
     appendUint32(bytes, static_cast<std::uint32_t>(critter.actionPoints));
     appendUint32(bytes, static_cast<std::uint32_t>(critter.combatResults));
     appendUint32(bytes, static_cast<std::uint32_t>(critter.team));
+    appendUint32(bytes, static_cast<std::uint32_t>(critter.fid));
+    appendUint32(bytes, static_cast<std::uint32_t>(critter.frame));
+    appendUint32(bytes, critter.objectFlags);
+    appendUint32(bytes, static_cast<std::uint32_t>(critter.lightDistance));
+    appendUint32(bytes, static_cast<std::uint32_t>(critter.lightIntensity));
+    appendUint32(bytes, static_cast<std::uint32_t>(critter.combatManeuver));
+    appendUint32(bytes, static_cast<std::uint32_t>(critter.damageLastTurn));
+    appendUint32(bytes, critter.whoHitMeId.value);
 }
 
 void appendItem(std::vector<std::uint8_t>& bytes, const ItemSnapshot& item)
@@ -374,6 +390,11 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
         return SnapshotError::InvalidPhaseRevision;
     }
     if (!isValidCombatTurnState(snapshot.combat, snapshot.phase)) {
+        return SnapshotError::InvalidCombatState;
+    }
+    if (snapshot.combatFreeMove < 0 || snapshot.combatFreeMove > 100
+        || (snapshot.phase != SessionPhase::Combat
+            && snapshot.combatFreeMove != 0)) {
         return SnapshotError::InvalidCombatState;
     }
     if (snapshot.gameTime <= 0) {
@@ -467,7 +488,11 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
             || actor.elevation < 0 || actor.elevation > 2
             || actor.rotation < 0 || actor.rotation > 5
             || actor.hitPoints < 0
-            || actor.actionPoints < 0) {
+            || actor.actionPoints < 0
+            || actor.fid < 0
+            || actor.frame < 0
+            || (actor.objectFlags & ~kSharedObjectFlagMask) != 0
+            || actor.lightDistance < 0 || actor.lightDistance > 8) {
             return SnapshotError::InvalidActorState;
         }
     }
@@ -482,7 +507,24 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
             || critter.elevation < 0 || critter.elevation > 2
             || critter.rotation < 0 || critter.rotation > 5
             || critter.hitPoints < 0
-            || critter.actionPoints < 0) {
+            || critter.actionPoints < 0
+            || critter.fid < 0
+            || critter.frame < 0
+            || (critter.objectFlags & ~kSharedObjectFlagMask) != 0
+            || critter.lightDistance < 0 || critter.lightDistance > 8) {
+            return SnapshotError::InvalidCritterState;
+        }
+    }
+
+    for (const ActorSnapshot& actor : snapshot.actors) {
+        if (isValid(actor.whoHitMeId)
+            && entityIds.find(actor.whoHitMeId.value) == entityIds.end()) {
+            return SnapshotError::InvalidActorState;
+        }
+    }
+    for (const CritterSnapshot& critter : snapshot.critters) {
+        if (isValid(critter.whoHitMeId)
+            && entityIds.find(critter.whoHitMeId.value) == entityIds.end()) {
             return SnapshotError::InvalidCritterState;
         }
     }
@@ -669,6 +711,7 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
     appendWorldMap(payload, canonical.worldMap);
     appendWorldMapTravel(payload, canonical.worldMapTravel);
     appendCombatTurnState(payload, canonical.combat);
+    appendUint32(payload, static_cast<std::uint32_t>(canonical.combatFreeMove));
 
     std::vector<std::uint8_t> protectedBytes;
     protectedBytes.reserve(sizeof(std::uint64_t) + payload.size());
@@ -803,7 +846,7 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
         return result;
     }
     std::size_t combatCountOffset = kSnapshotHeaderSize
-        + expectedPayloadSize - sizeof(std::uint32_t);
+        + expectedPayloadSize - 2 * sizeof(std::uint32_t);
     std::uint32_t combatCount = readUint32(packet, combatCountOffset);
     if (combatCount > kMaximumCombatInitiative
         || payloadSize != expectedPayloadSize + static_cast<std::size_t>(combatCount) * 8) {
@@ -822,6 +865,15 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
         actor.hitPoints = static_cast<std::int32_t>(readUint32(packet, offset));
         actor.actionPoints = static_cast<std::int32_t>(readUint32(packet, offset));
         actor.combatResults = static_cast<std::int32_t>(readUint32(packet, offset));
+        actor.fid = static_cast<std::int32_t>(readUint32(packet, offset));
+        actor.frame = static_cast<std::int32_t>(readUint32(packet, offset));
+        actor.objectFlags = readUint32(packet, offset);
+        actor.lightDistance = static_cast<std::int32_t>(readUint32(packet, offset));
+        actor.lightIntensity = static_cast<std::int32_t>(readUint32(packet, offset));
+        actor.combatManeuver = static_cast<std::int32_t>(readUint32(packet, offset));
+        actor.damageLastTurn = static_cast<std::int32_t>(readUint32(packet, offset));
+        actor.team = static_cast<std::int32_t>(readUint32(packet, offset));
+        actor.whoHitMeId.value = readUint32(packet, offset);
         readCharacterBuild(packet, offset, actor.build);
         result.snapshot.actors.push_back(actor);
     }
@@ -838,6 +890,14 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
         critter.actionPoints = static_cast<std::int32_t>(readUint32(packet, offset));
         critter.combatResults = static_cast<std::int32_t>(readUint32(packet, offset));
         critter.team = static_cast<std::int32_t>(readUint32(packet, offset));
+        critter.fid = static_cast<std::int32_t>(readUint32(packet, offset));
+        critter.frame = static_cast<std::int32_t>(readUint32(packet, offset));
+        critter.objectFlags = readUint32(packet, offset);
+        critter.lightDistance = static_cast<std::int32_t>(readUint32(packet, offset));
+        critter.lightIntensity = static_cast<std::int32_t>(readUint32(packet, offset));
+        critter.combatManeuver = static_cast<std::int32_t>(readUint32(packet, offset));
+        critter.damageLastTurn = static_cast<std::int32_t>(readUint32(packet, offset));
+        critter.whoHitMeId.value = readUint32(packet, offset);
         result.snapshot.critters.push_back(critter);
     }
 
@@ -976,6 +1036,7 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
             PlayerId { readUint32(packet, offset) },
         });
     }
+    result.snapshot.combatFreeMove = static_cast<std::int32_t>(readUint32(packet, offset));
 
     result.error = validateSnapshot(result.snapshot);
     if (result.error == SnapshotError::None) {
@@ -1005,6 +1066,7 @@ SnapshotDigestResult computeSnapshotDigest(const WorldSnapshot& snapshot)
     // authoritative identity/order/revision, not the UI countdown, is state.
     digestCombat.remainingMilliseconds = 0;
     appendCombatTurnState(sessionBytes, digestCombat);
+    appendUint32(sessionBytes, static_cast<std::uint32_t>(canonical.combatFreeMove));
     result.digest.session = digestBytes(sessionBytes);
 
     std::vector<std::uint8_t> actorBytes;

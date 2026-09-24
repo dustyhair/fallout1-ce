@@ -119,6 +119,22 @@ public:
     {
         return CommandExecutionStatus::InvalidAction;
     }
+    virtual CommandExecutionStatus combatMove(Object*, const CombatMoveCommand&)
+    {
+        return CommandExecutionStatus::InvalidAction;
+    }
+    virtual CommandExecutionStatus combatItem(Object*, const CombatItemCommand&)
+    {
+        return CommandExecutionStatus::InvalidAction;
+    }
+    virtual CommandExecutionStatus combatReload(Object*, const CombatReloadCommand&)
+    {
+        return CommandExecutionStatus::InvalidAction;
+    }
+    virtual CommandExecutionStatus combatFace(Object*, const CombatFaceCommand&)
+    {
+        return CommandExecutionStatus::InvalidAction;
+    }
     virtual EndTurnExecution endTurn(Object*, PlayerId, const EndTurnCommand&)
     {
         return {};

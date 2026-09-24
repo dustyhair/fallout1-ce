@@ -24,6 +24,10 @@ enum class AgentControlCommandType {
     GameStairs,
     GameRest,
     GameGive,
+    GameAttack,
+    GameReload,
+    GameCombatItem,
+    GameEndTurn,
 };
 
 struct AgentControlCommand {
@@ -35,6 +39,8 @@ struct AgentControlCommand {
     int tile = -1;
     int elevation = -1;
     int rotation = -1;
+    int hitMode = -1;
+    int hitLocation = 8;
     int skill = -1;
     int elevatorType = -1;
     int elevatorLevel = -1;

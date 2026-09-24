@@ -287,6 +287,43 @@ struct AttackCommand {
     EntityId targetId;
     std::int32_t hitMode = 0;
     std::int32_t hitLocation = 0;
+    std::uint64_t turnRevision = 0;
+};
+
+enum class CombatActionKind : std::uint8_t {
+    Move = 1,
+    UseItem = 2,
+    Reload = 3,
+    Face = 4,
+};
+
+constexpr bool isValid(CombatActionKind kind)
+{
+    return kind >= CombatActionKind::Move && kind <= CombatActionKind::Face;
+}
+
+struct CombatMoveCommand {
+    std::uint64_t turnRevision = 0;
+    std::int32_t destinationTile = -1;
+    std::int32_t elevation = -1;
+    bool running = false;
+};
+
+struct CombatItemCommand {
+    std::uint64_t turnRevision = 0;
+    EntityId itemId;
+    EntityId targetId; // Empty for self-use.
+};
+
+struct CombatReloadCommand {
+    std::uint64_t turnRevision = 0;
+    EntityId weaponId;
+    std::int32_t hitMode = 0;
+};
+
+struct CombatFaceCommand {
+    std::uint64_t turnRevision = 0;
+    std::int32_t rotation = 0;
 };
 
 // A player may end only the combat turn identified by this revision. Combat
@@ -317,7 +354,7 @@ constexpr bool isValid(const WorldMapRouteCommand& route)
             && route.targetY >= 0 && route.targetY < kWorldMapHeight;
 }
 
-using GameCommandPayload = std::variant<MoveCommand, FaceCommand, InteractCommand, PickupCommand, LootCommand, UseSkillCommand, UseItemOnCommand, ElevatorCommand, ExitGridCommand, SceneryTransitionCommand, RestCommand, InventoryTransferCommand, ItemDropCommand, AttackCommand, EndTurnCommand, SharedModalCommand, WorldMapRouteCommand>;
+using GameCommandPayload = std::variant<MoveCommand, FaceCommand, InteractCommand, PickupCommand, LootCommand, UseSkillCommand, UseItemOnCommand, ElevatorCommand, ExitGridCommand, SceneryTransitionCommand, RestCommand, InventoryTransferCommand, ItemDropCommand, AttackCommand, CombatMoveCommand, CombatItemCommand, CombatReloadCommand, CombatFaceCommand, EndTurnCommand, SharedModalCommand, WorldMapRouteCommand>;
 
 struct GameCommand {
     CommandSequence sequence;
@@ -527,6 +564,32 @@ struct CombatTurnStateChangedEvent {
     CombatTurnState state;
 };
 
+// Effects are committed by the immediately following authoritative state
+// checkpoint. The guest does not acknowledge this event before applying it.
+struct CombatActionResolvedEvent {
+    EntityId actorId;
+    CombatActionKind kind = CombatActionKind::Move;
+    EntityId subjectId;
+    std::uint64_t turnRevision = 0;
+    std::uint32_t phaseRevision = 0;
+};
+
+struct PlayerProgressionResult {
+    PlayerId playerId;
+    EntityId actorId;
+    std::int32_t experience = 0;
+    std::int32_t level = 1;
+    std::int32_t unspentSkillPoints = 0;
+};
+
+// The host has already applied the XP and level-up rules. A following state
+// checkpoint carries the complete build; this event attributes the award.
+struct PartyExperienceAwardedEvent {
+    EntityId actorId; // Host/system origin; player results remain roster-keyed.
+    std::int32_t amount = 0;
+    std::vector<PlayerProgressionResult> players;
+};
+
 struct SharedModalStateChangedEvent {
     EntityId actorId;
     SharedModalKind kind = SharedModalKind::Dialogue;
@@ -542,7 +605,7 @@ struct WorldMapRouteSelectedEvent {
     bool clear = false;
 };
 
-using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, ItemPickupCompletedEvent, LootStartedEvent, SkillUseStartedEvent, ItemUseStartedEvent, ElevatorTransitionedEvent, ExitGridTransitionedEvent, SceneryTransitionedEvent, RestStateChangedEvent, InventoryTransferredEvent, ItemDroppedEvent, AttackStartedEvent, CombatTurnStateChangedEvent, SharedModalStateChangedEvent, WorldMapRouteSelectedEvent, WorldMapArrivedEvent>;
+using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, ItemPickupCompletedEvent, LootStartedEvent, SkillUseStartedEvent, ItemUseStartedEvent, ElevatorTransitionedEvent, ExitGridTransitionedEvent, SceneryTransitionedEvent, RestStateChangedEvent, InventoryTransferredEvent, ItemDroppedEvent, AttackStartedEvent, CombatTurnStateChangedEvent, CombatActionResolvedEvent, PartyExperienceAwardedEvent, SharedModalStateChangedEvent, WorldMapRouteSelectedEvent, WorldMapArrivedEvent>;
 
 struct GameEvent {
     EventSequence sequence;

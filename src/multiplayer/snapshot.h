@@ -14,7 +14,7 @@ namespace fallout {
 namespace multiplayer {
 
 constexpr std::uint32_t kSnapshotMagic = 0x46434D53;
-constexpr std::uint16_t kSnapshotVersion = 13;
+constexpr std::uint16_t kSnapshotVersion = 15;
 constexpr std::size_t kSnapshotHeaderSize = 28;
 constexpr std::size_t kMaxSnapshotPayloadSize = 512 * 1024;
 constexpr std::size_t kMaxSnapshotActors = 16;
@@ -25,6 +25,7 @@ constexpr std::size_t kMaxSnapshotItems = 4096;
 constexpr std::size_t kMaxSnapshotVariables = 8192;
 constexpr std::size_t kMaxSnapshotTimedEvents = 1024;
 constexpr std::size_t kMaxTimedEventPayloadValues = 6;
+constexpr std::uint32_t kSharedObjectFlagMask = 0xB70FF839;
 
 struct ActorSnapshot {
     EntityId entityId;
@@ -35,6 +36,15 @@ struct ActorSnapshot {
     std::int32_t hitPoints = 0;
     std::int32_t actionPoints = 0;
     std::int32_t combatResults = 0;
+    std::int32_t fid = 0;
+    std::int32_t frame = 0;
+    std::uint32_t objectFlags = 0;
+    std::int32_t lightDistance = 0;
+    std::int32_t lightIntensity = 0;
+    std::int32_t combatManeuver = 0;
+    std::int32_t damageLastTurn = 0;
+    std::int32_t team = 0;
+    EntityId whoHitMeId;
     CharacterBuild build;
 };
 
@@ -72,6 +82,14 @@ struct CritterSnapshot {
     std::int32_t actionPoints = 0;
     std::int32_t combatResults = 0;
     std::int32_t team = 0;
+    std::int32_t fid = 0;
+    std::int32_t frame = 0;
+    std::uint32_t objectFlags = 0;
+    std::int32_t lightDistance = 0;
+    std::int32_t lightIntensity = 0;
+    std::int32_t combatManeuver = 0;
+    std::int32_t damageLastTurn = 0;
+    EntityId whoHitMeId;
 };
 
 struct ItemSnapshot {
@@ -120,6 +138,7 @@ struct WorldSnapshot {
     WorldMapState worldMap;
     WorldMapTravelSnapshot worldMapTravel;
     CombatTurnState combat;
+    std::int32_t combatFreeMove = 0;
     std::vector<ActorSnapshot> actors;
     std::vector<CritterSnapshot> critters;
     std::vector<DoorSnapshot> doors;

@@ -9,7 +9,7 @@
 namespace fallout {
 namespace multiplayer {
 
-constexpr std::uint16_t kGameplayWireVersion = 21;
+constexpr std::uint16_t kGameplayWireVersion = 25;
 
 enum class GameplayWireError {
     None,

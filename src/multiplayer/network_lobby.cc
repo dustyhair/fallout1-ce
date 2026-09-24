@@ -1,5 +1,6 @@
 #include "multiplayer/network_lobby.h"
 
+#include <algorithm>
 #include <limits>
 #include <utility>
 #include <variant>
@@ -14,13 +15,14 @@ namespace {
 constexpr std::size_t kLobbyHeaderSize = 4;
 constexpr std::size_t kChatHeaderSize = 6;
 constexpr std::size_t kMaxQueuedChatMessages = 32;
-constexpr std::uint16_t kRecoveryWireVersion = 1;
+constexpr std::uint16_t kRecoveryWireVersion = 2;
 constexpr std::size_t kRecoveryHeaderSize = 4;
 
 enum class RecoveryMessageType : std::uint8_t {
     Request = 1,
     Snapshot = 2,
     Complete = 3,
+    Applied = 4,
 };
 
 void appendUInt16(std::vector<std::uint8_t>& bytes, std::uint16_t value)
@@ -111,6 +113,8 @@ bool isSupportedLiveEvent(const GameEventPayload& payload)
         || std::holds_alternative<ItemDroppedEvent>(payload)
         || std::holds_alternative<AttackStartedEvent>(payload)
         || std::holds_alternative<CombatTurnStateChangedEvent>(payload)
+        || std::holds_alternative<CombatActionResolvedEvent>(payload)
+        || std::holds_alternative<PartyExperienceAwardedEvent>(payload)
         || std::holds_alternative<SharedModalStateChangedEvent>(payload)
         || std::holds_alternative<WorldMapRouteSelectedEvent>(payload)
         || std::holds_alternative<WorldMapArrivedEvent>(payload);
@@ -134,6 +138,7 @@ bool NetworkLobby::start(NetworkLaunchMode mode, SessionId sessionId, std::uniqu
     _nextEventSequence = 1;
     _nextExpectedEventSequence = 1;
     _lastAppliedEventSequence = {};
+    _acknowledgedEvents.clear();
     _pendingCommandSequences.clear();
     _recoveryRequests.clear();
     _peerCommands.clear();
@@ -277,13 +282,14 @@ bool NetworkLobby::sendLocalRest(std::int32_t minutes, std::uint32_t phaseRevisi
         phaseRevision);
 }
 
-bool NetworkLobby::sendLocalAttack(EntityId targetId, std::int32_t hitMode, std::int32_t hitLocation, std::uint32_t phaseRevision)
+bool NetworkLobby::sendLocalAttack(EntityId targetId, std::int32_t hitMode,
+    std::int32_t hitLocation, std::uint64_t turnRevision, std::uint32_t phaseRevision)
 {
     PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
     EntityId actorId { playerId.value };
     return sendLocalAction(
         AttackStartedEvent { actorId, targetId, hitMode, hitLocation },
-        AttackCommand { targetId, hitMode, hitLocation },
+        AttackCommand { targetId, hitMode, hitLocation, turnRevision },
         phaseRevision);
 }
 
@@ -297,6 +303,52 @@ bool NetworkLobby::sendLocalEndTurn(std::uint64_t turnRevision, std::uint32_t ph
     return sendLocalAction(
         CombatTurnStateChangedEvent { actorId, SessionPhase::Combat, phaseRevision, {} },
         EndTurnCommand { turnRevision }, phaseRevision, SessionPhase::Combat);
+}
+
+bool NetworkLobby::sendLocalCombatMove(std::int32_t tile,
+    std::int32_t elevation, bool running, std::uint64_t turnRevision,
+    std::uint32_t phaseRevision)
+{
+    EntityId actorId { kGuestPlayerId.value };
+    return _mode == NetworkLaunchMode::Join && sendLocalAction(
+        CombatActionResolvedEvent { actorId, CombatActionKind::Move,
+            {}, turnRevision, phaseRevision },
+        CombatMoveCommand { turnRevision, tile, elevation, running },
+        phaseRevision, SessionPhase::Combat);
+}
+
+bool NetworkLobby::sendLocalCombatItem(EntityId itemId, EntityId targetId,
+    std::uint64_t turnRevision, std::uint32_t phaseRevision)
+{
+    EntityId actorId { kGuestPlayerId.value };
+    return _mode == NetworkLaunchMode::Join && sendLocalAction(
+        CombatActionResolvedEvent { actorId, CombatActionKind::UseItem,
+            itemId, turnRevision, phaseRevision },
+        CombatItemCommand { turnRevision, itemId, targetId },
+        phaseRevision, SessionPhase::Combat);
+}
+
+bool NetworkLobby::sendLocalCombatReload(EntityId weaponId,
+    std::int32_t hitMode, std::uint64_t turnRevision,
+    std::uint32_t phaseRevision)
+{
+    EntityId actorId { kGuestPlayerId.value };
+    return _mode == NetworkLaunchMode::Join && sendLocalAction(
+        CombatActionResolvedEvent { actorId, CombatActionKind::Reload,
+            weaponId, turnRevision, phaseRevision },
+        CombatReloadCommand { turnRevision, weaponId, hitMode },
+        phaseRevision, SessionPhase::Combat);
+}
+
+bool NetworkLobby::sendLocalCombatFace(std::int32_t rotation,
+    std::uint64_t turnRevision, std::uint32_t phaseRevision)
+{
+    EntityId actorId { kGuestPlayerId.value };
+    return _mode == NetworkLaunchMode::Join && sendLocalAction(
+        CombatActionResolvedEvent { actorId, CombatActionKind::Face,
+            {}, turnRevision, phaseRevision },
+        CombatFaceCommand { turnRevision, rotation },
+        phaseRevision, SessionPhase::Combat);
 }
 
 bool NetworkLobby::sendLocalSharedModal(SharedModalKind kind, bool open, SessionPhase currentPhase, std::uint32_t phaseRevision)
@@ -391,6 +443,10 @@ bool NetworkLobby::sendLocalAction(
         command.expectedPhase = phaseOverride != SessionPhase::Lobby
             ? phaseOverride
             : (std::holds_alternative<AttackCommand>(commandPayload)
+                || std::holds_alternative<CombatMoveCommand>(commandPayload)
+                || std::holds_alternative<CombatItemCommand>(commandPayload)
+                || std::holds_alternative<CombatReloadCommand>(commandPayload)
+                || std::holds_alternative<CombatFaceCommand>(commandPayload)
                 || std::holds_alternative<EndTurnCommand>(commandPayload))
             ? SessionPhase::Combat
             : modal != nullptr && !modal->open
@@ -506,6 +562,7 @@ bool NetworkLobby::sendAuthoritativeEvent(GameEvent event)
         }
     }
     _nextEventSequence++;
+    _acknowledgedEvents[kHostPlayerId] = event.sequence;
     return true;
 }
 
@@ -574,7 +631,11 @@ bool NetworkLobby::confirmPeerEventApplied(EventSequence sequence)
         return false;
     }
     _lastAppliedEventSequence = sequence;
-    return true;
+    if (_state != NetworkLobbyState::Ready) return true;
+    std::vector<std::uint8_t> body;
+    appendUInt32(body, kGuestPlayerId.value);
+    appendUInt64(body, sequence.value);
+    return sendRecoveryMessage(static_cast<std::uint8_t>(RecoveryMessageType::Applied), body);
 }
 
 bool NetworkLobby::confirmSnapshotApplied(EventSequence sequence)
@@ -585,7 +646,11 @@ bool NetworkLobby::confirmSnapshotApplied(EventSequence sequence)
         return false;
     }
     _lastAppliedEventSequence = sequence;
-    return true;
+    if (_state != NetworkLobbyState::Ready) return true;
+    std::vector<std::uint8_t> body;
+    appendUInt32(body, kGuestPlayerId.value);
+    appendUInt64(body, sequence.value);
+    return sendRecoveryMessage(static_cast<std::uint8_t>(RecoveryMessageType::Applied), body);
 }
 
 EventReplay NetworkLobby::replayAfter(EventSequence lastApplied) const
@@ -652,7 +717,15 @@ bool NetworkLobby::sendRecovery(EventSequence lastApplied, const WorldSnapshot& 
         fail(NetworkLobbyError::ProtocolError);
         return false;
     }
-    if (replay.status == EventReplayStatus::SnapshotRequired) {
+    bool combatEffectsRequireSnapshot = replay.status == EventReplayStatus::Available
+        && std::any_of(replay.events.begin(), replay.events.end(), [](const GameEvent& event) {
+            return std::holds_alternative<AttackStartedEvent>(event.payload)
+                || std::holds_alternative<CombatTurnStateChangedEvent>(event.payload)
+                || std::holds_alternative<CombatActionResolvedEvent>(event.payload)
+                || std::holds_alternative<PartyExperienceAwardedEvent>(event.payload);
+        });
+    if (replay.status == EventReplayStatus::SnapshotRequired
+        || combatEffectsRequireSnapshot) {
         if (snapshot.lastIncludedEvent != _eventJournal.latestSequence()) {
             return false;
         }
@@ -774,6 +847,12 @@ EventSequence NetworkLobby::lastAppliedEvent() const
         return {};
     }
     return _lastAppliedEventSequence;
+}
+
+EventSequence NetworkLobby::acknowledgedEvent(PlayerId playerId) const
+{
+    auto found = _acknowledgedEvents.find(playerId);
+    return found != _acknowledgedEvents.end() ? found->second : EventSequence {};
 }
 
 CharacterLobbyError NetworkLobby::submitLocalSheet(const CharacterCreationSheet& sheet)
@@ -1033,6 +1112,22 @@ void NetworkLobby::handlePacket(const Packet& packet)
             _recoveryRequests.push_back(EventSequence { readUInt64(body, 0) });
             return;
         }
+        if (type == RecoveryMessageType::Applied) {
+            if (_mode != NetworkLaunchMode::Host || body.size() != 12
+                || readUInt32(body, 0) != kGuestPlayerId.value) {
+                fail(NetworkLobbyError::UnexpectedMessage);
+                return;
+            }
+            EventSequence applied { readUInt64(body, 4) };
+            EventSequence previous = acknowledgedEvent(kGuestPlayerId);
+            if (applied.value > _eventJournal.latestSequence().value
+                || applied.value < previous.value) {
+                fail(NetworkLobbyError::ProtocolError);
+                return;
+            }
+            _acknowledgedEvents[kGuestPlayerId] = applied;
+            return;
+        }
         if (type == RecoveryMessageType::Snapshot) {
             if (_mode != NetworkLaunchMode::Join || !_recovering) {
                 fail(NetworkLobbyError::UnexpectedMessage);
@@ -1279,6 +1374,7 @@ void NetworkLobby::markDisconnected()
     _commandResults.clear();
     _peerEvents.clear();
     _peerSnapshots.clear();
+    _authoritativeStates.clear();
     _recovering = false;
     _error = NetworkLobbyError::Disconnected;
     _state = NetworkLobbyState::Disconnected;

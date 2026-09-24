@@ -141,17 +141,69 @@ void executeCommand(const AgentControlCommand& command)
         agentJournalWriteAgentCommand(command.id, commandName, "accepted", "text injection started");
         return;
     case AgentControlCommandType::GameMove:
-        if (multiplayer::networkRuntimeSubmitLocalMove(command.tile, command.elevation, command.running)) {
+        if ((multiplayer::networkWorldPhase() != multiplayer::SessionPhase::Combat
+                || multiplayer::networkWorldActiveCombatOwner()
+                    == multiplayer::localPlayerId())
+            && multiplayer::networkRuntimeSubmitLocalMove(
+                command.tile, command.elevation, command.running)) {
             agentJournalWriteAgentCommand(command.id, commandName, "accepted", "semantic movement submitted");
         } else {
             agentJournalWriteAgentCommand(command.id, commandName, "rejected", "semantic movement is unavailable or invalid");
         }
         return;
     case AgentControlCommandType::GameFace:
-        if (multiplayer::networkRuntimeSubmitLocalFacing(command.rotation)) {
+        if ((multiplayer::networkWorldPhase() != multiplayer::SessionPhase::Combat
+                || multiplayer::networkWorldActiveCombatOwner()
+                    == multiplayer::localPlayerId())
+            && multiplayer::networkRuntimeSubmitLocalFacing(command.rotation)) {
             agentJournalWriteAgentCommand(command.id, commandName, "accepted", "semantic facing submitted");
         } else {
             agentJournalWriteAgentCommand(command.id, commandName, "rejected", "semantic facing is unavailable or invalid");
+        }
+        return;
+    case AgentControlCommandType::GameAttack: {
+        if (multiplayer::networkRuntimeSubmitCombatAttack(
+                multiplayer::EntityId { command.entityId }, command.hitMode,
+                command.hitLocation)) {
+            agentJournalWriteAgentCommand(command.id, commandName,
+                "accepted", "combat attack submitted");
+        } else {
+            agentJournalWriteAgentCommand(command.id, commandName,
+                "rejected", "combat target or active turn is unavailable");
+        }
+        return;
+    }
+    case AgentControlCommandType::GameReload:
+        if (multiplayer::networkRuntimeSubmitCombatReload(
+                multiplayer::EntityId { command.entityId }, command.hitMode)) {
+            agentJournalWriteAgentCommand(command.id, commandName,
+                "accepted", "combat reload submitted");
+        } else {
+            agentJournalWriteAgentCommand(command.id, commandName,
+                "rejected", "weapon or active turn is unavailable");
+        }
+        return;
+    case AgentControlCommandType::GameCombatItem:
+        if (multiplayer::networkRuntimeSubmitCombatItem(
+                multiplayer::EntityId { command.entityId },
+                multiplayer::EntityId { command.destinationEntityId })) {
+            agentJournalWriteAgentCommand(command.id, commandName,
+                "accepted", "combat item use submitted");
+        } else {
+            agentJournalWriteAgentCommand(command.id, commandName,
+                "rejected", "item or active turn is unavailable");
+        }
+        return;
+    case AgentControlCommandType::GameEndTurn:
+        if (multiplayer::networkWorldPhase() == multiplayer::SessionPhase::Combat
+            && multiplayer::networkWorldActiveCombatOwner()
+                == multiplayer::localPlayerId()) {
+            GNW_add_input_buffer(KEY_SPACE);
+            agentJournalWriteAgentCommand(command.id, commandName,
+                "accepted", "combat end-turn input queued");
+        } else {
+            agentJournalWriteAgentCommand(command.id, commandName,
+                "rejected", "active combat turn is unavailable");
         }
         return;
     case AgentControlCommandType::GameDoor:

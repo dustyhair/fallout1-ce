@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "game/object_types.h"
 #include "multiplayer/acting_player_context.h"
 #include "multiplayer/character_lobby.h"
 #include "multiplayer/combat_turn_controller.h"
@@ -105,9 +106,18 @@ WorldSnapshot sampleSnapshot()
     snapshot.actors[0].build.unspentSkillPoints = 7;
     snapshot.actors[0].build.prototypeFlags = 1 << 3; // PC_FLAG_LEVEL_UP_AVAILABLE.
     snapshot.actors[1].build.experience = 125;
+    snapshot.actors[0].fid = 0x01000002;
+    snapshot.actors[0].frame = 2;
+    snapshot.actors[0].objectFlags = 0x10;
+    snapshot.actors[0].combatManeuver = 1;
+    snapshot.actors[0].whoHitMeId = EntityId { 12 };
     snapshot.critters = {
         CritterSnapshot { EntityId { 12 }, 0x01000023, 20106, 0, 4, 6, 7, 0, 1 },
     };
+    snapshot.critters[0].fid = 0x01000004;
+    snapshot.critters[0].frame = 3;
+    snapshot.critters[0].damageLastTurn = 5;
+    snapshot.critters[0].whoHitMeId = EntityId { 2 };
     snapshot.doors = {
         DoorSnapshot { EntityId { 9 }, true, false, 5 },
     };
@@ -882,7 +892,7 @@ void testGameplayWireFormat()
         GameCommand { CommandSequence { 5 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, FaceCommand { 4 } },
         GameCommand { CommandSequence { 6 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, InventoryTransferCommand { EntityId { 42 }, EntityId { 20 }, EntityId { 43 }, 3, 5, ItemDescriptor { 40, 7, 8, 9 } } },
         GameCommand { CommandSequence { 7 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, ItemDropCommand { EntityId { 20 }, EntityId { 43 }, 3, 5, ItemDescriptor { 40, 7, 8, 9 } } },
-        GameCommand { CommandSequence { 8 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, AttackCommand { EntityId { 42 }, 1, 8 } },
+        GameCommand { CommandSequence { 8 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, AttackCommand { EntityId { 42 }, 1, 8, 1 } },
         GameCommand { CommandSequence { 9 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, SharedModalCommand { SharedModalKind::Dialogue, true } },
         GameCommand { CommandSequence { 10 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, UseSkillCommand { EntityId { 40 }, ExplorationSkill::Traps } },
         GameCommand { CommandSequence { 11 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Exploration, 3, UseItemOnCommand { EntityId { 43 }, EntityId { 40 } } },
@@ -2101,6 +2111,10 @@ void testNetworkCharacterLobby()
         "guest receives the host movement");
     expect(hostMoveEvent.has_value() && guest.confirmPeerEventApplied(hostMoveEvent->sequence),
         "guest confirms the first event after applying it");
+    host.poll();
+    expect(host.acknowledgedEvent(kHostPlayerId) == EventSequence { 1 }
+            && host.acknowledgedEvent(kGuestPlayerId) == EventSequence { 1 },
+        "host tracks its own and the guest's applied boundaries independently");
     expect(!guest.takePeerEvent().has_value(), "received host movement is consumed once");
     expect(guest.sendLocalMove(12346, 1, false), "guest sends its local movement");
     host.poll();
@@ -2292,6 +2306,10 @@ void testNetworkCharacterLobby()
             && liveSkill->skill == ExplorationSkill::Traps
             && guest.confirmPeerEventApplied(liveSkillEvent->sequence),
         "guest accepts and confirms the host skill-use boundary");
+    host.poll();
+    expect(host.acknowledgedEvent(kHostPlayerId) == EventSequence { 10 }
+            && host.acknowledgedEvent(kGuestPlayerId) == EventSequence { 10 },
+        "participant acknowledgements advance monotonically through live events");
     EventReplay completeReplay = host.replayAfter(EventSequence {});
     expect(completeReplay.status == EventReplayStatus::Available
             && completeReplay.events.size() == 10
@@ -2337,6 +2355,9 @@ void testNetworkCharacterLobby()
     expect(host.sendLocalFacing(2)
             && host.latestAuthoritativeEvent() == EventSequence { 11 },
         "host continues the authoritative journal while the guest is absent");
+    expect(host.acknowledgedEvent(kHostPlayerId) == EventSequence { 11 }
+            && host.acknowledgedEvent(kGuestPlayerId) == EventSequence { 10 },
+        "a disconnected guest does not rewind or stall the host's applied boundary");
 
     LoopbackTransportPair resumedPair = createLoopbackTransportPair();
     expect(host.reattachTransport(std::move(resumedPair.first))
@@ -2365,6 +2386,9 @@ void testNetworkCharacterLobby()
     expect(resumedFacing.has_value() && guest.confirmPeerEventApplied(resumedFacing->sequence)
             && guest.lastAppliedEvent() == EventSequence { 11 },
         "guest confirms the replayed event as its new reconnect boundary");
+    host.poll();
+    expect(host.acknowledgedEvent(kGuestPlayerId) == EventSequence { 11 },
+        "reconnected guest acknowledgement advances only its own boundary");
     WorldSnapshot authoritativeState = sampleSnapshot();
     expect(host.sendAuthoritativeState(authoritativeState),
         "host sends a non-journaled full authoritative correction");
@@ -2676,6 +2700,56 @@ public:
         return nextStatus;
     }
 
+    CommandExecutionStatus combatMove(Object* actor, const CombatMoveCommand& command) override
+    {
+        combatActionCalls++;
+        lastActor = actor;
+        lastCombatTurnRevision = command.turnRevision;
+        recordContext();
+        return combatActionAllowed(actor, command.turnRevision);
+    }
+
+    CommandExecutionStatus combatItem(Object* actor, const CombatItemCommand& command) override
+    {
+        combatActionCalls++;
+        lastActor = actor;
+        lastCombatTurnRevision = command.turnRevision;
+        recordContext();
+        return combatActionAllowed(actor, command.turnRevision);
+    }
+
+    CommandExecutionStatus combatReload(Object* actor, const CombatReloadCommand& command) override
+    {
+        combatActionCalls++;
+        lastActor = actor;
+        lastCombatTurnRevision = command.turnRevision;
+        recordContext();
+        return combatActionAllowed(actor, command.turnRevision);
+    }
+
+    CommandExecutionStatus combatFace(Object* actor, const CombatFaceCommand& command) override
+    {
+        combatActionCalls++;
+        lastActor = actor;
+        lastCombatTurnRevision = command.turnRevision;
+        recordContext();
+        return combatActionAllowed(actor, command.turnRevision);
+    }
+
+    CommandExecutionStatus combatActionAllowed(Object* actor, std::uint64_t revision) const
+    {
+        if (combatTurns == nullptr || modalSession == nullptr) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        std::optional<EntityId> actorId = modalSession->entities().findEntity(actor);
+        const CombatTurnEntry* turn = combatTurns->current();
+        return actorId.has_value() && turn != nullptr
+                && turn->actorId == *actorId && turn->owner.has_value()
+                && turn->owner == modalSession->players().findByActor(*actorId)->id
+                && revision == combatTurns->revision()
+            ? nextStatus : CommandExecutionStatus::InvalidAction;
+    }
+
     SharedModalExecution setSharedModal(Object* actor, const SharedModalCommand& command) override
     {
         modalCalls++;
@@ -2788,6 +2862,8 @@ public:
     int sceneryTransitionCalls = 0;
     int restCalls = 0;
     int attackCalls = 0;
+    int combatActionCalls = 0;
+    std::uint64_t lastCombatTurnRevision = 0;
     int modalCalls = 0;
     int endTurnCalls = 0;
     int transferCalls = 0;
@@ -2919,6 +2995,7 @@ void testCombatTurnCommandsAndReplication()
     WorldSnapshot snapshot = sampleSnapshot();
     snapshot.phase = SessionPhase::Combat;
     snapshot.combat = turns.snapshot(100);
+    snapshot.combatFreeMove = 4;
     snapshot.combat.initiative[0].actorId = snapshot.actors[1].entityId;
     snapshot.combat.initiative[1].actorId = snapshot.actors[0].entityId;
     snapshot.combat.initiative[2].actorId = snapshot.critters[0].entityId;
@@ -2930,11 +3007,174 @@ void testCombatTurnCommandsAndReplication()
     SnapshotDecodeResult decodedSnapshot = decodeSnapshot(packet);
     expect(decodedSnapshot
             && decodedSnapshot.snapshot.combat.revision == turns.revision()
-            && decodedSnapshot.snapshot.combat.initiative.size() == 3,
-        "combat recovery snapshot restores initiative and turn revision");
+            && decodedSnapshot.snapshot.combat.initiative.size() == 3
+            && decodedSnapshot.snapshot.combatFreeMove == 4,
+        "combat recovery snapshot restores initiative, turn revision, and free movement");
+    WorldSnapshot statusSnapshot = snapshot;
+    statusSnapshot.actors[0].combatResults = DAM_KNOCKED_OUT;
+    statusSnapshot.actors[0].elevation = 1;
+    statusSnapshot.critters[0].combatResults = DAM_DEAD;
+    statusSnapshot.critters[0].hitPoints = 0;
+    statusSnapshot.critters[0].combatManeuver = CRITTER_MANUEVER_FLEEING;
+    expect(encodeSnapshot(statusSnapshot, packet) == SnapshotError::None,
+        "combat recovery accepts knockout, death, fleeing, and separated elevations");
+    SnapshotDecodeResult statuses = decodeSnapshot(packet);
+    expect(statuses
+            && statuses.snapshot.actors[1].combatResults == DAM_KNOCKED_OUT
+            && statuses.snapshot.actors[1].elevation == 1
+            && statuses.snapshot.critters[0].combatResults == DAM_DEAD
+            && statuses.snapshot.critters[0].hitPoints == 0
+            && statuses.snapshot.critters[0].combatManeuver == CRITTER_MANUEVER_FLEEING,
+        "combat status and elevation survive a recovery round-trip");
     snapshot.combat.initiative[1].ownerId = kHostPlayerId;
     expect(validateSnapshot(snapshot) == SnapshotError::InvalidCombatState,
         "combat snapshot rejects mismatched player ownership");
+}
+
+void testCombatActionCommandsAndReplication()
+{
+    TestObject hostActor;
+    TestObject guestActor;
+    TestObject item;
+    TestObject weapon;
+    LocalSession session;
+    expect(session.start(asGameObject(hostActor), asGameObject(guestActor))
+            == LocalSessionError::None,
+        "combat action session starts");
+    submitBothCharacterSheets(session);
+    expect(session.transitionTo(SessionPhase::Loading) == LocalSessionError::None
+            && session.transitionTo(SessionPhase::Exploration) == LocalSessionError::None
+            && session.transitionTo(SessionPhase::Combat) == LocalSessionError::None,
+        "combat action session enters combat");
+    EntityId itemId = session.registerWorldObject(asGameObject(item)).entityId;
+    EntityId weaponId = session.registerWorldObject(asGameObject(weapon)).entityId;
+    CombatTurnController turns;
+    expect(turns.begin({
+               { session.playerActorId(kHostPlayerId), kHostPlayerId },
+               { session.playerActorId(kGuestPlayerId), kGuestPlayerId },
+           }, 100, 60000) == CombatTurnResult::Accepted,
+        "combat actions begin with a host-owned turn");
+    RecordingCommandExecutor executor;
+    executor.modalSession = &session;
+    executor.combatTurns = &turns;
+    CommandProcessor processor;
+    GameCommand command;
+    command.playerId = kHostPlayerId;
+    command.actorId = session.playerActorId(kHostPlayerId);
+    command.expectedPhase = SessionPhase::Combat;
+    command.expectedPhaseRevision = session.phaseRevision();
+    std::array<GameCommandPayload, 4> actions {
+        CombatMoveCommand { 1, 12345, 0, false },
+        CombatItemCommand { 1, itemId, {} },
+        CombatReloadCommand { 1, weaponId, 7 },
+        CombatFaceCommand { 1, 3 },
+    };
+    std::array<CombatActionKind, 4> kinds {
+        CombatActionKind::Move, CombatActionKind::UseItem,
+        CombatActionKind::Reload, CombatActionKind::Face,
+    };
+    ProtocolEnvelope envelope = sampleEnvelope();
+    for (std::size_t index = 0; index < actions.size(); index++) {
+        command.sequence.value = index + 1;
+        command.payload = actions[index];
+        expect(encodeGameCommand(command, envelope) == GameplayWireError::None,
+            "combat action command encodes");
+        GameCommandDecodeResult decoded = decodeGameCommand(envelope);
+        expect(decoded && decoded.command.payload.index() == command.payload.index(),
+            "combat action command round-trips over the wire");
+        AuthoritativeCommandResult result = processor.process(command, session, executor);
+        const auto* event = result.event.has_value()
+            ? std::get_if<CombatActionResolvedEvent>(&result.event->payload) : nullptr;
+        expect(result.result.status == CommandStatus::Accepted && event != nullptr
+                && event->kind == kinds[index]
+                && event->turnRevision == 1
+                && event->phaseRevision == session.phaseRevision(),
+            "combat action publishes an owned, revision-keyed result");
+        expect(executor.lastActor == asGameObject(hostActor)
+                && executor.lastActingPlayerId == kHostPlayerId
+                && executor.lastCombatTurnRevision == 1,
+            "combat action runs in the owned actor context");
+        if (event != nullptr) {
+            expect(encodeGameEvent(*result.event, envelope) == GameplayWireError::None,
+                "combat result event encodes");
+            GameEventDecodeResult replicated = decodeGameEvent(envelope);
+            const auto* copied = replicated
+                ? std::get_if<CombatActionResolvedEvent>(&replicated.event.payload)
+                : nullptr;
+            expect(copied != nullptr && copied->kind == kinds[index]
+                    && copied->subjectId == event->subjectId,
+                "combat result event round-trips over the wire");
+        }
+        expect(processor.process(command, session, executor).replayed
+                && executor.combatActionCalls == static_cast<int>(index + 1),
+            "replayed combat action does not execute twice");
+    }
+    command.sequence.value = 1;
+    command.playerId = kGuestPlayerId;
+    command.actorId = session.playerActorId(kGuestPlayerId);
+    command.payload = CombatMoveCommand { 1, 12346, 0, false };
+    expect(processor.process(command, session, executor).result.rejection
+            == CommandRejection::InvalidAction,
+        "out-of-turn combat movement cannot execute");
+    command.playerId = kHostPlayerId;
+    command.actorId = session.playerActorId(kHostPlayerId);
+    command.sequence.value = 5;
+    command.payload = CombatMoveCommand { 2, 12346, 0, false };
+    expect(processor.process(command, session, executor).result.rejection
+            == CommandRejection::InvalidAction,
+        "stale combat action revision cannot execute");
+    command.sequence.value = 6;
+    command.expectedPhaseRevision++;
+    command.payload = CombatFaceCommand { 1, 2 };
+    expect(processor.process(command, session, executor).result.rejection
+            == CommandRejection::Stale,
+        "stale session revision rejects combat action before execution");
+    command.expectedPhaseRevision--;
+    command.expectedPhase = SessionPhase::Exploration;
+    command.sequence.value = 7;
+    expect(processor.process(command, session, executor).result.rejection
+            == CommandRejection::WrongPhase,
+        "combat action cannot execute in a noncombat phase");
+    command.expectedPhase = SessionPhase::Combat;
+    command.sequence.value = 8;
+    command.payload = CombatItemCommand { 1, itemId,
+        session.playerActorId(kGuestPlayerId) };
+    expect(encodeGameCommand(command, envelope) == GameplayWireError::None,
+        "targeted combat item command encodes");
+    GameCommandDecodeResult targetedItem = decodeGameCommand(envelope);
+    const auto* targeted = targetedItem
+        ? std::get_if<CombatItemCommand>(&targetedItem.command.payload) : nullptr;
+    expect(targeted != nullptr
+            && targeted->targetId == session.playerActorId(kGuestPlayerId),
+        "targeted combat item retains its recipient identity");
+    command.expectedPhase = SessionPhase::Combat;
+    command.sequence.value = 9;
+    command.payload = AttackCommand { session.playerActorId(kGuestPlayerId), 6, 8, 1 };
+    expect(encodeGameCommand(command, envelope) == GameplayWireError::InvalidAttack,
+        "reload hit mode cannot be smuggled through an attack command");
+
+    GameEvent award;
+    award.sequence = EventSequence { 42 };
+    award.causedBy = CommandSequence { 1 };
+    award.payload = PartyExperienceAwardedEvent { session.playerActorId(kHostPlayerId), 125, {
+        { kHostPlayerId, session.playerActorId(kHostPlayerId), 250, 2, 12 },
+        { kGuestPlayerId, session.playerActorId(kGuestPlayerId), 250, 2, 12 },
+        { PlayerId { 3 }, EntityId { 99 }, 250, 2, 12 },
+    } };
+    expect(encodeGameEvent(award, envelope) == GameplayWireError::None,
+        "roster-keyed shared XP event encodes");
+    GameEventDecodeResult copiedAward = decodeGameEvent(envelope);
+    const auto* progression = copiedAward
+        ? std::get_if<PartyExperienceAwardedEvent>(&copiedAward.event.payload)
+        : nullptr;
+    expect(progression != nullptr && progression->amount == 125
+            && progression->players.size() == 3
+            && progression->players[2].playerId == PlayerId { 3 }
+            && progression->players[2].level == 2,
+        "shared XP and level progression round-trip for three players");
+    std::get<PartyExperienceAwardedEvent>(award.payload).players[2].playerId = kGuestPlayerId;
+    expect(encodeGameEvent(award, envelope) == GameplayWireError::InvalidCombatTurn,
+        "shared XP event rejects duplicate participant results");
 }
 
 void testAuthoritativeCommandProcessing()
@@ -3331,7 +3571,7 @@ void testAuthoritativeCommandProcessing()
         "command test enters combat before accepting an attack");
     attack.expectedPhase = SessionPhase::Combat;
     attack.expectedPhaseRevision = session.phaseRevision();
-    attack.payload = AttackCommand { registeredLootableCritter.entityId, 1, 8 };
+    attack.payload = AttackCommand { registeredLootableCritter.entityId, 1, 8, 1 };
     AuthoritativeCommandResult attacked = processor.process(attack, session, executor);
     const AttackStartedEvent* attackEvent = attacked.event.has_value()
         ? std::get_if<AttackStartedEvent>(&attacked.event->payload)
@@ -3462,7 +3702,7 @@ void testSnapshotRoundTripAndRecovery()
                                                         + PC_TRAIT_MAX
                                                         + 4)
         * sizeof(std::uint32_t);
-    expect(packet.size() == kSnapshotHeaderSize + 48 + 2 * (32 + characterBuildWireSize) + 36 + 12 + 48 + 2 * 56 + 6 * 4 + 2 * 36 + 31 * 29 + 15 * 7 + 6 * 4 + 20 + 14 * 4 + 28,
+    expect(packet.size() == kSnapshotHeaderSize + 48 + 2 * (68 + characterBuildWireSize) + 68 + 12 + 48 + 2 * 56 + 6 * 4 + 2 * 36 + 31 * 29 + 15 * 7 + 6 * 4 + 20 + 14 * 4 + 32,
         "snapshot packet declares a fixed-width payload");
     expect(packet[0] == 'F' && packet[1] == 'C' && packet[2] == 'M' && packet[3] == 'S', "snapshot magic uses network byte order");
 
@@ -3479,7 +3719,12 @@ void testSnapshotRoundTripAndRecovery()
             && decoded.snapshot.worldMap.knownTownEntrances[14] == 1,
         "snapshot keeps authoritative world-map discovery and encounter history");
     expect(decoded.snapshot.actors.size() == 2 && decoded.snapshot.actors[0].entityId == EntityId { 1 }, "decoded actors use canonical entity order");
-    expect(decoded.snapshot.actors[1].tile == 20102 && decoded.snapshot.actors[1].hitPoints == 28, "snapshot keeps guest actor state");
+    expect(decoded.snapshot.actors[1].tile == 20102
+            && decoded.snapshot.actors[1].hitPoints == 28
+            && decoded.snapshot.actors[1].fid == 0x01000002
+            && decoded.snapshot.actors[1].frame == 2
+            && decoded.snapshot.actors[1].whoHitMeId == EntityId { 12 },
+        "snapshot keeps guest actor combat and presentation state");
     expect(decoded.snapshot.actors[0].build.experience == 125
             && decoded.snapshot.actors[1].build.experience == 2500
             && decoded.snapshot.actors[1].build.level == 2
@@ -3489,7 +3734,11 @@ void testSnapshotRoundTripAndRecovery()
     expect(decoded.snapshot.critters.size() == 1
             && decoded.snapshot.critters[0].entityId == EntityId { 12 }
             && decoded.snapshot.critters[0].hitPoints == 6
-            && decoded.snapshot.critters[0].actionPoints == 7,
+            && decoded.snapshot.critters[0].actionPoints == 7
+            && decoded.snapshot.critters[0].fid == 0x01000004
+            && decoded.snapshot.critters[0].frame == 3
+            && decoded.snapshot.critters[0].damageLastTurn == 5
+            && decoded.snapshot.critters[0].whoHitMeId == EntityId { 2 },
         "snapshot keeps authoritative NPC combat state");
     expect(decoded.snapshot.doors.size() == 1 && decoded.snapshot.doors[0].open, "snapshot keeps door state");
     expect(decoded.snapshot.scenery.size() == 1
@@ -3922,6 +4171,7 @@ int main()
     fallout::multiplayer::testNetworkCombatTurnTransport();
     fallout::multiplayer::testLocalSessionLifecycle();
     fallout::multiplayer::testCombatTurnCommandsAndReplication();
+    fallout::multiplayer::testCombatActionCommandsAndReplication();
     fallout::multiplayer::testAuthoritativeCommandProcessing();
     fallout::multiplayer::testSnapshotRoundTripAndRecovery();
     fallout::multiplayer::testNetworkSessionRecoveryPrimitives();

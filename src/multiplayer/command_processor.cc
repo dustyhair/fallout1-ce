@@ -40,6 +40,10 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
 
     const SharedModalCommand* modal = std::get_if<SharedModalCommand>(&command.payload);
     SessionPhase requiredPhase = (std::holds_alternative<AttackCommand>(command.payload)
+            || std::holds_alternative<CombatMoveCommand>(command.payload)
+            || std::holds_alternative<CombatItemCommand>(command.payload)
+            || std::holds_alternative<CombatReloadCommand>(command.payload)
+            || std::holds_alternative<CombatFaceCommand>(command.payload)
             || std::holds_alternative<EndTurnCommand>(command.payload))
         ? SessionPhase::Combat
         : std::holds_alternative<WorldMapRouteCommand>(command.payload)
@@ -91,6 +95,10 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     const InventoryTransferCommand* transfer = std::get_if<InventoryTransferCommand>(&command.payload);
     const ItemDropCommand* drop = std::get_if<ItemDropCommand>(&command.payload);
     const AttackCommand* attack = std::get_if<AttackCommand>(&command.payload);
+    const CombatMoveCommand* combatMove = std::get_if<CombatMoveCommand>(&command.payload);
+    const CombatItemCommand* combatItem = std::get_if<CombatItemCommand>(&command.payload);
+    const CombatReloadCommand* combatReload = std::get_if<CombatReloadCommand>(&command.payload);
+    const CombatFaceCommand* combatFace = std::get_if<CombatFaceCommand>(&command.payload);
     const EndTurnCommand* endTurn = std::get_if<EndTurnCommand>(&command.payload);
     const WorldMapRouteCommand* worldMapRoute = std::get_if<WorldMapRouteCommand>(&command.payload);
     Object* target = nullptr;
@@ -296,6 +304,26 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
         } else if (attack != nullptr) {
             executionStatus = executor.attack(actor, target, *attack);
             event.payload = AttackStartedEvent { command.actorId, attack->targetId, attack->hitMode, attack->hitLocation };
+        } else if (combatMove != nullptr) {
+            executionStatus = executor.combatMove(actor, *combatMove);
+            event.payload = CombatActionResolvedEvent { command.actorId,
+                CombatActionKind::Move, {}, combatMove->turnRevision,
+                session.phaseRevision() };
+        } else if (combatItem != nullptr) {
+            executionStatus = executor.combatItem(actor, *combatItem);
+            event.payload = CombatActionResolvedEvent { command.actorId,
+                CombatActionKind::UseItem, combatItem->itemId,
+                combatItem->turnRevision, session.phaseRevision() };
+        } else if (combatReload != nullptr) {
+            executionStatus = executor.combatReload(actor, *combatReload);
+            event.payload = CombatActionResolvedEvent { command.actorId,
+                CombatActionKind::Reload, combatReload->weaponId,
+                combatReload->turnRevision, session.phaseRevision() };
+        } else if (combatFace != nullptr) {
+            executionStatus = executor.combatFace(actor, *combatFace);
+            event.payload = CombatActionResolvedEvent { command.actorId,
+                CombatActionKind::Face, {}, combatFace->turnRevision,
+                session.phaseRevision() };
         } else if (endTurn != nullptr) {
             EndTurnExecution turn = executor.endTurn(actor, command.playerId, *endTurn);
             executionStatus = turn.status;

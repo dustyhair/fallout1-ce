@@ -20,7 +20,9 @@
 #include "game/skilldex.h"
 #include "game/tile.h"
 #include "multiplayer/developer_local_session.h"
+#include "multiplayer/local_player_context.h"
 #include "multiplayer/network_runtime.h"
+#include "multiplayer/network_world.h"
 #include "platform_compat.h"
 #include "plib/color/color.h"
 #include "plib/gnw/gnw.h"
@@ -875,6 +877,15 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
         return;
     }
 
+    if (multiplayer::networkWorldActive()
+        && isInCombat()
+        && (mouseState & MOUSE_EVENT_LEFT_BUTTON_UP) != 0
+        && gmouse_3d_current_mode != GAME_MOUSE_MODE_MOVE
+        && gmouse_3d_current_mode != GAME_MOUSE_MODE_CROSSHAIR
+        && gmouse_3d_current_mode != GAME_MOUSE_MODE_USE_CROSSHAIR) {
+        return;
+    }
+
     if ((mouseState & MOUSE_EVENT_LEFT_BUTTON_UP) != 0) {
         if (gmouse_3d_current_mode == GAME_MOUSE_MODE_MOVE) {
             int actionPoints;
@@ -999,6 +1010,13 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
             if (target != NULL) {
                 Object* weapon;
                 if (intface_get_current_item(&weapon) != -1) {
+                    if (isInCombat()
+                        && multiplayer::networkRuntimeHandleLocalItemUse(
+                            multiplayer::localPlayerActor(), weapon, target)) {
+                        gmouse_set_cursor(MOUSE_CURSOR_NONE);
+                        gmouse_3d_set_mode(GAME_MOUSE_MODE_MOVE);
+                        return;
+                    }
                     if (isInCombat()) {
                         int hitMode = intface_is_item_right_hand()
                             ? HIT_MODE_RIGHT_WEAPON_PRIMARY
@@ -1431,7 +1449,11 @@ void gmouse_3d_toggle_mode()
 {
     int mode = (gmouse_3d_current_mode + 1) % 3;
 
-    if (isInCombat()) {
+    bool combatPresentation = isInCombat()
+        || (multiplayer::networkRuntimeIsGuestReplica()
+            && multiplayer::networkWorldPhase()
+                == multiplayer::SessionPhase::Combat);
+    if (combatPresentation) {
         Object* item;
         if (intface_get_current_item(&item) == 0) {
             if (item != NULL && item_get_type(item) != ITEM_TYPE_WEAPON && mode == GAME_MOUSE_MODE_CROSSHAIR) {

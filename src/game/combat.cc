@@ -31,6 +31,8 @@
 #include "game/stat.h"
 #include "game/tile.h"
 #include "game/trait.h"
+#include "multiplayer/acting_player_context.h"
+#include "multiplayer/local_player_context.h"
 #include "multiplayer/network_runtime.h"
 #include "multiplayer/network_world.h"
 #include "platform_compat.h"
@@ -2226,7 +2228,8 @@ static int combat_input()
             combat_end();
         } else {
             scripts_check_state_in_combat();
-            if (!multiplayer::networkWorldActive()) {
+            if (!multiplayer::networkWorldActive()
+                || input == -2 || input == -20) {
                 game_handle_input(input, true);
             }
         }
@@ -2276,6 +2279,19 @@ static int combat_turn(Object* a1, bool a2)
     if (owner.has_value() && a1 != obj_dude) {
         bool unableToAct = (a1->data.critter.combat.results
             & (DAM_KNOCKED_OUT | DAM_DEAD | DAM_LOSE_TURN)) != 0;
+        if (!unableToAct && !a2) {
+            action_points = stat_level(a1, STAT_MAXIMUM_ACTION_POINTS);
+            if (gcsd != NULL) {
+                action_points += gcsd->actionPointsBonus;
+            }
+            a1->data.critter.combat.ap = action_points;
+            multiplayer::PlayerCharacterState* player = multiplayer::playerStateForActor(a1);
+            if (player != nullptr) {
+                multiplayer::ScopedActingPlayerContext actingPlayer(*player, a1);
+                combat_free_move = 2 * perk_level(PERK_BONUS_MOVE);
+            }
+            multiplayer::networkRuntimeRequestCombatTurnCheckpoint();
+        }
         while (!unableToAct && multiplayer::networkWorldCombatTurnMatches(a1)
             && multiplayer::networkWorldCombatTurnRevision() == turnRevision
             && game_user_wants_to_quit == 0 && combat_end_due_to_load == 0) {
@@ -2290,6 +2306,7 @@ static int combat_turn(Object* a1, bool a2)
         a1->data.critter.combat.ap = 0;
         a1->data.critter.combat.damageLastTurn = 0;
         a1->data.critter.combat.results &= ~DAM_LOSE_TURN;
+        combat_free_move = 0;
         return game_user_wants_to_quit != 0 || combat_end_due_to_load != 0 ? -1 : 0;
     }
 
@@ -2468,7 +2485,7 @@ void combat(STRUCT_664980* attack)
         int v6;
 
         if (v3 != 0) {
-            if (combat_turn(obj_dude, true) == -1) {
+            if (combat_turn(obj_dude, true) == -1 || combat_end_due_to_load) {
                 v6 = -1;
             } else {
                 int index;
@@ -2501,7 +2518,11 @@ void combat(STRUCT_664980* attack)
             }
 
             for (; v6 < list_com; v6++) {
-                if (combat_turn(combat_list[v6], false) == -1) {
+                int turnResult = combat_turn(combat_list[v6], false);
+                // A load/recovery can finish combat while the turn's input
+                // loop is pumping network traffic. combat_over_from_load has
+                // already freed combat_list, so never enter the next actor.
+                if (turnResult == -1 || combat_end_due_to_load) {
                     break;
                 }
 
@@ -2512,7 +2533,7 @@ void combat(STRUCT_664980* attack)
                 gcsd = NULL;
             }
 
-            if (v6 < list_com) {
+            if (combat_end_due_to_load || v6 < list_com) {
                 break;
             }
 

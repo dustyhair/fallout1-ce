@@ -26,6 +26,7 @@
 #include "game/stat.h"
 #include "game/tile.h"
 #include "multiplayer/local_player_context.h"
+#include "multiplayer/network_runtime.h"
 #include "multiplayer/presentation_bridge.h"
 #include "platform_compat.h"
 #include "plib/color/color.h"
@@ -1462,6 +1463,10 @@ void intface_use_item()
                     ? HIT_MODE_LEFT_WEAPON_RELOAD
                     : HIT_MODE_RIGHT_WEAPON_RELOAD;
 
+                if (multiplayer::networkRuntimeHandleCombatReload(ptr->item, hitMode)) {
+                    return;
+                }
+
                 Object* player = intface_player();
                 int actionPointsRequired = item_mp_cost(player, hitMode, false);
                 if (actionPointsRequired <= player->data.critter.combat.ap) {
@@ -1489,6 +1494,9 @@ void intface_use_item()
         gmouse_3d_set_mode(GAME_MOUSE_MODE_USE_CROSSHAIR);
     } else if (proto_action_can_use(ptr->item->pid)) {
         if (isInCombat()) {
+            if (multiplayer::networkRuntimeHandleCombatItemUse(ptr->item)) {
+                return;
+            }
             Object* player = intface_player();
             int actionPointsRequired = item_mp_cost(player, ptr->secondaryHitMode, false);
             if (actionPointsRequired <= player->data.critter.combat.ap) {

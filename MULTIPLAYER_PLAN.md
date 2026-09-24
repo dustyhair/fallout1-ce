@@ -1,6 +1,6 @@
 # Two-player co-op plan
 
-Status: Phases 0, 1, 2, 2.25, 2.5, 3A, 3B, and 4A are complete on the `multiplayer-plan` branch. Transport, lobby, journal, snapshot recovery, authenticated reconnect, content manifest, and first-contact fingerprint verification are implemented. Same-map exploration converges through the host command processor and authoritative checkpoints; replicas do not rerun rule-bearing scripts, rolls, or timed queues. Installed-data two-process scenarios cover movement, doors, pickup, loot, inventory gifts, skills, item-on-target quest completion, scenery and container state, XP, independent elevator, ladder, and typed-stair travel, shared cross-map elevators, exits, and typed stairs, agreed rest, world-map travel into towns, terrain, and encounters, and semantic combat turn ownership. Live player combat actions, including attacks, remain blocked until Phase 4B replicates their complete authoritative effects.
+Status: Phases 0, 1, 2, 2.25, 2.5, 3A, 3B, 4A, and 4B are complete on the `multiplayer-plan` branch. Transport, lobby, journal, snapshot recovery, authenticated reconnect, content manifest, and first-contact fingerprint verification are implemented. Same-map exploration converges through the host command processor and authoritative checkpoints; replicas do not rerun rule-bearing scripts, rolls, or timed queues. Installed-data two-process scenarios cover movement, doors, pickup, loot, inventory gifts, skills, item-on-target quest completion, scenery and container state, XP, independent elevator, ladder, and typed-stair travel, shared cross-map elevators, exits, and typed stairs, agreed rest, world-map travel into towns, terrain, and encounters, and combat actions, effects, statuses, script-queued entry, and reconnect with complete authoritative checkpoints.
 
 ## Goal
 
@@ -469,16 +469,44 @@ Exit condition: initiative advances through host, guest, and AI actors in the sa
 
 ### Phase 4B: sequential combat actions and recovery
 
-- Replicate movement, attack, item, reload, stance, and end-turn commands and their complete host-selected results.
-- Add shared XP and progression events.
-- Cover death, knockout, fleeing, elevation changes, and combat triggered by scripts.
-- Encode combat ownership and results by actor/player identity, and track
-  recovery acknowledgement per participant so another player's reconnect does
-  not stall or rewind the authoritative turn.
+- [x] Replicate semantic combat movement, attack, self-use and targeted item use,
+  reload, facing, and end-turn intents through the host command processor. The
+  host finishes animation callbacks before publishing an action result, then
+  sends an immediate full-state checkpoint containing HP, AP, ammo, inventory,
+  death/animation presentation, combat identity, and bonus-move points. The
+  guest does not rerun scripts, damage, rolls, ammo rules, or XP rules. "Stance"
+  means facing/equipped-hand presentation and selected attack mode in this
+  engine; there is no independent crouch/stance mechanic to synchronize.
+- [x] Add ordered, player-keyed party XP/progression events with a complete
+  build checkpoint; the host applies XP once and the guest applies no level-up
+  rules. Track applied-event acknowledgement separately for each participant.
+- [x] Verify installed-data live guest attack and combat movement through the
+  real host combat loop, matching full-state digests and zero guest scripts,
+  attacks, and RNG. Headless tests cover action round-trips, ownership, stale
+  revisions, duplicate suppression, three-player XP event shape, and
+  independent reconnect acknowledgement boundaries.
+- [x] Cover death, knockout, fleeing, elevation changes, and the script-queued
+  combat entry path with installed-data host/guest scenarios and full-state
+  digests. The knockout/fleeing fixture injects those status flags at the first
+  authoritative combat checkpoint; a naturally produced status or content-
+  script encounter remains part of the Phase 6 compatibility campaign.
+- [x] Verify self-use and targeted item use, reload, and facing through
+  installed-data two-process scenarios, including action-checkpoint AP costs,
+  consumed Stimpak, conserved total ammo, and final digest convergence.
+- [x] Run a complete multi-round encounter with guest disconnect/reconnect
+  during an active turn, then continue it without duplicate effects or turn
+  rewind. Include the pending action checkpoint in recovery; the test fixture
+  ends the encounter deterministically on a later player turn after both
+  players and AI have advanced.
 
-Do not enable live attack commands merely because their wire format exists. Phase 4A ownership is in place, but the runtime must continue rejecting attacks until Phase 4B publishes their complete authoritative effects.
+Live attacks are permitted only through the revision-keyed 4B host executor and
+its complete authoritative checkpoint. A command wire type by itself is never
+sufficient to enable a rule-bearing action.
 
-Exit condition: a complete encounter survives save, load, and guest reconnection.
+Exit condition: a complete encounter, including a guest reconnect during
+combat, converges without repeated guest rules or lost/duplicated effects.
+Durable stop, save, load, and later resumption are Phase 6's sidecar/recovery
+exit condition; requiring them here conflicted with that phase's ownership.
 
 ### Phase 5: dialogue and quests
 

@@ -6,6 +6,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "multiplayer/character_lobby.h"
@@ -71,7 +72,16 @@ public:
     bool sendLocalExitGrid(EntityId exitId, std::uint32_t phaseRevision = 1);
     bool sendLocalSceneryTransition(EntityId transitionId, std::uint32_t phaseRevision = 1);
     bool sendLocalRest(std::int32_t minutes, std::uint32_t phaseRevision = 1);
-    bool sendLocalAttack(EntityId targetId, std::int32_t hitMode, std::int32_t hitLocation, std::uint32_t phaseRevision = 1);
+    bool sendLocalAttack(EntityId targetId, std::int32_t hitMode, std::int32_t hitLocation,
+        std::uint64_t turnRevision, std::uint32_t phaseRevision = 1);
+    bool sendLocalCombatMove(std::int32_t tile, std::int32_t elevation,
+        bool running, std::uint64_t turnRevision, std::uint32_t phaseRevision);
+    bool sendLocalCombatItem(EntityId itemId, EntityId targetId, std::uint64_t turnRevision,
+        std::uint32_t phaseRevision);
+    bool sendLocalCombatReload(EntityId weaponId, std::int32_t hitMode,
+        std::uint64_t turnRevision, std::uint32_t phaseRevision);
+    bool sendLocalCombatFace(std::int32_t rotation, std::uint64_t turnRevision,
+        std::uint32_t phaseRevision);
     bool sendLocalEndTurn(std::uint64_t turnRevision, std::uint32_t phaseRevision);
     bool sendLocalSharedModal(SharedModalKind kind, bool open, SessionPhase currentPhase, std::uint32_t phaseRevision = 1);
     bool sendLocalWorldMapRoute(const WorldMapRouteCommand& route, std::uint32_t phaseRevision = 1);
@@ -114,6 +124,7 @@ public:
     bool reattachTransport(std::unique_ptr<Transport> transport);
     bool queueRecovery(EventSequence lastApplied);
     EventSequence lastAppliedEvent() const;
+    EventSequence acknowledgedEvent(PlayerId playerId) const;
     void poll();
     bool disconnectForReconnect();
     void stop();
@@ -163,6 +174,7 @@ private:
     std::uint64_t _nextEventSequence = 1;
     std::uint64_t _nextExpectedEventSequence = 1;
     EventSequence _lastAppliedEventSequence;
+    std::unordered_map<PlayerId, EventSequence, PlayerIdHash> _acknowledgedEvents;
     std::deque<CommandSequence> _pendingCommandSequences;
     std::deque<EventSequence> _recoveryRequests;
     std::deque<GameCommand> _peerCommands;

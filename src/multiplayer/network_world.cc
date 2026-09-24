@@ -7,6 +7,7 @@
 #include <deque>
 #include <limits>
 #include <optional>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <unordered_map>
@@ -44,7 +45,9 @@
 #include "multiplayer/local_session.h"
 #include "multiplayer/presentation_bridge.h"
 #include "plib/gnw/debug.h"
+#include "plib/gnw/input.h"
 #include "plib/gnw/memory.h"
+#include "plib/gnw/svga.h"
 
 namespace fallout {
 namespace multiplayer {
@@ -54,6 +57,7 @@ LocalSession session;
 Object* peerActor = nullptr;
 CommandProcessor commandProcessor;
 CombatTurnController combatTurns;
+bool combatActionResolving = false;
 constexpr std::uint64_t kCombatTurnDurationMilliseconds = 60000;
 
 std::uint64_t combatClockMilliseconds()
@@ -395,7 +399,6 @@ constexpr int kAntidotePid = 49;
 constexpr int kChildrenIndependentStairPid = 0x200015C;
 constexpr int kChildrenIndependentStairTile = 18900;
 
-constexpr std::uint32_t kSharedObjectFlagMask = 0xB70FF839;
 
 bool isExitGrid(const Object* object)
 {
@@ -635,9 +638,19 @@ bool applyActorAndCritterState(const WorldSnapshot& snapshot)
             }
             dirty = true;
         }
-        critter_adjust_hits(actor, actorState.hitPoints - critter_get_hits(actor));
+        if (!applySharedObjectPresentation(actor, actorState.fid,
+                actorState.frame, actorState.objectFlags,
+                actorState.lightDistance, actorState.lightIntensity)) {
+            return false;
+        }
+        // A replica applies the host's selected death and animation state; it
+        // must never call critter_kill through critter_adjust_hits here.
+        actor->data.critter.hp = actorState.hitPoints;
         actor->data.critter.combat.ap = actorState.actionPoints;
         actor->data.critter.combat.results = actorState.combatResults;
+        actor->data.critter.combat.maneuver = actorState.combatManeuver;
+        actor->data.critter.combat.damageLastTurn = actorState.damageLastTurn;
+        actor->data.critter.combat.team = actorState.team;
         if (dirty) {
             tile_refresh_rect(&dirtyRect, actorState.elevation);
         }
@@ -659,13 +672,36 @@ bool applyActorAndCritterState(const WorldSnapshot& snapshot)
             }
             dirty = true;
         }
-        critter_adjust_hits(critter, critterState.hitPoints - critter_get_hits(critter));
+        if (!applySharedObjectPresentation(critter, critterState.fid,
+                critterState.frame, critterState.objectFlags,
+                critterState.lightDistance, critterState.lightIntensity)) {
+            return false;
+        }
+        critter->data.critter.hp = critterState.hitPoints;
         critter->data.critter.combat.ap = critterState.actionPoints;
         critter->data.critter.combat.results = critterState.combatResults;
         critter->data.critter.combat.team = critterState.team;
+        critter->data.critter.combat.maneuver = critterState.combatManeuver;
+        critter->data.critter.combat.damageLastTurn = critterState.damageLastTurn;
         if (dirty) {
             tile_refresh_rect(&dirtyRect, critterState.elevation);
         }
+    }
+    for (const ActorSnapshot& actorState : snapshot.actors) {
+        Object* actor = session.entities().findObject(actorState.entityId);
+        actor->data.critter.combat.whoHitMe = isValid(actorState.whoHitMeId)
+            ? session.entities().findObject(actorState.whoHitMeId) : nullptr;
+        actor->data.critter.combat.whoHitMeCid =
+            actor->data.critter.combat.whoHitMe != nullptr
+            ? actor->data.critter.combat.whoHitMe->cid : -1;
+    }
+    for (const CritterSnapshot& critterState : snapshot.critters) {
+        Object* critter = session.entities().findObject(critterState.entityId);
+        critter->data.critter.combat.whoHitMe = isValid(critterState.whoHitMeId)
+            ? session.entities().findObject(critterState.whoHitMeId) : nullptr;
+        critter->data.critter.combat.whoHitMeCid =
+            critter->data.critter.combat.whoHitMe != nullptr
+            ? critter->data.critter.combat.whoHitMe->cid : -1;
     }
     return true;
 }
@@ -1138,6 +1174,156 @@ bool advanceSharedRest(int minutes, bool untilHealed)
 
 class NetworkCommandExecutor : public CommandExecutor {
 public:
+    bool combatActionAllowed(Object* actor, std::uint64_t revision) const
+    {
+        if (worldMode != NetworkLaunchMode::Host || !session.isActive()
+            || session.phase() != SessionPhase::Combat || !isInCombat()
+            || actor == nullptr || revision == 0 || combatActionResolving
+            || (actor->data.critter.combat.results
+                & (DAM_KNOCKED_OUT | DAM_DEAD | DAM_LOSE_TURN)) != 0) {
+            return false;
+        }
+        std::optional<EntityId> actorId = session.entities().findEntity(actor);
+        const CombatTurnEntry* turn = combatTurns.current();
+        return actorId.has_value() && turn != nullptr
+            && turn->actorId == *actorId && turn->owner.has_value()
+            && turn->owner == networkWorldCombatOwner(actor)
+            && combatTurns.revision() == revision;
+    }
+
+    CommandExecutionStatus combatMove(Object* actor,
+        const CombatMoveCommand& command) override
+    {
+        if (!combatActionAllowed(actor, command.turnRevision)
+            || !hexGridTileIsValid(command.destinationTile)
+            || command.elevation != actor->elevation
+            || command.destinationTile == actor->tile
+            || actor->data.critter.combat.ap + combat_free_move <= 0) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        std::array<unsigned char, kMaximumMovementPathLength> path;
+        int pathLength = make_path(actor, actor->tile,
+            command.destinationTile, path.data(), 1);
+        if (pathLength <= 0 || pathLength > kAnimationMaximumPathLength) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        int startingTile = actor->tile;
+        register_clear(actor);
+        int request = actor == obj_dude
+            ? ANIMATION_REQUEST_RESERVED : ANIMATION_REQUEST_UNRESERVED;
+        if (register_begin(request) == -1) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        int scheduled = register_object_move_along_path(actor,
+            command.destinationTile, command.elevation, path.data(),
+            pathLength, command.running, 0);
+        int committed = register_end();
+        if (scheduled == -1 || committed == -1) {
+            register_clear(actor);
+            return CommandExecutionStatus::InvalidAction;
+        }
+        combatActionResolving = true;
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        while (anim_busy(actor) == -1 && std::chrono::steady_clock::now() < deadline) {
+            process_bk();
+            renderPresent();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (anim_busy(actor) == -1) {
+            register_clear(actor);
+        }
+        combatActionResolving = false;
+        return actor->tile != startingTile
+            ? CommandExecutionStatus::Applied : CommandExecutionStatus::InvalidAction;
+    }
+
+    CommandExecutionStatus combatItem(Object* actor,
+        const CombatItemCommand& command) override
+    {
+        Object* item = session.entities().findObject(command.itemId);
+        Object* target = isValid(command.targetId)
+            ? session.entities().findObject(command.targetId) : nullptr;
+        if (!combatActionAllowed(actor, command.turnRevision)
+            || item == nullptr || item->owner != actor
+            || (isValid(command.targetId)
+                ? target == nullptr || target == item
+                    || target->elevation != actor->elevation
+                    || target->tile < 0
+                    || obj_dist(actor, target) > 1
+                    || !proto_action_can_use_on(item->pid)
+                : !proto_action_can_use(item->pid)
+                    && !proto_action_can_use_on(item->pid))
+            || actor->data.critter.combat.ap < 2) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        combatActionResolving = true;
+        int result = target != nullptr
+            ? obj_use_item_on(actor, target, item)
+            : proto_action_can_use_on(item->pid)
+                ? obj_use_item_on(actor, actor, item)
+                : obj_use_item(actor, item);
+        combatActionResolving = false;
+        if (result != 0) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        actor->data.critter.combat.ap -= 2;
+        if (actor == obj_dude) {
+            intface_update_items(false);
+            intface_update_move_points(actor->data.critter.combat.ap, combat_free_move);
+        }
+        return CommandExecutionStatus::Applied;
+    }
+
+    CommandExecutionStatus combatReload(Object* actor,
+        const CombatReloadCommand& command) override
+    {
+        Object* weapon = session.entities().findObject(command.weaponId);
+        if (!combatActionAllowed(actor, command.turnRevision)
+            || weapon == nullptr || weapon->owner != actor
+            || item_get_type(weapon) != ITEM_TYPE_WEAPON
+            || (command.hitMode == HIT_MODE_LEFT_WEAPON_RELOAD
+                && inven_left_hand(actor) != weapon)
+            || (command.hitMode == HIT_MODE_RIGHT_WEAPON_RELOAD
+                && inven_right_hand(actor) != weapon)
+            || (command.hitMode != HIT_MODE_LEFT_WEAPON_RELOAD
+                && command.hitMode != HIT_MODE_RIGHT_WEAPON_RELOAD)
+            || actor->data.critter.combat.ap
+                < item_mp_cost(actor, command.hitMode, false)) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        bool reloaded = false;
+        combatActionResolving = true;
+        while (item_w_try_reload(actor, weapon) != -1) {
+            reloaded = true;
+        }
+        combatActionResolving = false;
+        if (!reloaded) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        actor->data.critter.combat.ap -= item_mp_cost(actor, command.hitMode, false);
+        if (actor == obj_dude) {
+            intface_update_items(false);
+            intface_update_move_points(actor->data.critter.combat.ap, combat_free_move);
+        }
+        return CommandExecutionStatus::Applied;
+    }
+
+    CommandExecutionStatus combatFace(Object* actor,
+        const CombatFaceCommand& command) override
+    {
+        if (!combatActionAllowed(actor, command.turnRevision)
+            || command.rotation < 0 || command.rotation >= ROTATION_COUNT
+            || command.rotation == actor->rotation) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        Rect dirtyRect {};
+        if (obj_set_rotation(actor, command.rotation, &dirtyRect) == -1) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        tile_refresh_rect(&dirtyRect, actor->elevation);
+        return CommandExecutionStatus::Applied;
+    }
+
     CommandExecutionStatus move(Object* actor, const MoveCommand& command) override
     {
         if (isInCombat()
@@ -1660,12 +1846,46 @@ public:
 
     CommandExecutionStatus attack(Object* actor, Object* target, const AttackCommand& command) override
     {
-        // Fail closed until the combat controller can prove active-turn
-        // ownership and publish complete authoritative effects.
-        (void)actor;
-        (void)target;
-        (void)command;
-        return CommandExecutionStatus::InvalidAction;
+        std::optional<EntityId> actorId = actor != nullptr
+            ? session.entities().findEntity(actor) : std::nullopt;
+        const CombatTurnEntry* turn = combatTurns.current();
+        if (worldMode != NetworkLaunchMode::Host
+            || session.phase() != SessionPhase::Combat
+            || !isInCombat()
+            || actor == nullptr
+            || target == nullptr
+            || actor == target
+            || actor->elevation != target->elevation
+            || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER
+            || command.hitMode < 0 || command.hitMode >= HIT_MODE_COUNT
+            || command.hitMode == HIT_MODE_LEFT_WEAPON_RELOAD
+            || command.hitMode == HIT_MODE_RIGHT_WEAPON_RELOAD
+            || command.hitLocation < 0 || command.hitLocation >= HIT_LOCATION_COUNT
+            || !actorId.has_value()
+            || turn == nullptr
+            || turn->actorId != *actorId
+            || !turn->owner.has_value()
+            || turn->owner != networkWorldCombatOwner(actor)
+            || combatTurns.revision() != command.turnRevision
+            || (actor->data.critter.combat.results
+                & (DAM_KNOCKED_OUT | DAM_DEAD | DAM_LOSE_TURN)) != 0
+            || combat_check_bad_shot(actor, target, command.hitMode,
+                   command.hitLocation != HIT_LOCATION_UNCALLED) != COMBAT_BAD_SHOT_OK
+            || combatActionResolving) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        combatActionResolving = true;
+        int result = combat_attack(actor, target, command.hitMode, command.hitLocation);
+        if (result == 0) {
+            // Fallout finishes ammo, damage, death, scripts, and XP in an
+            // animation callback. Keep the acting-player context alive until
+            // that callback has completed before publishing the result.
+            combat_turn_run();
+        }
+        combatActionResolving = false;
+        return result == 0
+            ? CommandExecutionStatus::Applied
+            : CommandExecutionStatus::InvalidAction;
     }
 
     EndTurnExecution endTurn(Object* actor, PlayerId playerId,
@@ -3094,6 +3314,199 @@ bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts)
         return false;
     }
     return true;
+}
+
+EntityId networkWorldCombatSmokeTarget()
+{
+    return !worldCritters.empty() ? worldCritters.front().first : EntityId {};
+}
+
+int networkWorldCombatSmokeMoveTile()
+{
+    Object* guest = networkWorldPlayerActor(kGuestPlayerId);
+    if (guest == nullptr) return -1;
+    for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+        int tile = tile_num_in_direction(guest->tile, rotation, 1);
+        if (hexGridTileIsValid(tile)
+            && obj_blocking_at(guest, tile, guest->elevation) == nullptr) {
+            return tile;
+        }
+    }
+    return -1;
+}
+
+bool networkWorldCombatSmokeTargetDead()
+{
+    return !worldCritters.empty() && worldCritters.front().second != nullptr
+        && critter_is_dead(worldCritters.front().second);
+}
+
+EntityId networkWorldCombatSmokeItem()
+{
+    Object* guest = networkWorldPlayerActor(kGuestPlayerId);
+    if (guest == nullptr) return {};
+    for (const auto& entry : worldItems) {
+        if (entry.second != nullptr && entry.second->owner == guest
+            && entry.second->pid == PROTO_ID_STIMPACK) {
+            return entry.first;
+        }
+    }
+    return {};
+}
+
+bool networkWorldCombatSmokeActorHealed()
+{
+    Object* guest = networkWorldPlayerActor(kGuestPlayerId);
+    return guest != nullptr
+        && critter_get_hits(guest)
+            > std::max(1, stat_level(guest, STAT_MAXIMUM_HIT_POINTS) - 20);
+}
+
+bool networkWorldPrepareCombatItemSmoke()
+{
+    Object* guest = networkWorldPlayerActor(kGuestPlayerId);
+    if (worldMode != NetworkLaunchMode::Host || guest == nullptr) return false;
+    Object* item = nullptr;
+    if (obj_pid_new(&item, PROTO_ID_STIMPACK) == -1 || item == nullptr) return false;
+    if (obj_disconnect(item, nullptr) == -1
+        || item_add_force(guest, item, 1) != 0) {
+        obj_erase_object(item, nullptr);
+        return false;
+    }
+    if (!registerItem(item)) return false;
+    guest->data.critter.hp = std::max(1,
+        stat_level(guest, STAT_MAXIMUM_HIT_POINTS) - 20);
+    return true;
+}
+
+EntityId networkWorldCombatSmokeWeapon()
+{
+    Object* guest = networkWorldPlayerActor(kGuestPlayerId);
+    if (guest == nullptr) return {};
+    for (const auto& entry : worldItems) {
+        if (entry.second != nullptr && entry.second->owner == guest
+            && item_get_type(entry.second) == ITEM_TYPE_WEAPON
+            && (entry.second->flags & OBJECT_IN_RIGHT_HAND) != 0) {
+            return entry.first;
+        }
+    }
+    return {};
+}
+
+bool networkWorldCombatSmokeWeaponLoaded()
+{
+    Object* weapon = networkWorldFindObject(networkWorldCombatSmokeWeapon());
+    return weapon != nullptr && item_w_curr_ammo(weapon) > 0;
+}
+
+int networkWorldCombatSmokeAmmoUnits()
+{
+    Object* guest = networkWorldPlayerActor(kGuestPlayerId);
+    Object* weapon = networkWorldFindObject(networkWorldCombatSmokeWeapon());
+    if (guest == nullptr || weapon == nullptr) return -1;
+    int units = item_w_curr_ammo(weapon);
+    Inventory* inventory = &guest->data.inventory;
+    for (int index = 0; index < inventory->length; index++) {
+        InventoryItem* entry = &inventory->items[index];
+        if (entry->item == nullptr || item_get_type(entry->item) != ITEM_TYPE_AMMO
+            || entry->quantity <= 0) continue;
+        units += item_w_curr_ammo(entry->item)
+            + (entry->quantity - 1) * item_w_max_ammo(entry->item);
+    }
+    return units;
+}
+
+bool networkWorldPrepareCombatReloadSmoke()
+{
+    Object* guest = networkWorldPlayerActor(kGuestPlayerId);
+    if (worldMode != NetworkLaunchMode::Host || guest == nullptr) return false;
+    int weaponPid = -1;
+    int ammoPid = -1;
+    for (int pid = 1; pid < 200 && weaponPid < 0; pid++) {
+        Proto* weaponProto = nullptr;
+        if (proto_ptr(pid, &weaponProto) != 0 || weaponProto == nullptr
+            || weaponProto->item.type != ITEM_TYPE_WEAPON
+            || weaponProto->item.data.weapon.ammoCapacity <= 0) continue;
+        int candidateAmmo = weaponProto->item.data.weapon.ammoTypePid;
+        Proto* ammoProto = nullptr;
+        if (candidateAmmo <= 0 || proto_ptr(candidateAmmo, &ammoProto) != 0
+            || ammoProto == nullptr || ammoProto->item.type != ITEM_TYPE_AMMO
+            || ammoProto->item.data.ammo.caliber
+                != weaponProto->item.data.weapon.caliber) continue;
+        weaponPid = pid;
+        ammoPid = candidateAmmo;
+    }
+    if (weaponPid < 0) return false;
+    Object* weapon = nullptr;
+    Object* ammo = nullptr;
+    if (obj_pid_new(&weapon, weaponPid) == -1 || weapon == nullptr
+        || obj_pid_new(&ammo, ammoPid) == -1 || ammo == nullptr) {
+        if (weapon != nullptr) obj_erase_object(weapon, nullptr);
+        if (ammo != nullptr) obj_erase_object(ammo, nullptr);
+        return false;
+    }
+    if (obj_disconnect(weapon, nullptr) == -1
+        || obj_disconnect(ammo, nullptr) == -1
+        || item_add_force(guest, weapon, 1) != 0
+        || item_add_force(guest, ammo, 1) != 0) {
+        return false;
+    }
+    weapon->flags |= OBJECT_IN_RIGHT_HAND;
+    item_w_set_curr_ammo(weapon, 0);
+    return static_cast<bool>(registerItem(weapon))
+        && static_cast<bool>(registerItem(ammo));
+}
+
+bool networkWorldPrepareCombatSeparatedElevationSmoke()
+{
+    Object* guest = networkWorldPlayerActor(kGuestPlayerId);
+    if (worldMode != NetworkLaunchMode::Host || guest == nullptr
+        || guest->elevation != 0) return false;
+    return obj_move_to_tile(guest, guest->tile, 1, nullptr) == 0
+        && guest->elevation == 1;
+}
+
+bool networkWorldPrepareCombatScriptStatusSmoke()
+{
+    Object* guest = networkWorldPlayerActor(kGuestPlayerId);
+    Object* target = !worldCritters.empty() ? worldCritters.front().second : nullptr;
+    if (worldMode != NetworkLaunchMode::Host || guest == nullptr
+        || target == nullptr) return false;
+    guest->data.critter.combat.results |= DAM_KNOCKED_OUT;
+    target->data.critter.combat.maneuver |= CRITTER_MANUEVER_FLEEING;
+    return true;
+}
+
+bool networkWorldCombatScriptStatusObserved()
+{
+    Object* guest = networkWorldPlayerActor(kGuestPlayerId);
+    Object* target = !worldCritters.empty() ? worldCritters.front().second : nullptr;
+    return guest != nullptr && target != nullptr
+        && (guest->data.critter.combat.results & DAM_KNOCKED_OUT) != 0
+        && (target->data.critter.combat.maneuver & CRITTER_MANUEVER_FLEEING) != 0;
+}
+
+bool networkWorldPrepareCombatAttackSmoke(bool lethal)
+{
+    if (worldMode != NetworkLaunchMode::Host || worldCritters.empty()) {
+        return false;
+    }
+    Object* guest = networkWorldPlayerActor(kGuestPlayerId);
+    Object* target = worldCritters.front().second;
+    if (guest == nullptr || target == nullptr || guest == target
+        || (target->data.critter.combat.results & DAM_DEAD) != 0) {
+        return false;
+    }
+    for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+        int tile = tile_num_in_direction(guest->tile, rotation, 1);
+        if (tile >= 0
+            && obj_blocking_at(target, tile, guest->elevation) == nullptr
+            && obj_move_to_tile(target, tile, guest->elevation, nullptr) == 0) {
+            if (lethal) target->data.critter.hp = 1;
+            return obj_dist(guest, target) == 1;
+        }
+    }
+    return false;
 }
 
 std::optional<EntityId> networkWorldPrepareDoorSmokeTest()
@@ -5371,6 +5784,7 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
     captured.phaseRevision = session.phaseRevision();
     if (captured.phase == SessionPhase::Combat) {
         captured.combat = combatTurns.snapshot(combatClockMilliseconds());
+        captured.combatFreeMove = combat_free_move;
     }
     captured.gameTime = game_time();
     worldmap_capture_state(captured.worldMap);
@@ -5405,6 +5819,16 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
             std::max(critter_get_hits(actor), 0),
             std::max(actor->data.critter.combat.ap, 0),
             actor->data.critter.combat.results,
+            actor->fid,
+            actor->frame,
+            sharedObjectFlags(actor),
+            actor->lightDistance,
+            actor->lightIntensity,
+            actor->data.critter.combat.maneuver,
+            actor->data.critter.combat.damageLastTurn,
+            actor->data.critter.combat.team,
+            session.entities().findEntity(actor->data.critter.combat.whoHitMe)
+                .value_or(EntityId {}),
             player->build,
         });
     }
@@ -5448,6 +5872,15 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
             std::max(critter->data.critter.combat.ap, 0),
             critter->data.critter.combat.results,
             critter->data.critter.combat.team,
+            critter->fid,
+            critter->frame,
+            sharedObjectFlags(critter),
+            critter->lightDistance,
+            critter->lightIntensity,
+            critter->data.critter.combat.maneuver,
+            critter->data.critter.combat.damageLastTurn,
+            session.entities().findEntity(critter->data.critter.combat.whoHitMe)
+                .value_or(EntityId {}),
         });
     }
     for (const auto& entry : worldDoors) {
@@ -5732,6 +6165,7 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
     } else {
         combatTurns.stop();
     }
+    combat_free_move = snapshot.combatFreeMove;
     Object* localActor = localPlayerActor();
     if (localActor == nullptr
         || (map_elevation != localActor->elevation && map_set_elevation(localActor->elevation) != 0)) {
@@ -5982,6 +6416,11 @@ bool networkWorldCombatTurnMatches(const Object* actor)
         && combatTurns.current()->actorId == *actorId;
 }
 
+bool networkWorldCombatActionResolving()
+{
+    return combatActionResolving;
+}
+
 void networkWorldCombatCompleteTurn(Object* actor, std::uint64_t expectedRevision)
 {
     if (worldMode != NetworkLaunchMode::Host
@@ -6081,6 +6520,40 @@ bool networkWorldApplyPeerCombatTurn(const CombatTurnStateChangedEvent& event)
     return combatTurns.restore(event.state, combatClockMilliseconds());
 }
 
+bool networkWorldApplyPeerCombatAction(const CombatActionResolvedEvent& event)
+{
+    if (worldMode != NetworkLaunchMode::Join || !session.isActive()
+        || session.phase() != SessionPhase::Combat
+        || !isValid(event.kind) || event.turnRevision == 0
+        || event.phaseRevision != session.phaseRevision()) {
+        return false;
+    }
+    return session.players().findByActor(event.actorId) != nullptr
+        && session.entities().findObject(event.actorId) != nullptr;
+}
+
+bool networkWorldApplyPeerPartyExperience(const PartyExperienceAwardedEvent& event)
+{
+    if (worldMode != NetworkLaunchMode::Join || !session.isActive()
+        || event.amount == 0
+        || event.players.size() != session.players().size()) {
+        return false;
+    }
+    std::unordered_set<PlayerId, PlayerIdHash> seen;
+    for (const PlayerProgressionResult& result : event.players) {
+        const PlayerCharacterState* player = session.players().find(result.playerId);
+        if (player == nullptr || player->actorId != result.actorId
+            || result.experience < 0 || result.level < 1
+            || result.unspentSkillPoints < 0
+            || !seen.insert(result.playerId).second) {
+            return false;
+        }
+    }
+    // Applying Fallout's XP routine here would repeat level-up rules. The
+    // following checkpoint commits the complete builds on the replica.
+    return true;
+}
+
 Object* networkWorldFindObject(EntityId entityId)
 {
     return session.isActive() && isValid(entityId)
@@ -6098,6 +6571,7 @@ Object* networkWorldPlayerActor(PlayerId playerId)
 
 void networkWorldLeave()
 {
+    combatActionResolving = false;
     combatTurns.stop();
     session.stop();
     worldDoors.clear();
@@ -6151,15 +6625,15 @@ PartyExperienceResult networkWorldAwardPartyExperience(int xp)
         return PartyExperienceResult::Failed;
     }
 
-    std::array<std::pair<PlayerCharacterState*, Object*>, 2> party;
-    std::size_t index = 0;
-    for (PlayerId playerId : { kHostPlayerId, kGuestPlayerId }) {
+    if (xp == 0) return PartyExperienceResult::Applied;
+    std::vector<std::pair<PlayerCharacterState*, Object*>> party;
+    for (PlayerId playerId : session.players().playerIds()) {
         PlayerCharacterState* player = session.players().find(playerId);
         Object* actor = player != nullptr ? session.entities().findObject(player->actorId) : nullptr;
         if (player == nullptr || actor == nullptr) {
             return PartyExperienceResult::Failed;
         }
-        party[index++] = { player, actor };
+        party.emplace_back(player, actor);
     }
 
     for (const auto& member : party) {
@@ -6168,6 +6642,21 @@ PartyExperienceResult networkWorldAwardPartyExperience(int xp)
             return PartyExperienceResult::Failed;
         }
     }
+    PartyExperienceAwardedEvent award;
+    award.actorId = session.playerActorId(kHostPlayerId);
+    award.amount = xp;
+    for (const auto& member : party) {
+        award.players.push_back(PlayerProgressionResult {
+            member.first->id,
+            member.first->actorId,
+            member.first->build.experience,
+            member.first->build.level,
+            member.first->build.unspentSkillPoints,
+        });
+    }
+    deferredEvents.push_back(GameEvent {
+        {}, CommandSequence { 1 }, std::move(award),
+    });
     return PartyExperienceResult::Applied;
 }
 
