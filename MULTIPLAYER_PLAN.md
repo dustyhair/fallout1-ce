@@ -431,15 +431,15 @@ Exit condition: two players can complete a small non-combat quest together on on
   2. [x] Connect controller-only route input, route changes, peer presentation, disconnect takeover, and host-only travel rules.
   3. [x] Publish town, terrain, encounter, interruption, and terminal-world-event arrivals with player placements and entrance selection; preserve recovery and cancellation semantics.
   4. [x] Verify host- and guest-proposed travel, Shady Sands arrival, route changes, after-departure cancellation, guest-controller takeover, deterministic encounter entry, and a timed-queue interruption with installed two-process scenarios, full digest convergence, zero guest rule execution, and authenticated replay. Isolated installed-data fixtures also cover before-departure cancellation, mid-route progress restore, daily healing, countdown detection, and consent rejection.
-- [ ] Require readiness from every connected participant for exits, rest, and world-map transitions—both players in the MVP—with an explicit host timeout policy where appropriate. Ordinary exits require proximity, fixed-duration rest requires matching consent with a 90-second expiry, and world-map entry requires explicit acceptance of the proposer's request with a 90-second expiry. Same-map elevators remain independently usable, with proximity-based shared rides.
+- [x] Require readiness from every connected participant for exits, rest, and world-map transitions—both players in the MVP—with an explicit host timeout policy where appropriate. Ordinary exits require proximity, fixed-duration rest requires matching consent with a 90-second expiry, and world-map entry requires explicit acceptance of the proposer's request with a 90-second expiry. Same-map elevators remain independently usable, with proximity-based shared rides.
 - Verify entity rebinding, every remote-player inventory, queued events, and state hashes across every transition boundary. Elevator, ordinary-exit, and typed-stair installed-data scenarios currently cover this contract.
 - [ ] Put transition readiness and destination placement behind roster-shaped
   helpers. Roster-shaped readiness checks now gate rest consent, cross-map
   elevators, ordinary exits, and script-backed cross-map stairs. The current
   elevator wire event may retain its version 13 host/guest fields. Ordinary
-  exits now use the shared bounded player-keyed placement type; world-map
-  travel and the remaining destination placement paths must reuse that roster
-  model rather than add another independent pair-shaped payload.
+  exits and world-map arrivals now use the shared bounded player-keyed
+  placement type; the remaining destination placement paths should reuse that
+  roster model rather than add another independent pair-shaped payload.
 
 Exit condition: two players can complete a small non-combat quest together, change maps and elevations, travel on the world map, and remain synchronized.
 
