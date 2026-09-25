@@ -2876,7 +2876,14 @@ void testNetworkCharacterLobby()
     host.poll();
     expect(host.acknowledgedEvent(kGuestPlayerId) == EventSequence { 11 },
         "reconnected guest acknowledgement advances only its own boundary");
+    expect(host.sendLocalFacing(3) && host.sendLocalFacing(4),
+        "host publishes events that a later checkpoint will supersede");
+    guest.poll();
+    expect(guest.takePeerEvent().has_value() && guest.takePeerEvent().has_value()
+            && guest.lastAppliedEvent() == EventSequence { 11 },
+        "receiving obsolete events does not acknowledge their application");
     WorldSnapshot authoritativeState = sampleSnapshot();
+    authoritativeState.lastIncludedEvent = host.latestAuthoritativeEvent();
     authoritativeState.phase = SessionPhase::Ending;
     expect(host.sendAuthoritativeState(authoritativeState),
         "host sends a non-journaled full authoritative correction");
@@ -2891,9 +2898,17 @@ void testNetworkCharacterLobby()
             && receivedState->items.size() == 2,
         "guest receives complete authoritative state independently of replay events");
     expect(receivedState.has_value()
+            && guest.confirmSnapshotApplied(receivedState->lastIncludedEvent)
+            && guest.lastAppliedEvent() == EventSequence { 13 }
+            && !guest.confirmSnapshotApplied(EventSequence { 12 })
+            && !guest.confirmSnapshotApplied(EventSequence { 14 }),
+        "applied checkpoints bridge obsolete events without rewinding or acknowledging unseen events");
+    expect(receivedState.has_value()
             && guest.confirmSessionEndingApplied(receivedState->phaseRevision),
         "guest confirms the applied ending checkpoint revision");
     host.poll();
+    expect(host.acknowledgedEvent(kGuestPlayerId) == EventSequence { 13 },
+        "host receives the repaired authoritative checkpoint acknowledgement");
     expect(receivedState.has_value()
             && host.acknowledgedEndingPhaseRevision() == receivedState->phaseRevision,
         "host receives the exact ending checkpoint revision acknowledgement");

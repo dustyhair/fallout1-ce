@@ -1,6 +1,10 @@
 # Two-player co-op plan
 
-Status: Phases 0, 1, 2, 2.25, 2.5, 3A, 3B, 4A, 4B, 5, 6, and 7 are complete on the `multiplayer-plan` branch. Transport, lobby, journal, snapshot recovery, authenticated reconnect, content manifest, first-contact fingerprint verification, bilateral trade, deterministic loot distribution, hidden host recovery saves, protocol diagnostics, deterministic transport-fault tests, the optional dependency-free single-player build, and the installed-data compatibility campaign are implemented. Same-map exploration converges through the host command processor and authoritative checkpoints; replicas do not rerun rule-bearing scripts, rolls, or timed queues. Installed-data two-process scenarios cover movement, doors, pickup, loot, inventory gifts, skills, item-on-target quest completion, scenery and container state, XP, independent elevator, ladder, and typed-stair travel, shared cross-map elevators, exits, and typed stairs, agreed rest, world-map travel into towns, terrain, and encounters, combat actions, effects, statuses, script-queued entry, and reconnect with complete authoritative checkpoints, plus host- and guest-led branching dialogue, split votes, attributed quest activity, talker skill checks, a script-requested combat transition, and durable recovery. Phase 6 headless coverage additionally verifies transactional trade revisions and conservation, roster-based cap/loot cursors, sidecar v1-v4 migration, saved-slot claims, durable shared activity, and cross-map recovery snapshot identity. Phase 7's 12-scenario persistent campaign and headless preflight pass with matching recovery digests after exposing and fixing mutable-string handling in interrupted-rest presentation.
+Status: Phases 0, 1, 2, 2.25, 2.5, 3A, 3B, 4A, 4B, 5, 6, and 7 are complete on the `multiplayer-plan` branch. Transport, lobby, journal, snapshot recovery, authenticated reconnect, content manifest, first-contact fingerprint verification, bilateral trade, deterministic loot distribution, hidden host recovery saves, protocol diagnostics, deterministic transport-fault tests, the optional dependency-free single-player build, and the installed-data compatibility campaign are implemented. Same-map exploration converges through the host command processor and authoritative checkpoints; replicas do not rerun rule-bearing scripts, rolls, or timed queues. Installed-data two-process scenarios cover movement, doors, pickup, loot, inventory gifts, skills, item-on-target quest completion, scenery and container state, XP, independent elevator, ladder, and typed-stair travel, shared cross-map elevators, exits, and typed stairs, agreed rest, world-map travel into towns, terrain, and encounters, combat actions, effects, statuses, script-queued entry, and reconnect with complete authoritative checkpoints, plus host- and guest-led branching dialogue, split votes, attributed quest activity, talker skill checks, a script-requested combat transition, and durable recovery. Phase 6 headless coverage additionally verifies transactional trade revisions and conservation, roster-based cap/loot cursors, sidecar v1-v4 migration, saved-slot claims, durable shared activity, and cross-map recovery snapshot identity. Phase 7's 13-scenario persistent campaign and headless preflight pass with matching recovery digests after exposing and fixing mutable-string handling in interrupted-rest presentation.
+
+The [2026-09-25 rebase audit](docs/multiplayer/rebase-regression-2026-09-25.md)
+records regression fixes, the expanded automated matrix, and the remaining
+manual/platform validation limits.
 
 ## Goal
 
@@ -548,7 +552,7 @@ dialogue-context Speech check for a guest talker, one attributed quest entry
 on each peer, and script-queued combat entry and exit. Headless tests cover a
 three-player majority, disconnect/timeout rules, bounded wire validation, and
 ordered, deduplicated multi-player activity replay through snapshots. Durable
-save/load of the shared feed remains Phase 6 sidecar work.
+save/load of the shared feed is implemented in the Phase 6 sidecar.
 
 Exit condition: the players can complete branching dialogue with a tie, a skill check, a quest update, and a combat transition.
 
@@ -613,12 +617,13 @@ duplication, and reordering profiles; headless tests combine those with strict
 command sequencing and malicious-length rejection. Each network lobby retains
 a bounded protocol-event/checksum diagnostic history and reports aggregate
 counters at shutdown. The campaign first gates transactional direct trade,
-loot rotation, and network faults in the headless core, then executes twelve
+loot rotation, and network faults in the headless core, then executes thirteen
 successive TLS host/guest scenarios over persistent isolated data trees,
 covering movement, loot, inventory conservation, containers, quest scripts,
 elevators, cross-map loading, encounters, interrupted timed rest, scripted
-combat, dialogue, and hidden-save recovery. All eleven pass, and the recovery
-processes finish with the same complete state digest.
+combat, dialogue, and hidden-save recovery. The maintained gate compares printed
+peer digests as well as pass markers; recovery must report a matching complete
+state digest. `FALLOUT_CAMPAIGN_FULL=1` expands the gate to 42 scenarios.
 
 `FALLOUT_ENABLE_MULTIPLAYER=OFF` now produces the same `fallout-ce` target with
 the original five-entry single-player menu and no Mbed TLS targets or live

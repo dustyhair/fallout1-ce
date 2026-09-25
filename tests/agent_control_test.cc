@@ -125,6 +125,9 @@ int main()
             && command.caps == 12 && command.itemEntityId == 77
             && command.quantity == 2,
         "parses a revisioned item and caps offer") && passed;
+    passed = expect(parse("49 game_trade_offer 9 3 12   ", command)
+            && command.caps == 12 && command.quantity == 0,
+        "parses a caps-only offer with trailing whitespace") && passed;
     passed = expect(parse("49 game_trade_confirm 9 4", command)
             && command.type == fallout::AgentControlCommandType::GameTradeConfirm
             && command.tradeRevision == 4,
@@ -191,7 +194,9 @@ int main()
     passed = expect(!parse("63 game_stairs 0", command), "rejects an invalid stairs or ladder entity") && passed;
     passed = expect(!parse("64 game_rest 17", command), "rejects an unsupported rest duration") && passed;
     passed = expect(!parse("65 game_trade_offer 9 0 1", command)
-            && !parse("66 game_trade_offer 9 1 1 77 0", command),
+            && !parse("66 game_trade_offer 9 1 1 77 0", command)
+            && !parse("67 game_trade_offer 9 1 1 garbage", command)
+            && !parse("68 game_trade_offer 9 1 1 18446744073709551616 2", command),
         "rejects stale or malformed trade offers") && passed;
 
     return passed ? 0 : 1;

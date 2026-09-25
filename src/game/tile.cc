@@ -1,5 +1,6 @@
 #include "game/tile.h"
 
+#include <algorithm>
 #include <assert.h>
 #include <limits.h>
 #include <string.h>
@@ -2014,6 +2015,21 @@ void tile_update_bounds_base()
             if (y > max_y) {
                 max_y = y;
             }
+        }
+    }
+
+    // Empty elevations and maps without scroll blockers have no object bounds.
+    // Use the finite projected grid instead of doing arithmetic on INT_MIN/MAX.
+    if (min_x == INT_MAX) {
+        int corners[] = { 0, grid_width - 1, grid_size - grid_width, grid_size - 1 };
+        for (int tile : corners) {
+            int x;
+            int y;
+            tile_coord(tile, &x, &y, map_elevation);
+            min_x = std::min(min_x, x + 16);
+            min_y = std::min(min_y, y + 8);
+            max_x = std::max(max_x, x + 16);
+            max_y = std::max(max_y, y + 8);
         }
     }
 

@@ -72,13 +72,21 @@ run_scenario()
     set +e
     (
         cd "$output_root/host"
-        timeout 240s xvfb-run -a ./fallout-ce "--multiplayer-host=$port" "${common[@]}"
+        timeout --kill-after=5s 240s xvfb-run -a ./fallout-ce "--multiplayer-host=$port" "${common[@]}"
     ) >"$host_log" 2>&1 &
     host_pid=$!
-    sleep 0.75
+    # Startup hashes the complete installed-data manifest before listening.
+    # A fixed sleep races that work on a busy machine.
+    for ((attempt = 0; attempt < 600; attempt++)); do
+        if grep -q 'MULTIPLAYER HOST: WAITING ON PORT' "$host_log" \
+            || ! kill -0 "$host_pid" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+    done
     (
         cd "$output_root/guest"
-        timeout 240s xvfb-run -a ./fallout-ce "--multiplayer-join=127.0.0.1:$port" "${common[@]}"
+        timeout --kill-after=5s 240s xvfb-run -a ./fallout-ce "--multiplayer-join=127.0.0.1:$port" "${common[@]}"
     ) >"$guest_log" 2>&1
     guest_status=$?
     wait "$host_pid"
@@ -94,6 +102,16 @@ run_scenario()
         echo "guest log: $guest_log" >&2
         exit 1
     fi
+    # Live fixtures print their final digest instead of comparing a checkpoint
+    # inside the fixture. A local pass on each peer is not proof of convergence.
+    host_digest=$(sed -nE '/MULTIPLAYER_.*PASS role=host/s/.* digest=([0-9]+).*/\1/p' "$host_log" | tail -n 1)
+    guest_digest=$(sed -nE '/MULTIPLAYER_.*PASS role=guest/s/.* digest=([0-9]+).*/\1/p' "$guest_log" | tail -n 1)
+    if [[ "$host_digest" != "$guest_digest" ]] \
+        || { [[ "$label" == recovery ]] && [[ -z "$host_digest" ]]; }; then
+        printf '%s\t%s\t%s\tFAIL\n' "$label" "$host_status" "$guest_status" >> "$summary"
+        echo "campaign state digest mismatch: $label host=$host_digest guest=$guest_digest" >&2
+        exit 1
+    fi
     printf '%s\t%s\t%s\tPASS\n' "$label" "$host_status" "$guest_status" >> "$summary"
 }
 
@@ -103,6 +121,7 @@ run_scenario()
 run_scenario movement
 run_scenario loot --multiplayer-smoke-scenario=loot
 run_scenario transfer --multiplayer-smoke-scenario=transfer
+run_scenario trade --multiplayer-smoke-scenario=trade
 run_scenario container --multiplayer-smoke-scenario=container
 run_scenario quest --multiplayer-smoke-scenario=quest
 run_scenario elevator --multiplayer-smoke-scenario=elevation
@@ -111,7 +130,22 @@ run_scenario worldmap_encounter --multiplayer-smoke-scenario=worldmap-encounter
 run_scenario timed_rest --multiplayer-smoke-scenario=rest \
     --multiplayer-smoke-rest-choice=until_morning --multiplayer-smoke-rest-interrupt
 run_scenario scripted_combat --multiplayer-smoke-scenario=combat-script-status
-run_scenario dialogue --multiplayer-smoke-scenario=dialogue-guest
+run_scenario dialogue_guest --multiplayer-smoke-scenario=dialogue-guest
 run_scenario recovery --multiplayer-smoke-scenario=recovery
+
+if [[ ${FALLOUT_CAMPAIGN_FULL:-0} == 1 ]]; then
+    for scenario in door pickup skill scenery exit-grid stairs \
+        typed-stairs-independent typed-stairs-cross-map \
+        combat-turn combat-attack combat-move combat-kill combat-face \
+        combat-item combat-item-target combat-reload combat-reconnect \
+        combat-elevation dialogue worldmap-host worldmap-guest \
+        worldmap-takeover worldmap-town worldmap-town-guest worldmap-queue; do
+        run_scenario "$scenario" "--multiplayer-smoke-scenario=$scenario"
+    done
+    run_scenario rest_fixed --multiplayer-smoke-scenario=rest --multiplayer-smoke-rest-minutes=10
+    run_scenario rest_healing --multiplayer-smoke-scenario=rest --multiplayer-smoke-rest-minutes=180
+    run_scenario rest_until_healed --multiplayer-smoke-scenario=rest --multiplayer-smoke-rest-choice=until_healed
+    run_scenario worldmap_state --multiplayer-smoke-worldmap-state
+fi
 
 echo "MULTIPLAYER_COMPATIBILITY_CAMPAIGN_PASS scenarios=$scenario_index headless=1 output=$output_root"

@@ -138,8 +138,9 @@ bool parseTradeOffer(std::istringstream& input,
         error = "expected: game_trade_offer <trade id> <revision> <caps> [item id quantity]";
         return false;
     }
-    if (input >> item) {
-        if (!(input >> quantity) || hasTrailingInput(input)
+    input >> std::ws;
+    if (!input.eof()) {
+        if (!(input >> item >> quantity) || hasTrailingInput(input)
             || item == 0 || quantity == 0
             || item > std::numeric_limits<std::uint32_t>::max()
             || quantity > static_cast<std::uint64_t>(

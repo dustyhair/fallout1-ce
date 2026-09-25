@@ -90,6 +90,7 @@ enum class SmokeScenario {
     Pickup,
     Loot,
     PlayerTransfer,
+    DirectTrade,
     Skill,
     Scenery,
     Container,
@@ -176,6 +177,8 @@ const char* smokeScenarioName()
         return "loot";
     case SmokeScenario::PlayerTransfer:
         return "transfer";
+    case SmokeScenario::DirectTrade:
+        return "trade";
     case SmokeScenario::Skill:
         return "skill";
     case SmokeScenario::Scenery:
@@ -1608,11 +1611,16 @@ void networkRuntimeBackgroundProcess()
                 }
                 while (!pendingCombatEffectAcks.empty()
                     && pendingCombatEffectAcks.front().value <= state->lastIncludedEvent.value) {
-                    if (!lobby.confirmPeerEventApplied(pendingCombatEffectAcks.front())) {
-                        debug_printf("Multiplayer combat checkpoint boundary could not be confirmed.\n");
-                        break;
-                    }
                     pendingCombatEffectAcks.pop_front();
+                }
+                // A complete applied checkpoint supersedes every covered event,
+                // including replay events rendered obsolete by a map arrival.
+                // Keeping the old cursor would strand all later acknowledgements.
+                if (state->lastIncludedEvent.value > lobby.lastAppliedEvent().value
+                    && !lobby.confirmSnapshotApplied(state->lastIncludedEvent)) {
+                    debug_printf("Multiplayer authoritative checkpoint boundary could not be confirmed.\n");
+                    lobby.abortRecovery();
+                    break;
                 }
                 if ((smokeScenario == SmokeScenario::CombatAttack
                         || smokeScenario == SmokeScenario::CombatMove
@@ -1831,6 +1839,8 @@ bool networkRuntimeConfigure(int argc, char** argv)
             smokeScenario = SmokeScenario::Pickup;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=loot") == 0) {
             smokeScenario = SmokeScenario::Loot;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=trade") == 0) {
+            smokeScenario = SmokeScenario::DirectTrade;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=transfer") == 0) {
             smokeScenario = SmokeScenario::PlayerTransfer;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=skill") == 0) {
@@ -2206,7 +2216,7 @@ static bool runLiveWorldMapTravelSmoke(const SessionId sessionId)
                 && (launchOptions.mode == NetworkLaunchMode::Host
                     || lobby.state() == NetworkLobbyState::Ready)
                 && std::chrono::steady_clock::now() - arrivedAt >= std::chrono::milliseconds(
-                    launchOptions.mode == NetworkLaunchMode::Host ? 2000 : 700)) {
+                    launchOptions.mode == NetworkLaunchMode::Host ? 2000 : 3000)) {
                 break;
             }
         }
@@ -2287,6 +2297,11 @@ static bool runLiveWorldMapTravelSmoke(const SessionId sessionId)
         static_cast<unsigned long long>(digest.digest.timedEvents),
         static_cast<unsigned long long>(digest.digest.worldMap));
     std::fflush(stdout);
+    // Keep the host connected while the guest drains its final checkpoint;
+    // shutdown itself must not become part of either measured boundary.
+    if (launchOptions.mode == NetworkLaunchMode::Host) {
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+    }
     return true;
 }
 
@@ -2747,6 +2762,117 @@ static bool runLiveDialogueSmoke(const SessionId sessionId)
     return true;
 }
 
+static bool runLiveDirectTradeSmoke(SessionId sessionId)
+{
+    const bool host = launchOptions.mode == NetworkLaunchMode::Host;
+    if (host && !networkWorldPreparePlayerTransferSmokeTest().has_value()) return false;
+    auto quantity = [](Object* actor) {
+        int total = 0;
+        if (actor == nullptr) return total;
+        for (int i = 0; i < actor->data.inventory.length; i++) {
+            const InventoryItem& entry = actor->data.inventory.items[i];
+            if (entry.item->pid == PROTO_ID_STIMPACK) total += entry.quantity;
+        }
+        return total;
+    };
+    Object* hostActor = networkWorldPlayerActor(kHostPlayerId);
+    Object* guestActor = networkWorldPlayerActor(kGuestPlayerId);
+    // Both offers deliberately use identical partial stacks. Applying one leg
+    // must not merge away the registered item promised by the other leg.
+    for (Object* actor : { hostActor, guestActor }) {
+        if (!host) break;
+        for (int i = actor->data.inventory.length - 1; i >= 0; i--) {
+            InventoryItem entry = actor->data.inventory.items[i];
+            if (entry.item->pid == PROTO_ID_STIMPACK) {
+                if (item_remove_mult(actor, entry.item, entry.quantity) != 0) return false;
+                obj_erase_object(entry.item, nullptr);
+            }
+        }
+        Object* item = nullptr;
+        if (obj_pid_new(&item, PROTO_ID_STIMPACK) == -1
+            || obj_disconnect(item, nullptr) == -1
+            || item_add_force(actor, item, 3) != 0
+            || !networkWorldEnsureItemRegistered(item).has_value()) return false;
+    }
+    const int initialHostItems = 3;
+    const int initialGuestItems = 3;
+    const auto initialRevision = networkWorldPhaseRevision();
+    bool offered = false;
+    bool confirmed = false;
+    bool began = false;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (std::chrono::steady_clock::now() < deadline) {
+        networkRuntimeBackgroundProcess();
+        if (networkRuntimeFailed()) break;
+        hostActor = networkWorldPlayerActor(kHostPlayerId);
+        guestActor = networkWorldPlayerActor(kGuestPlayerId);
+        if (hostActor == nullptr || guestActor == nullptr) break;
+        if (host && !began) {
+            began = networkRuntimeBeginDirectTrade(EntityId { kGuestPlayerId.value });
+            if (!began) break;
+        }
+        auto trade = networkWorldDirectTradeState();
+        if (trade.has_value()) {
+            if (trade->revision > 3) break; // Commit invalidation is a failure.
+            if (!offered && trade->revision == (host ? 1u : 2u)
+                && quantity(hostActor) == 3 && quantity(guestActor) == 3
+                && item_caps_total(guestActor) == 7) {
+                Object* actor = host ? hostActor : guestActor;
+                DirectTradeCommand command;
+                command.action = DirectTradeAction::SetOffer;
+                command.tradeId = trade->tradeId;
+                command.revision = trade->revision;
+                command.offer.caps = host ? 0 : 3;
+                for (int i = 0; i < actor->data.inventory.length; i++) {
+                    Object* item = actor->data.inventory.items[i].item;
+                    if (item->pid == PROTO_ID_STIMPACK) {
+                        command.offer.items.push_back({
+                            networkWorldFindEntity(item).value_or(EntityId {}),
+                            host ? 1u : 2u });
+                        break;
+                    }
+                }
+                if (!networkRuntimeSubmitDirectTrade(command)) break;
+                offered = true;
+            } else if (!confirmed && trade->revision == 3
+                && (host || trade->participants[0].confirmedRevision == 3)) {
+                if (!networkRuntimeSubmitDirectTrade(DirectTradeCommand {
+                        DirectTradeAction::Confirm, trade->tradeId,
+                        trade->revision, {}, {}, {} })) break;
+                confirmed = true;
+            }
+        }
+        if (confirmed && networkWorldPhase() == SessionPhase::Exploration
+            && networkWorldPhaseRevision() == initialRevision + 2
+            && item_caps_total(hostActor) == 3 && item_caps_total(guestActor) == 4
+            && quantity(hostActor) == initialHostItems + 1
+            && quantity(guestActor) == initialGuestItems - 1
+            && (!host || lobby.acknowledgedEvent(kGuestPlayerId).value
+                >= lobby.latestAuthoritativeEvent().value)) {
+            WorldSnapshot snapshot;
+            if (!networkWorldCaptureAuthoritativeState(host
+                    ? lobby.latestAuthoritativeEvent() : lobby.lastAppliedEvent(), snapshot)) break;
+            auto digest = computeSnapshotDigest(snapshot);
+            if (!digest) break;
+            std::fprintf(stdout,
+                "MULTIPLAYER_SMOKE_TEST_PASS role=%s session=%llu command=trade caps=7 items=%d digest=%llu\n",
+                host ? "host" : "guest", static_cast<unsigned long long>(sessionId.value),
+                initialHostItems + initialGuestItems,
+                static_cast<unsigned long long>(digest.digest.overall));
+            std::fflush(stdout);
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    std::fprintf(stderr, "Trade failure role=%s offered=%d confirmed=%d phase=%d revision=%llu initial=%llu caps=%d,%d items=%d,%d expected=%d,%d\n",
+        host ? "host" : "guest", offered, confirmed, static_cast<int>(networkWorldPhase()),
+        static_cast<unsigned long long>(networkWorldPhaseRevision()),
+        static_cast<unsigned long long>(initialRevision), item_caps_total(hostActor), item_caps_total(guestActor),
+        quantity(hostActor), quantity(guestActor), initialHostItems + 1, initialGuestItems - 1);
+    setStatus("MULTIPLAYER TRADE SMOKE FAILED: TRANSACTION OR CONSERVATION");
+    return false;
+}
+
 static bool runLiveRecoverySmoke(const CharacterCreationSheet& sheet,
     SessionId originalSessionId)
 {
@@ -2791,7 +2917,17 @@ static bool runLiveRecoverySmoke(const CharacterCreationSheet& sheet,
             return false;
         }
     }
-    if (!networkRuntimeStart()) {
+    // Rehashing the recovery patch tree can delay the host listener. Retry
+    // only this fresh-session fixture bootstrap, within a fixed deadline.
+    auto restartDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    bool restarted = networkRuntimeStart();
+    while (!restarted && launchOptions.mode == NetworkLaunchMode::Join
+        && std::chrono::steady_clock::now() < restartDeadline) {
+        networkRuntimeStop();
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        restarted = networkRuntimeStart();
+    }
+    if (!restarted) {
         setStatus("MULTIPLAYER RECOVERY SMOKE FAILED: SESSION RESTART");
         return false;
     }
@@ -2905,7 +3041,8 @@ bool networkRuntimeRunSmokeTest()
         }
 
         if (lobbyStarted && lobby.state() == NetworkLobbyState::Ready) {
-            if ((smokeScenario == SmokeScenario::Recovery
+            if ((smokeScenario == SmokeScenario::DirectTrade
+                    || smokeScenario == SmokeScenario::Recovery
                     || smokeScenario == SmokeScenario::WorldMapTravel
                     || isDialogueSmokeScenario()
                     || smokeScenario == SmokeScenario::CombatTurn
@@ -2946,6 +3083,11 @@ bool networkRuntimeRunSmokeTest()
             pendingLocalExitGrid = networkWorldReadyLocalExitGrid();
             if (!networkWorldRunPartyExperienceSmokeTest()) {
                 setStatus("MULTIPLAYER SMOKE TEST FAILED: PARTY EXPERIENCE AUTHORITY");
+                break;
+            }
+
+            if (smokeScenario == SmokeScenario::DirectTrade) {
+                if (runLiveDirectTradeSmoke(bootstrap.sessionId())) return true;
                 break;
             }
 

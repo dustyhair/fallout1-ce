@@ -14,7 +14,8 @@ log plus `summary.tsv`. A `BUILD_TESTING=ON` headless executable next to the
 game binary is required; it gates direct-trade transactions, loot rotation,
 fault injection, protocol bounds, and other core invariants before proprietary
 data is loaded. Every engine fixture requires a zero exit status and both pass
-markers. The engine fixture itself compares every sectioned authoritative
+markers. Printed final digests must match across peers; recovery must print a
+digest on both peers. Processes are forcibly stopped if they ignore the timeout. The engine fixture itself compares every sectioned authoritative
 checksum, verifies authenticated reconnect/replay, and rejects guest-side
 scripts, combat rules, random draws, or timed queues where applicable.
 
@@ -24,6 +25,7 @@ The maintained matrix is:
 | --- | --- |
 | direct-trade/fault core | Barter revisions and conservation, loot rotation, transport faults, wire bounds |
 | movement | Base scripts, pathfinding, modal phase gate, party XP, replay |
+| direct trade | Bilateral partial-stack exchange with identical items, cap/item conservation, matching final digests |
 | loot, transfer, and container | Inventory identity, quantity/cap conservation, dense item state |
 | quest | Major item-on-critter script, timer removal, globals, reputation, XP |
 | elevator and map transition | Independent elevation, shared map loading, actor/inventory rebinding |
@@ -54,3 +56,21 @@ message kind, ordered sequence, payload size, decode rejection, and sectioned
 state checksums. Shutdown prints aggregate sent/received/rejected and checksum
 counters as `MULTIPLAYER_PROTOCOL_DIAGNOSTICS`; smoke logs also print the full
 section checksums at convergence boundaries.
+
+## Full regression
+
+The default campaign contains 13 installed-data scenarios. Set
+`FALLOUT_CAMPAIGN_FULL=1` to run all 42 scenarios, including the individual
+combat actions, both dialogue talkers, independent and shared stairs,
+world-map controller/takeover variants, rest healing, and world-map persistence:
+
+```sh
+FALLOUT_CAMPAIGN_FULL=1 tools/run_multiplayer_compatibility_campaign.sh \
+    build-review/fallout-ce /path/to/Fallout /tmp/fallout-full-regression
+```
+
+The runner's digest rejection checks run without game data:
+
+```sh
+PYTHONPATH=tools python3 -m unittest discover -s tools/tests -v
+```

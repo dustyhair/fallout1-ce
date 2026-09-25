@@ -36,3 +36,9 @@ drivers use `game_trade_begin`, `game_trade_offer`, `game_trade_confirm`, and
 `game_trade_cancel`; the machine-readable world state exposes both offers and
 the current revision. Direct gifts remain available as a narrow convenience
 command, but do not weaken transactional trade validation.
+
+The engine reserves inventory capacity and detaches both outgoing offers before
+inserting either into its destination. This prevents Fallout's stack merging
+from destroying an item still named by the opposite offer. The installed-data
+`trade` fixture exchanges partial Stimpak stacks in both directions plus caps,
+then checks conservation and matching complete peer digests.

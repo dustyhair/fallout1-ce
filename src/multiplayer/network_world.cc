@@ -1291,20 +1291,34 @@ bool applyDirectTradePlan(const DirectTradeCommitPlan& plan)
         std::uint32_t quantity = 0;
     };
     std::vector<AppliedItem> applied;
+    // Reserve before detaching anything, so delivery and rollback cannot fail
+    // because an inventory needs to grow. Detach both offers before inserting
+    // either: a stack merge destroys the destination's old item object/ID.
+    for (const DirectTradeLeg& leg : plan.legs) {
+        Object* destination = session.entities().findObject(leg.destinationActorId);
+        Inventory& inventory = destination->data.inventory;
+        int capacity = inventory.length + static_cast<int>(leg.offer.items.size()) + 1;
+        if (inventory.capacity < capacity) {
+            auto* items = static_cast<InventoryItem*>(mem_realloc(inventory.items,
+                sizeof(InventoryItem) * capacity));
+            if (items == nullptr) return false;
+            inventory.items = items;
+            inventory.capacity = capacity;
+        }
+    }
+    auto restoreDetached = [&]() {
+        for (auto rollback = applied.rbegin(); rollback != applied.rend(); ++rollback) {
+            item_add_force(rollback->source, rollback->item,
+                static_cast<int>(rollback->quantity));
+        }
+    };
     for (const DirectTradeLeg& leg : plan.legs) {
         Object* source = session.entities().findObject(leg.sourceActorId);
-        Object* destination = session.entities().findObject(
-            leg.destinationActorId);
+        Object* destination = session.entities().findObject(leg.destinationActorId);
         for (const DirectTradeItemOffer& offered : leg.offer.items) {
             Object* item = session.entities().findObject(offered.itemId);
-            if (!applyInventoryTransfer(source, destination, item,
-                    offered.quantity, true)) {
-                for (auto rollback = applied.rbegin(); rollback != applied.rend();
-                     ++rollback) {
-                    applyInventoryTransfer(rollback->destination,
-                        rollback->source, rollback->item,
-                        rollback->quantity, true);
-                }
+            if (item_remove_mult(source, item, static_cast<int>(offered.quantity)) != 0) {
+                restoreDetached();
                 return false;
             }
             applied.push_back({ source, destination, item, offered.quantity });
@@ -1331,12 +1345,12 @@ bool applyDirectTradePlan(const DirectTradeCommitPlan& plan)
                 item_caps_adjust(actor, -capDeltas[adjusted]);
             }
         }
-        for (auto rollback = applied.rbegin(); rollback != applied.rend();
-             ++rollback) {
-            applyInventoryTransfer(rollback->destination, rollback->source,
-                rollback->item, rollback->quantity, true);
-        }
+        restoreDetached();
         return false;
+    }
+    for (const AppliedItem& transfer : applied) {
+        item_add_force(transfer.destination, transfer.item,
+            static_cast<int>(transfer.quantity));
     }
     return registerUntrackedInventory(session.entities().findObject(
                plan.legs[0].sourceActorId))
