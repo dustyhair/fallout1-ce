@@ -171,7 +171,8 @@ LocalSessionError LocalSession::restorePlayerCharacters(const MultiplayerSaveSid
     if (_phase != SessionPhase::Lobby && _phase != SessionPhase::Transition) {
         return LocalSessionError::InvalidTransition;
     }
-    if (validateMultiplayerSave(sidecar) != MultiplayerSaveError::None) {
+    if (validateMultiplayerSave(sidecar) != MultiplayerSaveError::None
+        || sidecar.players.size() != 2) {
         return LocalSessionError::InvalidSaveState;
     }
 

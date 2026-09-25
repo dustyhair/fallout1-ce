@@ -410,6 +410,14 @@ bool NetworkLobby::sendLocalInventoryTransfer(EntityId sourceId,
         phaseRevision);
 }
 
+bool NetworkLobby::sendLocalDirectTrade(const DirectTradeCommand& command,
+    std::uint32_t phaseRevision)
+{
+    PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
+    return sendLocalAction(DirectTradeStateChangedEvent { EntityId { playerId.value }, {} },
+        command, phaseRevision);
+}
+
 bool NetworkLobby::sendLocalItemDrop(EntityId sourceId,
     EntityId itemId,
     std::uint32_t quantity,

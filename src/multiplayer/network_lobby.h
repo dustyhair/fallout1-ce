@@ -95,6 +95,7 @@ public:
         std::uint32_t phaseRevision = 1,
         EntityId remainderItemId = {},
         ItemDescriptor itemDescriptor = {});
+    bool sendLocalDirectTrade(const DirectTradeCommand& command, std::uint32_t phaseRevision);
     bool sendLocalItemDrop(EntityId sourceId,
         EntityId itemId,
         std::uint32_t quantity,

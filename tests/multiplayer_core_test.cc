@@ -18,6 +18,7 @@
 #include "multiplayer/connection_handshake.h"
 #include "multiplayer/content_manifest.h"
 #include "multiplayer/dialogue_vote_controller.h"
+#include "multiplayer/direct_trade_controller.h"
 #include "multiplayer/entity_registry.h"
 #include "multiplayer/gameplay_wire.h"
 #include "multiplayer/local_session.h"
@@ -545,6 +546,7 @@ void testMultiplayerSaveSidecar()
 {
     MultiplayerSaveSidecar sidecar;
     sidecar.generation = 7;
+    sidecar.players.resize(2);
     const std::string saveData = "legacy SAVE.DAT bytes";
     sidecar.saveDatDigest = updateMultiplayerSaveDigest(kMultiplayerSaveDigestOffset, saveData.data(), saveData.size());
     sidecar.players[0].playerId = kHostPlayerId;
@@ -564,7 +566,7 @@ void testMultiplayerSaveSidecar()
     sidecar.players[1].build.taggedSkills = { SKILL_ENERGY_WEAPONS, SKILL_DOCTOR, SKILL_REPAIR, -1 };
     sidecar.players[1].build.level = 5;
     sidecar.players[1].build.experience = 10000;
-    sidecar.guestObjectData = { 0x00, 0x11, 0x00, 0xFE, 0xFF };
+    sidecar.players[1].objectData = { 0x00, 0x11, 0x00, 0xFE, 0xFF };
 
     expect(validateMultiplayerSave(sidecar) == MultiplayerSaveError::None, "two progressed character builds form valid save metadata");
     std::vector<std::uint8_t> packet;
@@ -577,15 +579,41 @@ void testMultiplayerSaveSidecar()
     expect(decoded.sidecar.generation == 7 && decoded.sidecar.saveDatDigest == sidecar.saveDatDigest, "sidecar keeps generation and SAVE.DAT digest");
     expect(decoded.sidecar.players[0] == sidecar.players[0], "sidecar keeps the host name and full build");
     expect(decoded.sidecar.players[1] == sidecar.players[1], "sidecar keeps the guest name and full build");
-    expect(decoded.sidecar.guestObjectData == sidecar.guestObjectData, "sidecar keeps opaque recursive guest object data");
+    expect(decoded.sidecar.players[1].objectData == sidecar.players[1].objectData, "sidecar keeps opaque recursive guest object data");
+
+    MultiplayerSaveSidecar versionTwo = sidecar;
+    versionTwo.version = 2;
+    std::vector<std::uint8_t> versionTwoPacket;
+    expect(encodeMultiplayerSave(versionTwo, versionTwoPacket) == MultiplayerSaveError::None, "version 2 sidecar still encodes");
+    MultiplayerSaveDecodeResult versionTwoDecoded = decodeMultiplayerSave(versionTwoPacket);
+    expect(versionTwoDecoded && versionTwoDecoded.sidecar.players == sidecar.players, "version 2 guest inventory migrates into its player record");
+
+    MultiplayerSaveSidecar threePlayer = sidecar;
+    SavedPlayerCharacter third = sidecar.players[1];
+    third.playerId = PlayerId { 3 };
+    third.name = "Third";
+    third.objectData = { 0xBE, 0xEF };
+    threePlayer.players.push_back(third);
+    std::vector<std::uint8_t> threePlayerPacket;
+    expect(encodeMultiplayerSave(threePlayer, threePlayerPacket) == MultiplayerSaveError::None, "version 3 stores a bounded third player");
+    MultiplayerSaveDecodeResult threePlayerDecoded = decodeMultiplayerSave(threePlayerPacket);
+    expect(threePlayerDecoded && threePlayerDecoded.sidecar.players == threePlayer.players, "version 3 restores player-keyed object records without reassigning IDs");
+    MultiplayerSaveSidecar replacementRoster = sidecar;
+    replacementRoster.players[1].playerId = PlayerId { 3 };
+    std::vector<std::uint8_t> replacementPacket;
+    expect(encodeMultiplayerSave(replacementRoster, replacementPacket) == MultiplayerSaveError::None,
+        "version 3 preserves a missing guest slot instead of renumbering its replacement");
+    MultiplayerSaveDecodeResult replacementDecoded = decodeMultiplayerSave(replacementPacket);
+    expect(replacementDecoded && replacementDecoded.sidecar.players[1].playerId == PlayerId { 3 },
+        "replacement player keeps its explicit ID after decode");
 
     MultiplayerSaveSidecar legacy = sidecar;
     legacy.version = 1;
-    legacy.guestObjectData.clear();
+    legacy.players[1].objectData.clear();
     std::vector<std::uint8_t> legacyPacket;
     expect(encodeMultiplayerSave(legacy, legacyPacket) == MultiplayerSaveError::None, "version 1 character-only sidecar still encodes");
     MultiplayerSaveDecodeResult legacyDecoded = decodeMultiplayerSave(legacyPacket);
-    expect(legacyDecoded && legacyDecoded.sidecar.version == 1 && legacyDecoded.sidecar.guestObjectData.empty(), "version 1 sidecar remains loadable with an empty guest inventory");
+    expect(legacyDecoded && legacyDecoded.sidecar.version == 1 && legacyDecoded.sidecar.players[1].objectData.empty(), "version 1 sidecar remains loadable with an empty guest inventory");
 
     std::uint64_t changedDigest = updateMultiplayerSaveDigest(kMultiplayerSaveDigestOffset, "legacy SAVE.DAT byteS", saveData.size());
     expect(changedDigest != sidecar.saveDatDigest, "SAVE.DAT digest detects different base-save bytes");
@@ -616,6 +644,12 @@ void testMultiplayerSaveSidecar()
     invalid = sidecar;
     invalid.players[1].playerId = kHostPlayerId;
     expect(validateMultiplayerSave(invalid) == MultiplayerSaveError::DuplicatePlayer, "sidecar rejects duplicate player slots");
+    invalid = threePlayer;
+    std::swap(invalid.players[1], invalid.players[2]);
+    expect(validateMultiplayerSave(invalid) == MultiplayerSaveError::NonCanonicalPlayerOrder, "sidecar rejects an out-of-order repeated player record");
+    invalid = sidecar;
+    invalid.players[0].objectData = { 1 };
+    expect(validateMultiplayerSave(invalid) == MultiplayerSaveError::InvalidPlayerObjectData, "story actor object data cannot shadow SAVE.DAT");
     invalid = sidecar;
     invalid.players[1].build.taggedSkills[0] = SKILL_COUNT;
     expect(validateMultiplayerSave(invalid) == MultiplayerSaveError::InvalidBuild, "sidecar rejects invalid restored build values");
@@ -627,6 +661,8 @@ void testMultiplayerSaveSidecar()
     TestObject guestActor;
     LocalSession source;
     expect(source.start(asGameObject(hostActor), asGameObject(guestActor)) == LocalSessionError::None, "sidecar source session starts");
+    expect(source.restorePlayerCharacters(threePlayer) == LocalSessionError::InvalidSaveState, "two-player runtime rejects a sidecar roster it cannot restore completely");
+    expect(source.restorePlayerCharacters(replacementRoster) == LocalSessionError::InvalidSaveState, "two-player runtime rejects a missing guest slot");
     expect(source.restorePlayerCharacters(sidecar) == LocalSessionError::None, "validated sidecar restores both registered players");
     expect(source.characterLobbyReady(), "restored players satisfy the loading gate without creation sheets");
     expect(source.transitionTo(SessionPhase::Loading) == LocalSessionError::None, "restored session can enter loading");
@@ -635,7 +671,124 @@ void testMultiplayerSaveSidecar()
 
     MultiplayerSaveSidecar captured;
     expect(captureMultiplayerSave(source.players(), 8, sidecar.saveDatDigest, captured) == MultiplayerSaveError::None, "active player state can be captured for the next generation");
-    expect(captured.generation == 8 && captured.players == sidecar.players, "capture uses canonical player IDs and preserves both builds");
+    expect(captured.generation == 8
+            && captured.players[0].playerId == sidecar.players[0].playerId
+            && captured.players[0].build == sidecar.players[0].build
+            && captured.players[1].playerId == sidecar.players[1].playerId
+            && captured.players[1].build == sidecar.players[1].build
+            && captured.players[1].objectData.empty(),
+        "capture uses canonical player IDs and leaves inventory serialization to the save flow");
+}
+
+void testDirectTradeController()
+{
+    DirectTradeController trade;
+    expect(trade.begin(kGuestPlayerId, kHostPlayerId), "trade begins with a canonical bilateral roster");
+    expect(trade.state().offers[0].playerId == kHostPlayerId
+            && trade.state().offers[1].playerId == kGuestPlayerId,
+        "trade participant order does not depend on who invited whom");
+    expect(trade.replaceOffer(kHostPlayerId, 1, 12,
+               { DirectTradeLine { EntityId { 9 }, 2 }, DirectTradeLine { EntityId { 4 }, 1 } })
+            == DirectTradeResult::Applied,
+        "host can replace its offer");
+    expect(trade.state().revision == 2
+            && trade.state().offers[0].items[0].itemId == EntityId { 4 },
+        "offer update increments revision and sorts item IDs");
+    expect(trade.confirm(kHostPlayerId, 2) == DirectTradeResult::Applied,
+        "first confirmation waits for the other player");
+    expect(trade.replaceOffer(kGuestPlayerId, 2, 7,
+               { DirectTradeLine { EntityId { 21 }, 1 } }) == DirectTradeResult::Applied,
+        "guest can change its offer before commit");
+    expect(!trade.state().offers[0].confirmed && !trade.state().offers[1].confirmed,
+        "an offer change clears both confirmations");
+    expect(trade.confirm(kHostPlayerId, 2) == DirectTradeResult::StaleRevision,
+        "old confirmation cannot accept a revised offer");
+    expect(trade.confirm(kGuestPlayerId, 3) == DirectTradeResult::Applied
+            && trade.confirm(kHostPlayerId, 3) == DirectTradeResult::ReadyToCommit,
+        "both players can confirm the same revision");
+    expect(trade.finishCommit(3, false) && trade.state().revision == 4
+            && !trade.state().offers[0].confirmed,
+        "failed inventory validation leaves offers in place but requires fresh confirmations");
+    expect(trade.replaceOffer(kHostPlayerId, 4, 0,
+               { DirectTradeLine { EntityId { 4 }, 1 }, DirectTradeLine { EntityId { 4 }, 2 } })
+            == DirectTradeResult::InvalidOffer,
+        "duplicate item IDs cannot double-spend one stack");
+    expect(trade.state().revision == 4, "invalid offer leaves trade state unchanged");
+    expect(trade.confirm(kHostPlayerId, 4) == DirectTradeResult::Applied
+            && trade.confirm(kGuestPlayerId, 4) == DirectTradeResult::ReadyToCommit
+            && trade.finishCommit(4, true) && !trade.active(),
+        "successful commit closes the trade once");
+    expect(!trade.finishCommit(4, true), "a committed trade cannot execute twice");
+    expect(trade.begin(kHostPlayerId, kGuestPlayerId) && trade.cancel(kGuestPlayerId)
+            && !trade.active(),
+        "either participant can cancel without moving anything");
+    expect(trade.begin(kHostPlayerId, PlayerId { 3 }) && !trade.cancel(kGuestPlayerId),
+        "bilateral trade ignores other roster members");
+}
+
+void testDirectTradeWire()
+{
+    GameCommand command;
+    command.sequence = CommandSequence { 1 };
+    command.playerId = kGuestPlayerId;
+    command.actorId = EntityId { kGuestPlayerId.value };
+    command.expectedPhase = SessionPhase::Exploration;
+    command.expectedPhaseRevision = 3;
+    command.payload = DirectTradeCommand { DirectTradeAction::Open, kHostPlayerId };
+    ProtocolEnvelope envelope = sampleEnvelope();
+    expect(encodeGameCommand(command, envelope) == GameplayWireError::None,
+        "direct trade open encodes");
+    GameCommandDecodeResult decodedCommand = decodeGameCommand(envelope);
+    const auto* open = decodedCommand ? std::get_if<DirectTradeCommand>(&decodedCommand.command.payload) : nullptr;
+    expect(open != nullptr && open->action == DirectTradeAction::Open
+            && open->partnerId == kHostPlayerId,
+        "direct trade open retains the bilateral participant ID");
+    command.payload = DirectTradeCommand { DirectTradeAction::SetItem, {}, 7,
+        EntityId { 42 }, 3 };
+    expect(encodeGameCommand(command, envelope) == GameplayWireError::None,
+        "revisioned item offer encodes");
+    decodedCommand = decodeGameCommand(envelope);
+    const auto* item = decodedCommand ? std::get_if<DirectTradeCommand>(&decodedCommand.command.payload) : nullptr;
+    expect(item != nullptr && item->revision == 7 && item->itemId == EntityId { 42 }
+            && item->quantity == 3,
+        "revisioned item offer round trips");
+    ProtocolEnvelope malformed = envelope;
+    malformed.payload[29] = 1;
+    expect(decodeGameCommand(malformed).error == GameplayWireError::InvalidReservedField,
+        "direct trade rejects a nonzero reserved byte");
+    command.payload = DirectTradeCommand { DirectTradeAction::Confirm, {}, 7 };
+    expect(encodeGameCommand(command, envelope) == GameplayWireError::None,
+        "trade confirmation encodes");
+    command.payload = DirectTradeCommand { DirectTradeAction::SetCaps, {}, 7, {}, 0,
+        static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) + 1 };
+    expect(encodeGameCommand(command, envelope) == GameplayWireError::InvalidQuantity,
+        "trade wire rejects caps outside engine range");
+
+    DirectTradeController trade;
+    expect(trade.begin(kHostPlayerId, kGuestPlayerId), "wire fixture trade begins");
+    expect(trade.replaceOffer(kGuestPlayerId, 1, 19,
+               { DirectTradeLine { EntityId { 42 }, 3 } }) == DirectTradeResult::Applied,
+        "wire fixture offer is valid");
+    GameEvent event;
+    event.sequence = EventSequence { 5 };
+    event.causedBy = CommandSequence { 1 };
+    event.payload = DirectTradeStateChangedEvent { EntityId { 2 }, trade.state() };
+    expect(encodeGameEvent(event, envelope) == GameplayWireError::None,
+        "full trade state encodes as one ordered event");
+    GameEventDecodeResult decodedEvent = decodeGameEvent(envelope);
+    const auto* state = decodedEvent ? std::get_if<DirectTradeStateChangedEvent>(&decodedEvent.event.payload) : nullptr;
+    expect(state != nullptr && state->state.revision == 2
+            && state->state.offers[1].caps == 19
+            && state->state.offers[1].items[0].itemId == EntityId { 42 },
+        "trade event preserves revision, caps, and item identity");
+    malformed = envelope;
+    malformed.payload[26] = 3;
+    expect(decodeGameEvent(malformed).error == GameplayWireError::InvalidLength,
+        "trade event rejects an oversized participant count");
+    event.payload = DirectTradeStateChangedEvent { EntityId { 2 }, {}, true, false };
+    expect(encodeGameEvent(event, envelope) == GameplayWireError::None
+            && decodeGameEvent(envelope),
+        "completed trade event with empty state round trips");
 }
 
 void testActingPlayerContext()
@@ -4362,6 +4515,8 @@ int main()
     fallout::multiplayer::testPlayerCharacterStateStore();
     fallout::multiplayer::testCharacterLobbyValidationAndWireFormat();
     fallout::multiplayer::testMultiplayerSaveSidecar();
+    fallout::multiplayer::testDirectTradeController();
+    fallout::multiplayer::testDirectTradeWire();
     fallout::multiplayer::testActingPlayerContext();
     fallout::multiplayer::testLocalPlayerContext();
     fallout::multiplayer::testProtocolRoundTrip();

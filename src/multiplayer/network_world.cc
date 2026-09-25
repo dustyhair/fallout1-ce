@@ -44,6 +44,7 @@
 #include "multiplayer/acting_player_context.h"
 #include "multiplayer/combat_turn_controller.h"
 #include "multiplayer/dialogue_vote_controller.h"
+#include "multiplayer/direct_trade_controller.h"
 #include "multiplayer/local_player_context.h"
 #include "multiplayer/local_session.h"
 #include "multiplayer/presentation_bridge.h"
@@ -81,6 +82,7 @@ struct PendingPickup {
 std::unordered_map<EntityId, PendingPickup, EntityIdHash> pendingPickups;
 std::deque<GameEvent> deferredEvents;
 DialogueVoteController dialogueVotes;
+DirectTradeController tradeController;
 std::optional<DialoguePresentationEvent> dialoguePresentation;
 struct PendingTalk {
     EntityId actorId;
@@ -164,6 +166,29 @@ struct PendingRestProposal {
     std::unordered_set<PlayerId, PlayerIdHash> readyPlayers;
 };
 std::optional<PendingRestProposal> pendingRestProposal;
+
+struct PreparedTradeMove {
+    Object* source = nullptr;
+    Object* destination = nullptr;
+    Object* item = nullptr;
+    Object* remainder = nullptr;
+    int quantity = 0;
+};
+
+bool reserveTradeInventory(Object* actor, std::size_t incoming)
+{
+    Inventory& inventory = actor->data.inventory;
+    if (incoming > static_cast<std::size_t>(std::numeric_limits<int>::max() - inventory.length)) return false;
+    int needed = inventory.length + static_cast<int>(incoming);
+    if (inventory.items != nullptr && inventory.capacity >= needed) return true;
+    int capacity = std::max(needed, inventory.capacity + 10);
+    auto* items = static_cast<InventoryItem*>(mem_realloc(inventory.items,
+        sizeof(InventoryItem) * static_cast<std::size_t>(capacity)));
+    if (items == nullptr) return false;
+    inventory.items = items;
+    inventory.capacity = capacity;
+    return true;
+}
 
 bool allConnectedPlayersReady(const std::unordered_set<PlayerId, PlayerIdHash>& readyPlayers)
 {
@@ -1236,6 +1261,112 @@ bool advanceSharedRest(int minutes, bool untilHealed)
     return interrupted || (untilHealed && !sharedPlayersHealed());
 }
 
+bool commitDirectTrade(const DirectTradeState& state)
+{
+    if (!isValidDirectTradeState(state) || !isAdjacentPlayerActor(
+            session.entities().findObject(session.playerActorId(state.offers[0].playerId)),
+            session.entities().findObject(session.playerActorId(state.offers[1].playerId)))) {
+        return false;
+    }
+    std::vector<PreparedTradeMove> moves;
+    for (std::size_t side = 0; side < 2; side++) {
+        const DirectTradeOffer& offer = state.offers[side];
+        Object* source = session.entities().findObject(session.playerActorId(offer.playerId));
+        Object* destination = session.entities().findObject(
+            session.playerActorId(state.offers[1 - side].playerId));
+        if (source == nullptr || destination == nullptr) return false;
+        for (const DirectTradeLine& line : offer.items) {
+            Object* item = session.entities().findObject(line.itemId);
+            if (item == nullptr || item->owner != source || item->pid == PROTO_ID_MONEY
+                || (item->flags & (OBJECT_EQUIPPED | OBJECT_USED)) != 0
+                || item_count(source, item) != static_cast<int>(line.quantity)) return false;
+            moves.push_back({ source, destination, item, nullptr,
+                static_cast<int>(line.quantity) });
+        }
+        if (offer.caps != 0) {
+            Object* capStack = nullptr;
+            for (int index = 0; index < source->data.inventory.length; index++) {
+                const InventoryItem& inventoryItem = source->data.inventory.items[index];
+                if (inventoryItem.item->pid == PROTO_ID_MONEY
+                    && inventoryItem.quantity >= static_cast<int>(offer.caps)) {
+                    capStack = inventoryItem.item;
+                    break;
+                }
+            }
+            if (capStack == nullptr) return false;
+            moves.push_back({ source, destination, capStack, nullptr,
+                static_cast<int>(offer.caps) });
+        }
+    }
+    // Allocate every object and inventory slot before the first mutation. Whole
+    // stacks can then move without a failing allocation midway through trade.
+    auto discardClones = [&moves]() {
+        for (PreparedTradeMove& move : moves) {
+            if (move.remainder != nullptr) obj_erase_object(move.remainder, nullptr);
+            move.remainder = nullptr;
+        }
+    };
+    for (PreparedTradeMove& move : moves) {
+        if (move.item->pid != PROTO_ID_MONEY
+            || item_count(move.source, move.item) == move.quantity) continue;
+        if (obj_copy(&move.remainder, move.item) != 0 || move.remainder == nullptr) {
+            discardClones();
+            return false;
+        }
+        obj_disconnect(move.remainder, nullptr);
+    }
+    std::size_t incoming[2] = { 0, 0 };
+    for (const PreparedTradeMove& move : moves) {
+        incoming[move.destination == session.entities().findObject(
+            session.playerActorId(state.offers[0].playerId)) ? 0 : 1]++;
+    }
+    for (std::size_t side = 0; side < 2; side++) {
+        Object* actor = session.entities().findObject(session.playerActorId(state.offers[side].playerId));
+        if (!reserveTradeInventory(actor, incoming[side])) {
+            discardClones();
+            return false;
+        }
+    }
+    // Checkpoints enumerate tracked items. An offered stack may already have
+    // an entity ID without being in that list (notably starting inventory).
+    for (const PreparedTradeMove& move : moves) {
+        std::optional<EntityId> id = session.entities().findEntity(move.item);
+        if (id.has_value()) {
+            trackWorldItem(*id, move.item);
+        } else if (!registerItem(move.item)) {
+            discardClones();
+            return false;
+        }
+    }
+    inventoryTransferInProgress = true;
+    // Remove both offers before adding either one. Receiving a stack can merge
+    // with (and erase) a stack that the other player is still offering.
+    for (PreparedTradeMove& move : moves) {
+        if (move.remainder != nullptr) {
+            Inventory& inventory = move.source->data.inventory;
+            for (int index = 0; index < inventory.length; index++) {
+                if (inventory.items[index].item != move.item) continue;
+                inventory.items[index].item = move.remainder;
+                inventory.items[index].quantity -= move.quantity;
+                move.remainder->owner = move.source;
+                move.item->owner = nullptr;
+                networkWorldHandleItemSplit(move.item, move.remainder);
+                move.remainder = nullptr;
+                break;
+            }
+        } else {
+            item_remove_mult(move.source, move.item, move.quantity);
+        }
+    }
+    for (const PreparedTradeMove& move : moves) {
+        item_add_force(move.destination, move.item, move.quantity);
+    }
+    inventoryTransferInProgress = false;
+    inven_refresh_inventory_window();
+    intface_redraw();
+    return true;
+}
+
 class NetworkCommandExecutor : public CommandExecutor {
 public:
     bool combatActionAllowed(Object* actor, std::uint64_t revision) const
@@ -2150,6 +2281,74 @@ public:
         }
         worldmap_authoritative_travel_cancel();
         return CommandExecutionStatus::Applied;
+    }
+
+    DirectTradeExecution directTrade(Object* actor, PlayerId playerId,
+        const DirectTradeCommand& command) override
+    {
+        DirectTradeExecution execution;
+        if (worldMode != NetworkLaunchMode::Host || !session.isActive()
+            || session.phase() != SessionPhase::Exploration || isInCombat()
+            || actor == nullptr || activeSharedModal.has_value()) return execution;
+
+        if (command.action == DirectTradeAction::Open) {
+            Object* partner = session.entities().findObject(session.playerActorId(command.partnerId));
+            if (command.revision != 0 || partner == nullptr
+                || !isAdjacentPlayerActor(actor, partner)
+                || !tradeController.begin(playerId, command.partnerId)) return execution;
+        } else {
+            if (!tradeController.active() || command.revision != tradeController.state().revision) {
+                return execution;
+            }
+            const DirectTradeOffer* offer = nullptr;
+            for (const DirectTradeOffer& candidate : tradeController.state().offers) {
+                if (candidate.playerId == playerId) offer = &candidate;
+            }
+            if (offer == nullptr) return execution;
+            if (command.action == DirectTradeAction::SetCaps) {
+                std::uint32_t directCaps = 0;
+                for (int index = 0; index < actor->data.inventory.length; index++) {
+                    const InventoryItem& entry = actor->data.inventory.items[index];
+                    if (entry.item->pid == PROTO_ID_MONEY && entry.quantity > 0) {
+                        directCaps = std::max(directCaps, static_cast<std::uint32_t>(entry.quantity));
+                    }
+                }
+                if (command.caps > directCaps
+                    || tradeController.replaceOffer(playerId, command.revision,
+                        command.caps, offer->items) != DirectTradeResult::Applied) return execution;
+            } else if (command.action == DirectTradeAction::SetItem) {
+                std::vector<DirectTradeLine> items = offer->items;
+                items.erase(std::remove_if(items.begin(), items.end(), [&](const DirectTradeLine& line) {
+                    return line.itemId == command.itemId;
+                }), items.end());
+                if (command.quantity != 0) {
+                    Object* item = session.entities().findObject(command.itemId);
+                    if (item == nullptr || item->owner != actor || item->pid == PROTO_ID_MONEY
+                        || (item->flags & (OBJECT_EQUIPPED | OBJECT_USED)) != 0
+                        || item_count(actor, item) != static_cast<int>(command.quantity)) return execution;
+                    items.push_back({ command.itemId, command.quantity });
+                }
+                if (tradeController.replaceOffer(playerId, command.revision,
+                        offer->caps, std::move(items)) != DirectTradeResult::Applied) return execution;
+            } else if (command.action == DirectTradeAction::Confirm) {
+                DirectTradeResult result = tradeController.confirm(playerId, command.revision);
+                if (result == DirectTradeResult::ReadyToCommit) {
+                    bool committed = commitDirectTrade(tradeController.state());
+                    tradeController.finishCommit(command.revision, committed);
+                    execution.committed = committed;
+                } else if (result != DirectTradeResult::Applied) {
+                    return execution;
+                }
+            } else if (command.action == DirectTradeAction::Cancel) {
+                if (!tradeController.cancel(playerId)) return execution;
+                execution.cancelled = true;
+            } else {
+                return execution;
+            }
+        }
+        execution.status = CommandExecutionStatus::Applied;
+        execution.state = tradeController.state();
+        return execution;
     }
 
     InventoryTransferExecution transferInventory(Object* actor,
@@ -4713,6 +4912,84 @@ bool networkWorldVerifyPlayerTransferRangeSmokeTest(EntityId itemId)
     return rejected && restored && playerLootRejected && gifted && takingRejected && rolledBack;
 }
 
+std::optional<EntityId> networkWorldPrepareDirectTradeSmokeTest()
+{
+    if (!session.isActive() || session.phase() != SessionPhase::Exploration) return std::nullopt;
+    Object* host = session.entities().findObject(session.playerActorId(kHostPlayerId));
+    Object* guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+    if (host == nullptr || guest == nullptr) return std::nullopt;
+    anim_stop();
+    bool placed = false;
+    for (int rotation = 0; rotation < ROTATION_COUNT && !placed; rotation++) {
+        int tile = tile_num_in_direction(host->tile, rotation, 1);
+        placed = hexGridTileIsValid(tile)
+            && obj_blocking_at(guest, tile, host->elevation) == nullptr
+            && obj_move_to_tile(guest, tile, host->elevation, nullptr) == 0;
+    }
+    if (!placed || !isAdjacentPlayerActor(host, guest)) return std::nullopt;
+    int hostCaps = item_caps_total(host);
+    int guestCaps = item_caps_total(guest);
+    if ((hostCaps > 0 && item_caps_adjust(host, -hostCaps) != 0)
+        || (guestCaps > 0 && item_caps_adjust(guest, -guestCaps) != 0)
+        || item_caps_adjust(host, 10) != 0
+        || item_caps_adjust(guest, 7) != 0) return std::nullopt;
+
+    Object* stimpak = nullptr;
+    if (obj_pid_new(&stimpak, PROTO_ID_STIMPACK) != 0 || stimpak == nullptr) return std::nullopt;
+    obj_disconnect(stimpak, nullptr);
+    if (item_add_force(host, stimpak, 1) != 0) {
+        obj_erase_object(stimpak, nullptr);
+        return std::nullopt;
+    }
+    for (int index = 0; index < host->data.inventory.length; index++) {
+        Object* item = host->data.inventory.items[index].item;
+        if (item != nullptr && item->pid == PROTO_ID_STIMPACK
+            && (item->flags & (OBJECT_EQUIPPED | OBJECT_USED)) == 0) {
+            stimpak = item;
+            break;
+        }
+    }
+    std::optional<EntityId> itemId = session.entities().findEntity(stimpak);
+    if (!itemId.has_value()) {
+        EntityRegistrationResult registration = registerItem(stimpak);
+        if (!registration) return std::nullopt;
+        itemId = registration.entityId;
+    }
+    tradeController.clear();
+    if (!tradeController.begin(kHostPlayerId, kGuestPlayerId)
+        || tradeController.replaceOffer(kHostPlayerId, 1, 3,
+               { DirectTradeLine { *itemId,
+                   static_cast<std::uint32_t>(item_count(host, stimpak)) } })
+            != DirectTradeResult::Applied
+        || tradeController.replaceOffer(kGuestPlayerId, 2, 2, {})
+            != DirectTradeResult::Applied
+        || tradeController.confirm(kHostPlayerId, 3) != DirectTradeResult::Applied) {
+        tradeController.clear();
+        return std::nullopt;
+    }
+    return itemId;
+}
+
+bool networkWorldVerifyDirectTradeSmokeTest(EntityId itemId)
+{
+    Object* host = session.entities().findObject(session.playerActorId(kHostPlayerId));
+    Object* guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+    Object* item = session.entities().findObject(itemId);
+    bool valid = session.isActive() && !tradeController.active()
+        && host != nullptr && guest != nullptr && item != nullptr
+        && item->owner == guest && item_count(guest, item) > 0
+        && item_caps_total(host) == 9 && item_caps_total(guest) == 8;
+    if (!valid) {
+        std::fprintf(stderr, "Trade smoke state: active=%d item=%p owner=%p guest=%p item_count=%d host_caps=%d guest_caps=%d.\n",
+            tradeController.active(), static_cast<void*>(item),
+            item != nullptr ? static_cast<void*>(item->owner) : nullptr,
+            static_cast<void*>(guest), item != nullptr && guest != nullptr ? item_count(guest, item) : -1,
+            host != nullptr ? item_caps_total(host) : -1,
+            guest != nullptr ? item_caps_total(guest) : -1);
+    }
+    return valid;
+}
+
 bool networkWorldRunSharedModalSmokeTest()
 {
     if (!session.isActive() || session.phase() != SessionPhase::Exploration) {
@@ -5437,6 +5714,25 @@ bool networkWorldApplyInventoryTransfer(const InventoryTransferredEvent& transfe
         inven_refresh_inventory_window();
     }
     return applied;
+}
+
+bool networkWorldApplyPeerDirectTrade(const DirectTradeStateChangedEvent& trade)
+{
+    return session.isActive() && tradeController.restore(trade.state);
+}
+
+const DirectTradeState& networkWorldDirectTradeState()
+{
+    return tradeController.state();
+}
+
+void networkWorldCancelDirectTrade()
+{
+    if (worldMode != NetworkLaunchMode::Host || !tradeController.active()) return;
+    tradeController.clear();
+    deferredEvents.push_back(GameEvent { {}, CommandSequence { UINT64_MAX },
+        DirectTradeStateChangedEvent {
+            session.playerActorId(kHostPlayerId), {}, false, true } });
 }
 
 bool networkWorldApplyItemDrop(const ItemDroppedEvent& drop)
@@ -7013,6 +7309,7 @@ Object* networkWorldPlayerActor(PlayerId playerId)
 
 void networkWorldLeave()
 {
+    tradeController.clear();
     combatActionResolving = false;
     combatTurns.stop();
     session.stop();

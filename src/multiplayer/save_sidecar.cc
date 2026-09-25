@@ -290,22 +290,27 @@ MultiplayerSaveError validateMultiplayerSave(const MultiplayerSaveSidecar& sidec
         return MultiplayerSaveError::InvalidGeneration;
     }
 
-    bool hostSeen = false;
-    bool guestSeen = false;
+    if (sidecar.players.size() < kMultiplayerSaveMinimumPlayerCount
+        || sidecar.players.size() > kMultiplayerSaveMaximumPlayerCount
+        || (sidecar.version < 3 && sidecar.players.size() != kMultiplayerSaveMinimumPlayerCount)) {
+        return MultiplayerSaveError::InvalidPlayerCount;
+    }
+    if (sidecar.players.front().playerId != kHostPlayerId) {
+        return MultiplayerSaveError::NonCanonicalPlayerOrder;
+    }
+    std::uint32_t previousId = 0;
+    std::size_t totalObjectBytes = 0;
     for (const SavedPlayerCharacter& player : sidecar.players) {
-        if (player.playerId == kHostPlayerId) {
-            if (hostSeen) {
-                return MultiplayerSaveError::DuplicatePlayer;
-            }
-            hostSeen = true;
-        } else if (player.playerId == kGuestPlayerId) {
-            if (guestSeen) {
-                return MultiplayerSaveError::DuplicatePlayer;
-            }
-            guestSeen = true;
-        } else {
+        if (!isValid(player.playerId)) {
             return MultiplayerSaveError::InvalidPlayerId;
         }
+        if (player.playerId.value == previousId) {
+            return MultiplayerSaveError::DuplicatePlayer;
+        }
+        if (player.playerId.value < previousId) {
+            return MultiplayerSaveError::NonCanonicalPlayerOrder;
+        }
+        previousId = player.playerId.value;
         if (player.name.empty()) {
             return MultiplayerSaveError::EmptyName;
         }
@@ -318,16 +323,18 @@ MultiplayerSaveError validateMultiplayerSave(const MultiplayerSaveSidecar& sidec
         if (!isValidBuild(player.build)) {
             return MultiplayerSaveError::InvalidBuild;
         }
+        if (player.playerId == kHostPlayerId && !player.objectData.empty()) {
+            return MultiplayerSaveError::InvalidPlayerObjectData;
+        }
+        if (player.objectData.size() > kMultiplayerSaveMaximumSize - kMultiplayerSaveHeaderSize - totalObjectBytes) {
+            return MultiplayerSaveError::InvalidPlayerObjectData;
+        }
+        totalObjectBytes += player.objectData.size();
     }
-    if (!hostSeen || !guestSeen) {
+    if (sidecar.version < 3 && sidecar.players[1].playerId != kGuestPlayerId) {
         return MultiplayerSaveError::PlayerMissing;
     }
-    if (sidecar.players[0].playerId != kHostPlayerId
-        || sidecar.players[1].playerId != kGuestPlayerId) {
-        return MultiplayerSaveError::NonCanonicalPlayerOrder;
-    }
-    if ((sidecar.version == 1 && !sidecar.guestObjectData.empty())
-        || sidecar.guestObjectData.size() > kMultiplayerSaveMaximumSize - kMultiplayerSaveHeaderSize) {
+    if (sidecar.version == 1 && !sidecar.players[1].objectData.empty()) {
         return MultiplayerSaveError::InvalidGuestObjectData;
     }
     return MultiplayerSaveError::None;
@@ -338,17 +345,20 @@ MultiplayerSaveError captureMultiplayerSave(const PlayerCharacterStateStore& pla
     std::uint64_t saveDatDigest,
     MultiplayerSaveSidecar& sidecar)
 {
-    const PlayerCharacterState* host = players.find(kHostPlayerId);
-    const PlayerCharacterState* guest = players.find(kGuestPlayerId);
-    if (host == nullptr || guest == nullptr) {
+    std::vector<PlayerId> ids = players.playerIds();
+    if (ids.size() < kMultiplayerSaveMinimumPlayerCount
+        || ids.size() > kMultiplayerSaveMaximumPlayerCount
+        || ids.front() != kHostPlayerId) {
         return MultiplayerSaveError::PlayerMissing;
     }
 
     MultiplayerSaveSidecar captured;
     captured.generation = generation;
     captured.saveDatDigest = saveDatDigest;
-    captured.players[0] = { host->id, host->name, host->build };
-    captured.players[1] = { guest->id, guest->name, guest->build };
+    for (PlayerId id : ids) {
+        const PlayerCharacterState* player = players.find(id);
+        captured.players.push_back({ player->id, player->name, player->build, {} });
+    }
     MultiplayerSaveError error = validateMultiplayerSave(captured);
     if (error == MultiplayerSaveError::None) {
         sidecar = std::move(captured);
@@ -365,12 +375,18 @@ MultiplayerSaveError encodeMultiplayerSave(const MultiplayerSaveSidecar& sidecar
     }
 
     std::vector<std::uint8_t> payload;
-    appendUInt16(payload, static_cast<std::uint16_t>(kMultiplayerSavePlayerCount));
-    appendPlayer(payload, sidecar.players[0]);
-    appendPlayer(payload, sidecar.players[1]);
-    if (sidecar.version >= 2) {
-        appendUInt32(payload, static_cast<std::uint32_t>(sidecar.guestObjectData.size()));
-        payload.insert(payload.end(), sidecar.guestObjectData.begin(), sidecar.guestObjectData.end());
+    appendUInt16(payload, static_cast<std::uint16_t>(sidecar.players.size()));
+    for (const SavedPlayerCharacter& player : sidecar.players) {
+        appendPlayer(payload, player);
+        if (sidecar.version >= 3) {
+            appendUInt32(payload, static_cast<std::uint32_t>(player.objectData.size()));
+            payload.insert(payload.end(), player.objectData.begin(), player.objectData.end());
+        }
+    }
+    if (sidecar.version == 2) {
+        const auto& guestData = sidecar.players[1].objectData;
+        appendUInt32(payload, static_cast<std::uint32_t>(guestData.size()));
+        payload.insert(payload.end(), guestData.begin(), guestData.end());
     }
     if (payload.size() > kMultiplayerSaveMaximumSize - kMultiplayerSaveHeaderSize) {
         return MultiplayerSaveError::PayloadTooLarge;
@@ -440,17 +456,35 @@ MultiplayerSaveDecodeResult decodeMultiplayerSave(const std::vector<std::uint8_t
         result.error = MultiplayerSaveError::TruncatedPayload;
         return result;
     }
-    if (playerCount != kMultiplayerSavePlayerCount) {
+    if (playerCount < kMultiplayerSaveMinimumPlayerCount
+        || playerCount > kMultiplayerSaveMaximumPlayerCount
+        || (result.sidecar.version < 3 && playerCount != kMultiplayerSaveMinimumPlayerCount)) {
         result.error = MultiplayerSaveError::InvalidPlayerCount;
         return result;
     }
+    result.sidecar.players.resize(playerCount);
     for (SavedPlayerCharacter& player : result.sidecar.players) {
         if (!readPlayer(reader, player)) {
             result.error = MultiplayerSaveError::TruncatedPayload;
             return result;
         }
+        if (result.sidecar.version >= 3) {
+            std::uint32_t objectSize;
+            if (!reader.readUInt32(objectSize)) {
+                result.error = MultiplayerSaveError::TruncatedPayload;
+                return result;
+            }
+            if (objectSize > kMultiplayerSaveMaximumSize - kMultiplayerSaveHeaderSize) {
+                result.error = MultiplayerSaveError::InvalidPlayerObjectData;
+                return result;
+            }
+            if (!reader.readBytes(objectSize, player.objectData)) {
+                result.error = MultiplayerSaveError::TruncatedPayload;
+                return result;
+            }
+        }
     }
-    if (result.sidecar.version >= 2) {
+    if (result.sidecar.version == 2) {
         std::uint32_t guestObjectSize;
         if (!reader.readUInt32(guestObjectSize)) {
             result.error = MultiplayerSaveError::TruncatedPayload;
@@ -460,7 +494,7 @@ MultiplayerSaveDecodeResult decodeMultiplayerSave(const std::vector<std::uint8_t
             result.error = MultiplayerSaveError::InvalidGuestObjectData;
             return result;
         }
-        if (!reader.readBytes(guestObjectSize, result.sidecar.guestObjectData)) {
+        if (!reader.readBytes(guestObjectSize, result.sidecar.players[1].objectData)) {
             result.error = MultiplayerSaveError::TruncatedPayload;
             return result;
         }

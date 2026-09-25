@@ -554,7 +554,15 @@ Exit condition: the players can complete branching dialogue with a tie, a skill 
 
 ### Phase 6: loot, trade, and recovery
 
-- Add transactional direct trading.
+In progress: `MULTI.DAT` version 3 stores a bounded, canonically ordered
+player roster with each non-story actor's object data in its player record.
+Version 1 and 2 records still decode; the current two-player runtime rejects a
+larger roster until it can restore every actor. Revisioned direct trading is
+live for adjacent players, with bilateral item/caps offers, confirmation,
+cancel, and an immediate authoritative checkpoint. Loot policy and durable
+network-session recovery remain open.
+
+- [x] Add transactional direct trading for directly owned full item stacks and caps.
 - Add cap splitting and alternating loot priority.
 - Finish the multiplayer save sidecar and recovery saves.
 - Handle missing guests, replaced characters, and incompatible save versions.

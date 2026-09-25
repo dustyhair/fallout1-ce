@@ -578,12 +578,15 @@ MultiplayerSaveError developerLocalSessionCaptureSave(std::uint64_t generation,
 
 bool developerLocalSessionStageLoadedSave(const MultiplayerSaveSidecar& sidecar)
 {
+    const SavedPlayerCharacter* guest = findSavedPlayer(sidecar, kGuestPlayerId);
     if (!enabled
         || validateMultiplayerSave(sidecar) != MultiplayerSaveError::None
-        || (!sidecar.guestObjectData.empty() && pendingLoadedGuestObject == nullptr)) {
+        || sidecar.players.size() != 2
+        || guest == nullptr
+        || (!guest->objectData.empty() && pendingLoadedGuestObject == nullptr)) {
         return false;
     }
-    if (sidecar.guestObjectData.empty()) {
+    if (guest->objectData.empty()) {
         discardPendingGuestObject();
         discardPreservedGuestInventory();
     }

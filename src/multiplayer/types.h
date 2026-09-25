@@ -276,6 +276,47 @@ struct InventoryTransferCommand {
     ItemDescriptor itemDescriptor;
 };
 
+constexpr std::size_t kMaximumDirectTradeLines = 16;
+
+struct DirectTradeLine {
+    EntityId itemId;
+    std::uint32_t quantity = 0;
+};
+
+inline bool operator==(const DirectTradeLine& lhs, const DirectTradeLine& rhs)
+{
+    return lhs.itemId == rhs.itemId && lhs.quantity == rhs.quantity;
+}
+
+struct DirectTradeOffer {
+    PlayerId playerId;
+    std::uint32_t caps = 0;
+    std::vector<DirectTradeLine> items;
+    bool confirmed = false;
+};
+
+struct DirectTradeState {
+    std::uint64_t revision = 0;
+    std::vector<DirectTradeOffer> offers;
+};
+
+enum class DirectTradeAction : std::uint8_t {
+    Open = 1,
+    SetCaps = 2,
+    SetItem = 3,
+    Confirm = 4,
+    Cancel = 5,
+};
+
+struct DirectTradeCommand {
+    DirectTradeAction action = DirectTradeAction::Open;
+    PlayerId partnerId;
+    std::uint64_t revision = 0;
+    EntityId itemId;
+    std::uint32_t quantity = 0;
+    std::uint32_t caps = 0;
+};
+
 struct ItemDropCommand {
     EntityId sourceId;
     EntityId itemId;
@@ -366,7 +407,7 @@ constexpr bool isValid(const WorldMapRouteCommand& route)
             && route.targetY >= 0 && route.targetY < kWorldMapHeight;
 }
 
-using GameCommandPayload = std::variant<MoveCommand, FaceCommand, InteractCommand, PickupCommand, LootCommand, UseSkillCommand, UseItemOnCommand, ElevatorCommand, ExitGridCommand, SceneryTransitionCommand, RestCommand, InventoryTransferCommand, ItemDropCommand, AttackCommand, CombatMoveCommand, CombatItemCommand, CombatReloadCommand, CombatFaceCommand, EndTurnCommand, SharedModalCommand, WorldMapRouteCommand, TalkCommand, DialogueVoteCommand>;
+using GameCommandPayload = std::variant<MoveCommand, FaceCommand, InteractCommand, PickupCommand, LootCommand, UseSkillCommand, UseItemOnCommand, ElevatorCommand, ExitGridCommand, SceneryTransitionCommand, RestCommand, InventoryTransferCommand, ItemDropCommand, AttackCommand, CombatMoveCommand, CombatItemCommand, CombatReloadCommand, CombatFaceCommand, EndTurnCommand, SharedModalCommand, WorldMapRouteCommand, TalkCommand, DialogueVoteCommand, DirectTradeCommand>;
 
 struct GameCommand {
     CommandSequence sequence;
@@ -535,6 +576,13 @@ struct InventoryTransferredEvent {
     ItemDescriptor itemDescriptor;
 };
 
+struct DirectTradeStateChangedEvent {
+    EntityId actorId;
+    DirectTradeState state;
+    bool committed = false;
+    bool cancelled = false;
+};
+
 struct ItemDroppedEvent {
     EntityId actorId;
     EntityId sourceId;
@@ -659,7 +707,7 @@ struct WorldMapRouteSelectedEvent {
     bool clear = false;
 };
 
-using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, ItemPickupCompletedEvent, LootStartedEvent, SkillUseStartedEvent, ItemUseStartedEvent, ElevatorTransitionedEvent, ExitGridTransitionedEvent, SceneryTransitionedEvent, RestStateChangedEvent, InventoryTransferredEvent, ItemDroppedEvent, AttackStartedEvent, CombatTurnStateChangedEvent, CombatActionResolvedEvent, PartyExperienceAwardedEvent, SharedModalStateChangedEvent, WorldMapRouteSelectedEvent, WorldMapArrivedEvent, DialogueRequestedEvent, DialogueVoteRecordedEvent, DialoguePresentationEvent, SharedActivityPublishedEvent>;
+using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, ItemPickupCompletedEvent, LootStartedEvent, SkillUseStartedEvent, ItemUseStartedEvent, ElevatorTransitionedEvent, ExitGridTransitionedEvent, SceneryTransitionedEvent, RestStateChangedEvent, InventoryTransferredEvent, ItemDroppedEvent, AttackStartedEvent, CombatTurnStateChangedEvent, CombatActionResolvedEvent, PartyExperienceAwardedEvent, SharedModalStateChangedEvent, WorldMapRouteSelectedEvent, WorldMapArrivedEvent, DialogueRequestedEvent, DialogueVoteRecordedEvent, DialoguePresentationEvent, SharedActivityPublishedEvent, DirectTradeStateChangedEvent>;
 
 struct GameEvent {
     EventSequence sequence;

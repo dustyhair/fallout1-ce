@@ -95,6 +95,7 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     const SceneryTransitionCommand* sceneryTransition = std::get_if<SceneryTransitionCommand>(&command.payload);
     const RestCommand* rest = std::get_if<RestCommand>(&command.payload);
     const InventoryTransferCommand* transfer = std::get_if<InventoryTransferCommand>(&command.payload);
+    const DirectTradeCommand* trade = std::get_if<DirectTradeCommand>(&command.payload);
     const ItemDropCommand* drop = std::get_if<ItemDropCommand>(&command.payload);
     const AttackCommand* attack = std::get_if<AttackCommand>(&command.payload);
     const CombatMoveCommand* combatMove = std::get_if<CombatMoveCommand>(&command.payload);
@@ -390,6 +391,16 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
                 transfer->sourceQuantity,
                 transferExecution.remainderItemId,
                 transferExecution.itemDescriptor,
+            };
+        } else if (trade != nullptr) {
+            DirectTradeExecution tradeExecution = executor.directTrade(actor,
+                command.playerId, *trade);
+            executionStatus = tradeExecution.status;
+            event.payload = DirectTradeStateChangedEvent {
+                command.actorId,
+                std::move(tradeExecution.state),
+                tradeExecution.committed,
+                tradeExecution.cancelled,
             };
         } else if (drop != nullptr) {
             ItemDropExecution dropExecution = executor.dropItem(actor,

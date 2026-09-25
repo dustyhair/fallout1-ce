@@ -10,6 +10,7 @@
 #include "multiplayer/character_lobby.h"
 #include "multiplayer/command_processor.h"
 #include "multiplayer/dialogue_vote_controller.h"
+#include "multiplayer/direct_trade_controller.h"
 #include "multiplayer/network_bootstrap.h"
 #include "multiplayer/snapshot.h"
 
@@ -52,6 +53,9 @@ bool networkWorldApplyPeerSharedModal(const SharedModalStateChangedEvent& modal)
 bool networkWorldApplyPeerWorldMapRoute(const WorldMapRouteSelectedEvent& route);
 bool networkWorldApplyPeerAttack(const AttackStartedEvent& attack);
 bool networkWorldApplyInventoryTransfer(const InventoryTransferredEvent& transfer, bool reverse = false);
+bool networkWorldApplyPeerDirectTrade(const DirectTradeStateChangedEvent& trade);
+const DirectTradeState& networkWorldDirectTradeState();
+void networkWorldCancelDirectTrade();
 bool networkWorldApplyItemDrop(const ItemDroppedEvent& drop);
 bool networkWorldApplyLocalItemDrop(Object* source, Object* item, std::uint32_t quantity);
 bool networkWorldBeginLocalLoot(Object* target);
@@ -214,6 +218,8 @@ bool networkWorldVerifySceneryTransitionSmokeTest(const SceneryTransitionSmokeFi
 bool networkWorldVerifyLootRangeSmokeTest(EntityId targetId);
 std::optional<EntityId> networkWorldPreparePlayerTransferSmokeTest();
 bool networkWorldVerifyPlayerTransferRangeSmokeTest(EntityId itemId);
+std::optional<EntityId> networkWorldPrepareDirectTradeSmokeTest();
+bool networkWorldVerifyDirectTradeSmokeTest(EntityId itemId);
 bool networkWorldRunSharedModalSmokeTest();
 
 } // namespace multiplayer

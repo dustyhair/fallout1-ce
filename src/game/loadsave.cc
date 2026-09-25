@@ -3007,13 +3007,17 @@ static bool SaveMultiplayerSidecar()
         != multiplayer::MultiplayerSaveError::None) {
         return false;
     }
+    multiplayer::SavedPlayerCharacter* guest = multiplayer::findSavedPlayer(sidecar, multiplayer::kGuestPlayerId);
+    if (guest == nullptr) {
+        return false;
+    }
 
     MultiplayerSidecarPath(relativePath, "MULTI.OBJ", true);
     RemoveMultiplayerGuestObjectTemporary();
     bool capturedGuestObject = multiplayer::developerLocalSessionWriteGuestObject(relativePath)
-        && ReadSaveFile(relativePath, multiplayer::kMultiplayerSaveMaximumSize, sidecar.guestObjectData);
+        && ReadSaveFile(relativePath, multiplayer::kMultiplayerSaveMaximumSize, guest->objectData);
     RemoveMultiplayerGuestObjectTemporary();
-    if (!capturedGuestObject || sidecar.guestObjectData.empty()) {
+    if (!capturedGuestObject || guest->objectData.empty()) {
         return false;
     }
 
@@ -3044,10 +3048,14 @@ static void LoadMultiplayerSidecar()
     bool valid = decoded
         && DigestSaveDat(saveDatDigest)
         && decoded.sidecar.saveDatDigest == saveDatDigest;
-    if (valid && !decoded.sidecar.guestObjectData.empty()) {
+    const multiplayer::SavedPlayerCharacter* guest = valid
+        ? multiplayer::findSavedPlayer(decoded.sidecar, multiplayer::kGuestPlayerId)
+        : nullptr;
+    valid = valid && guest != nullptr;
+    if (valid && !guest->objectData.empty()) {
         MultiplayerSidecarPath(relativePath, "MULTI.OBJ", true);
         RemoveMultiplayerGuestObjectTemporary();
-        valid = WriteSaveFile(relativePath, decoded.sidecar.guestObjectData)
+        valid = WriteSaveFile(relativePath, guest->objectData)
             && multiplayer::developerLocalSessionStageLoadedGuestObject(relativePath);
         RemoveMultiplayerGuestObjectTemporary();
     }

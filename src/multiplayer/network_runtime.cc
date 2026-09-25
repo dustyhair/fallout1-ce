@@ -81,12 +81,16 @@ bool backgroundProcessRegistered = false;
 bool lobbyStarted = false;
 bool smokeTestEnabled = false;
 std::optional<PlayerId> announcedWorldMapProposer;
+int directTradeWindow = -1;
+bool directTradeWindowRequested = false;
+std::vector<EntityId> directTradeListedItems;
 enum class SmokeScenario {
     Movement,
     Door,
     Pickup,
     Loot,
     PlayerTransfer,
+    DirectTrade,
     Skill,
     Scenery,
     Container,
@@ -172,6 +176,8 @@ const char* smokeScenarioName()
         return "loot";
     case SmokeScenario::PlayerTransfer:
         return "transfer";
+    case SmokeScenario::DirectTrade:
+        return "trade";
     case SmokeScenario::Skill:
         return "skill";
     case SmokeScenario::Scenery:
@@ -1072,6 +1078,9 @@ bool submitHostCommand(GameCommandPayload payload)
     bool needsCombatCheckpoint = isCheckpointedCombatAction(command.payload);
     AuthoritativeCommandResult outcome = networkWorldProcessCommand(command);
     bool accepted = outcome.result.status == CommandStatus::Accepted;
+    const auto* tradeOutcome = outcome.event.has_value()
+        ? std::get_if<DirectTradeStateChangedEvent>(&outcome.event->payload) : nullptr;
+    bool needsTradeCheckpoint = tradeOutcome != nullptr && tradeOutcome->committed;
     if (!accepted) {
         debug_printf("Multiplayer host command %llu rejected with reason %d.\n",
             static_cast<unsigned long long>(command.sequence.value),
@@ -1081,7 +1090,8 @@ bool submitHostCommand(GameCommandPayload payload)
         debug_printf("Multiplayer host command outcome could not be published.\n");
         return false;
     }
-    if (accepted && needsCombatCheckpoint && lobby.state() == NetworkLobbyState::Ready) {
+    if (accepted && (needsCombatCheckpoint || needsTradeCheckpoint)
+        && lobby.state() == NetworkLobbyState::Ready) {
         WorldSnapshot state;
         if (!networkWorldCaptureAuthoritativeState(lobby.latestAuthoritativeEvent(), state)
             || !lobby.sendAuthoritativeState(state)) {
@@ -1280,6 +1290,9 @@ void networkRuntimeBackgroundProcess()
                 }
                 bool needsCombatCheckpoint = outcome.result.status == CommandStatus::Accepted
                     && isCheckpointedCombatAction(command->payload);
+                const auto* tradeOutcome = outcome.event.has_value()
+                    ? std::get_if<DirectTradeStateChangedEvent>(&outcome.event->payload) : nullptr;
+                bool needsTradeCheckpoint = tradeOutcome != nullptr && tradeOutcome->committed;
                 bool outcomeSent = lobby.sendCommandOutcome(std::move(outcome));
                 if (needsCombatCheckpoint
                     && smokeScenario == SmokeScenario::CombatReconnect) {
@@ -1294,7 +1307,8 @@ void networkRuntimeBackgroundProcess()
                     debug_printf("Multiplayer command outcome could not be sent.\n");
                     break;
                 }
-                if (needsCombatCheckpoint && lobby.state() == NetworkLobbyState::Ready) {
+                if ((needsCombatCheckpoint || needsTradeCheckpoint)
+                    && lobby.state() == NetworkLobbyState::Ready) {
                     WorldSnapshot state;
                     if (!networkWorldCaptureAuthoritativeState(lobby.latestAuthoritativeEvent(), state)
                         || !lobby.sendAuthoritativeState(state)) {
@@ -1363,6 +1377,12 @@ void networkRuntimeBackgroundProcess()
                 pendingLocalItemDrop.reset();
                 pendingLocalExitGrid.reset();
                 lastSentCombatEndRevision = 0;
+                if (directTradeWindowRequested
+                    && networkWorldDirectTradeState().revision == 0) {
+                    directTradeWindowRequested = false;
+                    char message[] = "Trade request was rejected.";
+                    display_print(message);
+                }
             }
         }
         while (std::optional<GameEvent> event = lobby.takePeerEvent()) {
@@ -1415,6 +1435,9 @@ void networkRuntimeBackgroundProcess()
                 applied = networkWorldApplyPeerWorldMapRoute(*route);
             } else if (const auto* transfer = std::get_if<InventoryTransferredEvent>(&event->payload)) {
                 applied = networkWorldApplyInventoryTransfer(*transfer);
+            } else if (const auto* trade = std::get_if<DirectTradeStateChangedEvent>(&event->payload)) {
+                applied = networkWorldApplyPeerDirectTrade(*trade);
+                if (applied) directTradeWindowRequested = trade->state.revision != 0;
             } else if (const auto* drop = std::get_if<ItemDroppedEvent>(&event->payload)) {
                 applied = networkWorldApplyItemDrop(*drop);
             } else if (const auto* attack = std::get_if<AttackStartedEvent>(&event->payload)) {
@@ -1744,6 +1767,8 @@ bool networkRuntimeConfigure(int argc, char** argv)
             smokeScenario = SmokeScenario::Loot;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=transfer") == 0) {
             smokeScenario = SmokeScenario::PlayerTransfer;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=trade") == 0) {
+            smokeScenario = SmokeScenario::DirectTrade;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=skill") == 0) {
             smokeScenario = SmokeScenario::Skill;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=scenery") == 0) {
@@ -2881,6 +2906,9 @@ bool networkRuntimeRunSmokeTest()
                     && !networkWorldVerifyPlayerTransferRangeSmokeTest(*scenarioTargetId)) {
                     scenarioTargetId.reset();
                 }
+            } else if (smokeScenario == SmokeScenario::DirectTrade) {
+                scenarioTargetId = networkWorldPrepareDirectTradeSmokeTest();
+                scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
             } else if (smokeScenario == SmokeScenario::Skill) {
                 scenarioTargetId = networkWorldPrepareSkillSmokeTest();
                 scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
@@ -2977,6 +3005,10 @@ bool networkRuntimeRunSmokeTest()
                 };
                 break;
             }
+            case SmokeScenario::DirectTrade:
+                scenarioCommand.payload = DirectTradeCommand {
+                    DirectTradeAction::Confirm, {}, 3 };
+                break;
             case SmokeScenario::Skill:
                 scenarioCommand.payload = UseSkillCommand { *scenarioTargetId, ExplorationSkill::Traps };
                 break;
@@ -3169,6 +3201,13 @@ bool networkRuntimeRunSmokeTest()
                                     && item_caps_total(networkWorldPlayerActor(kGuestPlayerId)) == 4;
                             } else if (event && event.event.sequence == expectedEventSequence
                                 && event.event.causedBy == scenarioCommand.sequence
+                                && smokeScenario == SmokeScenario::DirectTrade) {
+                                const auto* trade = std::get_if<DirectTradeStateChangedEvent>(&event.event.payload);
+                                eventApplied = trade != nullptr && trade->committed
+                                    && trade->state.revision == 0
+                                    && networkWorldApplyPeerDirectTrade(*trade);
+                            } else if (event && event.event.sequence == expectedEventSequence
+                                && event.event.causedBy == scenarioCommand.sequence
                                 && smokeScenario == SmokeScenario::Skill) {
                                 const auto* skill = std::get_if<SkillUseStartedEvent>(&event.event.payload);
                                 eventApplied = skill != nullptr
@@ -3269,6 +3308,8 @@ bool networkRuntimeRunSmokeTest()
                                     && worldMapStateMatchesFixture(localState.worldMap);
                                 if (stateConverged && smokeScenario == SmokeScenario::Quest) {
                                     stateConverged = networkWorldVerifyQuestSmokeTest(*questFixture);
+                                } else if (stateConverged && smokeScenario == SmokeScenario::DirectTrade) {
+                                    stateConverged = networkWorldVerifyDirectTradeSmokeTest(*scenarioTargetId);
                                 } else if (stateConverged && smokeScenario == SmokeScenario::Elevation) {
                                     stateConverged = networkWorldVerifyElevatorSmokeTest(*elevatorFixture);
                                 } else if (stateConverged && smokeScenario == SmokeScenario::MapTransition) {
@@ -3352,6 +3393,11 @@ bool networkRuntimeRunSmokeTest()
                                     && transfer->quantity == 3
                                     && transfer->sourceQuantity == 7
                                     && transfer->itemDescriptor.pid == PROTO_ID_MONEY;
+                            } else if (smokeScenario == SmokeScenario::DirectTrade) {
+                                const auto* trade = std::get_if<DirectTradeCommand>(&command.command.payload);
+                                payloadMatches = trade != nullptr
+                                    && trade->action == DirectTradeAction::Confirm
+                                    && trade->revision == 3;
                             } else if (smokeScenario == SmokeScenario::Skill) {
                                 const auto* skill = std::get_if<UseSkillCommand>(&command.command.payload);
                                 payloadMatches = skill != nullptr
@@ -3465,6 +3511,8 @@ bool networkRuntimeRunSmokeTest()
                         case SmokeScenario::PlayerTransfer:
                             return item_caps_total(networkWorldPlayerActor(kHostPlayerId)) == 3
                                 && item_caps_total(networkWorldPlayerActor(kGuestPlayerId)) == 4;
+                        case SmokeScenario::DirectTrade:
+                            return networkWorldVerifyDirectTradeSmokeTest(*scenarioTargetId);
                         case SmokeScenario::Skill:
                             return anim_busy(scenarioActor) != -1;
                         case SmokeScenario::Scenery:
@@ -3923,10 +3971,178 @@ std::optional<LobbyChatMessage> networkRuntimeTakeChatMessage()
     return lobbyStarted ? lobby.takeChatMessage() : std::nullopt;
 }
 
+void closeDirectTradeWindow()
+{
+    if (directTradeWindow != -1) {
+        win_delete(directTradeWindow);
+        directTradeWindow = -1;
+    }
+    directTradeListedItems.clear();
+}
+
+void drawDirectTradeWindow()
+{
+    if (directTradeWindow == -1) return;
+    constexpr int width = 570;
+    constexpr int height = 420;
+    win_fill(directTradeWindow, 0, 0, width, height, colorTable[0]);
+    win_border(directTradeWindow);
+    int oldFont = text_curr();
+    text_font(101);
+    win_print(directTradeWindow, "DIRECT TRADE", 0, 20, 16, colorTable[21091]);
+    const DirectTradeState& state = networkWorldDirectTradeState();
+    if (state.revision == 0) {
+        win_print(directTradeWindow, "Waiting for the host to open trade...", 0, 20, 58, colorTable[21204]);
+        win_print(directTradeWindow, "Esc cancels this request.", 0, 20, 390, colorTable[21204]);
+        text_font(oldFont);
+        win_draw(directTradeWindow);
+        return;
+    }
+
+    PlayerId localId = launchOptions.mode == NetworkLaunchMode::Host
+        ? kHostPlayerId : kGuestPlayerId;
+    const DirectTradeOffer* localOffer = nullptr;
+    const DirectTradeOffer* peerOffer = nullptr;
+    for (const DirectTradeOffer& offer : state.offers) {
+        if (offer.playerId == localId) localOffer = &offer;
+        else peerOffer = &offer;
+    }
+    if (localOffer == nullptr || peerOffer == nullptr) {
+        text_font(oldFont);
+        win_draw(directTradeWindow);
+        return;
+    }
+    auto label = [&](const DirectTradeOffer& offer, const char* prefix, int x) {
+        std::string heading = std::string(prefix) + "  Caps: " + std::to_string(offer.caps)
+            + (offer.confirmed ? "  CONFIRMED" : "  pending");
+        win_print(directTradeWindow, heading.c_str(), 0, x, 45, colorTable[21091]);
+        int row = 0;
+        for (const DirectTradeLine& line : offer.items) {
+            if (row >= 7) break;
+            Object* item = networkWorldFindObject(line.itemId);
+            const char* name = item != nullptr ? item_name(item) : "Unknown item";
+            std::string text = std::string(name != nullptr ? name : "Item")
+                + " x" + std::to_string(line.quantity);
+            if (text.size() > 30) text.resize(30);
+            win_print(directTradeWindow, text.c_str(), 0, x, 74 + row * 19, colorTable[21204]);
+            row++;
+        }
+    };
+    label(*localOffer, "YOUR OFFER", 20);
+    label(*peerOffer, "THEIR OFFER", 295);
+
+    win_print(directTradeWindow, "Your inventory: press 1-9 to add or remove a full stack", 0,
+        20, 215, colorTable[21091]);
+    directTradeListedItems.clear();
+    Object* actor = networkWorldPlayerActor(localId);
+    if (actor != nullptr) {
+        for (int index = 0; index < actor->data.inventory.length
+                && directTradeListedItems.size() < 9; index++) {
+            InventoryItem& entry = actor->data.inventory.items[index];
+            Object* item = entry.item;
+            if (item == nullptr || item->pid == PROTO_ID_MONEY
+                || (item->flags & (OBJECT_EQUIPPED | OBJECT_USED)) != 0) continue;
+            std::optional<EntityId> id = networkWorldFindEntity(item);
+            if (!id.has_value()) continue;
+            directTradeListedItems.push_back(*id);
+            bool offered = std::any_of(localOffer->items.begin(), localOffer->items.end(),
+                [&](const DirectTradeLine& line) { return line.itemId == *id; });
+            std::string text = std::to_string(directTradeListedItems.size()) + ". "
+                + (item_name(item) != nullptr ? item_name(item) : "Item")
+                + " x" + std::to_string(entry.quantity)
+                + (offered ? "  [offered]" : "");
+            if (text.size() > 64) text.resize(64);
+            win_print(directTradeWindow, text.c_str(), 0, 20,
+                239 + static_cast<int>(directTradeListedItems.size() - 1) * 17,
+                colorTable[21204]);
+        }
+    }
+    win_print(directTradeWindow, "C: offer caps   Enter: confirm   Esc: cancel", 0,
+        20, 391, colorTable[21091]);
+    text_font(oldFont);
+    win_draw(directTradeWindow);
+}
+
 bool networkRuntimeHandleGameChatInput(int keyCode)
 {
     if (!networkWorldActive() || !networkRuntimeConnected()) {
+        if (launchOptions.mode == NetworkLaunchMode::Host) networkWorldCancelDirectTrade();
+        directTradeWindowRequested = false;
+        closeDirectTradeWindow();
         return false;
+    }
+
+    if (keyCode == KEY_CTRL_T && networkWorldPhase() == SessionPhase::Exploration) {
+        if (directTradeWindow != -1) {
+            const DirectTradeState& state = networkWorldDirectTradeState();
+            if (state.revision != 0) networkRuntimeSubmitDirectTrade(
+                DirectTradeCommand { DirectTradeAction::Cancel, {}, state.revision });
+            directTradeWindowRequested = false;
+            closeDirectTradeWindow();
+        } else {
+            const DirectTradeState& state = networkWorldDirectTradeState();
+            if (state.revision == 0) {
+                PlayerId partner = launchOptions.mode == NetworkLaunchMode::Host
+                    ? kGuestPlayerId : kHostPlayerId;
+                if (!networkRuntimeSubmitDirectTrade(
+                        DirectTradeCommand { DirectTradeAction::Open, partner })) return true;
+            }
+            directTradeWindowRequested = true;
+        }
+        return true;
+    }
+    if (directTradeWindowRequested && directTradeWindow == -1) {
+        directTradeWindow = win_add((screenGetWidth() - 570) / 2,
+            (screenGetHeight() - 420) / 2, 570, 420,
+            colorTable[0], WINDOW_MOVE_ON_TOP);
+        if (directTradeWindow == -1) directTradeWindowRequested = false;
+    }
+    if (!directTradeWindowRequested) closeDirectTradeWindow();
+    if (directTradeWindow != -1) {
+        drawDirectTradeWindow();
+        const DirectTradeState& state = networkWorldDirectTradeState();
+        PlayerId localId = launchOptions.mode == NetworkLaunchMode::Host
+            ? kHostPlayerId : kGuestPlayerId;
+        const DirectTradeOffer* localOffer = nullptr;
+        for (const DirectTradeOffer& offer : state.offers) {
+            if (offer.playerId == localId) localOffer = &offer;
+        }
+        if (keyCode == KEY_ESCAPE) {
+            if (state.revision != 0) networkRuntimeSubmitDirectTrade(
+                DirectTradeCommand { DirectTradeAction::Cancel, {}, state.revision });
+            directTradeWindowRequested = false;
+            closeDirectTradeWindow();
+        } else if (localOffer != nullptr && keyCode == KEY_RETURN) {
+            networkRuntimeSubmitDirectTrade(
+                DirectTradeCommand { DirectTradeAction::Confirm, {}, state.revision });
+        } else if (localOffer != nullptr
+            && (keyCode == KEY_LOWERCASE_C || keyCode == KEY_UPPERCASE_C)) {
+            char input[12] = {};
+            if (win_get_str(input, 10, "Caps to offer:", 80, 80) == 0) {
+                char* end = nullptr;
+                unsigned long caps = std::strtoul(input, &end, 10);
+                if (end != input && *end == '\0'
+                    && caps <= static_cast<unsigned long>(std::numeric_limits<std::int32_t>::max())) {
+                    networkRuntimeSubmitDirectTrade(DirectTradeCommand {
+                        DirectTradeAction::SetCaps, {}, state.revision, {}, 0,
+                        static_cast<std::uint32_t>(caps) });
+                }
+            }
+        } else if (localOffer != nullptr && keyCode >= KEY_1 && keyCode <= KEY_9) {
+            std::size_t index = static_cast<std::size_t>(keyCode - KEY_1);
+            if (index < directTradeListedItems.size()) {
+                EntityId itemId = directTradeListedItems[index];
+                Object* actor = networkWorldPlayerActor(localId);
+                Object* item = networkWorldFindObject(itemId);
+                bool offered = std::any_of(localOffer->items.begin(), localOffer->items.end(),
+                    [&](const DirectTradeLine& line) { return line.itemId == itemId; });
+                int quantity = actor != nullptr && item != nullptr ? item_count(actor, item) : 0;
+                if (offered || quantity > 0) networkRuntimeSubmitDirectTrade(
+                    DirectTradeCommand { DirectTradeAction::SetItem, {}, state.revision,
+                        itemId, offered ? 0U : static_cast<std::uint32_t>(quantity) });
+            }
+        }
+        return true;
     }
 
     // A world-map proposal is an explicit consent request, not a local map
@@ -4682,6 +4898,16 @@ bool networkRuntimeGiveItemToPlayer(EntityId destinationActorId, EntityId itemId
               command.itemDescriptor);
 }
 
+bool networkRuntimeSubmitDirectTrade(const DirectTradeCommand& command)
+{
+    if (!networkWorldActive() || networkWorldPhase() != SessionPhase::Exploration) {
+        return false;
+    }
+    return launchOptions.mode == NetworkLaunchMode::Host
+        ? submitHostCommand(command)
+        : lobby.sendLocalDirectTrade(command, networkWorldPhaseRevision());
+}
+
 bool networkRuntimeRequestSharedModal(SharedModalKind kind, bool open)
 {
     if (!networkWorldActive() || !isValid(kind)) {
@@ -5154,6 +5380,8 @@ bool networkRuntimeHandleLocalMoneyDrop(Object* source, Object* item, std::uint3
 
 void networkRuntimeLeaveWorld()
 {
+    directTradeWindowRequested = false;
+    closeDirectTradeWindow();
     pendingCombatEffectAcks.clear();
     lastSentLocalRotation = -1;
     nextHostCommandSequence = 1;
@@ -5167,6 +5395,8 @@ void networkRuntimeLeaveWorld()
 
 void networkRuntimeStop()
 {
+    directTradeWindowRequested = false;
+    closeDirectTradeWindow();
     set_background_processing_when_inactive(false);
     networkWorldLeave();
     agentJournalWriteWorldExit();

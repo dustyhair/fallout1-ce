@@ -64,6 +64,7 @@ std::string networkRuntimePendingRestProposerName();
 bool networkRuntimeLocalRestProposal();
 bool networkRuntimeHandleLocalAttack(Object* target, int hitMode, int hitLocation);
 bool networkRuntimeGiveItemToPlayer(EntityId destinationActorId, EntityId itemId, std::uint32_t quantity);
+bool networkRuntimeSubmitDirectTrade(const DirectTradeCommand& command);
 bool networkRuntimeRequestSharedModal(SharedModalKind kind, bool open);
 bool networkRuntimeSubmitLocalWorldMapRoute(std::int32_t targetX, std::int32_t targetY, bool clear = false);
 void networkRuntimeFlushWorldMapTerminalEvent();

@@ -23,6 +23,13 @@ struct InventoryTransferExecution {
     ItemDescriptor itemDescriptor;
 };
 
+struct DirectTradeExecution {
+    CommandExecutionStatus status = CommandExecutionStatus::InvalidAction;
+    DirectTradeState state;
+    bool committed = false;
+    bool cancelled = false;
+};
+
 struct DoorUseExecution {
     CommandExecutionStatus status = CommandExecutionStatus::InvalidAction;
     bool open = false;
@@ -160,6 +167,10 @@ public:
         Object* destination,
         Object* item,
         const InventoryTransferCommand& command) = 0;
+    virtual DirectTradeExecution directTrade(Object*, PlayerId, const DirectTradeCommand&)
+    {
+        return {};
+    }
     virtual ItemDropExecution dropItem(Object* actor,
         Object* source,
         Object* item,
