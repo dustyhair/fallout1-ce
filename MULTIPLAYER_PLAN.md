@@ -562,13 +562,15 @@ live for adjacent players, with bilateral item/caps offers, confirmation,
 cancel, and an immediate authoritative checkpoint. Looted caps now split across
 the ordered roster with a rotating remainder, and snapshot version 18 retains
 the cap and item-priority cursors across reconnect. The host applies a short
-priority window when both players loot the same source. An installed-data
-two-process cap split converges and replays. Item-priority contention, durable
-network-session recovery, and save/load of the loot cursors remain open.
+priority window when both players loot the same source. Installed-data
+two-process scenarios verify the cap split and a contested item request that
+is first rejected, then accepted after the priority window. Both converge and
+replay. Durable network-session recovery and save/load of the loot cursors
+remain open.
 
 - [x] Add transactional direct trading for directly owned full item stacks and caps.
 - [x] Split looted caps across the ordered roster and rotate extra caps between pools.
-- Verify contested item priority in an installed-data two-process scenario.
+- [x] Verify contested item priority in an installed-data two-process scenario.
 - Finish the multiplayer save sidecar and recovery saves.
 - Handle missing guests, replaced characters, and incompatible save versions.
 - Keep direct trades bilateral and revisioned by the two named participants,

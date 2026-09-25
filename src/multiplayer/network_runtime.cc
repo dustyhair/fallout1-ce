@@ -90,6 +90,7 @@ enum class SmokeScenario {
     Pickup,
     Loot,
     LootCaps,
+    LootPriority,
     PlayerTransfer,
     DirectTrade,
     Skill,
@@ -177,6 +178,8 @@ const char* smokeScenarioName()
         return "loot";
     case SmokeScenario::LootCaps:
         return "loot-caps";
+    case SmokeScenario::LootPriority:
+        return "loot-priority";
     case SmokeScenario::PlayerTransfer:
         return "transfer";
     case SmokeScenario::DirectTrade:
@@ -1770,6 +1773,8 @@ bool networkRuntimeConfigure(int argc, char** argv)
             smokeScenario = SmokeScenario::Loot;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=loot-caps") == 0) {
             smokeScenario = SmokeScenario::LootCaps;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=loot-priority") == 0) {
+            smokeScenario = SmokeScenario::LootPriority;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=transfer") == 0) {
             smokeScenario = SmokeScenario::PlayerTransfer;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=trade") == 0) {
@@ -2709,7 +2714,8 @@ bool networkRuntimeRunSmokeTest()
 
     bool submitted = false;
     auto deadline = std::chrono::steady_clock::now()
-        + std::chrono::seconds(smokeRestInterrupt || isDialogueSmokeScenario() ? 90 : 25);
+        + std::chrono::seconds(smokeRestInterrupt || isDialogueSmokeScenario() ? 90
+                : smokeScenario == SmokeScenario::LootPriority ? 40 : 25);
     while (std::chrono::steady_clock::now() < deadline) {
         networkRuntimeBackgroundProcess();
         if (lobbyStarted && !submitted && lobby.state() == NetworkLobbyState::Waiting) {
@@ -2811,6 +2817,8 @@ bool networkRuntimeRunSmokeTest()
             int scenarioDestinationTile = -1;
             std::optional<EntityId> scenarioTargetId;
             std::optional<EntityId> lootCapSourceId;
+            std::optional<EntityId> lootPrioritySourceId;
+            std::uint32_t lootPriorityQuantity = 0;
             std::optional<QuestSmokeFixture> questFixture;
             std::optional<ElevatorSmokeFixture> elevatorFixture;
             std::optional<MapTransitionSmokeFixture> mapTransitionFixture;
@@ -2910,6 +2918,13 @@ bool networkRuntimeRunSmokeTest()
                     networkWorldPrepareLootCapSmokeTest();
                 if (fixture.has_value()) {
                     lootCapSourceId = fixture->first;
+                    scenarioTargetId = fixture->second;
+                }
+            } else if (smokeScenario == SmokeScenario::LootPriority) {
+                std::optional<std::pair<EntityId, EntityId>> fixture =
+                    networkWorldPrepareLootPrioritySmokeTest();
+                if (fixture.has_value()) {
+                    lootPrioritySourceId = fixture->first;
                     scenarioTargetId = fixture->second;
                 }
             } else if (smokeScenario == SmokeScenario::PlayerTransfer) {
@@ -3013,6 +3028,23 @@ bool networkRuntimeRunSmokeTest()
                     *scenarioTargetId, 7, 7, descriptor };
                 break;
             }
+            case SmokeScenario::LootPriority: {
+                ItemDescriptor descriptor;
+                Object* item = networkWorldFindObject(*scenarioTargetId);
+                Object* source = lootPrioritySourceId.has_value()
+                    ? networkWorldFindObject(*lootPrioritySourceId) : nullptr;
+                int quantity = item != nullptr && source != nullptr ? item_count(source, item) : 0;
+                if (quantity <= 0 || !networkWorldDescribeItem(item, descriptor)) {
+                    scenarioCommandReady = false;
+                    break;
+                }
+                lootPriorityQuantity = static_cast<std::uint32_t>(quantity);
+                scenarioCommand.sequence = CommandSequence { 2 };
+                scenarioCommand.payload = InventoryTransferCommand {
+                    *lootPrioritySourceId, EntityId { kGuestPlayerId.value },
+                    *scenarioTargetId, lootPriorityQuantity, lootPriorityQuantity, descriptor };
+                break;
+            }
             case SmokeScenario::PlayerTransfer: {
                 Object* item = networkWorldFindObject(*scenarioTargetId);
                 ItemDescriptor descriptor;
@@ -3075,6 +3107,93 @@ bool networkRuntimeRunSmokeTest()
 
             if (smokeScenario == SmokeScenario::LootCaps) {
                 while (networkWorldTakeDeferredEvent().has_value()) {
+                }
+            }
+
+            if (smokeScenario == SmokeScenario::LootPriority) {
+                GameCommand earlyTransfer = scenarioCommand;
+                earlyTransfer.sequence = CommandSequence { 1 };
+                bool priorityProbePassed = false;
+                if (launchOptions.mode == NetworkLaunchMode::Join) {
+                    ProtocolEnvelope request;
+                    request.sessionId = sessionId;
+                    request.sequence = nextSendSequence++;
+                    Packet requestPacket;
+                    if (encodeGameCommand(earlyTransfer, request) == GameplayWireError::None
+                        && encodeEnvelope(request, requestPacket) == ProtocolError::None
+                        && transport->send(std::move(requestPacket)) == TransportSendResult::Sent) {
+                        while (std::chrono::steady_clock::now() < deadline && !priorityProbePassed) {
+                            transport->poll();
+                            while (std::optional<Packet> packet = transport->receive()) {
+                                ProtocolDecodeResult decoded = decodeEnvelope(*packet);
+                                if (!decoded || decoded.envelope.sessionId != sessionId
+                                    || decoded.envelope.sequence != nextReceiveSequence++
+                                    || decoded.envelope.kind != MessageKind::CommandResult) break;
+                                CommandResultDecodeResult result = decodeCommandResult(decoded.envelope);
+                                priorityProbePassed = result
+                                    && result.result.commandSequence == earlyTransfer.sequence
+                                    && result.result.status == CommandStatus::Rejected
+                                    && result.result.rejection == CommandRejection::InvalidAction
+                                    && result.result.eventCount == 0;
+                            }
+                            if (!transport->isConnected()) break;
+                            if (!priorityProbePassed) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        }
+                    }
+                    if (priorityProbePassed) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(5250));
+                    }
+                } else {
+                    std::optional<GameCommand> receivedProbe;
+                    while (std::chrono::steady_clock::now() < deadline && !receivedProbe.has_value()) {
+                        transport->poll();
+                        while (std::optional<Packet> packet = transport->receive()) {
+                            ProtocolDecodeResult decoded = decodeEnvelope(*packet);
+                            if (!decoded || decoded.envelope.sessionId != sessionId
+                                || decoded.envelope.sequence != nextReceiveSequence++
+                                || decoded.envelope.kind != MessageKind::Command) break;
+                            GameCommandDecodeResult command = decodeGameCommand(decoded.envelope);
+                            const auto* transfer = command
+                                ? std::get_if<InventoryTransferCommand>(&command.command.payload) : nullptr;
+                            if (transfer != nullptr
+                                && command.command.sequence == earlyTransfer.sequence
+                                && command.command.playerId == earlyTransfer.playerId
+                                && command.command.actorId == earlyTransfer.actorId
+                                && command.command.expectedPhase == earlyTransfer.expectedPhase
+                                && command.command.expectedPhaseRevision == earlyTransfer.expectedPhaseRevision
+                                && transfer->sourceId == *lootPrioritySourceId
+                                && transfer->destinationId == EntityId { kGuestPlayerId.value }
+                                && transfer->itemId == *scenarioTargetId
+                                && transfer->quantity == lootPriorityQuantity
+                                && transfer->sourceQuantity == lootPriorityQuantity
+                                && transfer->itemDescriptor.pid == PROTO_ID_STIMPACK) {
+                                receivedProbe = command.command;
+                            }
+                        }
+                        if (!transport->isConnected()) break;
+                        if (!receivedProbe.has_value()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    }
+                    if (receivedProbe.has_value()) {
+                        AuthoritativeCommandResult rejected = networkWorldProcessCommand(*receivedProbe);
+                        Object* source = networkWorldFindObject(*lootPrioritySourceId);
+                        Object* item = networkWorldFindObject(*scenarioTargetId);
+                        ProtocolEnvelope response;
+                        response.sessionId = sessionId;
+                        response.sequence = nextSendSequence++;
+                        Packet responsePacket;
+                        priorityProbePassed = rejected.result.status == CommandStatus::Rejected
+                            && rejected.result.rejection == CommandRejection::InvalidAction
+                            && !rejected.event.has_value()
+                            && source != nullptr && item != nullptr && item->owner == source
+                            && item_count(source, item) == static_cast<int>(lootPriorityQuantity)
+                            && encodeCommandResult(rejected.result, response) == GameplayWireError::None
+                            && encodeEnvelope(response, responsePacket) == ProtocolError::None
+                            && transport->send(std::move(responsePacket)) == TransportSendResult::Sent;
+                    }
+                }
+                if (!priorityProbePassed) {
+                    setStatus("MULTIPLAYER SMOKE TEST FAILED: LOOT PRIORITY WINDOW");
+                    break;
                 }
             }
 
@@ -3258,6 +3377,23 @@ bool networkRuntimeRunSmokeTest()
                                 }
                             } else if (event && event.event.sequence == expectedEventSequence
                                 && event.event.causedBy == scenarioCommand.sequence
+                                && smokeScenario == SmokeScenario::LootPriority) {
+                                const auto* transfer = std::get_if<InventoryTransferredEvent>(&event.event.payload);
+                                eventApplied = transfer != nullptr
+                                    && transfer->actorId == scenarioCommand.actorId
+                                    && transfer->sourceId == *lootPrioritySourceId
+                                    && transfer->destinationId == EntityId { kGuestPlayerId.value }
+                                    && transfer->itemId == *scenarioTargetId
+                                    && transfer->quantity == lootPriorityQuantity
+                                    && transfer->sourceQuantity == lootPriorityQuantity
+                                    && !isValid(transfer->remainderItemId)
+                                    && transfer->itemDescriptor.pid == PROTO_ID_STIMPACK
+                                    && networkWorldApplyInventoryTransfer(*transfer)
+                                    && networkWorldFindObject(*scenarioTargetId) != nullptr
+                                    && networkWorldFindObject(*scenarioTargetId)->owner
+                                        == networkWorldPlayerActor(kGuestPlayerId);
+                            } else if (event && event.event.sequence == expectedEventSequence
+                                && event.event.causedBy == scenarioCommand.sequence
                                 && smokeScenario == SmokeScenario::DirectTrade) {
                                 const auto* trade = std::get_if<DirectTradeStateChangedEvent>(&event.event.payload);
                                 eventApplied = trade != nullptr && trade->committed
@@ -3369,6 +3505,9 @@ bool networkRuntimeRunSmokeTest()
                                     stateConverged = networkWorldVerifyDirectTradeSmokeTest(*scenarioTargetId);
                                 } else if (stateConverged && smokeScenario == SmokeScenario::LootCaps) {
                                     stateConverged = networkWorldVerifyLootCapSmokeTest(*lootCapSourceId);
+                                } else if (stateConverged && smokeScenario == SmokeScenario::LootPriority) {
+                                    stateConverged = networkWorldVerifyLootPrioritySmokeTest(
+                                        *lootPrioritySourceId, *scenarioTargetId, lootPriorityQuantity);
                                 } else if (stateConverged && smokeScenario == SmokeScenario::Elevation) {
                                     stateConverged = networkWorldVerifyElevatorSmokeTest(*elevatorFixture);
                                 } else if (stateConverged && smokeScenario == SmokeScenario::MapTransition) {
@@ -3465,6 +3604,15 @@ bool networkRuntimeRunSmokeTest()
                                     && transfer->itemId == *scenarioTargetId
                                     && transfer->quantity == 7 && transfer->sourceQuantity == 7
                                     && transfer->itemDescriptor.pid == PROTO_ID_MONEY;
+                            } else if (smokeScenario == SmokeScenario::LootPriority) {
+                                const auto* transfer = std::get_if<InventoryTransferCommand>(&command.command.payload);
+                                payloadMatches = transfer != nullptr
+                                    && transfer->sourceId == *lootPrioritySourceId
+                                    && transfer->destinationId == EntityId { kGuestPlayerId.value }
+                                    && transfer->itemId == *scenarioTargetId
+                                    && transfer->quantity == lootPriorityQuantity
+                                    && transfer->sourceQuantity == lootPriorityQuantity
+                                    && transfer->itemDescriptor.pid == PROTO_ID_STIMPACK;
                             } else if (smokeScenario == SmokeScenario::DirectTrade) {
                                 const auto* trade = std::get_if<DirectTradeCommand>(&command.command.payload);
                                 payloadMatches = trade != nullptr
@@ -3585,6 +3733,9 @@ bool networkRuntimeRunSmokeTest()
                                 && item_caps_total(networkWorldPlayerActor(kGuestPlayerId)) == 4;
                         case SmokeScenario::LootCaps:
                             return networkWorldVerifyLootCapSmokeTest(*lootCapSourceId);
+                        case SmokeScenario::LootPriority:
+                            return networkWorldVerifyLootPrioritySmokeTest(
+                                *lootPrioritySourceId, *scenarioTargetId, lootPriorityQuantity);
                         case SmokeScenario::DirectTrade:
                             return networkWorldVerifyDirectTradeSmokeTest(*scenarioTargetId);
                         case SmokeScenario::Skill:

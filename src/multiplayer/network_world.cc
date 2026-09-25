@@ -4184,6 +4184,61 @@ bool networkWorldVerifyLootCapSmokeTest(EntityId sourceId)
     return valid;
 }
 
+std::optional<std::pair<EntityId, EntityId>> networkWorldPrepareLootPrioritySmokeTest()
+{
+    std::optional<EntityId> sourceId = networkWorldPrepareLootSmokeTest();
+    Object* source = sourceId.has_value() ? session.entities().findObject(*sourceId) : nullptr;
+    Object* guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+    Object* host = session.entities().findObject(session.playerActorId(kHostPlayerId));
+    if (source == nullptr || guest == nullptr || host == nullptr
+        || lootPolicy.itemPriority() != kHostPlayerId) return std::nullopt;
+
+    bool hostPlaced = false;
+    for (int rotation = 0; rotation < ROTATION_COUNT && !hostPlaced; rotation++) {
+        int tile = tile_num_in_direction(source->tile, rotation, 1);
+        hostPlaced = hexGridTileIsValid(tile)
+            && obj_blocking_at(host, tile, source->elevation) == nullptr
+            && obj_move_to_tile(host, tile, source->elevation, nullptr) == 0
+            && lootTargetIsInRange(host, source);
+    }
+    if (!hostPlaced || !lootTargetIsInRange(guest, source)) return std::nullopt;
+
+    Object* stimpak = nullptr;
+    if (obj_pid_new(&stimpak, PROTO_ID_STIMPACK) != 0 || stimpak == nullptr) return std::nullopt;
+    obj_disconnect(stimpak, nullptr);
+    if (item_add_force(source, stimpak, 1) != 0) {
+        obj_erase_object(stimpak, nullptr);
+        return std::nullopt;
+    }
+    for (int index = 0; index < source->data.inventory.length; index++) {
+        const InventoryItem& entry = source->data.inventory.items[index];
+        if (entry.item == nullptr || entry.item->pid != PROTO_ID_STIMPACK
+            || entry.quantity <= 0) continue;
+        std::optional<EntityId> itemId = session.entities().findEntity(entry.item);
+        if (!itemId.has_value()) {
+            EntityRegistrationResult registration = registerItem(entry.item);
+            if (!registration) return std::nullopt;
+            itemId = registration.entityId;
+        }
+        activeLootTargets[host] = source;
+        activeLootTargets[guest] = source;
+        return std::pair<EntityId, EntityId> { *sourceId, *itemId };
+    }
+    return std::nullopt;
+}
+
+bool networkWorldVerifyLootPrioritySmokeTest(EntityId sourceId, EntityId itemId, std::uint32_t quantity)
+{
+    Object* source = session.entities().findObject(sourceId);
+    Object* item = session.entities().findObject(itemId);
+    Object* guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+    return source != nullptr && item != nullptr && guest != nullptr
+        && item->owner == guest
+        && item_count(source, item) == 0
+        && item_count(guest, item) == static_cast<int>(quantity)
+        && lootPolicy.itemPriority() == kGuestPlayerId;
+}
+
 std::optional<EntityId> networkWorldPrepareSkillSmokeTest()
 {
     if (!session.isActive() || worldDoors.empty()) {
