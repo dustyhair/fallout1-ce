@@ -81,6 +81,23 @@ struct AgentJournalWorldState {
         std::vector<Vote> votes;
     };
     std::optional<Dialogue> dialogue;
+    struct Trade {
+        struct Item {
+            std::uint64_t entityId = 0;
+            std::uint32_t quantity = 0;
+        };
+        struct Participant {
+            std::uint32_t playerId = 0;
+            std::uint64_t actorId = 0;
+            std::uint32_t caps = 0;
+            bool confirmed = false;
+            std::vector<Item> items;
+        };
+        std::uint64_t id = 0;
+        std::uint64_t revision = 0;
+        std::vector<Participant> participants;
+    };
+    std::optional<Trade> trade;
     struct SharedActivity {
         std::uint64_t id = 0;
         std::uint32_t sourcePlayerId = 0;

@@ -1,6 +1,6 @@
 # Two-player co-op plan
 
-Status: Phases 0, 1, 2, 2.25, 2.5, 3A, 3B, 4A, 4B, and 5 are complete on the `multiplayer-plan` branch. Transport, lobby, journal, snapshot recovery, authenticated reconnect, content manifest, and first-contact fingerprint verification are implemented. Same-map exploration converges through the host command processor and authoritative checkpoints; replicas do not rerun rule-bearing scripts, rolls, or timed queues. Installed-data two-process scenarios cover movement, doors, pickup, loot, inventory gifts, skills, item-on-target quest completion, scenery and container state, XP, independent elevator, ladder, and typed-stair travel, shared cross-map elevators, exits, and typed stairs, agreed rest, world-map travel into towns, terrain, and encounters, combat actions, effects, statuses, script-queued entry, and reconnect with complete authoritative checkpoints, plus host- and guest-led branching dialogue, split votes, attributed quest activity, talker skill checks, and a script-requested combat transition.
+Status: Phases 0, 1, 2, 2.25, 2.5, 3A, 3B, 4A, 4B, 5, 6, and 7 are complete on the `multiplayer-plan` branch. Transport, lobby, journal, snapshot recovery, authenticated reconnect, content manifest, first-contact fingerprint verification, bilateral trade, deterministic loot distribution, hidden host recovery saves, protocol diagnostics, deterministic transport-fault tests, the optional dependency-free single-player build, and the installed-data compatibility campaign are implemented. Same-map exploration converges through the host command processor and authoritative checkpoints; replicas do not rerun rule-bearing scripts, rolls, or timed queues. Installed-data two-process scenarios cover movement, doors, pickup, loot, inventory gifts, skills, item-on-target quest completion, scenery and container state, XP, independent elevator, ladder, and typed-stair travel, shared cross-map elevators, exits, and typed stairs, agreed rest, world-map travel into towns, terrain, and encounters, combat actions, effects, statuses, script-queued entry, and reconnect with complete authoritative checkpoints, plus host- and guest-led branching dialogue, split votes, attributed quest activity, talker skill checks, a script-requested combat transition, and durable recovery. Phase 6 headless coverage additionally verifies transactional trade revisions and conservation, roster-based cap/loot cursors, sidecar v1-v4 migration, saved-slot claims, durable shared activity, and cross-map recovery snapshot identity. Phase 7's 12-scenario persistent campaign and headless preflight pass with matching recovery digests after exposing and fixing mutable-string handling in interrupted-rest presentation.
 
 ## Goal
 
@@ -554,23 +554,8 @@ Exit condition: the players can complete branching dialogue with a tie, a skill 
 
 ### Phase 6: loot, trade, and recovery
 
-In progress: `MULTI.DAT` version 3 stores a bounded, canonically ordered
-player roster with each non-story actor's object data in its player record.
-Version 1 and 2 records still decode; the current two-player runtime rejects a
-larger roster until it can restore every actor. Revisioned direct trading is
-live for adjacent players, with bilateral item/caps offers, confirmation,
-cancel, and an immediate authoritative checkpoint. Looted caps now split across
-the ordered roster with a rotating remainder, and snapshot version 18 retains
-the cap and item-priority cursors across reconnect. The host applies a short
-priority window when both players loot the same source. Installed-data
-two-process scenarios verify the cap split and a contested item request that
-is first rejected, then accepted after the priority window. Both converge and
-replay. Durable network-session recovery and save/load of the loot cursors
-remain open.
-
-- [x] Add transactional direct trading for directly owned full item stacks and caps.
-- [x] Split looted caps across the ordered roster and rotate extra caps between pools.
-- [x] Verify contested item priority in an installed-data two-process scenario.
+- Add transactional direct trading.
+- Add cap splitting and alternating loot priority.
 - Finish the multiplayer save sidecar and recovery saves.
 - Handle missing guests, replaced characters, and incompatible save versions.
 - Keep direct trades bilateral and revisioned by the two named participants,
@@ -579,6 +564,35 @@ remain open.
 - Version the sidecar so the existing two-player representation can migrate to
   a bounded repeated-player representation without changing `SAVE.DAT` or
   silently reassigning player IDs.
+
+Implemented: the host-owned direct-trade controller keeps exactly
+two named player/actor participants in deterministic order, bounds and
+canonicalizes item/cap offers, clears confirmations whenever either offer
+changes, and exposes a two-leg commit plan only after both participants confirm
+the same revision. Cancellation and disconnect move no assets; failed host
+inventory validation advances the revision before retry, and a committed
+revision cannot commit twice. Headless tests cover stale confirmations, offer
+edits, malformed duplicate entries, cancellation, disconnect, validation
+failure, cap conservation, and double-commit rejection. Versioned wire
+commands/events and snapshots carry the complete negotiation; the host validates
+and applies both legs once before publishing an immediate checkpoint. The
+in-game prompt and semantic-agent commands expose begin, offer, confirm, and
+cancel actions.
+
+Caps taken from a shared loot target split over the canonical player roster,
+with a persisted remainder cursor. Contested dead-critter items use a second
+persisted rotating priority cursor. Sidecar version 4 stores the bounded roster,
+remote actor object data, reconnect/replacement policy, ownership, both loot
+cursors, and shared Pip-Boy activity; versions 1 through 3 migrate explicitly.
+
+When the host leaves, Fallout's native save transaction writes the hidden
+`SAVEGAME/RECOVERY` generation plus its digest-bound sidecar, publishes an
+ending checkpoint, and closes the session. The multiplayer lobby's `RESUME`
+action loads that world for the host, reclaims or replaces the saved guest slot,
+verifies restored ownership, and sends a map-aware authoritative snapshot so
+the guest loads the recovered map before applying state. The installed-data
+`recovery` two-process smoke test now completes that entire stop/restart/load
+path and requires identical host and guest state digests afterward.
 
 Exit condition: a two-player session can be stopped, loaded later, and resumed without duplicating or losing items.
 
@@ -593,6 +607,25 @@ Exit condition: a two-player session can be stopped, loaded later, and resumed w
 - Audit the completed phases against the player-count expansion guardrails and
   update the known pair-shaped debt list before freezing the first-release
   protocol and sidecar formats.
+
+Implemented: the loopback transport accepts deterministic latency, loss,
+duplication, and reordering profiles; headless tests combine those with strict
+command sequencing and malicious-length rejection. Each network lobby retains
+a bounded protocol-event/checksum diagnostic history and reports aggregate
+counters at shutdown. The campaign first gates transactional direct trade,
+loot rotation, and network faults in the headless core, then executes twelve
+successive TLS host/guest scenarios over persistent isolated data trees,
+covering movement, loot, inventory conservation, containers, quest scripts,
+elevators, cross-map loading, encounters, interrupted timed rest, scripted
+combat, dialogue, and hidden-save recovery. All eleven pass, and the recovery
+processes finish with the same complete state digest.
+
+`FALLOUT_ENABLE_MULTIPLAYER=OFF` now produces the same `fallout-ce` target with
+the original five-entry single-player menu and no Mbed TLS targets or live
+socket/content-manifest implementation. Multiplayer flags fail explicitly.
+Hosting, firewall/NAT, fingerprint, compatibility, campaign, and limitation
+documentation is maintained under `docs/multiplayer`; the roster audit records
+the exact pair-shaped v1 debt that must move to a new wire/sidecar generation.
 
 Exit condition: the compatibility campaign completes without unresolved authoritative-state divergence, save corruption, item duplication/loss, or single-player regression.
 

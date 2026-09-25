@@ -10,7 +10,7 @@ namespace fallout {
 namespace multiplayer {
 namespace {
 
-constexpr std::size_t kSnapshotPayloadHeaderSize = 48;
+constexpr std::size_t kSnapshotPayloadHeaderSize = 52;
 constexpr std::size_t kCharacterBuildValueCount = SAVEABLE_STAT_COUNT * 2
     + SKILL_COUNT
     + PERK_COUNT
@@ -171,6 +171,81 @@ void appendSharedActivity(std::vector<std::uint8_t>& bytes,
         bytes.insert(bytes.end(), entry.sourceName.begin(), entry.sourceName.end());
         bytes.insert(bytes.end(), entry.text.begin(), entry.text.end());
     }
+}
+
+std::size_t directTradeSnapshotSize(const WorldSnapshot& snapshot)
+{
+    std::size_t size = 4;
+    if (!snapshot.directTrade.has_value()) return size;
+    size += 68;
+    for (const DirectTradeParticipant& participant
+        : snapshot.directTrade->participants) {
+        size += participant.offer.items.size() * 8;
+    }
+    return size;
+}
+
+void appendDirectTrade(std::vector<std::uint8_t>& bytes,
+    const WorldSnapshot& snapshot)
+{
+    appendUint32(bytes, snapshot.directTrade.has_value() ? 1 : 0);
+    if (!snapshot.directTrade.has_value()) return;
+    const DirectTradeState& state = *snapshot.directTrade;
+    appendUint64(bytes, state.tradeId);
+    appendUint64(bytes, state.revision);
+    appendUint8(bytes, static_cast<std::uint8_t>(state.status));
+    appendUint8(bytes, 2);
+    appendUint16(bytes, 0);
+    for (const DirectTradeParticipant& participant : state.participants) {
+        appendUint32(bytes, participant.playerId.value);
+        appendUint32(bytes, participant.actorId.value);
+        appendUint64(bytes, participant.confirmedRevision.value_or(0));
+        appendUint32(bytes, participant.offer.caps);
+        appendUint16(bytes,
+            static_cast<std::uint16_t>(participant.offer.items.size()));
+        appendUint16(bytes, 0);
+        for (const DirectTradeItemOffer& item : participant.offer.items) {
+            appendUint32(bytes, item.itemId.value);
+            appendUint32(bytes, item.quantity);
+        }
+    }
+}
+
+bool validDirectTradeState(const DirectTradeState& state)
+{
+    if (state.tradeId == 0 || state.revision == 0
+        || (state.status != DirectTradeStatus::Negotiating
+            && state.status != DirectTradeStatus::ReadyToCommit)) return false;
+    bool allConfirmed = true;
+    for (std::size_t index = 0; index < state.participants.size(); index++) {
+        const DirectTradeParticipant& participant = state.participants[index];
+        if (!isValid(participant.playerId) || !isValid(participant.actorId)
+            || participant.offer.items.size()
+                > kMaximumDirectTradeItemsPerPlayer
+            || participant.offer.caps > static_cast<std::uint32_t>(
+                std::numeric_limits<std::int32_t>::max())
+            || (index != 0
+                && participant.playerId.value
+                    <= state.participants[index - 1].playerId.value)
+            || (index != 0
+                && participant.actorId
+                    == state.participants[index - 1].actorId)
+            || (participant.confirmedRevision.has_value()
+                && *participant.confirmedRevision != state.revision)) return false;
+        EntityId previous;
+        for (const DirectTradeItemOffer& item : participant.offer.items) {
+            if (!isValid(item.itemId) || item.quantity == 0
+                || item.quantity > static_cast<std::uint32_t>(
+                    std::numeric_limits<std::int32_t>::max())
+                || (isValid(previous) && item.itemId.value <= previous.value)) {
+                return false;
+            }
+            previous = item.itemId;
+        }
+        allConfirmed = allConfirmed
+            && participant.confirmedRevision == state.revision;
+    }
+    return (state.status == DirectTradeStatus::ReadyToCommit) == allConfirmed;
 }
 
 std::uint8_t readUint8(const std::vector<std::uint8_t>& bytes, std::size_t& offset)
@@ -467,6 +542,9 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
     if (snapshot.gameTime <= 0) {
         return SnapshotError::InvalidGameTime;
     }
+    if (snapshot.mapId < 0) {
+        return SnapshotError::InvalidMap;
+    }
     if (snapshot.actors.size() > kMaxSnapshotActors) {
         return SnapshotError::TooManyActors;
     }
@@ -490,15 +568,18 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
     if (snapshot.timedEvents.size() > kMaxSnapshotTimedEvents) {
         return SnapshotError::TooManyTimedEvents;
     }
+    bool dialogueActive = isValid(snapshot.dialogueActorId);
+    bool tradeActive = snapshot.directTrade.has_value();
     if (snapshot.phase == SessionPhase::Dialogue) {
-        if (!isValid(snapshot.dialogueActorId)
+        if (dialogueActive == tradeActive) return SnapshotError::InvalidDialogueState;
+        if (dialogueActive && (!isValid(snapshot.dialogueActorId)
             || !std::any_of(snapshot.actors.begin(), snapshot.actors.end(),
                 [&](const ActorSnapshot& actor) {
                     return actor.entityId == snapshot.dialogueActorId;
-                })) return SnapshotError::InvalidDialogueState;
+                }))) return SnapshotError::InvalidDialogueState;
     } else if (isValid(snapshot.dialogueActorId)
         || snapshot.dialoguePresentation.has_value()
-        || !snapshot.dialogueBallots.empty()) {
+        || !snapshot.dialogueBallots.empty() || tradeActive) {
         return SnapshotError::InvalidDialogueState;
     }
     if (snapshot.dialoguePresentation.has_value()) {
@@ -525,6 +606,19 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
         }
     } else if (!snapshot.dialogueBallots.empty()) {
         return SnapshotError::InvalidDialogueState;
+    }
+    if (tradeActive) {
+        if (!validDirectTradeState(*snapshot.directTrade)) {
+            return SnapshotError::InvalidTradeState;
+        }
+        for (const DirectTradeParticipant& participant
+            : snapshot.directTrade->participants) {
+            if (!std::any_of(snapshot.actors.begin(), snapshot.actors.end(),
+                    [&](const ActorSnapshot& actor) {
+                        return actor.entityId == participant.actorId
+                            && actor.ownerId == participant.playerId;
+                    })) return SnapshotError::InvalidTradeState;
+        }
     }
     if (snapshot.sharedActivity.size() > kMaximumSharedActivityEntries) {
         return SnapshotError::InvalidDialogueState;
@@ -611,10 +705,6 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
             || actor.lightDistance < 0 || actor.lightDistance > 8) {
             return SnapshotError::InvalidActorState;
         }
-    }
-    if (playerIds.find(snapshot.nextExtraCapPlayer.value) == playerIds.end()
-        || playerIds.find(snapshot.nextItemPriorityPlayer.value) == playerIds.end()) {
-        return SnapshotError::InvalidPlayerId;
     }
 
     for (const CritterSnapshot& critter : snapshot.critters) {
@@ -762,7 +852,7 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
         + snapshot.combat.initiative.size() * 8
         + dialogueSnapshotSize(snapshot)
         + sharedActivitySnapshotSize(snapshot)
-        + 2 * sizeof(std::uint32_t);
+        + directTradeSnapshotSize(snapshot);
     if (payloadSize > kMaxSnapshotPayloadSize) {
         return SnapshotError::PayloadTooLarge;
     }
@@ -797,13 +887,14 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
         + canonical.combat.initiative.size() * 8
         + dialogueSnapshotSize(canonical)
         + sharedActivitySnapshotSize(canonical)
-        + 2 * sizeof(std::uint32_t));
+        + directTradeSnapshotSize(canonical));
 
     appendUint8(payload, static_cast<std::uint8_t>(canonical.phase));
     appendUint8(payload, 0);
     appendUint16(payload, 0);
     appendUint32(payload, canonical.phaseRevision);
     appendUint32(payload, static_cast<std::uint32_t>(canonical.gameTime));
+    appendUint32(payload, static_cast<std::uint32_t>(canonical.mapId));
     appendUint32(payload, static_cast<std::uint32_t>(canonical.actors.size()));
     appendUint32(payload, static_cast<std::uint32_t>(canonical.critters.size()));
     appendUint32(payload, static_cast<std::uint32_t>(canonical.doors.size()));
@@ -840,8 +931,7 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
     appendUint32(payload, static_cast<std::uint32_t>(canonical.combatFreeMove));
     appendDialogue(payload, canonical);
     appendSharedActivity(payload, canonical);
-    appendUint32(payload, canonical.nextExtraCapPlayer.value);
-    appendUint32(payload, canonical.nextItemPriorityPlayer.value);
+    appendDirectTrade(payload, canonical);
 
     std::vector<std::uint8_t> protectedBytes;
     protectedBytes.reserve(sizeof(std::uint64_t) + payload.size());
@@ -916,6 +1006,7 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
     }
     result.snapshot.phaseRevision = readUint32(packet, offset);
     result.snapshot.gameTime = static_cast<std::int32_t>(readUint32(packet, offset));
+    result.snapshot.mapId = static_cast<std::int32_t>(readUint32(packet, offset));
     std::uint32_t actorCount = readUint32(packet, offset);
     std::uint32_t critterCount = readUint32(packet, offset);
     std::uint32_t doorCount = readUint32(packet, offset);
@@ -981,7 +1072,7 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
     if (combatCount > kMaximumCombatInitiative
         || payloadSize < expectedPayloadSize
             + static_cast<std::size_t>(combatCount) * 8
-            + kDialogueSnapshotBaseSize + 4 + 2 * sizeof(std::uint32_t)) {
+            + kDialogueSnapshotBaseSize + 4) {
         result.error = SnapshotError::TrailingData;
         return result;
     }
@@ -1269,12 +1360,51 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
         offset += textLength;
         result.snapshot.sharedActivity.push_back(std::move(entry));
     }
-    if (offset + 2 * sizeof(std::uint32_t) > packet.size()) {
+    if (offset + 4 > packet.size()) {
         result.error = SnapshotError::TruncatedPayload;
         return result;
     }
-    result.snapshot.nextExtraCapPlayer.value = readUint32(packet, offset);
-    result.snapshot.nextItemPriorityPlayer.value = readUint32(packet, offset);
+    std::uint32_t hasTrade = readUint32(packet, offset);
+    if (hasTrade > 1) {
+        result.error = SnapshotError::InvalidTradeState;
+        return result;
+    }
+    if (hasTrade != 0) {
+        if (offset + 68 > packet.size()) {
+            result.error = SnapshotError::TruncatedPayload;
+            return result;
+        }
+        DirectTradeState trade;
+        trade.tradeId = readUint64(packet, offset);
+        trade.revision = readUint64(packet, offset);
+        trade.status = static_cast<DirectTradeStatus>(readUint8(packet, offset));
+        if (readUint8(packet, offset) != 2 || readUint16(packet, offset) != 0) {
+            result.error = SnapshotError::InvalidTradeState;
+            return result;
+        }
+        for (DirectTradeParticipant& participant : trade.participants) {
+            participant.playerId.value = readUint32(packet, offset);
+            participant.actorId.value = readUint32(packet, offset);
+            std::uint64_t confirmation = readUint64(packet, offset);
+            if (confirmation != 0) participant.confirmedRevision = confirmation;
+            participant.offer.caps = readUint32(packet, offset);
+            std::uint16_t itemCount = readUint16(packet, offset);
+            if (readUint16(packet, offset) != 0
+                || itemCount > kMaximumDirectTradeItemsPerPlayer
+                || offset + static_cast<std::size_t>(itemCount) * 8
+                    > packet.size()) {
+                result.error = SnapshotError::InvalidTradeState;
+                return result;
+            }
+            for (std::uint16_t index = 0; index < itemCount; index++) {
+                participant.offer.items.push_back(DirectTradeItemOffer {
+                    EntityId { readUint32(packet, offset) },
+                    readUint32(packet, offset),
+                });
+            }
+        }
+        result.snapshot.directTrade = std::move(trade);
+    }
     if (offset != packet.size()) {
         result.error = SnapshotError::TrailingData;
         return result;
@@ -1303,6 +1433,7 @@ SnapshotDigestResult computeSnapshotDigest(const WorldSnapshot& snapshot)
     appendUint8(sessionBytes, static_cast<std::uint8_t>(canonical.phase));
     appendUint32(sessionBytes, canonical.phaseRevision);
     appendUint32(sessionBytes, static_cast<std::uint32_t>(canonical.gameTime));
+    appendUint32(sessionBytes, static_cast<std::uint32_t>(canonical.mapId));
     CombatTurnState digestCombat = canonical.combat;
     // Deadlines are host-monotonic and drift between state captures. The
     // authoritative identity/order/revision, not the UI countdown, is state.
@@ -1311,8 +1442,7 @@ SnapshotDigestResult computeSnapshotDigest(const WorldSnapshot& snapshot)
     appendUint32(sessionBytes, static_cast<std::uint32_t>(canonical.combatFreeMove));
     appendDialogue(sessionBytes, canonical);
     appendSharedActivity(sessionBytes, canonical);
-    appendUint32(sessionBytes, canonical.nextExtraCapPlayer.value);
-    appendUint32(sessionBytes, canonical.nextItemPriorityPlayer.value);
+    appendDirectTrade(sessionBytes, canonical);
     result.digest.session = digestBytes(sessionBytes);
 
     std::vector<std::uint8_t> actorBytes;

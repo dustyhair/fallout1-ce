@@ -317,6 +317,35 @@ void agentJournalWriteWorldState(const AgentJournalWorldState& state)
     } else {
         fields << "null";
     }
+    fields << ",\"trade\":";
+    if (state.trade.has_value()) {
+        const auto& trade = *state.trade;
+        fields << "{\"id\":" << trade.id
+               << ",\"revision\":" << trade.revision
+               << ",\"participants\":[";
+        for (std::size_t index = 0; index < trade.participants.size(); index++) {
+            if (index != 0) fields << ',';
+            const auto& participant = trade.participants[index];
+            fields << "{\"player_id\":" << participant.playerId
+                   << ",\"actor_id\":" << participant.actorId
+                   << ",\"caps\":" << participant.caps
+                   << ",\"confirmed\":"
+                   << booleanValue(participant.confirmed)
+                   << ",\"items\":[";
+            for (std::size_t itemIndex = 0;
+                 itemIndex < participant.items.size(); itemIndex++) {
+                if (itemIndex != 0) fields << ',';
+                fields << "{\"entity_id\":"
+                       << participant.items[itemIndex].entityId
+                       << ",\"quantity\":"
+                       << participant.items[itemIndex].quantity << '}';
+            }
+            fields << "]}";
+        }
+        fields << "]}";
+    } else {
+        fields << "null";
+    }
     fields << ",\"shared_activity\":[";
     for (std::size_t index = 0; index < state.sharedActivity.size(); index++) {
         if (index != 0) fields << ',';

@@ -2,8 +2,10 @@
 
 #include <limits>
 
+#if FALLOUT_ENABLE_MULTIPLAYER
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/entropy.h>
+#endif
 
 #include "multiplayer/gameplay_wire.h"
 #include "multiplayer/protocol.h"
@@ -149,6 +151,7 @@ bool reconnectTokensEqual(const ReconnectToken& lhs, const ReconnectToken& rhs)
 bool generateReconnectToken(ReconnectToken& token)
 {
     token = {};
+#if FALLOUT_ENABLE_MULTIPLAYER
     mbedtls_entropy_context entropy;
     mbedtls_ctr_drbg_context random;
     mbedtls_entropy_init(&entropy);
@@ -169,6 +172,9 @@ bool generateReconnectToken(ReconnectToken& token)
         return false;
     }
     return true;
+#else
+    return false;
+#endif
 }
 
 ReconnectTokenRegistry::ReconnectTokenRegistry(SessionId sessionId)

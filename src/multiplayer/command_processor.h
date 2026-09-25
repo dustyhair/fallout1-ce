@@ -21,14 +21,8 @@ struct InventoryTransferExecution {
     EntityId itemId;
     EntityId remainderItemId;
     ItemDescriptor itemDescriptor;
-    std::optional<InventoryTransferredEvent> primaryEvent;
-};
-
-struct DirectTradeExecution {
-    CommandExecutionStatus status = CommandExecutionStatus::InvalidAction;
-    DirectTradeState state;
-    bool committed = false;
-    bool cancelled = false;
+    EntityId destinationId;
+    std::vector<PlayerCapShare> capShares;
 };
 
 struct DoorUseExecution {
@@ -88,6 +82,14 @@ struct RestExecution {
 struct EndTurnExecution {
     CommandExecutionStatus status = CommandExecutionStatus::InvalidAction;
     CombatTurnState state;
+};
+
+struct DirectTradeExecution {
+    CommandExecutionStatus status = CommandExecutionStatus::InvalidAction;
+    DirectTradeState state;
+    SessionPhase phase = SessionPhase::Exploration;
+    std::uint32_t phaseRevision = 0;
+    bool inventoryChanged = false;
 };
 
 class CommandExecutor {
@@ -163,15 +165,16 @@ public:
     {
         return CommandExecutionStatus::InvalidAction;
     }
+    virtual DirectTradeExecution directTrade(Object*, PlayerId,
+        const DirectTradeCommand&)
+    {
+        return {};
+    }
     virtual InventoryTransferExecution transferInventory(Object* actor,
         Object* source,
         Object* destination,
         Object* item,
         const InventoryTransferCommand& command) = 0;
-    virtual DirectTradeExecution directTrade(Object*, PlayerId, const DirectTradeCommand&)
-    {
-        return {};
-    }
     virtual ItemDropExecution dropItem(Object* actor,
         Object* source,
         Object* item,

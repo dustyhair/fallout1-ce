@@ -23,12 +23,13 @@
 #include "multiplayer/gameplay_wire.h"
 #include "multiplayer/local_session.h"
 #include "multiplayer/local_player_context.h"
-#include "multiplayer/loot_policy.h"
 #include "multiplayer/loopback_transport.h"
+#include "multiplayer/loot_distribution_controller.h"
 #include "multiplayer/network_bootstrap.h"
 #include "multiplayer/network_lobby.h"
 #include "multiplayer/player_character_state.h"
 #include "multiplayer/protocol.h"
+#include "multiplayer/protocol_diagnostics.h"
 #include "multiplayer/save_sidecar.h"
 #include "multiplayer/session_recovery.h"
 #include "multiplayer/snapshot.h"
@@ -92,6 +93,7 @@ WorldSnapshot sampleSnapshot()
     snapshot.phase = SessionPhase::Exploration;
     snapshot.phaseRevision = 7;
     snapshot.gameTime = 302400;
+    snapshot.mapId = 12;
     snapshot.worldMap.firstVisits = 5;
     snapshot.worldMap.specialEncounters = 2;
     snapshot.worldMap.town = TOWN_SHADY_SANDS;
@@ -274,6 +276,196 @@ void testCombatTurnController()
             && incapacitated.passPlayerTurn(thirdPlayer, thirdActor, 1, 101)
                 == CombatTurnResult::Accepted,
         "host may pass an incapacitated owner without accepting disconnected input");
+}
+
+void testDirectTradeController()
+{
+    const PlayerId thirdPlayer { 3 };
+    const EntityId hostActor { 10 };
+    const EntityId guestActor { 11 };
+    const EntityId hostKnife { 100 };
+    const EntityId hostStimpak { 101 };
+    const EntityId guestAmmo { 200 };
+    DirectTradeController trade;
+
+    expect(trade.begin(0, kHostPlayerId, hostActor,
+               kGuestPlayerId, guestActor)
+            == DirectTradeResult::InvalidParticipant,
+        "trade requires a nonzero transaction identity");
+    expect(trade.begin(7, kGuestPlayerId, guestActor,
+               kHostPlayerId, hostActor)
+            == DirectTradeResult::Accepted,
+        "two named participants can begin a direct trade");
+    expect(trade.state().participants[0].playerId == kHostPlayerId
+            && trade.state().participants[1].playerId == kGuestPlayerId
+            && trade.state().revision == 1,
+        "trade participants have deterministic order and initial revision");
+    expect(trade.begin(8, kHostPlayerId, hostActor,
+               thirdPlayer, EntityId { 12 })
+            == DirectTradeResult::InvalidState,
+        "an active bilateral trade cannot be replaced");
+
+    DirectTradeOffer hostOffer;
+    hostOffer.items = { { hostStimpak, 2 }, { hostKnife, 1 } };
+    hostOffer.caps = 11;
+    expect(trade.setOffer(kHostPlayerId, 1, hostOffer)
+            == DirectTradeResult::Accepted,
+        "host can publish an item and caps offer");
+    expect(trade.state().revision == 2
+            && trade.state().participants[0].offer.items[0].itemId == hostKnife,
+        "offer changes advance revision and canonicalize item order");
+    expect(trade.confirm(kGuestPlayerId, 1)
+            == DirectTradeResult::StaleRevision,
+        "confirmation cannot target an earlier offer revision");
+
+    DirectTradeOffer invalidOffer;
+    invalidOffer.items = { { guestAmmo, 1 }, { guestAmmo, 2 } };
+    expect(trade.setOffer(kGuestPlayerId, 2, invalidOffer)
+            == DirectTradeResult::InvalidOffer
+            && trade.state().revision == 2,
+        "duplicate item identities are rejected without mutating trade state");
+    invalidOffer.items.assign(kMaximumDirectTradeItemsPerPlayer + 1,
+        DirectTradeItemOffer { guestAmmo, 1 });
+    expect(trade.setOffer(kGuestPlayerId, 2, invalidOffer)
+            == DirectTradeResult::InvalidOffer,
+        "trade offer item collection has a strict bound");
+    invalidOffer.items.clear();
+    invalidOffer.caps = std::numeric_limits<std::uint32_t>::max();
+    expect(trade.setOffer(kGuestPlayerId, 2, invalidOffer)
+            == DirectTradeResult::InvalidOffer,
+        "trade cap quantities fit the engine's signed inventory counts");
+    DirectTradeOffer guestOffer;
+    guestOffer.items = { { guestAmmo, 24 } };
+    guestOffer.caps = 4;
+    expect(trade.setOffer(kGuestPlayerId, 2, guestOffer)
+            == DirectTradeResult::Accepted
+            && trade.state().revision == 3,
+        "guest offer joins the next shared revision");
+
+    expect(trade.confirm(kHostPlayerId, 3) == DirectTradeResult::Accepted
+            && !trade.commitPlan().has_value(),
+        "one confirmation does not expose a commit plan");
+    expect(trade.confirm(thirdPlayer, 3)
+            == DirectTradeResult::InvalidParticipant,
+        "a third player cannot join the bilateral transaction");
+    DirectTradeOffer changedHostOffer = hostOffer;
+    changedHostOffer.caps = 12;
+    expect(trade.setOffer(kHostPlayerId, 3, changedHostOffer)
+            == DirectTradeResult::Accepted
+            && trade.state().revision == 4
+            && !trade.state().participants[0].confirmedRevision.has_value(),
+        "changing either offer clears prior confirmations");
+    expect(trade.confirm(kGuestPlayerId, 3)
+            == DirectTradeResult::StaleRevision,
+        "other participant cannot confirm the pre-edit revision");
+    expect(trade.confirm(kHostPlayerId, 4) == DirectTradeResult::Accepted
+            && trade.confirm(kGuestPlayerId, 4)
+                == DirectTradeResult::ReadyToCommit,
+        "both participants confirming one revision prepares the transaction");
+
+    std::optional<DirectTradeCommitPlan> plan = trade.commitPlan();
+    expect(plan.has_value() && plan->tradeId == 7 && plan->revision == 4
+            && plan->legs[0].sourcePlayerId == kHostPlayerId
+            && plan->legs[0].destinationPlayerId == kGuestPlayerId
+            && plan->legs[0].offer.caps == 12
+            && plan->legs[1].sourcePlayerId == kGuestPlayerId
+            && plan->legs[1].destinationPlayerId == kHostPlayerId
+            && plan->legs[1].offer.items[0].quantity == 24,
+        "ready transaction names both directional legs without netting assets");
+    const std::uint32_t hostCapsBefore = 100;
+    const std::uint32_t guestCapsBefore = 50;
+    std::uint32_t hostCapsAfter = hostCapsBefore - plan->legs[0].offer.caps
+        + plan->legs[1].offer.caps;
+    std::uint32_t guestCapsAfter = guestCapsBefore - plan->legs[1].offer.caps
+        + plan->legs[0].offer.caps;
+    expect(hostCapsAfter == 92 && guestCapsAfter == 58
+            && hostCapsAfter + guestCapsAfter
+                == hostCapsBefore + guestCapsBefore,
+        "applying both directional legs conserves total caps");
+
+    expect(trade.invalidateCommit(4) == DirectTradeResult::Accepted
+            && trade.state().revision == 5
+            && trade.state().status == DirectTradeStatus::Negotiating,
+        "failed host inventory validation invalidates both confirmations");
+    expect(trade.confirm(kHostPlayerId, 4)
+            == DirectTradeResult::StaleRevision,
+        "invalidated transaction cannot commit from delayed confirmation");
+    expect(trade.confirm(kHostPlayerId, 5) == DirectTradeResult::Accepted
+            && trade.confirm(kGuestPlayerId, 5)
+                == DirectTradeResult::ReadyToCommit
+            && trade.commit(5) == DirectTradeResult::Accepted
+            && trade.state().status == DirectTradeStatus::Committed
+            && !trade.active(),
+        "validated two-sided transaction commits exactly once");
+    expect(trade.commit(5) == DirectTradeResult::InvalidState,
+        "committed transaction cannot commit twice");
+
+    expect(trade.begin(8, kHostPlayerId, hostActor,
+               kGuestPlayerId, guestActor)
+            == DirectTradeResult::Accepted
+            && trade.cancel(kGuestPlayerId, 1) == DirectTradeResult::Accepted
+            && trade.state().status == DirectTradeStatus::Cancelled,
+        "either participant can cancel before commit without a plan");
+    expect(trade.begin(9, kHostPlayerId, hostActor,
+               kGuestPlayerId, guestActor)
+            == DirectTradeResult::Accepted
+            && trade.disconnect(thirdPlayer)
+                == DirectTradeResult::InvalidParticipant
+            && trade.disconnect(kGuestPlayerId) == DirectTradeResult::Accepted
+            && trade.state().status == DirectTradeStatus::Cancelled,
+        "only a named participant disconnect cancels an in-flight trade");
+}
+
+void testLootDistributionController()
+{
+    const PlayerId third { 3 };
+    LootDistributionController loot;
+    expect(loot.begin({ third, kGuestPlayerId, kHostPlayerId })
+            == LootDistributionError::None
+            && loot.state().roster
+                == std::vector<PlayerId> { kHostPlayerId, kGuestPlayerId, third },
+        "loot policy canonicalizes a bounded player roster");
+
+    auto first = loot.splitCaps(5);
+    auto second = loot.splitCaps(2);
+    auto thirdSplit = loot.splitCaps(4);
+    expect(first.has_value() && (*first)[0].caps == 2
+            && (*first)[1].caps == 2 && (*first)[2].caps == 1,
+        "cap remainder begins at the first roster slot");
+    expect(second.has_value() && (*second)[0].caps == 1
+            && (*second)[1].caps == 0 && (*second)[2].caps == 1,
+        "later cap extras continue from the saved rotation cursor");
+    expect(thirdSplit.has_value() && (*thirdSplit)[0].caps == 1
+            && (*thirdSplit)[1].caps == 2 && (*thirdSplit)[2].caps == 1,
+        "cap extras alternate deterministically across distributions");
+    std::uint32_t distributed = 0;
+    for (const PlayerCapShare& share : *thirdSplit) distributed += share.caps;
+    expect(distributed == 4, "cap splitting conserves the source amount");
+
+    expect(loot.takeLootPriority({ kHostPlayerId, kGuestPlayerId, third })
+                == kHostPlayerId
+            && loot.takeLootPriority({ kHostPlayerId, kGuestPlayerId, third })
+                == kGuestPlayerId
+            && loot.takeLootPriority({ kHostPlayerId, third }) == third
+            && loot.takeLootPriority({ kHostPlayerId, third }) == kHostPlayerId,
+        "contested item priority rotates and skips ineligible players");
+    LootDistributionState saved = loot.state();
+    LootDistributionController restored;
+    expect(restored.restore(saved) == LootDistributionError::None
+            && restored.takeLootPriority({ kHostPlayerId, kGuestPlayerId, third })
+                == kGuestPlayerId,
+        "saved loot cursor resumes without repeating an award");
+
+    LootDistributionState invalid = saved;
+    invalid.roster = { kHostPlayerId, kHostPlayerId };
+    expect(restored.restore(invalid) == LootDistributionError::InvalidRoster,
+        "duplicate player slots cannot enter restored loot state");
+    invalid = saved;
+    invalid.nextCapExtraIndex = 3;
+    expect(restored.restore(invalid) == LootDistributionError::InvalidState,
+        "out-of-range saved cap cursor is rejected");
+    expect(!restored.takeLootPriority({ PlayerId { 9 } }).has_value(),
+        "loot priority rejects players outside the frozen roster");
 }
 
 void testEntityRegistry()
@@ -547,10 +739,12 @@ void testMultiplayerSaveSidecar()
 {
     MultiplayerSaveSidecar sidecar;
     sidecar.generation = 7;
-    sidecar.players.resize(2);
     const std::string saveData = "legacy SAVE.DAT bytes";
     sidecar.saveDatDigest = updateMultiplayerSaveDigest(kMultiplayerSaveDigestOffset, saveData.data(), saveData.size());
+    sidecar.sessionRules = 0x05;
+    sidecar.players.resize(2);
     sidecar.players[0].playerId = kHostPlayerId;
+    sidecar.players[0].actorId = EntityId { 1 };
     sidecar.players[0].name = "Vault Dweller";
     sidecar.players[0].build.baseStats[STAT_STRENGTH] = 8;
     sidecar.players[0].build.skillPoints[SKILL_SMALL_GUNS] = 23;
@@ -561,6 +755,7 @@ void testMultiplayerSaveSidecar()
     sidecar.players[0].build.level = 6;
     sidecar.players[0].build.experience = 15000;
     sidecar.players[1].playerId = kGuestPlayerId;
+    sidecar.players[1].actorId = EntityId { 2 };
     sidecar.players[1].name = "Guest";
     sidecar.players[1].build.baseStats[STAT_AGILITY] = 9;
     sidecar.players[1].build.skillPoints[SKILL_SPEECH] = 17;
@@ -568,6 +763,22 @@ void testMultiplayerSaveSidecar()
     sidecar.players[1].build.level = 5;
     sidecar.players[1].build.experience = 10000;
     sidecar.players[1].objectData = { 0x00, 0x11, 0x00, 0xFE, 0xFF };
+    sidecar.players[1].reconnectToken.bytes[0] = 0xA5;
+    sidecar.players[1].replacementAllowed = true;
+    sidecar.lootDistribution = {
+        { kHostPlayerId, kGuestPlayerId }, 1, 1
+    };
+    sidecar.ownership = {
+        { EntityId { 1 }, kHostPlayerId },
+        { EntityId { 2 }, kGuestPlayerId },
+        { EntityId { 40 }, kGuestPlayerId },
+    };
+    sidecar.sharedActivity = {
+        { 9, kGuestPlayerId, "Guest", SharedActivityKind::Quest,
+            733, 2, "Quest progressed" },
+        { 10, PlayerId {}, "World", SharedActivityKind::WorldOutcome,
+            7, 1, "World-map travel ended" },
+    };
 
     expect(validateMultiplayerSave(sidecar) == MultiplayerSaveError::None, "two progressed character builds form valid save metadata");
     std::vector<std::uint8_t> packet;
@@ -580,41 +791,75 @@ void testMultiplayerSaveSidecar()
     expect(decoded.sidecar.generation == 7 && decoded.sidecar.saveDatDigest == sidecar.saveDatDigest, "sidecar keeps generation and SAVE.DAT digest");
     expect(decoded.sidecar.players[0] == sidecar.players[0], "sidecar keeps the host name and full build");
     expect(decoded.sidecar.players[1] == sidecar.players[1], "sidecar keeps the guest name and full build");
-    expect(decoded.sidecar.players[1].objectData == sidecar.players[1].objectData, "sidecar keeps opaque recursive guest object data");
-
-    MultiplayerSaveSidecar versionTwo = sidecar;
-    versionTwo.version = 2;
-    std::vector<std::uint8_t> versionTwoPacket;
-    expect(encodeMultiplayerSave(versionTwo, versionTwoPacket) == MultiplayerSaveError::None, "version 2 sidecar still encodes");
-    MultiplayerSaveDecodeResult versionTwoDecoded = decodeMultiplayerSave(versionTwoPacket);
-    expect(versionTwoDecoded && versionTwoDecoded.sidecar.players == sidecar.players, "version 2 guest inventory migrates into its player record");
-
-    MultiplayerSaveSidecar threePlayer = sidecar;
-    SavedPlayerCharacter third = sidecar.players[1];
-    third.playerId = PlayerId { 3 };
-    third.name = "Third";
-    third.objectData = { 0xBE, 0xEF };
-    threePlayer.players.push_back(third);
-    std::vector<std::uint8_t> threePlayerPacket;
-    expect(encodeMultiplayerSave(threePlayer, threePlayerPacket) == MultiplayerSaveError::None, "version 3 stores a bounded third player");
-    MultiplayerSaveDecodeResult threePlayerDecoded = decodeMultiplayerSave(threePlayerPacket);
-    expect(threePlayerDecoded && threePlayerDecoded.sidecar.players == threePlayer.players, "version 3 restores player-keyed object records without reassigning IDs");
-    MultiplayerSaveSidecar replacementRoster = sidecar;
-    replacementRoster.players[1].playerId = PlayerId { 3 };
-    std::vector<std::uint8_t> replacementPacket;
-    expect(encodeMultiplayerSave(replacementRoster, replacementPacket) == MultiplayerSaveError::None,
-        "version 3 preserves a missing guest slot instead of renumbering its replacement");
-    MultiplayerSaveDecodeResult replacementDecoded = decodeMultiplayerSave(replacementPacket);
-    expect(replacementDecoded && replacementDecoded.sidecar.players[1].playerId == PlayerId { 3 },
-        "replacement player keeps its explicit ID after decode");
+    expect(decoded.sidecar.sessionRules == sidecar.sessionRules
+            && decoded.sidecar.lootDistribution.nextCapExtraIndex == 1
+            && decoded.sidecar.ownership == sidecar.ownership
+            && decoded.sidecar.sharedActivity.size() == 2
+            && decoded.sidecar.sharedActivity[0].text == "Quest progressed",
+        "sidecar keeps session rules, loot cursors, canonical ownership, and shared activity");
+    expect(resolveSavedPlayerSlot(sidecar, kGuestPlayerId,
+               sidecar.players[1].reconnectToken, true)
+            == SavedPlayerSlotResolution::ExactReconnect,
+        "saved guest reconnect credential reclaims the same player slot");
+    ReconnectToken replacementToken;
+    replacementToken.bytes[0] = 0x5A;
+    expect(resolveSavedPlayerSlot(sidecar, kGuestPlayerId,
+               replacementToken, true)
+                == SavedPlayerSlotResolution::ReplacementAllowed
+            && resolveSavedPlayerSlot(sidecar, kGuestPlayerId, {}, false)
+                == SavedPlayerSlotResolution::MissingAllowed,
+        "an explicitly replaceable guest slot can remain absent or be claimed");
+    MultiplayerSaveSidecar claimed = sidecar;
+    std::vector<std::uint8_t> savedGuestObject
+        = claimed.players[1].objectData;
+    expect(claimSavedPlayerSlot(claimed, kGuestPlayerId, replacementToken)
+                == MultiplayerSaveError::None
+            && reconnectTokensEqual(
+                claimed.players[1].reconnectToken, replacementToken)
+            && claimed.players[1].objectData == savedGuestObject
+            && claimed.players[1].playerId == kGuestPlayerId
+            && claimed.players[1].actorId == EntityId { 2 },
+        "replacement rotates credentials without reassigning identity or inventory");
+    expect(resolveSavedPlayerSlot(sidecar, kHostPlayerId,
+               replacementToken, true)
+            == SavedPlayerSlotResolution::Rejected,
+        "the non-replaceable host slot rejects a different credential");
 
     MultiplayerSaveSidecar legacy = sidecar;
+    legacy.version = 2;
+    legacy.sessionRules = 0;
+    legacy.players[1].reconnectToken = {};
+    legacy.ownership.resize(2);
+    legacy.sharedActivity.clear();
+    std::vector<std::uint8_t> legacyPacket;
+    expect(encodeMultiplayerSave(legacy, legacyPacket) == MultiplayerSaveError::None,
+        "version 2 two-player sidecar still encodes");
+    MultiplayerSaveDecodeResult legacyDecoded = decodeMultiplayerSave(legacyPacket);
+    expect(legacyDecoded && legacyDecoded.sidecar.version == 2
+            && legacyDecoded.sidecar.players.size() == 2
+            && legacyDecoded.sidecar.players[1].objectData
+                == sidecar.players[1].objectData
+            && legacyDecoded.sidecar.lootDistribution.roster
+                == std::vector<PlayerId> { kHostPlayerId, kGuestPlayerId },
+        "version 2 migrates into the roster representation with guest inventory");
+    MultiplayerSaveSidecar version3 = sidecar;
+    version3.version = 3;
+    version3.sharedActivity.clear();
+    expect(encodeMultiplayerSave(version3, legacyPacket)
+                == MultiplayerSaveError::None,
+        "version 3 roster sidecar still encodes without durable activity");
+    legacyDecoded = decodeMultiplayerSave(legacyPacket);
+    expect(legacyDecoded && legacyDecoded.sidecar.version == 3
+            && legacyDecoded.sidecar.sharedActivity.empty(),
+        "version 3 migrates with an empty durable activity feed");
     legacy.version = 1;
     legacy.players[1].objectData.clear();
-    std::vector<std::uint8_t> legacyPacket;
-    expect(encodeMultiplayerSave(legacy, legacyPacket) == MultiplayerSaveError::None, "version 1 character-only sidecar still encodes");
-    MultiplayerSaveDecodeResult legacyDecoded = decodeMultiplayerSave(legacyPacket);
-    expect(legacyDecoded && legacyDecoded.sidecar.version == 1 && legacyDecoded.sidecar.players[1].objectData.empty(), "version 1 sidecar remains loadable with an empty guest inventory");
+    expect(encodeMultiplayerSave(legacy, legacyPacket) == MultiplayerSaveError::None,
+        "version 1 character-only sidecar still encodes");
+    legacyDecoded = decodeMultiplayerSave(legacyPacket);
+    expect(legacyDecoded && legacyDecoded.sidecar.version == 1
+            && legacyDecoded.sidecar.players[1].objectData.empty(),
+        "version 1 sidecar remains loadable with an empty guest inventory");
 
     std::uint64_t changedDigest = updateMultiplayerSaveDigest(kMultiplayerSaveDigestOffset, "legacy SAVE.DAT byteS", saveData.size());
     expect(changedDigest != sidecar.saveDatDigest, "SAVE.DAT digest detects different base-save bytes");
@@ -645,25 +890,40 @@ void testMultiplayerSaveSidecar()
     invalid = sidecar;
     invalid.players[1].playerId = kHostPlayerId;
     expect(validateMultiplayerSave(invalid) == MultiplayerSaveError::DuplicatePlayer, "sidecar rejects duplicate player slots");
-    invalid = threePlayer;
-    std::swap(invalid.players[1], invalid.players[2]);
-    expect(validateMultiplayerSave(invalid) == MultiplayerSaveError::NonCanonicalPlayerOrder, "sidecar rejects an out-of-order repeated player record");
-    invalid = sidecar;
-    invalid.players[0].objectData = { 1 };
-    expect(validateMultiplayerSave(invalid) == MultiplayerSaveError::InvalidPlayerObjectData, "story actor object data cannot shadow SAVE.DAT");
     invalid = sidecar;
     invalid.players[1].build.taggedSkills[0] = SKILL_COUNT;
     expect(validateMultiplayerSave(invalid) == MultiplayerSaveError::InvalidBuild, "sidecar rejects invalid restored build values");
     invalid = sidecar;
+    invalid.sharedActivity[1].id = invalid.sharedActivity[0].id;
+    expect(validateMultiplayerSave(invalid) == MultiplayerSaveError::InvalidActivity,
+        "sidecar rejects duplicate or unordered shared activity identities");
+    invalid = sidecar;
     invalid.version = 1;
-    expect(validateMultiplayerSave(invalid) == MultiplayerSaveError::InvalidGuestObjectData, "version 1 sidecar cannot smuggle an unversioned guest object payload");
+    invalid.sessionRules = 0;
+    invalid.players[1].reconnectToken = {};
+    expect(validateMultiplayerSave(invalid) == MultiplayerSaveError::InvalidPlayerObjectData, "version 1 sidecar cannot smuggle an unversioned guest object payload");
+
+    MultiplayerSaveSidecar threePlayer = sidecar;
+    SavedPlayerCharacter third = sidecar.players[1];
+    third.playerId = PlayerId { 3 };
+    third.actorId = EntityId { 3 };
+    third.name = "Third";
+    third.objectData.clear();
+    third.reconnectToken.bytes[0] = 0xA6;
+    threePlayer.players.push_back(third);
+    threePlayer.lootDistribution.roster.push_back(third.playerId);
+    threePlayer.ownership.insert(threePlayer.ownership.begin() + 2,
+        SavedEntityOwnership { third.actorId, third.playerId });
+    expect(validateMultiplayerSave(threePlayer) == MultiplayerSaveError::None
+            && encodeMultiplayerSave(threePlayer, packet)
+                == MultiplayerSaveError::None
+            && decodeMultiplayerSave(packet).sidecar.players.size() == 3,
+        "version 3 supports a bounded deterministic repeated-player roster");
 
     TestObject hostActor;
     TestObject guestActor;
     LocalSession source;
     expect(source.start(asGameObject(hostActor), asGameObject(guestActor)) == LocalSessionError::None, "sidecar source session starts");
-    expect(source.restorePlayerCharacters(threePlayer) == LocalSessionError::InvalidSaveState, "two-player runtime rejects a sidecar roster it cannot restore completely");
-    expect(source.restorePlayerCharacters(replacementRoster) == LocalSessionError::InvalidSaveState, "two-player runtime rejects a missing guest slot");
     expect(source.restorePlayerCharacters(sidecar) == LocalSessionError::None, "validated sidecar restores both registered players");
     expect(source.characterLobbyReady(), "restored players satisfy the loading gate without creation sheets");
     expect(source.transitionTo(SessionPhase::Loading) == LocalSessionError::None, "restored session can enter loading");
@@ -672,154 +932,14 @@ void testMultiplayerSaveSidecar()
 
     MultiplayerSaveSidecar captured;
     expect(captureMultiplayerSave(source.players(), 8, sidecar.saveDatDigest, captured) == MultiplayerSaveError::None, "active player state can be captured for the next generation");
-    expect(captured.generation == 8
-            && captured.players[0].playerId == sidecar.players[0].playerId
+    expect(captured.generation == 8 && captured.players.size() == 2
+            && captured.players[0].playerId == kHostPlayerId
             && captured.players[0].build == sidecar.players[0].build
-            && captured.players[1].playerId == sidecar.players[1].playerId
+            && captured.players[1].playerId == kGuestPlayerId
             && captured.players[1].build == sidecar.players[1].build
-            && captured.players[1].objectData.empty(),
-        "capture uses canonical player IDs and leaves inventory serialization to the save flow");
-}
-
-void testDirectTradeController()
-{
-    DirectTradeController trade;
-    expect(trade.begin(kGuestPlayerId, kHostPlayerId), "trade begins with a canonical bilateral roster");
-    expect(trade.state().offers[0].playerId == kHostPlayerId
-            && trade.state().offers[1].playerId == kGuestPlayerId,
-        "trade participant order does not depend on who invited whom");
-    expect(trade.replaceOffer(kHostPlayerId, 1, 12,
-               { DirectTradeLine { EntityId { 9 }, 2 }, DirectTradeLine { EntityId { 4 }, 1 } })
-            == DirectTradeResult::Applied,
-        "host can replace its offer");
-    expect(trade.state().revision == 2
-            && trade.state().offers[0].items[0].itemId == EntityId { 4 },
-        "offer update increments revision and sorts item IDs");
-    expect(trade.confirm(kHostPlayerId, 2) == DirectTradeResult::Applied,
-        "first confirmation waits for the other player");
-    expect(trade.replaceOffer(kGuestPlayerId, 2, 7,
-               { DirectTradeLine { EntityId { 21 }, 1 } }) == DirectTradeResult::Applied,
-        "guest can change its offer before commit");
-    expect(!trade.state().offers[0].confirmed && !trade.state().offers[1].confirmed,
-        "an offer change clears both confirmations");
-    expect(trade.confirm(kHostPlayerId, 2) == DirectTradeResult::StaleRevision,
-        "old confirmation cannot accept a revised offer");
-    expect(trade.confirm(kGuestPlayerId, 3) == DirectTradeResult::Applied
-            && trade.confirm(kHostPlayerId, 3) == DirectTradeResult::ReadyToCommit,
-        "both players can confirm the same revision");
-    expect(trade.finishCommit(3, false) && trade.state().revision == 4
-            && !trade.state().offers[0].confirmed,
-        "failed inventory validation leaves offers in place but requires fresh confirmations");
-    expect(trade.replaceOffer(kHostPlayerId, 4, 0,
-               { DirectTradeLine { EntityId { 4 }, 1 }, DirectTradeLine { EntityId { 4 }, 2 } })
-            == DirectTradeResult::InvalidOffer,
-        "duplicate item IDs cannot double-spend one stack");
-    expect(trade.state().revision == 4, "invalid offer leaves trade state unchanged");
-    expect(trade.confirm(kHostPlayerId, 4) == DirectTradeResult::Applied
-            && trade.confirm(kGuestPlayerId, 4) == DirectTradeResult::ReadyToCommit
-            && trade.finishCommit(4, true) && !trade.active(),
-        "successful commit closes the trade once");
-    expect(!trade.finishCommit(4, true), "a committed trade cannot execute twice");
-    expect(trade.begin(kHostPlayerId, kGuestPlayerId) && trade.cancel(kGuestPlayerId)
-            && !trade.active(),
-        "either participant can cancel without moving anything");
-    expect(trade.begin(kHostPlayerId, PlayerId { 3 }) && !trade.cancel(kGuestPlayerId),
-        "bilateral trade ignores other roster members");
-}
-
-void testLootPolicy()
-{
-    LootPolicy policy;
-    expect(policy.reset({ PlayerId { 3 }, kGuestPlayerId, kHostPlayerId }),
-        "loot policy accepts a sorted roster independent of join order");
-    std::vector<LootCapShare> first = policy.splitCaps(8);
-    expect(first.size() == 3 && first[0].playerId == kHostPlayerId
-            && first[0].quantity == 3 && first[1].quantity == 3
-            && first[2].quantity == 2,
-        "cap remainder begins at the first canonical player");
-    policy.advanceCaps(8);
-    std::vector<LootCapShare> second = policy.splitCaps(4);
-    expect(second.size() == 3 && second[0].quantity == 1
-            && second[1].quantity == 1 && second[2].quantity == 2,
-        "extra caps rotate to the next player across loot pools");
-    policy.advanceCaps(4);
-    expect(policy.nextExtraCapPlayer() == kHostPlayerId,
-        "cap remainder cursor wraps through the roster");
-    expect(policy.itemPriority() == kHostPlayerId, "item priority begins at the first player");
-    policy.advanceItemPriority();
-    expect(policy.itemPriority() == kGuestPlayerId, "contested item priority alternates");
-    LootPolicy restored;
-    expect(restored.restore({ PlayerId { 3 }, kHostPlayerId, kGuestPlayerId },
-               policy.nextExtraCapPlayer(), policy.nextItemPriorityPlayer())
-            && restored.splitCaps(4) == policy.splitCaps(4),
-        "loot cursors survive roster-based recovery");
-    expect(!restored.restore({ kHostPlayerId, kGuestPlayerId }, PlayerId { 3 }, kHostPlayerId),
-        "recovery rejects a cursor outside the roster");
-}
-
-void testDirectTradeWire()
-{
-    GameCommand command;
-    command.sequence = CommandSequence { 1 };
-    command.playerId = kGuestPlayerId;
-    command.actorId = EntityId { kGuestPlayerId.value };
-    command.expectedPhase = SessionPhase::Exploration;
-    command.expectedPhaseRevision = 3;
-    command.payload = DirectTradeCommand { DirectTradeAction::Open, kHostPlayerId };
-    ProtocolEnvelope envelope = sampleEnvelope();
-    expect(encodeGameCommand(command, envelope) == GameplayWireError::None,
-        "direct trade open encodes");
-    GameCommandDecodeResult decodedCommand = decodeGameCommand(envelope);
-    const auto* open = decodedCommand ? std::get_if<DirectTradeCommand>(&decodedCommand.command.payload) : nullptr;
-    expect(open != nullptr && open->action == DirectTradeAction::Open
-            && open->partnerId == kHostPlayerId,
-        "direct trade open retains the bilateral participant ID");
-    command.payload = DirectTradeCommand { DirectTradeAction::SetItem, {}, 7,
-        EntityId { 42 }, 3 };
-    expect(encodeGameCommand(command, envelope) == GameplayWireError::None,
-        "revisioned item offer encodes");
-    decodedCommand = decodeGameCommand(envelope);
-    const auto* item = decodedCommand ? std::get_if<DirectTradeCommand>(&decodedCommand.command.payload) : nullptr;
-    expect(item != nullptr && item->revision == 7 && item->itemId == EntityId { 42 }
-            && item->quantity == 3,
-        "revisioned item offer round trips");
-    ProtocolEnvelope malformed = envelope;
-    malformed.payload[29] = 1;
-    expect(decodeGameCommand(malformed).error == GameplayWireError::InvalidReservedField,
-        "direct trade rejects a nonzero reserved byte");
-    command.payload = DirectTradeCommand { DirectTradeAction::Confirm, {}, 7 };
-    expect(encodeGameCommand(command, envelope) == GameplayWireError::None,
-        "trade confirmation encodes");
-    command.payload = DirectTradeCommand { DirectTradeAction::SetCaps, {}, 7, {}, 0,
-        static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) + 1 };
-    expect(encodeGameCommand(command, envelope) == GameplayWireError::InvalidQuantity,
-        "trade wire rejects caps outside engine range");
-
-    DirectTradeController trade;
-    expect(trade.begin(kHostPlayerId, kGuestPlayerId), "wire fixture trade begins");
-    expect(trade.replaceOffer(kGuestPlayerId, 1, 19,
-               { DirectTradeLine { EntityId { 42 }, 3 } }) == DirectTradeResult::Applied,
-        "wire fixture offer is valid");
-    GameEvent event;
-    event.sequence = EventSequence { 5 };
-    event.causedBy = CommandSequence { 1 };
-    event.payload = DirectTradeStateChangedEvent { EntityId { 2 }, trade.state() };
-    expect(encodeGameEvent(event, envelope) == GameplayWireError::None,
-        "full trade state encodes as one ordered event");
-    GameEventDecodeResult decodedEvent = decodeGameEvent(envelope);
-    const auto* state = decodedEvent ? std::get_if<DirectTradeStateChangedEvent>(&decodedEvent.event.payload) : nullptr;
-    expect(state != nullptr && state->state.revision == 2
-            && state->state.offers[1].caps == 19
-            && state->state.offers[1].items[0].itemId == EntityId { 42 },
-        "trade event preserves revision, caps, and item identity");
-    malformed = envelope;
-    malformed.payload[26] = 3;
-    expect(decodeGameEvent(malformed).error == GameplayWireError::InvalidLength,
-        "trade event rejects an oversized participant count");
-    event.payload = DirectTradeStateChangedEvent { EntityId { 2 }, {}, true, false };
-    expect(encodeGameEvent(event, envelope) == GameplayWireError::None
-            && decodeGameEvent(envelope),
-        "completed trade event with empty state round trips");
+            && captured.lootDistribution.roster
+                == std::vector<PlayerId> { kHostPlayerId, kGuestPlayerId },
+        "capture uses canonical player IDs and initializes roster-shaped policy");
 }
 
 void testActingPlayerContext()
@@ -972,10 +1092,56 @@ void testProtocolRejectsInvalidPackets()
     trailing.push_back(0);
     expect(decodeEnvelope(trailing).error == ProtocolError::TrailingData, "trailing data is rejected");
 
+    std::vector<std::uint8_t> maliciousLength = packet;
+    maliciousLength[8] = 0xFF;
+    maliciousLength[9] = 0xFF;
+    maliciousLength[10] = 0xFF;
+    maliciousLength[11] = 0xFF;
+    expect(decodeEnvelope(maliciousLength).error == ProtocolError::PayloadTooLarge,
+        "attacker-controlled payload lengths are bounded before allocation");
+
     ProtocolEnvelope oversized = sampleEnvelope();
     oversized.payload.resize(kMaxProtocolPayloadSize + 1);
     expect(encodeEnvelope(oversized, packet) == ProtocolError::PayloadTooLarge, "oversized payload is rejected before encoding");
     expect(packet.empty(), "failed encoding leaves no partial packet");
+}
+
+void testProtocolDiagnostics()
+{
+    ProtocolDiagnostics diagnostics;
+    ProtocolEnvelope envelope = sampleEnvelope();
+    diagnostics.recordEnvelope(ProtocolDiagnosticDirection::Sent, envelope);
+    diagnostics.recordEnvelope(ProtocolDiagnosticDirection::Received, envelope);
+    diagnostics.recordRejected(ProtocolError::PayloadTooLarge, 12);
+
+    SnapshotDigestResult digest = computeSnapshotDigest(sampleSnapshot());
+    expect(static_cast<bool>(digest), "diagnostic checksum fixture is valid");
+    if (digest) {
+        diagnostics.recordStateChecksum(ProtocolDiagnosticDirection::ChecksumSent,
+            EventSequence { 41 }, digest.digest);
+        diagnostics.recordStateChecksum(ProtocolDiagnosticDirection::ChecksumReceived,
+            EventSequence { 41 }, digest.digest);
+    }
+
+    const ProtocolDiagnosticCounters& counters = diagnostics.counters();
+    expect(counters.sentByKind[static_cast<std::size_t>(MessageKind::Command)] == 1
+            && counters.receivedByKind[static_cast<std::size_t>(MessageKind::Command)] == 1
+            && counters.rejectedPackets == 1
+            && counters.sentChecksums == 1
+            && counters.receivedChecksums == 1,
+        "protocol diagnostics count messages, malformed packets, and state checksums");
+    expect(diagnostics.records().size() == 5
+            && diagnostics.records().back().stateDigest.overall == digest.digest.overall,
+        "protocol diagnostics retain sectioned checksum details");
+
+    for (std::size_t index = 0; index < kProtocolDiagnosticCapacity + 10; index++) {
+        diagnostics.recordEnvelope(ProtocolDiagnosticDirection::Sent, envelope);
+    }
+    expect(diagnostics.records().size() == kProtocolDiagnosticCapacity,
+        "protocol diagnostic history remains bounded during long sessions");
+    diagnostics.reset();
+    expect(diagnostics.records().empty() && diagnostics.counters().rejectedPackets == 0,
+        "protocol diagnostics reset between sessions");
 }
 
 void testContentManifest()
@@ -1000,6 +1166,8 @@ void testContentManifest()
         && writeFile(root / "critter.dat", "critter archive bytes")
         && writeFile(patches / "SCRIPTS" / "DOOR.INT", "script version one")
         && writeFile(patches / "MAPS" / "VAULT.MAP", "map version one")
+        && writeFile(patches / "MAPS" / "VAULT.EDG", "generated edge cache one")
+        && writeFile(patches / "MAPS" / "VAULT.SAV", "runtime map state one")
         && writeFile(patches / "TEXT" / "ENGLISH" / "GAME" / "WORLD.MSG", "message version one")
         && writeFile(patches / "SOUND" / "LOCAL.ACM", "presentation-only sound");
     expect(fixtureCreated, "content manifest test fixture is created");
@@ -1029,6 +1197,17 @@ void testContentManifest()
         patches.string());
     expect(presentationChanged && presentationChanged.digest == first.digest,
         "content manifest ignores presentation-only patch files");
+
+    writeFile(patches / "MAPS" / "VAULT.EDG", "generated edge cache two");
+    writeFile(patches / "MAPS" / "VAULT.SAV", "runtime map state two");
+    ContentManifestResult runtimeMapStateChanged = buildContentManifest(
+        (root / "master.dat").string(),
+        (root / "critter.dat").string(),
+        patches.string(),
+        patches.string());
+    expect(runtimeMapStateChanged
+            && runtimeMapStateChanged.digest == first.digest,
+        "content manifest ignores mutable map state and generated caches");
 
     writeFile(patches / "SCRIPTS" / "DOOR.INT", "script version two");
     ContentManifestResult scriptChanged = buildContentManifest(
@@ -1712,6 +1891,81 @@ void testGameplayWireFormat()
             && itemUseEvent->targetId == EntityId { 40 },
         "item-use event round trips as a presentation cue without replica-side scripts");
 
+    DirectTradeCommand tradeCommand;
+    tradeCommand.action = DirectTradeAction::SetOffer;
+    tradeCommand.tradeId = 9;
+    tradeCommand.revision = 7;
+    tradeCommand.offer.caps = 12;
+    tradeCommand.offer.items = {
+        { EntityId { 100 }, 1 }, { EntityId { 101 }, 3 }
+    };
+    GameCommand tradeWire { CommandSequence { 24 }, kGuestPlayerId,
+        EntityId { 20 }, SessionPhase::Dialogue, 4, tradeCommand };
+    ProtocolEnvelope tradeEnvelope = gameplayEnvelope(101);
+    expect(encodeGameCommand(tradeWire, tradeEnvelope)
+            == GameplayWireError::None,
+        "bounded revisioned trade offer encodes");
+    GameCommandDecodeResult decodedTrade = decodeGameCommand(tradeEnvelope);
+    const DirectTradeCommand* decodedTradeCommand = decodedTrade
+        ? std::get_if<DirectTradeCommand>(&decodedTrade.command.payload) : nullptr;
+    expect(decodedTradeCommand != nullptr
+            && decodedTradeCommand->tradeId == 9
+            && decodedTradeCommand->revision == 7
+            && decodedTradeCommand->offer.caps == 12
+            && decodedTradeCommand->offer.items == tradeCommand.offer.items,
+        "trade offer preserves its revision, caps, items, and quantities");
+    tradeCommand.offer.items[1].itemId = EntityId { 100 };
+    tradeWire.payload = tradeCommand;
+    expect(encodeGameCommand(tradeWire, tradeEnvelope)
+            == GameplayWireError::InvalidTrade,
+        "trade wire rejects duplicate or noncanonical item identities");
+
+    DirectTradeState committedTrade;
+    committedTrade.tradeId = 9;
+    committedTrade.revision = 7;
+    committedTrade.status = DirectTradeStatus::Committed;
+    committedTrade.participants[0] = { kHostPlayerId, EntityId { 10 },
+        DirectTradeOffer { { { EntityId { 200 }, 2 } }, 4 }, 7 };
+    committedTrade.participants[1] = { kGuestPlayerId, EntityId { 20 },
+        DirectTradeOffer { { { EntityId { 100 }, 1 } }, 12 }, 7 };
+    GameEvent tradeEvent { EventSequence { 40 }, CommandSequence { 24 },
+        DirectTradeStateChangedEvent { EntityId { 20 }, committedTrade,
+            SessionPhase::Exploration, 5, true } };
+    ProtocolEnvelope tradeEventEnvelope = gameplayEnvelope(102);
+    expect(encodeGameEvent(tradeEvent, tradeEventEnvelope)
+            == GameplayWireError::None,
+        "committed bilateral trade state encodes as one authoritative event");
+    GameEventDecodeResult decodedTradeEvent = decodeGameEvent(tradeEventEnvelope);
+    const DirectTradeStateChangedEvent* tradeState = decodedTradeEvent
+        ? std::get_if<DirectTradeStateChangedEvent>(
+            &decodedTradeEvent.event.payload) : nullptr;
+    expect(tradeState != nullptr && tradeState->inventoryChanged
+            && tradeState->state.status == DirectTradeStatus::Committed
+            && tradeState->state.participants[0].offer.items[0].quantity == 2
+            && tradeState->state.participants[1].offer.caps == 12,
+        "trade event round trips confirmations and both directional offers");
+
+    GameEvent capsEvent { EventSequence { 41 }, CommandSequence { 25 },
+        CapsDistributedEvent { EntityId { 10 }, EntityId { 90 }, 5,
+            { { kHostPlayerId, EntityId { 10 }, 3 },
+                { kGuestPlayerId, EntityId { 20 }, 2 } } } };
+    ProtocolEnvelope capsEnvelope = gameplayEnvelope(103);
+    expect(encodeGameEvent(capsEvent, capsEnvelope)
+            == GameplayWireError::None,
+        "canonical cap split encodes as one authoritative transaction");
+    GameEventDecodeResult decodedCaps = decodeGameEvent(capsEnvelope);
+    const CapsDistributedEvent* caps = decodedCaps
+        ? std::get_if<CapsDistributedEvent>(&decodedCaps.event.payload)
+        : nullptr;
+    expect(caps != nullptr && caps->caps == 5 && caps->shares.size() == 2
+            && caps->shares[0].caps == 3
+            && caps->shares[1].actorId == EntityId { 20 },
+        "cap split round trips its deterministic player-keyed shares");
+    std::get<CapsDistributedEvent>(capsEvent.payload).shares[1].caps = 3;
+    expect(encodeGameEvent(capsEvent, capsEnvelope)
+            == GameplayWireError::InvalidQuantity,
+        "cap split wire rejects creation of extra currency");
+
     ProtocolEnvelope missingSession = gameplayEnvelope(42);
     missingSession.sessionId = {};
     expect(encodeGameCommand(commands[0], missingSession) == GameplayWireError::InvalidSessionId,
@@ -1784,6 +2038,54 @@ void testLoopbackTransport()
     pair.second->close();
     expect(!pair.first->isConnected(), "closing one endpoint disconnects its peer");
     expect(pair.first->send(Packet { 7 }) == TransportSendResult::Disconnected, "send fails after peer closes");
+}
+
+void testImpairedLoopbackTransport()
+{
+    LoopbackFaultProfile latency;
+    latency.latencyPolls = 2;
+    LoopbackTransportPair delayed = createLoopbackTransportPair(latency);
+    expect(delayed.first->send(Packet { 1 }) == TransportSendResult::Sent,
+        "latency fixture accepts a packet");
+    expect(!delayed.second->receive().has_value(),
+        "latency fixture withholds a packet before polling");
+    delayed.second->poll();
+    expect(!delayed.second->receive().has_value(),
+        "latency fixture withholds a packet for the configured polls");
+    delayed.second->poll();
+    expect(delayed.second->receive() == std::optional<Packet> { Packet { 1 } },
+        "latency fixture releases a packet on its deterministic deadline");
+
+    LoopbackFaultProfile loss;
+    loss.dropEvery = 2;
+    LoopbackTransportPair lossy = createLoopbackTransportPair(loss);
+    expect(lossy.first->send(Packet { 1 }) == TransportSendResult::Sent
+            && lossy.first->send(Packet { 2 }) == TransportSendResult::Sent
+            && lossy.first->send(Packet { 3 }) == TransportSendResult::Sent,
+        "loss fixture reports lower-layer packet acceptance");
+    expect(lossy.second->receive() == std::optional<Packet> { Packet { 1 } }
+            && lossy.second->receive() == std::optional<Packet> { Packet { 3 } }
+            && !lossy.second->receive().has_value(),
+        "loss fixture deterministically drops every configured packet");
+
+    LoopbackFaultProfile duplication;
+    duplication.duplicateEvery = 2;
+    LoopbackTransportPair duplicated = createLoopbackTransportPair(duplication);
+    duplicated.first->send(Packet { 1 });
+    duplicated.first->send(Packet { 2 });
+    expect(duplicated.second->receive() == std::optional<Packet> { Packet { 1 } }
+            && duplicated.second->receive() == std::optional<Packet> { Packet { 2 } }
+            && duplicated.second->receive() == std::optional<Packet> { Packet { 2 } },
+        "duplication fixture repeats the selected packet exactly");
+
+    LoopbackFaultProfile reordering;
+    reordering.reorderEvery = 2;
+    LoopbackTransportPair reordered = createLoopbackTransportPair(reordering);
+    reordered.first->send(Packet { 1 });
+    reordered.first->send(Packet { 2 });
+    expect(reordered.second->receive() == std::optional<Packet> { Packet { 2 } }
+            && reordered.second->receive() == std::optional<Packet> { Packet { 1 } },
+        "reordering fixture swaps the selected packet with its predecessor");
 }
 
 std::unique_ptr<Transport> acceptTcpPeer(TcpListener& listener)
@@ -2575,6 +2877,7 @@ void testNetworkCharacterLobby()
     expect(host.acknowledgedEvent(kGuestPlayerId) == EventSequence { 11 },
         "reconnected guest acknowledgement advances only its own boundary");
     WorldSnapshot authoritativeState = sampleSnapshot();
+    authoritativeState.phase = SessionPhase::Ending;
     expect(host.sendAuthoritativeState(authoritativeState),
         "host sends a non-journaled full authoritative correction");
     guest.poll();
@@ -2587,6 +2890,13 @@ void testNetworkCharacterLobby()
             && receivedState->doors.size() == 1
             && receivedState->items.size() == 2,
         "guest receives complete authoritative state independently of replay events");
+    expect(receivedState.has_value()
+            && guest.confirmSessionEndingApplied(receivedState->phaseRevision),
+        "guest confirms the applied ending checkpoint revision");
+    host.poll();
+    expect(receivedState.has_value()
+            && host.acknowledgedEndingPhaseRevision() == receivedState->phaseRevision,
+        "host receives the exact ending checkpoint revision acknowledgement");
     expect(host.takeTransport() != nullptr && guest.takeTransport() != nullptr,
         "ready lobbies hand the connection to the game session");
 
@@ -3415,6 +3725,14 @@ void testAuthoritativeCommandProcessing()
             && duplicate.event->sequence == EventSequence { 1 },
         "duplicate command identifies the original event without republishing it");
 
+    GameCommand outOfOrder = move;
+    outOfOrder.sequence.value = 3;
+    AuthoritativeCommandResult sequenceGap = processor.process(outOfOrder, session, executor);
+    expect(sequenceGap.result.rejection == CommandRejection::Stale
+            && executor.moveCalls == 1
+            && !sequenceGap.event.has_value(),
+        "out-of-order command gaps fail closed without engine execution");
+
     GameCommand stolen = move;
     stolen.sequence.value = 1;
     stolen.playerId = kGuestPlayerId;
@@ -3878,8 +4196,6 @@ void testAuthoritativeCommandProcessing()
 void testSnapshotRoundTripAndRecovery()
 {
     WorldSnapshot authoritative = sampleSnapshot();
-    authoritative.nextExtraCapPlayer = kGuestPlayerId;
-    authoritative.nextItemPriorityPlayer = kGuestPlayerId;
     std::vector<std::uint8_t> packet;
     expect(encodeSnapshot(authoritative, packet) == SnapshotError::None, "valid snapshot encodes");
     constexpr std::size_t characterBuildWireSize = (SAVEABLE_STAT_COUNT * 2
@@ -3889,7 +4205,7 @@ void testSnapshotRoundTripAndRecovery()
                                                         + PC_TRAIT_MAX
                                                         + 4)
         * sizeof(std::uint32_t);
-    expect(packet.size() == kSnapshotHeaderSize + 48 + 2 * (68 + characterBuildWireSize) + 68 + 12 + 48 + 2 * 56 + 6 * 4 + 2 * 36 + 31 * 29 + 15 * 7 + 6 * 4 + 20 + 14 * 4 + 32 + 8 + 4 + 8,
+    expect(packet.size() == kSnapshotHeaderSize + 52 + 2 * (68 + characterBuildWireSize) + 68 + 12 + 48 + 2 * 56 + 6 * 4 + 2 * 36 + 31 * 29 + 15 * 7 + 6 * 4 + 20 + 14 * 4 + 32 + 8 + 4 + 4,
         "snapshot packet declares a fixed-width payload");
     expect(packet[0] == 'F' && packet[1] == 'C' && packet[2] == 'M' && packet[3] == 'S', "snapshot magic uses network byte order");
 
@@ -3899,9 +4215,8 @@ void testSnapshotRoundTripAndRecovery()
     expect(decoded.snapshot.phase == SessionPhase::Exploration
             && decoded.snapshot.phaseRevision == 7
             && decoded.snapshot.gameTime == 302400
-            && decoded.snapshot.nextExtraCapPlayer == kGuestPlayerId
-            && decoded.snapshot.nextItemPriorityPlayer == kGuestPlayerId,
-        "snapshot keeps session phase and authoritative world time");
+            && decoded.snapshot.mapId == 12,
+        "snapshot keeps session phase, map, and authoritative world time");
     expect(decoded.snapshot.worldMap.specialEncounters == 2
             && decoded.snapshot.worldMap.x == 1075
             && decoded.snapshot.worldMap.grid[42] == 2
@@ -3959,15 +4274,6 @@ void testSnapshotRoundTripAndRecovery()
     SnapshotDigestResult decodedDigest = computeSnapshotDigest(decoded.snapshot);
     expect(static_cast<bool>(authoritativeDigest) && authoritativeDigest.digest == decodedDigest.digest, "snapshot digest is stable across wire round trip and input order");
     expect(firstDivergentSection(authoritativeDigest.digest, decodedDigest.digest) == SnapshotSection::None, "matching snapshots report no divergent section");
-    WorldSnapshot lootCursorDrift = decoded.snapshot;
-    lootCursorDrift.nextExtraCapPlayer = kHostPlayerId;
-    expect(firstDivergentSection(authoritativeDigest.digest,
-               computeSnapshotDigest(lootCursorDrift).digest) == SnapshotSection::Session,
-        "loot cursor drift reports the session section");
-    WorldSnapshot invalidLootCursor = decoded.snapshot;
-    invalidLootCursor.nextItemPriorityPlayer = PlayerId { 3 };
-    expect(validateSnapshot(invalidLootCursor) == SnapshotError::InvalidPlayerId,
-        "snapshot rejects a loot cursor outside its player roster");
 
     WorldSnapshot sessionDrift = decoded.snapshot;
     sessionDrift.phaseRevision++;
@@ -4093,6 +4399,43 @@ void testSnapshotRoundTripAndRecovery()
     expect(validateSnapshot(approvedTravel) == SnapshotError::InvalidWorldMapTravelState,
         "snapshot rejects an out-of-bounds travel target");
 
+    WorldSnapshot activeTrade = decoded.snapshot;
+    activeTrade.phase = SessionPhase::Dialogue;
+    activeTrade.phaseRevision++;
+    DirectTradeState tradeState;
+    tradeState.tradeId = 77;
+    tradeState.revision = 3;
+    tradeState.status = DirectTradeStatus::Negotiating;
+    tradeState.participants = {
+        DirectTradeParticipant { kHostPlayerId, EntityId { 1 },
+            DirectTradeOffer { { { EntityId { 10 }, 1 } }, 5 }, 3 },
+        DirectTradeParticipant { kGuestPlayerId, EntityId { 2 },
+            DirectTradeOffer { {}, 2 }, std::nullopt },
+    };
+    activeTrade.directTrade = tradeState;
+    expect(encodeSnapshot(activeTrade, planningPacket) == SnapshotError::None,
+        "snapshot encodes an in-progress bilateral trade");
+    SnapshotDecodeResult restoredTrade = decodeSnapshot(planningPacket);
+    expect(restoredTrade
+            && restoredTrade.snapshot.directTrade.has_value()
+            && restoredTrade.snapshot.directTrade->tradeId == 77
+            && restoredTrade.snapshot.directTrade->participants[0]
+                    .confirmedRevision == 3
+            && restoredTrade.snapshot.directTrade->participants[1]
+                    .offer.caps == 2,
+        "snapshot restores trade offers and revision confirmations");
+    WorldSnapshot changedTrade = activeTrade;
+    changedTrade.directTrade->participants[1].offer.caps = 3;
+    expect(firstDivergentSection(computeSnapshotDigest(activeTrade).digest,
+               computeSnapshotDigest(changedTrade).digest)
+            == SnapshotSection::Session,
+        "trade negotiation drift reports the session section");
+    WorldSnapshot tradeWithoutDialogue = activeTrade;
+    tradeWithoutDialogue.phase = SessionPhase::Exploration;
+    expect(validateSnapshot(tradeWithoutDialogue)
+            == SnapshotError::InvalidDialogueState,
+        "snapshot rejects a trade outside the dialogue phase");
+
     SnapshotReplica replica;
     expect(replica.apply(actorDrift) == SnapshotError::None, "replica accepts locally drifted state");
     expect(replica.digest().digest != authoritativeDigest.digest, "drifted replica digest differs from the host");
@@ -4165,6 +4508,10 @@ void testSnapshotRoundTripAndRecovery()
     invalidGameTime.gameTime = 0;
     expect(validateSnapshot(invalidGameTime) == SnapshotError::InvalidGameTime,
         "snapshot rejects an invalid authoritative world time");
+    WorldSnapshot invalidMap = authoritative;
+    invalidMap.mapId = -1;
+    expect(validateSnapshot(invalidMap) == SnapshotError::InvalidMap,
+        "snapshot rejects an invalid authoritative map identity");
 
     WorldSnapshot invalidItem = authoritative;
     invalidItem.items[0].quantity = 0;
@@ -4552,6 +4899,8 @@ int main()
 {
     fallout::multiplayer::testCoreTypes();
     fallout::multiplayer::testCombatTurnController();
+    fallout::multiplayer::testDirectTradeController();
+    fallout::multiplayer::testLootDistributionController();
     fallout::multiplayer::testDialogueVotingPolicies();
     fallout::multiplayer::testDialogueAndActivityWireRecovery();
     fallout::multiplayer::testEntityRegistry();
@@ -4559,16 +4908,15 @@ int main()
     fallout::multiplayer::testPlayerCharacterStateStore();
     fallout::multiplayer::testCharacterLobbyValidationAndWireFormat();
     fallout::multiplayer::testMultiplayerSaveSidecar();
-    fallout::multiplayer::testDirectTradeController();
-    fallout::multiplayer::testLootPolicy();
-    fallout::multiplayer::testDirectTradeWire();
     fallout::multiplayer::testActingPlayerContext();
     fallout::multiplayer::testLocalPlayerContext();
     fallout::multiplayer::testProtocolRoundTrip();
     fallout::multiplayer::testProtocolRejectsInvalidPackets();
+    fallout::multiplayer::testProtocolDiagnostics();
     fallout::multiplayer::testContentManifest();
     fallout::multiplayer::testGameplayWireFormat();
     fallout::multiplayer::testLoopbackTransport();
+    fallout::multiplayer::testImpairedLoopbackTransport();
     fallout::multiplayer::testTcpTransportAndHandshake();
     fallout::multiplayer::testNetworkLaunchAndBootstrap();
     fallout::multiplayer::testNetworkCharacterLobby();

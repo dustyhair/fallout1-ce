@@ -39,6 +39,7 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     };
 
     const SharedModalCommand* modal = std::get_if<SharedModalCommand>(&command.payload);
+    const DirectTradeCommand* directTrade = std::get_if<DirectTradeCommand>(&command.payload);
     SessionPhase requiredPhase = (std::holds_alternative<AttackCommand>(command.payload)
             || std::holds_alternative<CombatMoveCommand>(command.payload)
             || std::holds_alternative<CombatItemCommand>(command.payload)
@@ -49,6 +50,9 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
         : std::holds_alternative<WorldMapRouteCommand>(command.payload)
         ? SessionPhase::Transition
         : std::holds_alternative<DialogueVoteCommand>(command.payload)
+        ? SessionPhase::Dialogue
+        : directTrade != nullptr
+                && directTrade->action != DirectTradeAction::Begin
         ? SessionPhase::Dialogue
         : modal != nullptr && modal->kind == SharedModalKind::WorldMap && !modal->open
         ? session.phase()
@@ -95,7 +99,6 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     const SceneryTransitionCommand* sceneryTransition = std::get_if<SceneryTransitionCommand>(&command.payload);
     const RestCommand* rest = std::get_if<RestCommand>(&command.payload);
     const InventoryTransferCommand* transfer = std::get_if<InventoryTransferCommand>(&command.payload);
-    const DirectTradeCommand* trade = std::get_if<DirectTradeCommand>(&command.payload);
     const ItemDropCommand* drop = std::get_if<ItemDropCommand>(&command.payload);
     const AttackCommand* attack = std::get_if<AttackCommand>(&command.payload);
     const CombatMoveCommand* combatMove = std::get_if<CombatMoveCommand>(&command.payload);
@@ -162,6 +165,32 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
         hasTarget = true;
     } else if (worldMapRoute != nullptr && !isValid(*worldMapRoute)) {
         return rejectAndRemember(CommandRejection::Malformed);
+    } else if (directTrade != nullptr) {
+        bool begin = directTrade->action == DirectTradeAction::Begin;
+        bool setOffer = directTrade->action == DirectTradeAction::SetOffer;
+        if (directTrade->action < DirectTradeAction::Begin
+            || directTrade->action > DirectTradeAction::Cancel
+            || directTrade->tradeId == 0
+            || (begin && (directTrade->revision != 0
+                || !isValid(directTrade->otherPlayerId)
+                || !isValid(directTrade->otherActorId)))
+            || (!begin && directTrade->revision == 0)
+            || (!setOffer && (!directTrade->offer.items.empty()
+                || directTrade->offer.caps != 0))
+            || directTrade->offer.caps
+                > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())
+            || directTrade->offer.items.size()
+                > kMaximumDirectTradeItemsPerPlayer) {
+            return rejectAndRemember(CommandRejection::Malformed);
+        }
+        EntityId previous;
+        for (const DirectTradeItemOffer& offered : directTrade->offer.items) {
+            if (!isValid(offered.itemId) || offered.quantity == 0
+                || offered.itemId.value <= previous.value) {
+                return rejectAndRemember(CommandRejection::Malformed);
+            }
+            previous = offered.itemId;
+        }
     }
     if (hasTarget) {
         target = session.entities().findObject(targetId);
@@ -375,6 +404,17 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
                 worldMapRoute->targetY,
                 worldMapRoute->clear,
             };
+        } else if (directTrade != nullptr) {
+            DirectTradeExecution trade = executor.directTrade(actor,
+                command.playerId, *directTrade);
+            executionStatus = trade.status;
+            event.payload = DirectTradeStateChangedEvent {
+                command.actorId,
+                std::move(trade.state),
+                trade.phase,
+                trade.phaseRevision,
+                trade.inventoryChanged,
+            };
         } else if (transfer != nullptr) {
             InventoryTransferExecution transferExecution = executor.transferInventory(actor,
                 source,
@@ -382,26 +422,27 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
                 item,
                 *transfer);
             executionStatus = transferExecution.status;
-            event.payload = transferExecution.primaryEvent.value_or(InventoryTransferredEvent {
-                command.actorId,
-                transfer->sourceId,
-                transfer->destinationId,
-                transferExecution.itemId,
-                transfer->quantity,
-                transfer->sourceQuantity,
-                transferExecution.remainderItemId,
-                transferExecution.itemDescriptor,
-            });
-        } else if (trade != nullptr) {
-            DirectTradeExecution tradeExecution = executor.directTrade(actor,
-                command.playerId, *trade);
-            executionStatus = tradeExecution.status;
-            event.payload = DirectTradeStateChangedEvent {
-                command.actorId,
-                std::move(tradeExecution.state),
-                tradeExecution.committed,
-                tradeExecution.cancelled,
-            };
+            if (!transferExecution.capShares.empty()) {
+                event.payload = CapsDistributedEvent {
+                    command.actorId,
+                    transfer->sourceId,
+                    transfer->quantity,
+                    std::move(transferExecution.capShares),
+                };
+            } else {
+                event.payload = InventoryTransferredEvent {
+                    command.actorId,
+                    transfer->sourceId,
+                    isValid(transferExecution.destinationId)
+                        ? transferExecution.destinationId
+                        : transfer->destinationId,
+                    transferExecution.itemId,
+                    transfer->quantity,
+                    transfer->sourceQuantity,
+                    transferExecution.remainderItemId,
+                    transferExecution.itemDescriptor,
+                };
+            }
         } else if (drop != nullptr) {
             ItemDropExecution dropExecution = executor.dropItem(actor,
                 source,

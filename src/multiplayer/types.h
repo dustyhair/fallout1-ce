@@ -1,8 +1,10 @@
 #ifndef FALLOUT_MULTIPLAYER_TYPES_H_
 #define FALLOUT_MULTIPLAYER_TYPES_H_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -262,6 +264,75 @@ struct ItemDescriptor {
     std::int32_t data1 = 0;
 };
 
+constexpr std::size_t kMaximumDirectTradeItemsPerPlayer = 64;
+
+struct DirectTradeItemOffer {
+    EntityId itemId;
+    std::uint32_t quantity = 0;
+};
+
+bool operator==(const DirectTradeItemOffer& lhs,
+    const DirectTradeItemOffer& rhs);
+
+struct DirectTradeOffer {
+    std::vector<DirectTradeItemOffer> items;
+    std::uint32_t caps = 0;
+};
+
+bool operator==(const DirectTradeOffer& lhs, const DirectTradeOffer& rhs);
+
+struct DirectTradeParticipant {
+    PlayerId playerId;
+    EntityId actorId;
+    DirectTradeOffer offer;
+    std::optional<std::uint64_t> confirmedRevision;
+};
+
+enum class DirectTradeStatus : std::uint8_t {
+    Inactive = 0,
+    Negotiating = 1,
+    ReadyToCommit = 2,
+    Committed = 3,
+    Cancelled = 4,
+};
+
+struct DirectTradeState {
+    std::uint64_t tradeId = 0;
+    std::uint64_t revision = 0;
+    DirectTradeStatus status = DirectTradeStatus::Inactive;
+    std::array<DirectTradeParticipant, 2> participants;
+};
+
+struct DirectTradeLeg {
+    PlayerId sourcePlayerId;
+    EntityId sourceActorId;
+    PlayerId destinationPlayerId;
+    EntityId destinationActorId;
+    DirectTradeOffer offer;
+};
+
+struct DirectTradeCommitPlan {
+    std::uint64_t tradeId = 0;
+    std::uint64_t revision = 0;
+    std::array<DirectTradeLeg, 2> legs;
+};
+
+enum class DirectTradeAction : std::uint8_t {
+    Begin = 1,
+    SetOffer = 2,
+    Confirm = 3,
+    Cancel = 4,
+};
+
+struct DirectTradeCommand {
+    DirectTradeAction action = DirectTradeAction::Begin;
+    std::uint64_t tradeId = 0;
+    std::uint64_t revision = 0;
+    PlayerId otherPlayerId;
+    EntityId otherActorId;
+    DirectTradeOffer offer;
+};
+
 constexpr bool hasItemDescriptor(const ItemDescriptor& descriptor)
 {
     return descriptor.pid != -1;
@@ -274,47 +345,6 @@ struct InventoryTransferCommand {
     std::uint32_t quantity = 0;
     std::uint32_t sourceQuantity = 0;
     ItemDescriptor itemDescriptor;
-};
-
-constexpr std::size_t kMaximumDirectTradeLines = 16;
-
-struct DirectTradeLine {
-    EntityId itemId;
-    std::uint32_t quantity = 0;
-};
-
-inline bool operator==(const DirectTradeLine& lhs, const DirectTradeLine& rhs)
-{
-    return lhs.itemId == rhs.itemId && lhs.quantity == rhs.quantity;
-}
-
-struct DirectTradeOffer {
-    PlayerId playerId;
-    std::uint32_t caps = 0;
-    std::vector<DirectTradeLine> items;
-    bool confirmed = false;
-};
-
-struct DirectTradeState {
-    std::uint64_t revision = 0;
-    std::vector<DirectTradeOffer> offers;
-};
-
-enum class DirectTradeAction : std::uint8_t {
-    Open = 1,
-    SetCaps = 2,
-    SetItem = 3,
-    Confirm = 4,
-    Cancel = 5,
-};
-
-struct DirectTradeCommand {
-    DirectTradeAction action = DirectTradeAction::Open;
-    PlayerId partnerId;
-    std::uint64_t revision = 0;
-    EntityId itemId;
-    std::uint32_t quantity = 0;
-    std::uint32_t caps = 0;
 };
 
 struct ItemDropCommand {
@@ -576,11 +606,27 @@ struct InventoryTransferredEvent {
     ItemDescriptor itemDescriptor;
 };
 
+struct PlayerCapShare {
+    PlayerId playerId;
+    EntityId actorId;
+    std::uint32_t caps = 0;
+};
+
+struct CapsDistributedEvent {
+    EntityId actorId;
+    EntityId sourceId;
+    std::uint32_t caps = 0;
+    std::vector<PlayerCapShare> shares;
+};
+
+// Inventory effects of a committed trade are carried by the immediately
+// following authoritative checkpoint. Replicas never apply trade rules.
 struct DirectTradeStateChangedEvent {
     EntityId actorId;
     DirectTradeState state;
-    bool committed = false;
-    bool cancelled = false;
+    SessionPhase phase = SessionPhase::Exploration;
+    std::uint32_t phaseRevision = 0;
+    bool inventoryChanged = false;
 };
 
 struct ItemDroppedEvent {
@@ -707,7 +753,7 @@ struct WorldMapRouteSelectedEvent {
     bool clear = false;
 };
 
-using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, ItemPickupCompletedEvent, LootStartedEvent, SkillUseStartedEvent, ItemUseStartedEvent, ElevatorTransitionedEvent, ExitGridTransitionedEvent, SceneryTransitionedEvent, RestStateChangedEvent, InventoryTransferredEvent, ItemDroppedEvent, AttackStartedEvent, CombatTurnStateChangedEvent, CombatActionResolvedEvent, PartyExperienceAwardedEvent, SharedModalStateChangedEvent, WorldMapRouteSelectedEvent, WorldMapArrivedEvent, DialogueRequestedEvent, DialogueVoteRecordedEvent, DialoguePresentationEvent, SharedActivityPublishedEvent, DirectTradeStateChangedEvent>;
+using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, ItemPickupCompletedEvent, LootStartedEvent, SkillUseStartedEvent, ItemUseStartedEvent, ElevatorTransitionedEvent, ExitGridTransitionedEvent, SceneryTransitionedEvent, RestStateChangedEvent, InventoryTransferredEvent, CapsDistributedEvent, DirectTradeStateChangedEvent, ItemDroppedEvent, AttackStartedEvent, CombatTurnStateChangedEvent, CombatActionResolvedEvent, PartyExperienceAwardedEvent, SharedModalStateChangedEvent, WorldMapRouteSelectedEvent, WorldMapArrivedEvent, DialogueRequestedEvent, DialogueVoteRecordedEvent, DialoguePresentationEvent, SharedActivityPublishedEvent>;
 
 struct GameEvent {
     EventSequence sequence;

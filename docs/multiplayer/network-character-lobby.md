@@ -1,10 +1,14 @@
 # Network character lobby
 
+For release validation and deployment details, see the
+[compatibility campaign](compatibility-campaign.md) and
+[hosting/limitations guide](hosting-and-limitations.md).
+
 After the TCP handshake, both games show the connection state at the bottom of the main menu. Players can enter the dedicated **Multiplayer** screen, see the host and guest slots, select or create their characters, and start once both slots are ready. The earlier **New Game** waiting-window path remains available for command-line host and join sessions.
 
 Each peer sends one versioned `Lobby` message containing its existing `CharacterCreationSheet` wire format. The host requires player 1 on its local sheet and player 2 on the guest sheet. It validates names, SPECIAL totals, age, gender, tagged skills, and traits before sending `Ready`. The guest also validates the host sheet. Both peers require the authoritative session ID and an exact per-direction message sequence starting at 2, after handshake sequence 1.
 
-Lobby protocol version 3 also carries chat on that ordered message stream. A chat body contains the sender player ID, a 16-bit text length, and up to 64 printable ASCII characters. The receiver requires the sender ID to match the authenticated peer role, rejects malformed or control-character text, and keeps a bounded receive queue. Chat is available after the TCP lobby starts and does not affect character readiness.
+Lobby protocol version 4 also carries chat on that ordered message stream and the revision-keyed Ending acknowledgement used by durable shutdown. A chat body contains the sender player ID, a 16-bit text length, and up to 64 printable ASCII characters. The receiver requires the sender ID to match the authenticated peer role, rejects malformed or control-character text, and keeps a bounded receive queue. Chat is available after the TCP lobby starts and does not affect character readiness.
 
 The dedicated lobby enables **Start Game** only after the host has both valid sheets and both peers enter the ready state. Pressing Escape returns to the main menu without closing the connection. A player cannot replace a sheet after submitting it.
 
@@ -20,10 +24,6 @@ Passing `--multiplayer-smoke-scenario=pickup` selects the pickup fixture. It use
 
 Passing `--multiplayer-smoke-scenario=loot` selects a registered map critter, places the guest actor beside it, first proves that a remote loot command is rejected without an event, then sends the adjacent command through the host command processor. It applies the authoritative loot-start event and verifies checkpoint and replay convergence.
 
-Passing `--multiplayer-smoke-scenario=loot-caps` gives that source seven caps. The guest requests the full stack; the host distributes four to the host and three to the guest, then advances the extra-cap cursor to the guest. Two ordered inventory events and snapshot version 18 converge on both processes and replay after reconnect. Ordinary items use a rotating priority cursor when both players have the same loot source open; the other player can take the item after a five-second priority window.
-
-Passing `--multiplayer-smoke-scenario=loot-priority` places both players beside the same source with its loot open. The guest's first request for a Stimpak is rejected while the host has priority, without an event or inventory change. The guest retries after the five-second window and receives the item. Both processes check the new priority cursor, full state digest, authenticated replay, and zero guest-side rule execution.
-
 Passing `--multiplayer-smoke-scenario=transfer` creates the same seven-cap guest stack on both processes. It first proves that an out-of-range gift and a forged attempt to take from the host are rejected without events. The guest then gives three caps to the adjacent host over the real command channel. Both peers must reach the same four/three cap split identities, converge at the checkpoint, and replay the transfer after reconnect.
 
 Passing `--multiplayer-smoke-scenario=skill` places the guest beside the same registered door and submits Traps through the real skill command. The host runs the asynchronous skill action under the guest character context; the guest applies only the ordered presentation boundary. Both processes then require the same complete authoritative state digest and replay the skill event after reconnect.
@@ -33,6 +33,8 @@ Passing `--multiplayer-smoke-scenario=scenery` selects a registered non-door sce
 Passing `--multiplayer-smoke-scenario=container` places the guest beside a registered ground container and submits Lockpick. The fixture changes one shared container flag only on the host, and the checkpoint must converge the complete item section—including container art/frame, flags, and light—before authenticated replay.
 
 Passing `--multiplayer-smoke-scenario=quest` loads `SHADYW.MAP`, places the guest beside Jarvis, and gives that actor a registered antidote. The real item-use command cures Jarvis on the host: the script consumes the antidote, removes its timer, changes local and global state, adds reputation, and awards 400 party XP. The guest executes no script or random rule work, removes the consumed item through the checkpoint, matches the complete digest, and replays the event after authenticated reconnect.
+
+Passing `--multiplayer-smoke-scenario=recovery` loads `SHADYW.MAP`, gives the guest seven caps, and publishes durable shared activity. The host writes the hidden recovery generation, sends an acknowledged `Ending` checkpoint, and both processes establish a fresh TLS session. Before reconnecting, the guest deliberately loads a different map. The host then loads `SAVEGAME/RECOVERY`; its first authoritative snapshot makes the guest load the recovered map, rebase static entity identities from the native `.SAV`, and restore the guest inventory, saved ownership topology, and activity feed. Both processes require map 26, seven guest caps, the activity record, and the same complete snapshot digest before printing `MULTIPLAYER_RECOVERY_SMOKE_PASS`.
 
 Passing `--multiplayer-smoke-scenario=elevation` loads `VAULT13.MAP`, places the guest at the installed Vault 13 elevator source and the host outside its shared-ride radius, and sends a destination level through gameplay wire version 17. The host independently resolves the source and destination, moves only the guest upstairs, leaves the host downstairs, and publishes both exact player states plus the resulting phase revision. Each process keeps its local player's floor visible; both peers then require complete checkpoint convergence and authenticated replay. Production elevator commands also carry a second player automatically when that player is within four hexes on the source elevation.
 
@@ -65,6 +67,9 @@ Phase 4B's `combat-attack`, `combat-move`, `combat-kill`, `combat-item`, `combat
 ```text
 fallout-ce --multiplayer-host=45455 --multiplayer-smoke-test
 fallout-ce --multiplayer-join=127.0.0.1:45455 --multiplayer-smoke-test
+
+fallout-ce --multiplayer-host=45455 --multiplayer-smoke-test --multiplayer-smoke-scenario=recovery
+fallout-ce --multiplayer-join=127.0.0.1:45455 --multiplayer-smoke-test --multiplayer-smoke-scenario=recovery
 ```
 
 ## Current boundary
@@ -79,8 +84,11 @@ Loot initiation and inventory transfers are also live. Canonically registered cr
 
 Player inventory drops are live as well. The host executes drop scripts, assigns IDs to dropped objects and split remainders, and publishes the final ground position. The guest inventory window refreshes as accepted events arrive. Ordinary stack quantities are drained in order through the returned remainder identities, while caps are handled as one authoritative bulk drop.
 
-Minimal direct player gifts are live through the semantic `game_give` command. The host permits only a directly owned, unequipped item moving from the sender to the adjacent peer; reverse “take” requests and remote transfers are rejected. Stack and cap splits reuse the authoritative inventory event and recovery snapshot path.
-
-Direct trading is available in exploration while the players stand on adjacent hexes. Press Ctrl+T to open the trade window. Keys 1–9 toggle the displayed full item stacks, C sets a caps offer, Enter confirms, and Esc cancels. The host checks ownership and the current revision on every change. Changing either offer clears both confirmations; the transfer happens only after both players confirm the same revision. A completed trade sends an immediate item checkpoint. `--multiplayer-smoke-scenario=trade` exchanges an item and caps in both directions, then checks the complete state digest and authenticated replay.
+Minimal direct player gifts remain available through the semantic `game_give`
+command. Full direct trade uses a bilateral revision: either adjacent player can
+begin, replace an item/cap offer, confirm the current revision, or cancel. Any
+offer edit clears both confirmations. The host revalidates and applies the
+complete two-leg transaction once, then publishes the committed state and an
+immediate inventory checkpoint.
 
 Direct item-on-target use is live through human inventory input and the semantic `game_use_item` command. The host requires a registered item owned by the acting player and a registered target, runs the normal action and script, and publishes a presentation-only event before the authoritative checkpoint carries the results.

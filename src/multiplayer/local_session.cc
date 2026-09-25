@@ -168,11 +168,12 @@ LocalSessionError LocalSession::restorePlayerCharacters(const MultiplayerSaveSid
     if (!_active) {
         return LocalSessionError::NotActive;
     }
-    if (_phase != SessionPhase::Lobby && _phase != SessionPhase::Transition) {
+    if (_phase != SessionPhase::Lobby
+        && _phase != SessionPhase::Transition
+        && _phase != SessionPhase::Exploration) {
         return LocalSessionError::InvalidTransition;
     }
-    if (validateMultiplayerSave(sidecar) != MultiplayerSaveError::None
-        || sidecar.players.size() != 2) {
+    if (validateMultiplayerSave(sidecar) != MultiplayerSaveError::None) {
         return LocalSessionError::InvalidSaveState;
     }
 

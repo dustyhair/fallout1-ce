@@ -73,6 +73,17 @@ int main(int argc, char** argv)
     door.distance = 2;
     door.locked = true;
     state.visibleInteractables.push_back(door);
+    fallout::AgentJournalWorldState::Trade trade;
+    trade.id = 9;
+    trade.revision = 3;
+    fallout::AgentJournalWorldState::Trade::Participant trader;
+    trader.playerId = 1;
+    trader.actorId = 1;
+    trader.caps = 12;
+    trader.confirmed = true;
+    trader.items.push_back({ 66, 2 });
+    trade.participants.push_back(trader);
+    state.trade = trade;
     fallout::agentJournalWriteWorldState(state);
     fallout::agentJournalWriteWorldState(state);
     state.pendingRestMinutes = 30;
@@ -118,6 +129,11 @@ int main(int argc, char** argv)
             && lines[4].find("\"locked\":true") != std::string::npos,
         "journal records structured actors, enemies, and interactable targets")
         && passed;
+    passed = expect(lines.size() > 4
+            && lines[4].find("\"trade\":{\"id\":9,\"revision\":3")
+                != std::string::npos
+            && lines[4].find("\"confirmed\":true") != std::string::npos,
+        "journal exposes the active trade revision and offer") && passed;
     passed = expect(lines.size() > 5
             && lines[5].find("\"pending_rest\":{\"minutes\":30") != std::string::npos
             && lines[5].find("\"choice\":\"fixed\"") != std::string::npos

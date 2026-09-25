@@ -26,6 +26,10 @@ enum class AgentControlCommandType {
     GameTalk,
     GameVote,
     GameGive,
+    GameTradeBegin,
+    GameTradeOffer,
+    GameTradeConfirm,
+    GameTradeCancel,
     GameAttack,
     GameReload,
     GameCombatItem,
@@ -53,6 +57,9 @@ struct AgentControlCommand {
     std::uint32_t itemEntityId = 0;
     std::uint32_t destinationEntityId = 0;
     std::uint32_t quantity = 0;
+    std::uint32_t caps = 0;
+    std::uint64_t tradeId = 0;
+    std::uint64_t tradeRevision = 0;
     bool running = false;
     std::string text;
 };

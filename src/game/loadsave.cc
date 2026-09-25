@@ -41,6 +41,8 @@
 #include "game/wordwrap.h"
 #include "game/worldmap.h"
 #include "multiplayer/developer_local_session.h"
+#include "multiplayer/network_runtime.h"
+#include "multiplayer/network_world.h"
 #include "multiplayer/save_sidecar.h"
 #include "platform_compat.h"
 #include "plib/color/color.h"
@@ -159,6 +161,7 @@ static int SaveObjDudeCid(DB_FILE* stream);
 static int EraseSave();
 static bool SaveMultiplayerSidecar();
 static void LoadMultiplayerSidecar();
+static void SaveDirectoryPath(char* path, bool relative, bool trailingSeparator);
 
 // 0x46D930
 static const int lsgrphs[LOAD_SAVE_FRM_COUNT] = {
@@ -175,6 +178,12 @@ static const int lsgrphs[LOAD_SAVE_FRM_COUNT] = {
 
 // 0x50595C
 static int slot_cursor = 0;
+
+// Recovery uses the normal Fallout save machinery, including per-map .SAV
+// files, but lives outside the ten player-visible slots.
+static bool recovery_slot_active = false;
+static bool suppress_save_confirmation = false;
+static bool suppress_load_confirmation = false;
 
 // 0x505960
 static bool quick_done = false;
@@ -1507,6 +1516,22 @@ static int LSGameEnd(int windowType)
     return 0;
 }
 
+static void SaveDirectoryPath(char* path, bool relative, bool trailingSeparator)
+{
+    const char* suffix = trailingSeparator ? "\\" : "";
+    if (recovery_slot_active) {
+        if (relative) {
+            snprintf(path, COMPAT_MAX_PATH, "%s\\%s%s", "SAVEGAME", "RECOVERY", suffix);
+        } else {
+            snprintf(path, COMPAT_MAX_PATH, "%s\\%s\\%s%s", patches, "SAVEGAME", "RECOVERY", suffix);
+        }
+    } else if (relative) {
+        snprintf(path, COMPAT_MAX_PATH, "%s\\%s%.2d%s", "SAVEGAME", "SLOT", slot_cursor + 1, suffix);
+    } else {
+        snprintf(path, COMPAT_MAX_PATH, "%s\\%s\\%s%.2d%s", patches, "SAVEGAME", "SLOT", slot_cursor + 1, suffix);
+    }
+}
+
 // 0x46F978
 static int SaveSlot()
 {
@@ -1519,14 +1544,14 @@ static int SaveSlot()
     snprintf(gmpath, sizeof(gmpath), "%s\\%s", patches, "SAVEGAME");
     compat_mkdir(gmpath);
 
-    snprintf(gmpath, sizeof(gmpath), "%s\\%s\\%s%.2d", patches, "SAVEGAME", "SLOT", slot_cursor + 1);
+    SaveDirectoryPath(gmpath, false, false);
     compat_mkdir(gmpath);
 
     if (SaveBackup() == -1) {
         debug_printf("\nLOADSAVE: Warning, can't backup save file!\n");
     }
 
-    snprintf(gmpath, sizeof(gmpath), "%s\\%s%.2d\\", "SAVEGAME", "SLOT", slot_cursor + 1);
+    SaveDirectoryPath(gmpath, true, true);
     strcat(gmpath, "SAVE.DAT");
 
     debug_printf("\nLOADSAVE: Save name: %s\n", gmpath);
@@ -1535,7 +1560,7 @@ static int SaveSlot()
     if (flptr == NULL) {
         debug_printf("\nLOADSAVE: ** Error opening save game for writing! **\n");
         RestoreSave();
-        snprintf(gmpath, sizeof(gmpath), "%s\\%s%.2d\\", "SAVEGAME", "SLOT", slot_cursor + 1);
+        SaveDirectoryPath(gmpath, true, true);
         MapDirErase(gmpath, "BAK");
         partyMemberUnPrepSave();
         gsound_background_unpause();
@@ -1548,7 +1573,7 @@ static int SaveSlot()
         debug_printf("LOADSAVE: Save file header size written: %d bytes.\n", db_ftell(flptr) - pos);
         db_fclose(flptr);
         RestoreSave();
-        snprintf(gmpath, sizeof(gmpath), "%s\\%s%.2d\\", "SAVEGAME", "SLOT", slot_cursor + 1);
+        SaveDirectoryPath(gmpath, true, true);
         MapDirErase(gmpath, "BAK");
         partyMemberUnPrepSave();
         gsound_background_unpause();
@@ -1562,7 +1587,7 @@ static int SaveSlot()
             debug_printf("\nLOADSAVE: ** Error writing save function #%d data! **\n", index);
             db_fclose(flptr);
             RestoreSave();
-            snprintf(gmpath, sizeof(gmpath), "%s\\%s%.2d\\", "SAVEGAME", "SLOT", slot_cursor + 1);
+            SaveDirectoryPath(gmpath, true, true);
             MapDirErase(gmpath, "BAK");
             partyMemberUnPrepSave();
             gsound_background_unpause();
@@ -1579,21 +1604,23 @@ static int SaveSlot()
     if (!SaveMultiplayerSidecar()) {
         debug_printf("\nLOADSAVE: ** Error writing multiplayer save metadata! **\n");
         RestoreSave();
-        snprintf(gmpath, sizeof(gmpath), "%s\\%s%.2d\\", "SAVEGAME", "SLOT", slot_cursor + 1);
+        SaveDirectoryPath(gmpath, true, true);
         MapDirErase(gmpath, "BAK");
         partyMemberUnPrepSave();
         gsound_background_unpause();
         return -1;
     }
 
-    snprintf(gmpath, sizeof(gmpath), "%s\\%s%.2d\\", "SAVEGAME", "SLOT", slot_cursor + 1);
+    SaveDirectoryPath(gmpath, true, true);
     MapDirErase(gmpath, "BAK");
 
-    lsgmesg.num = 140;
-    if (message_search(&lsgame_msgfl, &lsgmesg)) {
-        display_print(lsgmesg.text);
-    } else {
-        debug_printf("\nError: Couldn't find LoadSave Message!");
+    if (!suppress_save_confirmation) {
+        lsgmesg.num = 140;
+        if (message_search(&lsgame_msgfl, &lsgmesg)) {
+            display_print(lsgmesg.text);
+        } else {
+            debug_printf("\nError: Couldn't find LoadSave Message!");
+        }
     }
 
     gsound_background_unpause();
@@ -1620,7 +1647,7 @@ static int LoadSlot(int slot)
 
     loadingGame = 1;
 
-    snprintf(gmpath, sizeof(gmpath), "%s\\%s%.2d\\", "SAVEGAME", "SLOT", slot_cursor + 1);
+    SaveDirectoryPath(gmpath, true, true);
     strcat(gmpath, "SAVE.DAT");
 
     LoadSaveSlotData* ptr = &(LSData[slot]);
@@ -1669,12 +1696,14 @@ static int LoadSlot(int slot)
     MapDirErase(str, "BAK");
     proto_dude_update_gender();
 
-    // Game Loaded.
-    lsgmesg.num = 141;
-    if (message_search(&lsgame_msgfl, &lsgmesg) == 1) {
-        display_print(lsgmesg.text);
-    } else {
-        debug_printf("\nError: Couldn't find LoadSave Message!");
+    if (!suppress_load_confirmation) {
+        // Game Loaded.
+        lsgmesg.num = 141;
+        if (message_search(&lsgame_msgfl, &lsgmesg) == 1) {
+            display_print(lsgmesg.text);
+        } else {
+            debug_printf("\nError: Couldn't find LoadSave Message!");
+        }
     }
 
     loadingGame = 0;
@@ -2359,14 +2388,14 @@ static int GameMap2Slot(DB_FILE* stream)
         return -1;
     }
 
-    snprintf(gmpath, sizeof(gmpath), "%s\\%s%.2d\\", "SAVEGAME", "SLOT", slot_cursor + 1);
+    SaveDirectoryPath(gmpath, true, true);
 
     if (MapDirErase(gmpath, "SAV") == -1) {
         db_free_file_list(&fileNameList, NULL);
         return -1;
     }
 
-    snprintf(gmpath, sizeof(gmpath), "%s\\%s\\%s%.2d\\", patches, "SAVEGAME", "SLOT", slot_cursor + 1);
+    SaveDirectoryPath(gmpath, false, true);
     strmfe(str0, "AUTOMAP.DB", "SAV");
     strcat(gmpath, str0);
     compat_remove(gmpath);
@@ -2379,7 +2408,8 @@ static int GameMap2Slot(DB_FILE* stream)
         }
 
         snprintf(str0, sizeof(str0), "%s\\%s", "MAPS", string);
-        snprintf(str1, sizeof(str1), "%s\\%s%.2d\\%s", "SAVEGAME", "SLOT", slot_cursor + 1, string);
+        SaveDirectoryPath(str1, true, true);
+        strcat(str1, string);
         if (copy_file(str0, str1) == -1) {
             db_free_file_list(&fileNameList, NULL);
             return -1;
@@ -2389,7 +2419,8 @@ static int GameMap2Slot(DB_FILE* stream)
     db_free_file_list(&fileNameList, NULL);
 
     strmfe(str0, "AUTOMAP.DB", "SAV");
-    snprintf(str1, sizeof(str1), "%s\\%s%.2d\\%s", "SAVEGAME", "SLOT", slot_cursor + 1, str0);
+    SaveDirectoryPath(str1, true, true);
+    strcat(str1, str0);
     snprintf(str0, sizeof(str0), "%s\\%s", "MAPS", "AUTOMAP.DB");
 
     if (copy_file(str0, str1) == -1) {
@@ -2447,7 +2478,8 @@ static int SlotMap2Game(DB_FILE* stream)
             break;
         }
 
-        snprintf(str0, sizeof(str0), "%s\\%s%.2d\\%s", "SAVEGAME", "SLOT", slot_cursor + 1, fileName);
+        SaveDirectoryPath(str0, true, true);
+        strcat(str0, fileName);
         snprintf(str1, sizeof(str1), "%s\\%s", "MAPS", fileName);
 
         if (copy_file(str0, str1) == -1) {
@@ -2457,7 +2489,8 @@ static int SlotMap2Game(DB_FILE* stream)
     }
 
     const char* automapFileName = strmfe(str1, "AUTOMAP.DB", "SAV");
-    snprintf(str0, sizeof(str0), "%s\\%s%.2d\\%s", "SAVEGAME", "SLOT", slot_cursor + 1, automapFileName);
+    SaveDirectoryPath(str0, true, true);
+    strcat(str0, automapFileName);
     snprintf(str1, sizeof(str1), "%s\\%s", "MAPS", "AUTOMAP.DB");
     if (copy_file(str0, str1) == -1) {
         return -1;
@@ -2640,7 +2673,7 @@ static int SaveBackup()
 {
     debug_printf("\nLOADSAVE: Backing up save slot files..\n");
 
-    snprintf(gmpath, sizeof(gmpath), "%s\\%s\\%s%.2d\\", patches, "SAVEGAME", "SLOT", slot_cursor + 1);
+    SaveDirectoryPath(gmpath, false, true);
     strcpy(str0, gmpath);
 
     strcat(str0, "SAVE.DAT");
@@ -2655,7 +2688,7 @@ static int SaveBackup()
         }
     }
 
-    snprintf(gmpath, sizeof(gmpath), "%s\\%s%.2d\\", "SAVEGAME", "SLOT", slot_cursor + 1);
+    SaveDirectoryPath(gmpath, true, true);
     snprintf(str0, sizeof(str0), "%s*.%s", gmpath, "SAV");
 
     char** fileList;
@@ -2666,7 +2699,7 @@ static int SaveBackup()
 
     map_backup_count = fileListLength;
 
-    snprintf(gmpath, sizeof(gmpath), "%s\\%s\\%s%.2d\\", patches, "SAVEGAME", "SLOT", slot_cursor + 1);
+    SaveDirectoryPath(gmpath, false, true);
     for (int index = fileListLength - 1; index >= 0; index--) {
         strcpy(str0, gmpath);
         strcat(str0, fileList[index]);
@@ -2682,7 +2715,7 @@ static int SaveBackup()
 
     debug_printf("\nLOADSAVE: %d map files backed up.\n", fileListLength);
 
-    snprintf(gmpath, sizeof(gmpath), "%s\\%s%.2d\\", "SAVEGAME", "SLOT", slot_cursor + 1);
+    SaveDirectoryPath(gmpath, true, true);
 
     char* v1 = strmfe(str2, "AUTOMAP.DB", "SAV");
     snprintf(str0, sizeof(str0), "%s\\%s", gmpath, v1);
@@ -2713,7 +2746,7 @@ static int RestoreSave()
 
     EraseSave();
 
-    snprintf(gmpath, sizeof(gmpath), "%s\\%s\\%s%.2d\\", patches, "SAVEGAME", "SLOT", slot_cursor + 1);
+    SaveDirectoryPath(gmpath, false, true);
     strcpy(str0, gmpath);
     strcat(str0, "SAVE.DAT");
     strmfe(str1, str0, "BAK");
@@ -2724,7 +2757,7 @@ static int RestoreSave()
         return -1;
     }
 
-    snprintf(gmpath, sizeof(gmpath), "%s\\%s%.2d\\", "SAVEGAME", "SLOT", slot_cursor + 1);
+    SaveDirectoryPath(gmpath, true, true);
     snprintf(str0, sizeof(str0), "%s*.%s", gmpath, "BAK");
 
     char** fileList;
@@ -2739,7 +2772,7 @@ static int RestoreSave()
         return -1;
     }
 
-    snprintf(gmpath, sizeof(gmpath), "%s\\%s\\%s%.2d\\", patches, "SAVEGAME", "SLOT", slot_cursor + 1);
+    SaveDirectoryPath(gmpath, false, true);
 
     for (int index = fileListLength - 1; index >= 0; index--) {
         strcpy(str0, gmpath);
@@ -2759,7 +2792,7 @@ static int RestoreSave()
         return 0;
     }
 
-    snprintf(gmpath, sizeof(gmpath), "%s\\%s\\%s%.2d\\", patches, "SAVEGAME", "SLOT", slot_cursor + 1);
+    SaveDirectoryPath(gmpath, false, true);
     char* v1 = strmfe(str2, "AUTOMAP.DB", "BAK");
     strcpy(str0, gmpath);
     strcat(str0, v1);
@@ -2801,12 +2834,12 @@ static int EraseSave()
 {
     debug_printf("\nLOADSAVE: Erasing save(bad) slot...\n");
 
-    snprintf(gmpath, sizeof(gmpath), "%s\\%s\\%s%.2d\\", patches, "SAVEGAME", "SLOT", slot_cursor + 1);
+    SaveDirectoryPath(gmpath, false, true);
     strcpy(str0, gmpath);
     strcat(str0, "SAVE.DAT");
     compat_remove(str0);
 
-    snprintf(gmpath, sizeof(gmpath), "%s\\%s%.2d\\", "SAVEGAME", "SLOT", slot_cursor + 1);
+    SaveDirectoryPath(gmpath, true, true);
     snprintf(str0, sizeof(str0), "%s*.%s", gmpath, "SAV");
 
     char** fileList;
@@ -2815,7 +2848,7 @@ static int EraseSave()
         return -1;
     }
 
-    snprintf(gmpath, sizeof(gmpath), "%s\\%s\\%s%.2d\\", patches, "SAVEGAME", "SLOT", slot_cursor + 1);
+    SaveDirectoryPath(gmpath, false, true);
     for (int index = fileListLength - 1; index >= 0; index--) {
         strcpy(str0, gmpath);
         strcat(str0, fileList[index]);
@@ -2824,7 +2857,7 @@ static int EraseSave()
 
     db_free_file_list(&fileList, NULL);
 
-    snprintf(gmpath, sizeof(gmpath), "%s\\%s\\%s%.2d\\", patches, "SAVEGAME", "SLOT", slot_cursor + 1);
+    SaveDirectoryPath(gmpath, false, true);
 
     char* v1 = strmfe(str1, "AUTOMAP.DB", "SAV");
     strcpy(str0, gmpath);
@@ -2871,7 +2904,8 @@ static bool WriteSaveFile(const char* relativePath, const std::vector<std::uint8
 
 static bool DigestSaveDat(std::uint64_t& digest)
 {
-    snprintf(gmpath, sizeof(gmpath), "%s\\%s%.2d\\%s", "SAVEGAME", "SLOT", slot_cursor + 1, "SAVE.DAT");
+    SaveDirectoryPath(gmpath, true, true);
+    strcat(gmpath, "SAVE.DAT");
     DB_FILE* stream = db_fopen(gmpath, "rb");
     if (stream == nullptr) {
         return false;
@@ -2901,11 +2935,8 @@ static bool DigestSaveDat(std::uint64_t& digest)
 
 static void MultiplayerSidecarPath(char* path, const char* fileName, bool relative)
 {
-    if (relative) {
-        snprintf(path, COMPAT_MAX_PATH, "%s\\%s%.2d\\%s", "SAVEGAME", "SLOT", slot_cursor + 1, fileName);
-    } else {
-        snprintf(path, COMPAT_MAX_PATH, "%s\\%s\\%s%.2d\\%s", patches, "SAVEGAME", "SLOT", slot_cursor + 1, fileName);
-    }
+    SaveDirectoryPath(path, relative, true);
+    strcat(path, fileName);
 }
 
 static bool FileExists(const char* path)
@@ -2977,7 +3008,9 @@ static void RemoveMultiplayerGuestObjectTemporary()
 
 static bool SaveMultiplayerSidecar()
 {
-    if (!multiplayer::developerLocalSessionIsActive()) {
+    bool developerSession = multiplayer::developerLocalSessionIsActive();
+    bool networkSession = multiplayer::networkRuntimeHostWorldActive();
+    if (!developerSession && !networkSession) {
         RemoveMultiplayerSidecar();
         RemoveMultiplayerGuestObjectTemporary();
         return true;
@@ -3003,19 +3036,45 @@ static bool SaveMultiplayerSidecar()
     }
 
     multiplayer::MultiplayerSaveSidecar sidecar;
-    if (multiplayer::developerLocalSessionCaptureSave(generation, saveDatDigest, sidecar)
-        != multiplayer::MultiplayerSaveError::None) {
-        return false;
-    }
-    multiplayer::SavedPlayerCharacter* guest = multiplayer::findSavedPlayer(sidecar, multiplayer::kGuestPlayerId);
-    if (guest == nullptr) {
+    multiplayer::MultiplayerSaveError captureError = developerSession
+        ? multiplayer::developerLocalSessionCaptureSave(
+            generation, saveDatDigest, sidecar)
+        : multiplayer::networkRuntimeCaptureSave(
+            generation, saveDatDigest, sidecar);
+    if (captureError != multiplayer::MultiplayerSaveError::None) {
         return false;
     }
 
     MultiplayerSidecarPath(relativePath, "MULTI.OBJ", true);
     RemoveMultiplayerGuestObjectTemporary();
-    bool capturedGuestObject = multiplayer::developerLocalSessionWriteGuestObject(relativePath)
-        && ReadSaveFile(relativePath, multiplayer::kMultiplayerSaveMaximumSize, guest->objectData);
+    multiplayer::SavedPlayerCharacter* guest = nullptr;
+    for (multiplayer::SavedPlayerCharacter& player : sidecar.players) {
+        if (player.playerId == multiplayer::kGuestPlayerId) guest = &player;
+    }
+    bool objectWritten = false;
+    if (developerSession) {
+        objectWritten = multiplayer::developerLocalSessionWriteGuestObject(
+            relativePath);
+    } else {
+        Object* actor = multiplayer::networkWorldPlayerActor(
+            multiplayer::kGuestPlayerId);
+        DB_FILE* stream = actor != nullptr
+            ? db_fopen(relativePath, "wb") : nullptr;
+        if (stream != nullptr) {
+            int savedFlags = actor->flags;
+            int savedSid = actor->sid;
+            actor->flags &= ~OBJECT_NO_SAVE;
+            actor->sid = -1;
+            int rc = obj_save_obj(stream, actor);
+            actor->flags = savedFlags;
+            actor->sid = savedSid;
+            objectWritten = db_fclose(stream) == 0 && rc == 0;
+        }
+    }
+    bool capturedGuestObject = objectWritten
+        && guest != nullptr
+        && ReadSaveFile(relativePath, multiplayer::kMultiplayerSaveMaximumSize,
+            guest->objectData);
     RemoveMultiplayerGuestObjectTemporary();
     if (!capturedGuestObject || guest->objectData.empty()) {
         return false;
@@ -3030,7 +3089,12 @@ static bool SaveMultiplayerSidecar()
 
 static void LoadMultiplayerSidecar()
 {
-    if (!multiplayer::developerLocalSessionIsEnabled()) {
+    bool developerSession = multiplayer::developerLocalSessionIsEnabled();
+    bool networkSession = recovery_slot_active
+        && multiplayer::networkRuntimeMode()
+            == multiplayer::NetworkLaunchMode::Host
+        && multiplayer::networkRuntimeConnected();
+    if (!developerSession && !networkSession) {
         return;
     }
 
@@ -3039,7 +3103,9 @@ static void LoadMultiplayerSidecar()
     std::vector<std::uint8_t> bytes;
     if (!ReadSaveFile(relativePath, multiplayer::kMultiplayerSaveMaximumSize, bytes)) {
         debug_printf("LOADSAVE: No multiplayer sidecar is available for this slot.\n");
-        multiplayer::developerLocalSessionRejectLoadedSave();
+        if (developerSession) {
+            multiplayer::developerLocalSessionRejectLoadedSave();
+        }
         return;
     }
 
@@ -3048,25 +3114,150 @@ static void LoadMultiplayerSidecar()
     bool valid = decoded
         && DigestSaveDat(saveDatDigest)
         && decoded.sidecar.saveDatDigest == saveDatDigest;
-    const multiplayer::SavedPlayerCharacter* guest = valid
-        ? multiplayer::findSavedPlayer(decoded.sidecar, multiplayer::kGuestPlayerId)
-        : nullptr;
-    valid = valid && guest != nullptr;
-    if (valid && !guest->objectData.empty()) {
+    const multiplayer::SavedPlayerCharacter* guest = nullptr;
+    for (const multiplayer::SavedPlayerCharacter& player : decoded.sidecar.players) {
+        if (player.playerId == multiplayer::kGuestPlayerId) guest = &player;
+    }
+    Object* loadedGuest = nullptr;
+    if (valid && guest != nullptr && !guest->objectData.empty()) {
         MultiplayerSidecarPath(relativePath, "MULTI.OBJ", true);
         RemoveMultiplayerGuestObjectTemporary();
-        valid = WriteSaveFile(relativePath, guest->objectData)
-            && multiplayer::developerLocalSessionStageLoadedGuestObject(relativePath);
+        valid = WriteSaveFile(relativePath, guest->objectData);
+        if (valid && developerSession) {
+            valid = multiplayer::developerLocalSessionStageLoadedGuestObject(relativePath);
+        } else if (valid) {
+            DB_FILE* stream = db_fopen(relativePath, "rb");
+            int rc = stream != nullptr
+                ? obj_load_obj(stream, &loadedGuest, -1, nullptr) : -1;
+            valid = stream != nullptr
+                && rc == 0
+                && loadedGuest != nullptr
+                && PID_TYPE(loadedGuest->pid) == OBJ_TYPE_CRITTER
+                && db_ftell(stream) == db_filelength(stream);
+            if (stream != nullptr) db_fclose(stream);
+        }
         RemoveMultiplayerGuestObjectTemporary();
     }
-    if (!valid || !multiplayer::developerLocalSessionStageLoadedSave(decoded.sidecar)) {
+    bool staged = valid && (developerSession
+            ? multiplayer::developerLocalSessionStageLoadedSave(decoded.sidecar)
+            : multiplayer::networkRuntimeStageLoadedSave(decoded.sidecar,
+                  loadedGuest));
+    if (!staged) {
+        if (loadedGuest != nullptr) {
+            loadedGuest->flags &= ~OBJECT_NO_REMOVE;
+            obj_erase_object(loadedGuest, nullptr);
+        }
         debug_printf("LOADSAVE: Multiplayer sidecar is corrupt or does not match SAVE.DAT; loading without multiplayer.\n");
-        multiplayer::developerLocalSessionRejectLoadedSave();
+        if (developerSession) {
+            multiplayer::developerLocalSessionRejectLoadedSave();
+        }
         return;
     }
 
     debug_printf("LOADSAVE: Multiplayer sidecar generation %llu staged.\n",
         static_cast<unsigned long long>(decoded.sidecar.generation));
+}
+
+bool MultiplayerRecoverySaveExists()
+{
+    if (!config_get_string(&game_config, GAME_CONFIG_SYSTEM_KEY,
+            GAME_CONFIG_MASTER_PATCHES_KEY, &patches)) {
+        patches = emgpath;
+    }
+
+    bool priorRecovery = recovery_slot_active;
+    recovery_slot_active = true;
+    char relativePath[COMPAT_MAX_PATH];
+    MultiplayerSidecarPath(relativePath, "MULTI.DAT", true);
+    std::vector<std::uint8_t> bytes;
+    bool present = ReadSaveFile(relativePath,
+                       multiplayer::kMultiplayerSaveMaximumSize, bytes);
+    multiplayer::MultiplayerSaveDecodeResult decoded;
+    std::uint64_t digest = 0;
+    if (present) {
+        decoded = multiplayer::decodeMultiplayerSave(bytes);
+        present = decoded && DigestSaveDat(digest)
+            && decoded.sidecar.saveDatDigest == digest;
+    }
+    recovery_slot_active = priorRecovery;
+    return present;
+}
+
+bool SaveMultiplayerRecoveryGame()
+{
+    if (!multiplayer::networkRuntimeHostWorldActive()) {
+        return false;
+    }
+    if (!config_get_string(&game_config, GAME_CONFIG_SYSTEM_KEY,
+            GAME_CONFIG_MASTER_PATCHES_KEY, &patches)) {
+        patches = emgpath;
+    }
+    if (isInCombat()) {
+        intface_end_window_close(false);
+        combat_over_from_load();
+    }
+
+    int priorSlot = slot_cursor;
+    LoadSaveSlotData priorData = LSData[9];
+    bool priorRecovery = recovery_slot_active;
+    bool priorSuppress = suppress_save_confirmation;
+    recovery_slot_active = true;
+    suppress_save_confirmation = true;
+    slot_cursor = 9;
+    memset(&LSData[slot_cursor], 0, sizeof(LSData[slot_cursor]));
+    strncpy(LSData[slot_cursor].description, "MULTIPLAYER RECOVERY", 29);
+
+    thumbnail_image[1] = nullptr;
+    int snapshotResult = QuickSnapShot();
+    bool saved = snapshotResult == 1 && SaveSlot() == 0;
+    if (thumbnail_image[1] != nullptr) {
+        mem_free(snapshot);
+        snapshot = nullptr;
+        thumbnail_image[1] = nullptr;
+    }
+
+    LSData[9] = priorData;
+    slot_cursor = priorSlot;
+    suppress_save_confirmation = priorSuppress;
+    recovery_slot_active = priorRecovery;
+    gmouse_set_cursor(MOUSE_CURSOR_ARROW);
+    debug_printf(saved
+            ? "LOADSAVE: Multiplayer recovery save published.\n"
+            : "LOADSAVE: Multiplayer recovery save failed; previous recovery was retained when possible.\n");
+    return saved;
+}
+
+bool LoadMultiplayerRecoveryGame()
+{
+    if (!MultiplayerRecoverySaveExists()) {
+        return false;
+    }
+
+    int priorSlot = slot_cursor;
+    LoadSaveSlotData priorData = LSData[9];
+    bool priorRecovery = recovery_slot_active;
+    bool priorSuppress = suppress_load_confirmation;
+    recovery_slot_active = true;
+    suppress_load_confirmation = true;
+    slot_cursor = 9;
+
+    SaveDirectoryPath(gmpath, true, true);
+    strcat(gmpath, "SAVE.DAT");
+    flptr = db_fopen(gmpath, "rb");
+    bool loaded = flptr != nullptr && LoadHeader(slot_cursor) == 0;
+    if (flptr != nullptr) {
+        db_fclose(flptr);
+        flptr = nullptr;
+    }
+    if (loaded) {
+        loaded = LoadSlot(slot_cursor) == 0;
+    }
+
+    LSData[9] = priorData;
+    slot_cursor = priorSlot;
+    suppress_load_confirmation = priorSuppress;
+    recovery_slot_active = priorRecovery;
+    return loaded;
 }
 
 } // namespace fallout

@@ -17,7 +17,7 @@ namespace fallout {
 namespace multiplayer {
 
 constexpr std::uint32_t kSnapshotMagic = 0x46434D53;
-constexpr std::uint16_t kSnapshotVersion = 18;
+constexpr std::uint16_t kSnapshotVersion = 19;
 constexpr std::size_t kSnapshotHeaderSize = 28;
 constexpr std::size_t kMaxSnapshotPayloadSize = 512 * 1024;
 constexpr std::size_t kMaxSnapshotActors = 16;
@@ -138,6 +138,7 @@ struct WorldSnapshot {
     SessionPhase phase = SessionPhase::Lobby;
     std::uint32_t phaseRevision = 0;
     std::int32_t gameTime = 1;
+    std::int32_t mapId = 0;
     WorldMapState worldMap;
     WorldMapTravelSnapshot worldMapTravel;
     CombatTurnState combat;
@@ -155,8 +156,7 @@ struct WorldSnapshot {
     std::optional<DialoguePresentationEvent> dialoguePresentation;
     std::vector<DialogueBallot> dialogueBallots;
     std::vector<SharedActivityEntry> sharedActivity;
-    PlayerId nextExtraCapPlayer = kHostPlayerId;
-    PlayerId nextItemPriorityPlayer = kHostPlayerId;
+    std::optional<DirectTradeState> directTrade;
 };
 
 enum class SnapshotError {
@@ -172,6 +172,7 @@ enum class SnapshotError {
     InvalidPhase,
     InvalidPhaseRevision,
     InvalidGameTime,
+    InvalidMap,
     TooManyActors,
     TooManyCritters,
     TooManyDoors,
@@ -193,6 +194,7 @@ enum class SnapshotError {
     InvalidWorldMapTravelState,
     InvalidCombatState,
     InvalidDialogueState,
+    InvalidTradeState,
 };
 
 struct SnapshotDecodeResult {

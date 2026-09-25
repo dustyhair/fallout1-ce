@@ -66,6 +66,7 @@ static int main_loadgame_new();
 static void main_unload_new();
 static void main_game_loop();
 static void main_start_selected_game();
+static void main_resume_multiplayer_recovery();
 static bool main_selfrun_init();
 static void main_selfrun_exit();
 static void main_selfrun_record();
@@ -184,14 +185,20 @@ int gnw_main(int argc, char** argv)
                 main_menu_create();
 
                 break;
-            case MAIN_MENU_MULTIPLAYER:
+#if FALLOUT_ENABLE_MULTIPLAYER
+            case MAIN_MENU_MULTIPLAYER: {
                 main_menu_hide(true);
                 main_menu_destroy();
-                if (multiplayer::multiplayerLobbyScreen() == multiplayer::MultiplayerLobbyScreenResult::StartGame) {
+                multiplayer::MultiplayerLobbyScreenResult lobbyResult = multiplayer::multiplayerLobbyScreen();
+                if (lobbyResult == multiplayer::MultiplayerLobbyScreenResult::StartGame) {
                     main_start_selected_game();
+                } else if (lobbyResult == multiplayer::MultiplayerLobbyScreenResult::ResumeRecovery) {
+                    main_resume_multiplayer_recovery();
                 }
                 main_menu_create();
                 break;
+            }
+#endif
             case MAIN_MENU_LOAD_GAME:
                 if (1) {
                     int win = win_add(0, 0, screenGetWidth(), screenGetHeight(), colorTable[0], WINDOW_MODAL | WINDOW_MOVE_ON_TOP);
@@ -294,6 +301,33 @@ static void main_start_selected_game()
     }
 }
 
+static void main_resume_multiplayer_recovery()
+{
+    int win = win_add(0, 0, screenGetWidth(), screenGetHeight(), colorTable[0],
+        WINDOW_MODAL | WINDOW_MOVE_ON_TOP);
+    gsound_background_stop();
+    main_loadgame_new();
+    loadColorTable("color.pal");
+    palette_fade_to(cmap);
+
+    bool loaded = LoadMultiplayerRecoveryGame();
+    if (loaded && multiplayer::networkRuntimeEnterWorld()) {
+        if (win != -1) {
+            win_delete(win);
+            win = -1;
+        }
+        main_game_loop();
+    } else {
+        debug_printf("\n ** Error restoring multiplayer recovery save! **\n");
+        multiplayer::networkRuntimeDisconnect();
+    }
+
+    palette_fade_to(white_palette);
+    if (win != -1) win_delete(win);
+    main_unload_new();
+    main_reset_system();
+}
+
 // 0x4728CC
 static bool main_init_system(int argc, char** argv)
 {
@@ -377,7 +411,19 @@ static int main_loadgame_new()
 // 0x472A40
 static void main_unload_new()
 {
+    bool hostSessionEnding = multiplayer::networkRuntimeHostWorldActive();
+    bool remoteSessionEnded = multiplayer::networkRuntimeMode()
+            == multiplayer::NetworkLaunchMode::Join
+        && multiplayer::networkWorldPhase()
+            == multiplayer::SessionPhase::Ending;
+    if (hostSessionEnding) {
+        SaveMultiplayerRecoveryGame();
+        multiplayer::networkRuntimeEndHostSession();
+    }
     multiplayer::networkRuntimeLeaveWorld();
+    if (hostSessionEnding || remoteSessionEnded) {
+        multiplayer::networkRuntimeDisconnect();
+    }
     multiplayer::developerLocalSessionStop();
     obj_turn_off(obj_dude, NULL);
     map_exit();
@@ -425,6 +471,9 @@ static void main_game_loop()
 
         if ((obj_dude->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) != 0) {
             main_show_death_scene = 1;
+            game_user_wants_to_quit = 2;
+        }
+        if (multiplayer::networkWorldPhase() == multiplayer::SessionPhase::Ending) {
             game_user_wants_to_quit = 2;
         }
 

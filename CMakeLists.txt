@@ -22,8 +22,16 @@ set(CMAKE_CXX_EXTENSIONS NO)
 
 option(ASAN "Enable address sanitizer" OFF)
 option(UBSAN "Enable undefined behaviour sanitizer" OFF)
+option(FALLOUT_ENABLE_MULTIPLAYER "Build multiplayer and secure direct-IP networking" ON)
 
-add_subdirectory("third_party/mbedtls")
+if(FALLOUT_ENABLE_MULTIPLAYER)
+    add_subdirectory("third_party/mbedtls")
+    set(MULTIPLAYER_CONTENT_MANIFEST_SOURCE "src/multiplayer/content_manifest.cc")
+    set(MULTIPLAYER_TCP_TRANSPORT_SOURCE "src/multiplayer/tcp_transport.cc")
+else()
+    set(MULTIPLAYER_CONTENT_MANIFEST_SOURCE "src/multiplayer/content_manifest_disabled.cc")
+    set(MULTIPLAYER_TCP_TRANSPORT_SOURCE "src/multiplayer/tcp_transport_disabled.cc")
+endif()
 
 include(CTest)
 
@@ -46,9 +54,7 @@ add_library(fallout-multiplayer-core STATIC
     "src/multiplayer/dialogue_vote_controller.h"
     "src/multiplayer/direct_trade_controller.cc"
     "src/multiplayer/direct_trade_controller.h"
-    "src/multiplayer/loot_policy.cc"
-    "src/multiplayer/loot_policy.h"
-    "src/multiplayer/content_manifest.cc"
+    "${MULTIPLAYER_CONTENT_MANIFEST_SOURCE}"
     "src/multiplayer/content_manifest.h"
     "src/multiplayer/command_processor.cc"
     "src/multiplayer/command_processor.h"
@@ -60,6 +66,8 @@ add_library(fallout-multiplayer-core STATIC
     "src/multiplayer/local_session.h"
     "src/multiplayer/local_player_context.cc"
     "src/multiplayer/local_player_context.h"
+    "src/multiplayer/loot_distribution_controller.cc"
+    "src/multiplayer/loot_distribution_controller.h"
     "src/multiplayer/loopback_transport.cc"
     "src/multiplayer/loopback_transport.h"
     "src/multiplayer/network_bootstrap.cc"
@@ -70,19 +78,25 @@ add_library(fallout-multiplayer-core STATIC
     "src/multiplayer/player_character_state.h"
     "src/multiplayer/protocol.cc"
     "src/multiplayer/protocol.h"
+    "src/multiplayer/protocol_diagnostics.cc"
+    "src/multiplayer/protocol_diagnostics.h"
     "src/multiplayer/save_sidecar.cc"
     "src/multiplayer/save_sidecar.h"
     "src/multiplayer/session_recovery.cc"
     "src/multiplayer/session_recovery.h"
     "src/multiplayer/snapshot.cc"
     "src/multiplayer/snapshot.h"
-    "src/multiplayer/tcp_transport.cc"
+    "${MULTIPLAYER_TCP_TRANSPORT_SOURCE}"
     "src/multiplayer/tcp_transport.h"
     "src/multiplayer/transport.h"
     "src/multiplayer/types.h"
 )
 target_include_directories(fallout-multiplayer-core PUBLIC src)
-target_link_libraries(fallout-multiplayer-core PUBLIC MbedTLS::mbedtls MbedTLS::mbedcrypto MbedTLS::mbedx509)
+target_compile_definitions(fallout-multiplayer-core PUBLIC
+    FALLOUT_ENABLE_MULTIPLAYER=$<BOOL:${FALLOUT_ENABLE_MULTIPLAYER}>)
+if(FALLOUT_ENABLE_MULTIPLAYER)
+    target_link_libraries(fallout-multiplayer-core PUBLIC MbedTLS::mbedtls MbedTLS::mbedcrypto MbedTLS::mbedx509)
+endif()
 set_target_properties(fallout-multiplayer-core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(WIN32)
     target_link_libraries(fallout-multiplayer-core PUBLIC ws2_32)
@@ -138,11 +152,13 @@ if (BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
     add_test(NAME agent-journal
         COMMAND fallout-agent-journal-test "${CMAKE_CURRENT_BINARY_DIR}/agent-journal-test.jsonl")
 
-    add_executable(fallout-multiplayer-core-test
-        "tests/multiplayer_core_test.cc"
-    )
-    target_link_libraries(fallout-multiplayer-core-test PRIVATE fallout-multiplayer-core)
-    add_test(NAME multiplayer-core COMMAND fallout-multiplayer-core-test)
+    if(FALLOUT_ENABLE_MULTIPLAYER)
+        add_executable(fallout-multiplayer-core-test
+            "tests/multiplayer_core_test.cc"
+        )
+        target_link_libraries(fallout-multiplayer-core-test PRIVATE fallout-multiplayer-core)
+        add_test(NAME multiplayer-core COMMAND fallout-multiplayer-core-test)
+    endif()
 endif()
 
 if(ASAN)

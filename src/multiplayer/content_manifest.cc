@@ -79,8 +79,18 @@ bool isGameplayPatchPath(const std::filesystem::path& relative)
         return false;
     }
     std::string top = normalizedRelativePath(*component);
+    if (top == "maps") {
+        std::string extension = normalizedRelativePath(relative.extension());
+        // Fallout writes per-session map state and generated edge caches into
+        // the same directory as immutable .MAP patches. They are save data,
+        // not compatibility inputs, and can legitimately differ per peer.
+        return extension != ".sav"
+            && extension != ".bak"
+            && extension != ".edg"
+            && extension != ".tmp"
+            && normalizedRelativePath(relative.filename()) != "automap.db";
+    }
     return top == "scripts"
-        || top == "maps"
         || top == "proto"
         || top == "text";
 }

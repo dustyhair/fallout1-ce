@@ -7,133 +7,233 @@
 namespace fallout {
 namespace multiplayer {
 
-bool isValidDirectTradeState(const DirectTradeState& state)
+bool operator==(const DirectTradeItemOffer& lhs, const DirectTradeItemOffer& rhs)
 {
-    if (state.revision == 0) return state.offers.empty();
-    if (state.offers.size() != 2
-        || !isValid(state.offers[0].playerId)
-        || state.offers[0].playerId.value >= state.offers[1].playerId.value) return false;
-    for (const DirectTradeOffer& offer : state.offers) {
-        if (offer.caps > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())
-            || offer.items.size() > kMaximumDirectTradeLines) return false;
-        std::uint32_t previousId = 0;
-        for (const DirectTradeLine& line : offer.items) {
-            if (!isValid(line.itemId) || line.itemId.value <= previousId
-                || line.quantity == 0
-                || line.quantity > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) return false;
-            previousId = line.itemId.value;
-        }
-    }
-    return true;
+    return lhs.itemId == rhs.itemId && lhs.quantity == rhs.quantity;
 }
 
-bool DirectTradeController::begin(PlayerId first, PlayerId second)
+bool operator==(const DirectTradeOffer& lhs, const DirectTradeOffer& rhs)
 {
-    if (active() || !isValid(first) || !isValid(second) || first == second) {
-        return false;
+    return lhs.caps == rhs.caps && lhs.items == rhs.items;
+}
+
+namespace {
+
+bool canonicalizeOffer(DirectTradeOffer& offer)
+{
+    if (offer.items.size() > kMaximumDirectTradeItemsPerPlayer) return false;
+    std::sort(offer.items.begin(), offer.items.end(),
+        [](const DirectTradeItemOffer& lhs, const DirectTradeItemOffer& rhs) {
+            return lhs.itemId.value < rhs.itemId.value;
+        });
+    EntityId previous;
+    for (const DirectTradeItemOffer& item : offer.items) {
+        if (!isValid(item.itemId) || item.quantity == 0
+            || item.quantity > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())
+            || item.itemId == previous) {
+            return false;
+        }
+        previous = item.itemId;
     }
-    if (second.value < first.value) std::swap(first, second);
+    return offer.caps <= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max());
+}
+
+} // namespace
+
+DirectTradeResult DirectTradeController::begin(std::uint64_t tradeId,
+    PlayerId firstPlayerId, EntityId firstActorId,
+    PlayerId secondPlayerId, EntityId secondActorId)
+{
+    if (active()) return DirectTradeResult::InvalidState;
+    if (tradeId == 0 || !isValid(firstPlayerId) || !isValid(secondPlayerId)
+        || firstPlayerId == secondPlayerId || !isValid(firstActorId)
+        || !isValid(secondActorId) || firstActorId == secondActorId) {
+        return DirectTradeResult::InvalidParticipant;
+    }
+
+    clear();
+    _state.tradeId = tradeId;
     _state.revision = 1;
-    _state.offers = { DirectTradeOffer { first }, DirectTradeOffer { second } };
-    return true;
+    _state.status = DirectTradeStatus::Negotiating;
+    _state.participants = {
+        DirectTradeParticipant { firstPlayerId, firstActorId, {}, std::nullopt },
+        DirectTradeParticipant { secondPlayerId, secondActorId, {}, std::nullopt },
+    };
+    if (_state.participants[1].playerId.value < _state.participants[0].playerId.value) {
+        std::swap(_state.participants[0], _state.participants[1]);
+    }
+    return DirectTradeResult::Accepted;
 }
 
-DirectTradeOffer* DirectTradeController::offerFor(PlayerId playerId)
+DirectTradeResult DirectTradeController::restore(const DirectTradeState& state)
 {
-    for (DirectTradeOffer& offer : _state.offers) {
-        if (offer.playerId == playerId) return &offer;
+    if (state.tradeId == 0 || state.revision == 0
+        || (state.status != DirectTradeStatus::Negotiating
+            && state.status != DirectTradeStatus::ReadyToCommit)
+        || state.participants[0].playerId.value
+            >= state.participants[1].playerId.value
+        || state.participants[0].actorId == state.participants[1].actorId) {
+        return DirectTradeResult::InvalidState;
     }
-    return nullptr;
-}
-
-DirectTradeResult DirectTradeController::replaceOffer(PlayerId playerId,
-    std::uint64_t expectedRevision, std::uint32_t caps,
-    std::vector<DirectTradeLine> items)
-{
-    if (!active()) return DirectTradeResult::Inactive;
-    if (expectedRevision != _state.revision) return DirectTradeResult::StaleRevision;
-    DirectTradeOffer* offer = offerFor(playerId);
-    if (offer == nullptr) return DirectTradeResult::InvalidParticipant;
-    if (caps > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())
-        || items.size() > kMaximumDirectTradeLines) {
-        return DirectTradeResult::InvalidOffer;
-    }
-    std::sort(items.begin(), items.end(), [](const DirectTradeLine& a,
-                                         const DirectTradeLine& b) {
-        return a.itemId.value < b.itemId.value;
-    });
-    for (std::size_t index = 0; index < items.size(); index++) {
-        if (!isValid(items[index].itemId) || items[index].quantity == 0
-            || items[index].quantity > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())
-            || (index > 0 && items[index - 1].itemId == items[index].itemId)) {
-            return DirectTradeResult::InvalidOffer;
+    bool ready = true;
+    for (const DirectTradeParticipant& party : state.participants) {
+        DirectTradeOffer offer = party.offer;
+        if (!isValid(party.playerId) || !isValid(party.actorId)
+            || !canonicalizeOffer(offer) || !(offer == party.offer)
+            || (party.confirmedRevision.has_value()
+                && *party.confirmedRevision != state.revision)) {
+            return DirectTradeResult::InvalidState;
         }
+        ready = ready && party.confirmedRevision == state.revision;
     }
-    if (offer->caps == caps && offer->items == items) {
-        return DirectTradeResult::Applied;
+    if ((state.status == DirectTradeStatus::ReadyToCommit) != ready) {
+        return DirectTradeResult::InvalidState;
     }
+    _state = state;
+    return DirectTradeResult::Accepted;
+}
+
+DirectTradeResult DirectTradeController::setOffer(PlayerId playerId,
+    std::uint64_t revision, DirectTradeOffer offer)
+{
+    if (_state.status != DirectTradeStatus::Negotiating) {
+        return DirectTradeResult::InvalidState;
+    }
+    DirectTradeParticipant* party = participant(playerId);
+    if (party == nullptr) return DirectTradeResult::InvalidParticipant;
+    if (revision != _state.revision) return DirectTradeResult::StaleRevision;
+    if (!canonicalizeOffer(offer)) return DirectTradeResult::InvalidOffer;
+    if (party->offer == offer) return DirectTradeResult::Accepted;
     if (_state.revision == std::numeric_limits<std::uint64_t>::max()) {
-        return DirectTradeResult::InvalidOffer;
+        return DirectTradeResult::InvalidState;
     }
-    offer->caps = caps;
-    offer->items = std::move(items);
+    party->offer = std::move(offer);
     _state.revision++;
-    for (DirectTradeOffer& participant : _state.offers) participant.confirmed = false;
-    return DirectTradeResult::Applied;
+    clearConfirmations();
+    return DirectTradeResult::Accepted;
 }
 
 DirectTradeResult DirectTradeController::confirm(PlayerId playerId,
-    std::uint64_t expectedRevision)
+    std::uint64_t revision)
 {
-    if (!active()) return DirectTradeResult::Inactive;
-    if (expectedRevision != _state.revision) return DirectTradeResult::StaleRevision;
-    DirectTradeOffer* offer = offerFor(playerId);
-    if (offer == nullptr) return DirectTradeResult::InvalidParticipant;
-    offer->confirmed = true;
-    return std::all_of(_state.offers.begin(), _state.offers.end(),
-               [](const DirectTradeOffer& participant) { return participant.confirmed; })
-        ? DirectTradeResult::ReadyToCommit
-        : DirectTradeResult::Applied;
-}
-
-bool DirectTradeController::finishCommit(std::uint64_t expectedRevision,
-    bool committed)
-{
-    if (!active() || expectedRevision != _state.revision
-        || !std::all_of(_state.offers.begin(), _state.offers.end(),
-            [](const DirectTradeOffer& offer) { return offer.confirmed; })) {
-        return false;
+    if (_state.status != DirectTradeStatus::Negotiating
+        && _state.status != DirectTradeStatus::ReadyToCommit) {
+        return DirectTradeResult::InvalidState;
     }
-    if (committed) {
-        clear();
-    } else {
-        if (_state.revision == std::numeric_limits<std::uint64_t>::max()) {
-            clear();
-        } else {
-            _state.revision++;
-            for (DirectTradeOffer& offer : _state.offers) offer.confirmed = false;
-        }
+    DirectTradeParticipant* party = participant(playerId);
+    if (party == nullptr) return DirectTradeResult::InvalidParticipant;
+    if (revision != _state.revision) return DirectTradeResult::StaleRevision;
+    party->confirmedRevision = revision;
+    bool ready = std::all_of(_state.participants.begin(), _state.participants.end(),
+        [revision](const DirectTradeParticipant& candidate) {
+            return candidate.confirmedRevision == revision;
+        });
+    if (ready) {
+        _state.status = DirectTradeStatus::ReadyToCommit;
+        return DirectTradeResult::ReadyToCommit;
     }
-    return true;
+    return DirectTradeResult::Accepted;
 }
 
-bool DirectTradeController::cancel(PlayerId playerId)
+DirectTradeResult DirectTradeController::cancel(PlayerId playerId,
+    std::uint64_t revision)
 {
-    if (!active() || offerFor(playerId) == nullptr) return false;
-    clear();
-    return true;
+    if (!active()) return DirectTradeResult::InvalidState;
+    if (participant(playerId) == nullptr) return DirectTradeResult::InvalidParticipant;
+    if (revision != _state.revision) return DirectTradeResult::StaleRevision;
+    _state.status = DirectTradeStatus::Cancelled;
+    clearConfirmations();
+    return DirectTradeResult::Accepted;
 }
 
-bool DirectTradeController::restore(const DirectTradeState& state)
+DirectTradeResult DirectTradeController::disconnect(PlayerId playerId)
 {
-    if (!isValidDirectTradeState(state)) return false;
-    _state = state;
-    return true;
+    if (!active()) return DirectTradeResult::InvalidState;
+    if (participant(playerId) == nullptr) return DirectTradeResult::InvalidParticipant;
+    _state.status = DirectTradeStatus::Cancelled;
+    clearConfirmations();
+    return DirectTradeResult::Accepted;
+}
+
+DirectTradeResult DirectTradeController::invalidateCommit(std::uint64_t revision)
+{
+    if (_state.status != DirectTradeStatus::ReadyToCommit) {
+        return DirectTradeResult::InvalidState;
+    }
+    if (revision != _state.revision) return DirectTradeResult::StaleRevision;
+    if (_state.revision == std::numeric_limits<std::uint64_t>::max()) {
+        return DirectTradeResult::InvalidState;
+    }
+    _state.revision++;
+    _state.status = DirectTradeStatus::Negotiating;
+    clearConfirmations();
+    return DirectTradeResult::Accepted;
+}
+
+DirectTradeResult DirectTradeController::commit(std::uint64_t revision)
+{
+    if (_state.status != DirectTradeStatus::ReadyToCommit) {
+        return DirectTradeResult::InvalidState;
+    }
+    if (revision != _state.revision) return DirectTradeResult::StaleRevision;
+    _state.status = DirectTradeStatus::Committed;
+    return DirectTradeResult::Accepted;
 }
 
 void DirectTradeController::clear()
 {
     _state = {};
+}
+
+bool DirectTradeController::active() const
+{
+    return _state.status == DirectTradeStatus::Negotiating
+        || _state.status == DirectTradeStatus::ReadyToCommit;
+}
+
+std::optional<DirectTradeCommitPlan> DirectTradeController::commitPlan() const
+{
+    if (_state.status != DirectTradeStatus::ReadyToCommit) return std::nullopt;
+    DirectTradeCommitPlan plan;
+    plan.tradeId = _state.tradeId;
+    plan.revision = _state.revision;
+    for (std::size_t index = 0; index < _state.participants.size(); index++) {
+        const DirectTradeParticipant& source = _state.participants[index];
+        const DirectTradeParticipant& destination = _state.participants[1 - index];
+        plan.legs[index] = DirectTradeLeg {
+            source.playerId,
+            source.actorId,
+            destination.playerId,
+            destination.actorId,
+            source.offer,
+        };
+    }
+    return plan;
+}
+
+DirectTradeParticipant* DirectTradeController::participant(PlayerId playerId)
+{
+    auto found = std::find_if(_state.participants.begin(), _state.participants.end(),
+        [playerId](const DirectTradeParticipant& candidate) {
+            return candidate.playerId == playerId;
+        });
+    return found != _state.participants.end() ? &*found : nullptr;
+}
+
+const DirectTradeParticipant* DirectTradeController::participant(PlayerId playerId) const
+{
+    auto found = std::find_if(_state.participants.begin(), _state.participants.end(),
+        [playerId](const DirectTradeParticipant& candidate) {
+            return candidate.playerId == playerId;
+        });
+    return found != _state.participants.end() ? &*found : nullptr;
+}
+
+void DirectTradeController::clearConfirmations()
+{
+    for (DirectTradeParticipant& party : _state.participants) {
+        party.confirmedRevision.reset();
+    }
 }
 
 } // namespace multiplayer

@@ -10,7 +10,6 @@
 #include "multiplayer/character_lobby.h"
 #include "multiplayer/command_processor.h"
 #include "multiplayer/dialogue_vote_controller.h"
-#include "multiplayer/direct_trade_controller.h"
 #include "multiplayer/network_bootstrap.h"
 #include "multiplayer/snapshot.h"
 
@@ -31,6 +30,9 @@ enum class PartyExperienceResult {
 bool networkWorldEnter(NetworkLaunchMode mode,
     const CharacterCreationSheet& localSheet,
     const CharacterCreationSheet& peerSheet);
+bool networkWorldRestoreMultiplayerSave(const MultiplayerSaveSidecar& sidecar,
+    Object* savedGuestActor);
+bool networkWorldBeginEnding();
 bool networkWorldApplyPeerMove(const ActorMovementStartedEvent& movement);
 bool networkWorldApplyPeerFacing(const ActorFacingChangedEvent& facing);
 bool networkWorldApplyPeerDoorUse(const DoorUseStartedEvent& doorUse);
@@ -53,9 +55,7 @@ bool networkWorldApplyPeerSharedModal(const SharedModalStateChangedEvent& modal)
 bool networkWorldApplyPeerWorldMapRoute(const WorldMapRouteSelectedEvent& route);
 bool networkWorldApplyPeerAttack(const AttackStartedEvent& attack);
 bool networkWorldApplyInventoryTransfer(const InventoryTransferredEvent& transfer, bool reverse = false);
-bool networkWorldApplyPeerDirectTrade(const DirectTradeStateChangedEvent& trade);
-const DirectTradeState& networkWorldDirectTradeState();
-void networkWorldCancelDirectTrade();
+bool networkWorldApplyCapsDistribution(const CapsDistributedEvent& distribution);
 bool networkWorldApplyItemDrop(const ItemDroppedEvent& drop);
 bool networkWorldApplyLocalItemDrop(Object* source, Object* item, std::uint32_t quantity);
 bool networkWorldBeginLocalLoot(Object* target);
@@ -95,6 +95,9 @@ bool networkWorldEndDialogue();
 bool networkWorldApplyPeerDialogueRequested(const DialogueRequestedEvent& event);
 bool networkWorldApplyPeerDialogueVote(const DialogueVoteRecordedEvent& event);
 bool networkWorldApplyPeerDialoguePresentation(const DialoguePresentationEvent& event);
+bool networkWorldApplyPeerDirectTrade(const DirectTradeStateChangedEvent& event);
+void networkWorldDirectTradeSetConnected(PlayerId playerId, bool connected);
+std::optional<DirectTradeState> networkWorldDirectTradeState();
 void networkWorldCancelPendingWorldMapProposal();
 void networkWorldHostTakeOverWorldMapTravel();
 bool networkWorldSynchronizeEnginePhase();
@@ -133,6 +136,11 @@ bool networkWorldApplyPeerCombatAction(const CombatActionResolvedEvent& event);
 bool networkWorldApplyPeerPartyExperience(const PartyExperienceAwardedEvent& event);
 Object* networkWorldFindObject(EntityId entityId);
 Object* networkWorldPlayerActor(PlayerId playerId);
+MultiplayerSaveError networkWorldCaptureMultiplayerSave(
+    std::uint64_t generation,
+    std::uint64_t saveDatDigest,
+    const ReconnectToken& guestReconnectToken,
+    MultiplayerSaveSidecar& sidecar);
 void networkWorldLeave();
 bool networkWorldActive();
 bool networkWorldReplicaSessionActive();
@@ -158,10 +166,6 @@ bool networkWorldRunPartyExperienceSmokeTest();
 std::optional<EntityId> networkWorldPrepareDoorSmokeTest();
 std::optional<EntityId> networkWorldPreparePickupSmokeTest();
 std::optional<EntityId> networkWorldPrepareLootSmokeTest();
-std::optional<std::pair<EntityId, EntityId>> networkWorldPrepareLootCapSmokeTest();
-bool networkWorldVerifyLootCapSmokeTest(EntityId sourceId);
-std::optional<std::pair<EntityId, EntityId>> networkWorldPrepareLootPrioritySmokeTest();
-bool networkWorldVerifyLootPrioritySmokeTest(EntityId sourceId, EntityId itemId, std::uint32_t quantity);
 std::optional<EntityId> networkWorldPrepareSkillSmokeTest();
 std::optional<EntityId> networkWorldPrepareScenerySmokeTest();
 bool networkWorldMutateScenerySmokeTest(EntityId targetId);
@@ -222,8 +226,8 @@ bool networkWorldVerifySceneryTransitionSmokeTest(const SceneryTransitionSmokeFi
 bool networkWorldVerifyLootRangeSmokeTest(EntityId targetId);
 std::optional<EntityId> networkWorldPreparePlayerTransferSmokeTest();
 bool networkWorldVerifyPlayerTransferRangeSmokeTest(EntityId itemId);
-std::optional<EntityId> networkWorldPrepareDirectTradeSmokeTest();
-bool networkWorldVerifyDirectTradeSmokeTest(EntityId itemId);
+bool networkWorldPrepareRecoverySmokeTest();
+bool networkWorldVerifyRecoverySmokeTest();
 bool networkWorldRunSharedModalSmokeTest();
 
 } // namespace multiplayer

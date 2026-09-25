@@ -115,6 +115,23 @@ int main()
             && command.quantity == 12,
         "parses a semantic player gift")
         && passed;
+    passed = expect(parse("49 game_trade_begin 2", command)
+            && command.type == fallout::AgentControlCommandType::GameTradeBegin
+            && command.entityId == 2,
+        "parses a bilateral trade request") && passed;
+    passed = expect(parse("49 game_trade_offer 9 3 12 77 2", command)
+            && command.type == fallout::AgentControlCommandType::GameTradeOffer
+            && command.tradeId == 9 && command.tradeRevision == 3
+            && command.caps == 12 && command.itemEntityId == 77
+            && command.quantity == 2,
+        "parses a revisioned item and caps offer") && passed;
+    passed = expect(parse("49 game_trade_confirm 9 4", command)
+            && command.type == fallout::AgentControlCommandType::GameTradeConfirm
+            && command.tradeRevision == 4,
+        "parses a revisioned trade confirmation") && passed;
+    passed = expect(parse("49 game_trade_cancel 9 4", command)
+            && command.type == fallout::AgentControlCommandType::GameTradeCancel,
+        "parses a revisioned trade cancellation") && passed;
     passed = expect(parse("50 game_skill traps 77", command)
             && command.type == fallout::AgentControlCommandType::GameSkill
             && command.skill == 11
@@ -173,6 +190,9 @@ int main()
     passed = expect(!parse("62 game_exit 0", command), "rejects an invalid exit-grid entity") && passed;
     passed = expect(!parse("63 game_stairs 0", command), "rejects an invalid stairs or ladder entity") && passed;
     passed = expect(!parse("64 game_rest 17", command), "rejects an unsupported rest duration") && passed;
+    passed = expect(!parse("65 game_trade_offer 9 0 1", command)
+            && !parse("66 game_trade_offer 9 1 1 77 0", command),
+        "rejects stale or malformed trade offers") && passed;
 
     return passed ? 0 : 1;
 }

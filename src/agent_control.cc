@@ -312,6 +312,45 @@ void executeCommand(const AgentControlCommand& command)
             agentJournalWriteAgentCommand(command.id, commandName, "rejected", "player gift is unavailable or invalid");
         }
         return;
+    case AgentControlCommandType::GameTradeBegin:
+        if (multiplayer::networkRuntimeBeginDirectTrade(
+                multiplayer::EntityId { command.entityId })) {
+            agentJournalWriteAgentCommand(command.id, commandName, "accepted",
+                "bilateral trade negotiation started");
+        } else {
+            agentJournalWriteAgentCommand(command.id, commandName, "rejected",
+                "other player is unavailable or not adjacent");
+        }
+        return;
+    case AgentControlCommandType::GameTradeOffer:
+    case AgentControlCommandType::GameTradeConfirm:
+    case AgentControlCommandType::GameTradeCancel: {
+        multiplayer::DirectTradeCommand trade;
+        trade.tradeId = command.tradeId;
+        trade.revision = command.tradeRevision;
+        if (command.type == AgentControlCommandType::GameTradeOffer) {
+            trade.action = multiplayer::DirectTradeAction::SetOffer;
+            trade.offer.caps = command.caps;
+            if (command.itemEntityId != 0) {
+                trade.offer.items.push_back({
+                    multiplayer::EntityId { command.itemEntityId },
+                    command.quantity,
+                });
+            }
+        } else if (command.type == AgentControlCommandType::GameTradeConfirm) {
+            trade.action = multiplayer::DirectTradeAction::Confirm;
+        } else {
+            trade.action = multiplayer::DirectTradeAction::Cancel;
+        }
+        if (multiplayer::networkRuntimeSubmitDirectTrade(trade)) {
+            agentJournalWriteAgentCommand(command.id, commandName, "accepted",
+                "revisioned trade action submitted");
+        } else {
+            agentJournalWriteAgentCommand(command.id, commandName, "rejected",
+                "trade id, revision, offer, or phase is invalid");
+        }
+        return;
+    }
     }
 }
 

@@ -2477,8 +2477,18 @@ void gmouse_remove_item_outline(Object* object)
 
 void gameMouseRefreshImmediately()
 {
+    // Rendering can request an uncached prototype, whose database read can
+    // cross the map-load refresh threshold and invoke this callback again.
+    // A nested refresh cannot make useful progress and would recurse until
+    // the stack is exhausted.
+    static bool refreshing = false;
+    if (refreshing) {
+        return;
+    }
+    refreshing = true;
     gmouse_bk_process();
     renderPresent();
+    refreshing = false;
 }
 
 } // namespace fallout

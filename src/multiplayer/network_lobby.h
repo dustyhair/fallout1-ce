@@ -12,6 +12,7 @@
 #include "multiplayer/character_lobby.h"
 #include "multiplayer/command_processor.h"
 #include "multiplayer/network_bootstrap.h"
+#include "multiplayer/protocol_diagnostics.h"
 #include "multiplayer/session_recovery.h"
 #include "multiplayer/snapshot.h"
 #include "multiplayer/transport.h"
@@ -20,7 +21,7 @@
 namespace fallout {
 namespace multiplayer {
 
-constexpr std::uint16_t kNetworkLobbyVersion = 3;
+constexpr std::uint16_t kNetworkLobbyVersion = 4;
 constexpr std::size_t kMaxLobbyChatMessageLength = 64;
 
 struct LobbyChatMessage {
@@ -86,6 +87,8 @@ public:
     bool sendLocalSharedModal(SharedModalKind kind, bool open, SessionPhase currentPhase, std::uint32_t phaseRevision = 1);
     bool sendLocalTalk(EntityId targetId, std::uint32_t phaseRevision);
     bool sendLocalDialogueVote(std::uint64_t revision, std::uint8_t option, std::uint32_t phaseRevision);
+    bool sendLocalDirectTrade(const DirectTradeCommand& trade,
+        std::uint32_t phaseRevision);
     bool sendLocalWorldMapRoute(const WorldMapRouteCommand& route, std::uint32_t phaseRevision = 1);
     bool sendLocalInventoryTransfer(EntityId sourceId,
         EntityId destinationId,
@@ -95,7 +98,6 @@ public:
         std::uint32_t phaseRevision = 1,
         EntityId remainderItemId = {},
         ItemDescriptor itemDescriptor = {});
-    bool sendLocalDirectTrade(const DirectTradeCommand& command, std::uint32_t phaseRevision);
     bool sendLocalItemDrop(EntityId sourceId,
         EntityId itemId,
         std::uint32_t quantity,
@@ -121,6 +123,8 @@ public:
     std::optional<WorldSnapshot> takePeerSnapshot();
     bool sendAuthoritativeState(const WorldSnapshot& snapshot);
     std::optional<WorldSnapshot> takeAuthoritativeState();
+    bool confirmSessionEndingApplied(std::uint32_t phaseRevision);
+    std::uint32_t acknowledgedEndingPhaseRevision() const;
     EventSequence latestAuthoritativeEvent() const;
     bool recoveryInProgress() const;
     void abortRecovery();
@@ -140,6 +144,7 @@ public:
     bool startRequested() const;
     std::uint64_t nextSendSequence() const;
     std::uint64_t nextReceiveSequence() const;
+    const ProtocolDiagnostics& diagnostics() const;
     std::unique_ptr<Transport> takeTransport();
 
 private:
@@ -177,6 +182,7 @@ private:
     std::uint64_t _nextEventSequence = 1;
     std::uint64_t _nextExpectedEventSequence = 1;
     EventSequence _lastAppliedEventSequence;
+    std::uint32_t _acknowledgedEndingPhaseRevision = 0;
     std::unordered_map<PlayerId, EventSequence, PlayerIdHash> _acknowledgedEvents;
     std::deque<CommandSequence> _pendingCommandSequences;
     std::deque<EventSequence> _recoveryRequests;
@@ -188,6 +194,7 @@ private:
     std::deque<WorldSnapshot> _authoritativeStates;
     bool _recovering = false;
     EventJournal _eventJournal;
+    ProtocolDiagnostics _diagnostics;
     std::unique_ptr<Transport> _transport;
 };
 

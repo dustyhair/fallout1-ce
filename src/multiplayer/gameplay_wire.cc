@@ -1,11 +1,11 @@
 #include "multiplayer/gameplay_wire.h"
 
+#include <algorithm>
 #include <limits>
 #include <unordered_set>
 #include <variant>
 
 #include "multiplayer/combat_turn_controller.h"
-#include "multiplayer/direct_trade_controller.h"
 
 namespace fallout {
 namespace multiplayer {
@@ -65,6 +65,7 @@ enum class EventType : std::uint8_t {
     DialoguePresentation = 24,
     SharedActivityPublished = 25,
     DirectTradeStateChanged = 26,
+    CapsDistributed = 27,
 };
 
 constexpr std::size_t kCommandHeaderSize = 28;
@@ -73,7 +74,6 @@ constexpr std::size_t kTargetCommandSize = kCommandHeaderSize + 4;
 constexpr std::size_t kFacingCommandSize = kCommandHeaderSize + 8;
 constexpr std::size_t kItemDescriptorSize = 16;
 constexpr std::size_t kInventoryTransferCommandSize = kCommandHeaderSize + 20 + kItemDescriptorSize;
-constexpr std::size_t kDirectTradeCommandSize = kCommandHeaderSize + 28;
 constexpr std::size_t kItemDropCommandSize = kCommandHeaderSize + 16 + kItemDescriptorSize;
 constexpr std::size_t kAttackCommandSize = kCommandHeaderSize + 20;
 constexpr std::size_t kEndTurnCommandSize = kCommandHeaderSize + 8;
@@ -83,6 +83,7 @@ constexpr std::size_t kCombatReloadCommandSize = kCommandHeaderSize + 16;
 constexpr std::size_t kCombatFaceCommandSize = kCommandHeaderSize + 12;
 constexpr std::size_t kSharedModalCommandSize = kCommandHeaderSize + 4;
 constexpr std::size_t kDialogueVoteCommandSize = kCommandHeaderSize + 12;
+constexpr std::size_t kDirectTradeCommandBaseSize = kCommandHeaderSize + 36;
 constexpr std::size_t kSkillCommandSize = kCommandHeaderSize + 8;
 constexpr std::size_t kItemUseCommandSize = kCommandHeaderSize + 8;
 constexpr std::size_t kElevatorCommandSize = kCommandHeaderSize + 8;
@@ -102,6 +103,11 @@ constexpr std::size_t kPartyExperienceEventBaseSize = kEventHeaderSize + 12;
 constexpr std::size_t kPlayerProgressionSize = 20;
 constexpr std::size_t kSharedModalEventSize = kEventHeaderSize + 12;
 constexpr std::size_t kDialogueVoteEventSize = kEventHeaderSize + 16;
+constexpr std::size_t kDirectTradeEventBaseSize = kEventHeaderSize + 32;
+constexpr std::size_t kDirectTradeParticipantSize = 24;
+constexpr std::size_t kDirectTradeItemSize = 8;
+constexpr std::size_t kCapsDistributedEventBaseSize = kEventHeaderSize + 16;
+constexpr std::size_t kCapShareSize = 12;
 constexpr std::size_t kSkillEventSize = kEventHeaderSize + 12;
 constexpr std::size_t kItemUseEventSize = kEventHeaderSize + 12;
 constexpr std::size_t kElevatorEventSize = kEventHeaderSize + 40;
@@ -196,6 +202,58 @@ ItemDescriptor readItemDescriptor(const std::vector<std::uint8_t>& bytes, std::s
         readInt32(bytes, offset + 8),
         readInt32(bytes, offset + 12),
     };
+}
+
+bool isValidTradeOffer(const DirectTradeOffer& offer)
+{
+    if (offer.items.size() > kMaximumDirectTradeItemsPerPlayer
+        || offer.caps > static_cast<std::uint32_t>(
+            std::numeric_limits<std::int32_t>::max())) return false;
+    EntityId previous;
+    for (const DirectTradeItemOffer& item : offer.items) {
+        if (!isValid(item.itemId) || item.quantity == 0
+            || item.quantity > static_cast<std::uint32_t>(
+                std::numeric_limits<std::int32_t>::max())
+            || (isValid(previous) && item.itemId.value <= previous.value)) {
+            return false;
+        }
+        previous = item.itemId;
+    }
+    return true;
+}
+
+bool isValidTradeState(const DirectTradeState& state)
+{
+    if (state.tradeId == 0 || state.revision == 0
+        || state.status < DirectTradeStatus::Negotiating
+        || state.status > DirectTradeStatus::Cancelled) return false;
+    bool allConfirmed = true;
+    for (std::size_t index = 0; index < state.participants.size(); index++) {
+        const DirectTradeParticipant& participant = state.participants[index];
+        if (!isValid(participant.playerId) || !isValid(participant.actorId)
+            || !isValidTradeOffer(participant.offer)
+            || (index != 0
+                && participant.playerId.value
+                    <= state.participants[index - 1].playerId.value)
+            || (index != 0
+                && participant.actorId
+                    == state.participants[index - 1].actorId)
+            || (participant.confirmedRevision.has_value()
+                && *participant.confirmedRevision != state.revision)) {
+            return false;
+        }
+        allConfirmed = allConfirmed
+            && participant.confirmedRevision == state.revision;
+    }
+    if ((state.status == DirectTradeStatus::ReadyToCommit
+            || state.status == DirectTradeStatus::Committed)
+        != allConfirmed) return false;
+    if (state.status == DirectTradeStatus::Cancelled) {
+        for (const DirectTradeParticipant& participant : state.participants) {
+            if (participant.confirmedRevision.has_value()) return false;
+        }
+    }
+    return true;
 }
 
 GameplayWireError validateEnvelope(const ProtocolEnvelope& envelope, MessageKind expectedKind)
@@ -299,32 +357,6 @@ GameplayWireError validateCommand(const GameCommand& command)
             ? GameplayWireError::None
             : GameplayWireError::InvalidQuantity;
     }
-    if (const auto* trade = std::get_if<DirectTradeCommand>(&command.payload)) {
-        bool base = trade->caps <= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())
-            && trade->quantity <= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max());
-        bool valid = false;
-        switch (trade->action) {
-        case DirectTradeAction::Open:
-            valid = isValid(trade->partnerId) && trade->partnerId != command.playerId
-                && trade->revision == 0 && !isValid(trade->itemId)
-                && trade->quantity == 0 && trade->caps == 0;
-            break;
-        case DirectTradeAction::SetCaps:
-            valid = !isValid(trade->partnerId) && trade->revision != 0
-                && !isValid(trade->itemId) && trade->quantity == 0;
-            break;
-        case DirectTradeAction::SetItem:
-            valid = !isValid(trade->partnerId) && trade->revision != 0
-                && isValid(trade->itemId) && trade->caps == 0;
-            break;
-        case DirectTradeAction::Confirm:
-        case DirectTradeAction::Cancel:
-            valid = !isValid(trade->partnerId) && trade->revision != 0
-                && !isValid(trade->itemId) && trade->quantity == 0 && trade->caps == 0;
-            break;
-        }
-        return base && valid ? GameplayWireError::None : GameplayWireError::InvalidQuantity;
-    }
     if (const auto* drop = std::get_if<ItemDropCommand>(&command.payload)) {
         if (!isValid(drop->sourceId)
             || !isValidItemDescriptor(drop->itemDescriptor)
@@ -384,6 +416,28 @@ GameplayWireError validateCommand(const GameCommand& command)
     if (const auto* vote = std::get_if<DialogueVoteCommand>(&command.payload)) {
         return vote->revision != 0 && vote->option < kMaximumDialogueOptions
             ? GameplayWireError::None : GameplayWireError::InvalidModal;
+    }
+    if (const auto* trade = std::get_if<DirectTradeCommand>(&command.payload)) {
+        if (trade->action < DirectTradeAction::Begin
+            || trade->action > DirectTradeAction::Cancel
+            || trade->tradeId == 0 || !isValidTradeOffer(trade->offer)) {
+            return GameplayWireError::InvalidTrade;
+        }
+        if (trade->action == DirectTradeAction::Begin) {
+            return trade->revision == 0
+                    && isValid(trade->otherPlayerId)
+                    && isValid(trade->otherActorId)
+                    && trade->otherPlayerId != command.playerId
+                    && trade->otherActorId != command.actorId
+                    && trade->offer.items.empty() && trade->offer.caps == 0
+                ? GameplayWireError::None : GameplayWireError::InvalidTrade;
+        }
+        return trade->revision != 0
+                && !isValid(trade->otherPlayerId)
+                && !isValid(trade->otherActorId)
+                && (trade->action == DirectTradeAction::SetOffer
+                    || (trade->offer.items.empty() && trade->offer.caps == 0))
+            ? GameplayWireError::None : GameplayWireError::InvalidTrade;
     }
     if (const auto* route = std::get_if<WorldMapRouteCommand>(&command.payload)) {
         return isValid(*route) ? GameplayWireError::None : GameplayWireError::InvalidMove;
@@ -522,6 +576,34 @@ GameplayWireError validateEvent(const GameEvent& event)
             ? GameplayWireError::None
             : GameplayWireError::InvalidQuantity;
     }
+    if (const auto* distribution = std::get_if<CapsDistributedEvent>(&event.payload)) {
+        if (!isValid(distribution->actorId)
+            || !isValid(distribution->sourceId)
+            || distribution->caps == 0
+            || distribution->caps > static_cast<std::uint32_t>(
+                std::numeric_limits<std::int32_t>::max())
+            || distribution->shares.size() < 2
+            || distribution->shares.size() > kMaximumTransitionPlayers) {
+            return GameplayWireError::InvalidQuantity;
+        }
+        std::uint64_t sum = 0;
+        PlayerId previous;
+        bool actorIncluded = false;
+        for (const PlayerCapShare& share : distribution->shares) {
+            if (!isValid(share.playerId) || !isValid(share.actorId)
+                || (isValid(previous)
+                    && share.playerId.value <= previous.value)) {
+                return GameplayWireError::InvalidEntityId;
+            }
+            previous = share.playerId;
+            actorIncluded = actorIncluded
+                || share.actorId == distribution->actorId;
+            sum += share.caps;
+        }
+        return actorIncluded && sum == distribution->caps
+            ? GameplayWireError::None
+            : GameplayWireError::InvalidQuantity;
+    }
     if (const auto* drop = std::get_if<ItemDroppedEvent>(&event.payload)) {
         if (!isValid(drop->actorId)
             || !isValid(drop->sourceId)
@@ -649,11 +731,21 @@ GameplayWireError validateEvent(const GameEvent& event)
             ? GameplayWireError::None : GameplayWireError::InvalidModal;
     }
     if (const auto* trade = std::get_if<DirectTradeStateChangedEvent>(&event.payload)) {
-        return isValid(trade->actorId)
-                && !(trade->committed && trade->cancelled)
-                && isValidDirectTradeState(trade->state)
-                && (!(trade->committed || trade->cancelled) || trade->state.revision == 0)
-            ? GameplayWireError::None : GameplayWireError::InvalidModal;
+        if (!isValid(trade->actorId) || !isKnownPhase(trade->phase)
+            || trade->phaseRevision == 0 || !isValidTradeState(trade->state)) {
+            return GameplayWireError::InvalidTrade;
+        }
+        if (std::none_of(trade->state.participants.begin(),
+                trade->state.participants.end(), [&](const auto& participant) {
+                    return participant.actorId == trade->actorId;
+                })) return GameplayWireError::InvalidTrade;
+        bool terminal = trade->state.status == DirectTradeStatus::Committed
+            || trade->state.status == DirectTradeStatus::Cancelled;
+        return trade->phase == (terminal
+                       ? SessionPhase::Exploration : SessionPhase::Dialogue)
+                && trade->inventoryChanged
+                    == (trade->state.status == DirectTradeStatus::Committed)
+            ? GameplayWireError::None : GameplayWireError::InvalidTrade;
     }
     if (const auto* route = std::get_if<WorldMapRouteSelectedEvent>(&event.payload)) {
         return isValid(route->actorId)
@@ -893,15 +985,6 @@ GameplayWireError encodeGameCommand(const GameCommand& command, ProtocolEnvelope
         appendUInt32(envelope.payload, transfer->quantity);
         appendUInt32(envelope.payload, transfer->sourceQuantity);
         appendItemDescriptor(envelope.payload, transfer->itemDescriptor);
-    } else if (const auto* trade = std::get_if<DirectTradeCommand>(&command.payload)) {
-        appendCommandHeader(command, CommandType::DirectTrade, envelope.payload);
-        envelope.payload.push_back(static_cast<std::uint8_t>(trade->action));
-        envelope.payload.insert(envelope.payload.end(), 3, 0);
-        appendUInt32(envelope.payload, trade->partnerId.value);
-        appendUInt64(envelope.payload, trade->revision);
-        appendUInt32(envelope.payload, trade->itemId.value);
-        appendUInt32(envelope.payload, trade->quantity);
-        appendUInt32(envelope.payload, trade->caps);
     } else if (const auto* drop = std::get_if<ItemDropCommand>(&command.payload)) {
         appendCommandHeader(command, CommandType::ItemDrop, envelope.payload);
         appendUInt32(envelope.payload, drop->sourceId.value);
@@ -921,6 +1004,22 @@ GameplayWireError encodeGameCommand(const GameCommand& command, ProtocolEnvelope
         appendCommandHeader(command, CommandType::DialogueVote, envelope.payload);
         appendUInt64(envelope.payload, vote->revision);
         appendUInt32(envelope.payload, vote->option);
+    } else if (const auto* trade = std::get_if<DirectTradeCommand>(&command.payload)) {
+        appendCommandHeader(command, CommandType::DirectTrade, envelope.payload);
+        envelope.payload.push_back(static_cast<std::uint8_t>(trade->action));
+        envelope.payload.insert(envelope.payload.end(), 3, 0);
+        appendUInt64(envelope.payload, trade->tradeId);
+        appendUInt64(envelope.payload, trade->revision);
+        appendUInt32(envelope.payload, trade->otherPlayerId.value);
+        appendUInt32(envelope.payload, trade->otherActorId.value);
+        appendUInt32(envelope.payload, trade->offer.caps);
+        appendUInt16(envelope.payload,
+            static_cast<std::uint16_t>(trade->offer.items.size()));
+        appendUInt16(envelope.payload, 0);
+        for (const DirectTradeItemOffer& item : trade->offer.items) {
+            appendUInt32(envelope.payload, item.itemId.value);
+            appendUInt32(envelope.payload, item.quantity);
+        }
     } else if (const auto* route = std::get_if<WorldMapRouteCommand>(&command.payload)) {
         appendCommandHeader(command, CommandType::WorldMapRoute, envelope.payload);
         appendInt32(envelope.payload, route->targetX);
@@ -1067,24 +1166,40 @@ GameCommandDecodeResult decodeGameCommand(const ProtocolEnvelope& envelope)
             readItemDescriptor(envelope.payload, 48),
         };
         break;
-    case CommandType::DirectTrade:
-        if (envelope.payload.size() != kDirectTradeCommandSize) {
+    case CommandType::DirectTrade: {
+        if (envelope.payload.size() < kDirectTradeCommandBaseSize
+            || envelope.payload[29] != 0 || envelope.payload[30] != 0
+            || envelope.payload[31] != 0
+            || readUInt16(envelope.payload, 62) != 0) {
             result.error = GameplayWireError::InvalidLength;
             return result;
         }
-        if (envelope.payload[29] != 0 || envelope.payload[30] != 0 || envelope.payload[31] != 0) {
-            result.error = GameplayWireError::InvalidReservedField;
+        std::uint16_t itemCount = readUInt16(envelope.payload, 60);
+        if (itemCount > kMaximumDirectTradeItemsPerPlayer
+            || envelope.payload.size() != kDirectTradeCommandBaseSize
+                    + static_cast<std::size_t>(itemCount)
+                        * kDirectTradeItemSize) {
+            result.error = GameplayWireError::InvalidLength;
             return result;
         }
-        result.command.payload = DirectTradeCommand {
-            static_cast<DirectTradeAction>(envelope.payload[28]),
-            PlayerId { readUInt32(envelope.payload, 32) },
-            readUInt64(envelope.payload, 36),
-            EntityId { readUInt32(envelope.payload, 44) },
-            readUInt32(envelope.payload, 48),
-            readUInt32(envelope.payload, 52),
-        };
+        DirectTradeCommand trade;
+        trade.action = static_cast<DirectTradeAction>(envelope.payload[28]);
+        trade.tradeId = readUInt64(envelope.payload, 32);
+        trade.revision = readUInt64(envelope.payload, 40);
+        trade.otherPlayerId.value = readUInt32(envelope.payload, 48);
+        trade.otherActorId.value = readUInt32(envelope.payload, 52);
+        trade.offer.caps = readUInt32(envelope.payload, 56);
+        std::size_t offset = kDirectTradeCommandBaseSize;
+        for (std::uint16_t index = 0; index < itemCount; index++) {
+            trade.offer.items.push_back(DirectTradeItemOffer {
+                EntityId { readUInt32(envelope.payload, offset) },
+                readUInt32(envelope.payload, offset + 4),
+            });
+            offset += kDirectTradeItemSize;
+        }
+        result.command.payload = std::move(trade);
         break;
+    }
     case CommandType::ItemDrop:
         if (envelope.payload.size() != kItemDropCommandSize) {
             result.error = GameplayWireError::InvalidLength;
@@ -1377,6 +1492,47 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
         appendUInt32(envelope.payload, transfer->sourceQuantity);
         appendUInt32(envelope.payload, transfer->remainderItemId.value);
         appendItemDescriptor(envelope.payload, transfer->itemDescriptor);
+    } else if (const auto* distribution = std::get_if<CapsDistributedEvent>(&event.payload)) {
+        appendEventHeader(event, EventType::CapsDistributed, envelope.payload);
+        appendUInt32(envelope.payload, distribution->actorId.value);
+        appendUInt32(envelope.payload, distribution->sourceId.value);
+        appendUInt32(envelope.payload, distribution->caps);
+        appendUInt16(envelope.payload,
+            static_cast<std::uint16_t>(distribution->shares.size()));
+        appendUInt16(envelope.payload, 0);
+        for (const PlayerCapShare& share : distribution->shares) {
+            appendUInt32(envelope.payload, share.playerId.value);
+            appendUInt32(envelope.payload, share.actorId.value);
+            appendUInt32(envelope.payload, share.caps);
+        }
+    } else if (const auto* trade = std::get_if<DirectTradeStateChangedEvent>(&event.payload)) {
+        appendEventHeader(event, EventType::DirectTradeStateChanged,
+            envelope.payload);
+        appendUInt32(envelope.payload, trade->actorId.value);
+        envelope.payload.push_back(static_cast<std::uint8_t>(trade->state.status));
+        envelope.payload.push_back(static_cast<std::uint8_t>(trade->phase));
+        envelope.payload.push_back(trade->inventoryChanged ? 1 : 0);
+        envelope.payload.push_back(0);
+        appendUInt32(envelope.payload, trade->phaseRevision);
+        appendUInt64(envelope.payload, trade->state.tradeId);
+        appendUInt64(envelope.payload, trade->state.revision);
+        appendUInt16(envelope.payload,
+            static_cast<std::uint16_t>(trade->state.participants.size()));
+        appendUInt16(envelope.payload, 0);
+        for (const DirectTradeParticipant& participant : trade->state.participants) {
+            appendUInt32(envelope.payload, participant.playerId.value);
+            appendUInt32(envelope.payload, participant.actorId.value);
+            appendUInt64(envelope.payload,
+                participant.confirmedRevision.value_or(0));
+            appendUInt32(envelope.payload, participant.offer.caps);
+            appendUInt16(envelope.payload,
+                static_cast<std::uint16_t>(participant.offer.items.size()));
+            appendUInt16(envelope.payload, 0);
+            for (const DirectTradeItemOffer& item : participant.offer.items) {
+                appendUInt32(envelope.payload, item.itemId.value);
+                appendUInt32(envelope.payload, item.quantity);
+            }
+        }
     } else if (const auto* drop = std::get_if<ItemDroppedEvent>(&event.payload)) {
         appendEventHeader(event, EventType::ItemDropped, envelope.payload);
         appendUInt32(envelope.payload, drop->actorId.value);
@@ -1431,25 +1587,6 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
         appendInt32(envelope.payload, activity->entry.value);
         envelope.payload.insert(envelope.payload.end(), activity->entry.sourceName.begin(), activity->entry.sourceName.end());
         envelope.payload.insert(envelope.payload.end(), activity->entry.text.begin(), activity->entry.text.end());
-    } else if (const auto* trade = std::get_if<DirectTradeStateChangedEvent>(&event.payload)) {
-        appendEventHeader(event, EventType::DirectTradeStateChanged, envelope.payload);
-        appendUInt32(envelope.payload, trade->actorId.value);
-        envelope.payload.push_back(trade->committed ? 1 : 0);
-        envelope.payload.push_back(trade->cancelled ? 1 : 0);
-        envelope.payload.push_back(static_cast<std::uint8_t>(trade->state.offers.size()));
-        envelope.payload.push_back(0);
-        appendUInt64(envelope.payload, trade->state.revision);
-        for (const DirectTradeOffer& offer : trade->state.offers) {
-            appendUInt32(envelope.payload, offer.playerId.value);
-            appendUInt32(envelope.payload, offer.caps);
-            envelope.payload.push_back(offer.confirmed ? 1 : 0);
-            envelope.payload.push_back(static_cast<std::uint8_t>(offer.items.size()));
-            appendUInt16(envelope.payload, 0);
-            for (const DirectTradeLine& line : offer.items) {
-                appendUInt32(envelope.payload, line.itemId.value);
-                appendUInt32(envelope.payload, line.quantity);
-            }
-        }
     } else if (const auto* route = std::get_if<WorldMapRouteSelectedEvent>(&event.payload)) {
         appendEventHeader(event, EventType::WorldMapRouteSelected, envelope.payload);
         appendUInt32(envelope.payload, route->actorId.value);
@@ -1705,6 +1842,93 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
             readItemDescriptor(envelope.payload, 48),
         };
         break;
+    case EventType::CapsDistributed: {
+        if (envelope.payload.size() < kCapsDistributedEventBaseSize
+            || readUInt16(envelope.payload, 34) != 0) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        std::uint16_t shareCount = readUInt16(envelope.payload, 32);
+        if (shareCount < 2 || shareCount > kMaximumTransitionPlayers
+            || envelope.payload.size() != kCapsDistributedEventBaseSize
+                + static_cast<std::size_t>(shareCount) * kCapShareSize) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        CapsDistributedEvent distribution;
+        distribution.actorId = EntityId { readUInt32(envelope.payload, 20) };
+        distribution.sourceId = EntityId { readUInt32(envelope.payload, 24) };
+        distribution.caps = readUInt32(envelope.payload, 28);
+        std::size_t offset = kCapsDistributedEventBaseSize;
+        distribution.shares.reserve(shareCount);
+        for (std::uint16_t index = 0; index < shareCount; index++) {
+            distribution.shares.push_back(PlayerCapShare {
+                PlayerId { readUInt32(envelope.payload, offset) },
+                EntityId { readUInt32(envelope.payload, offset + 4) },
+                readUInt32(envelope.payload, offset + 8),
+            });
+            offset += kCapShareSize;
+        }
+        result.event.payload = std::move(distribution);
+        break;
+    }
+    case EventType::DirectTradeStateChanged: {
+        if (envelope.payload.size() < kDirectTradeEventBaseSize
+            || envelope.payload[27] != 0
+            || readUInt16(envelope.payload, 48) != 2
+            || readUInt16(envelope.payload, 50) != 0
+            || envelope.payload[26] > 1) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        DirectTradeStateChangedEvent trade;
+        trade.actorId.value = readUInt32(envelope.payload, 20);
+        trade.state.status = static_cast<DirectTradeStatus>(
+            envelope.payload[24]);
+        trade.phase = static_cast<SessionPhase>(envelope.payload[25]);
+        trade.inventoryChanged = envelope.payload[26] != 0;
+        trade.phaseRevision = readUInt32(envelope.payload, 28);
+        trade.state.tradeId = readUInt64(envelope.payload, 32);
+        trade.state.revision = readUInt64(envelope.payload, 40);
+        std::size_t offset = kDirectTradeEventBaseSize;
+        for (DirectTradeParticipant& participant : trade.state.participants) {
+            if (offset + kDirectTradeParticipantSize > envelope.payload.size()) {
+                result.error = GameplayWireError::InvalidLength;
+                return result;
+            }
+            participant.playerId.value = readUInt32(envelope.payload, offset);
+            participant.actorId.value = readUInt32(envelope.payload, offset + 4);
+            std::uint64_t confirmation = readUInt64(envelope.payload,
+                offset + 8);
+            if (confirmation != 0) participant.confirmedRevision = confirmation;
+            participant.offer.caps = readUInt32(envelope.payload, offset + 16);
+            std::uint16_t itemCount = readUInt16(envelope.payload, offset + 20);
+            if (itemCount > kMaximumDirectTradeItemsPerPlayer
+                || readUInt16(envelope.payload, offset + 22) != 0) {
+                result.error = GameplayWireError::InvalidLength;
+                return result;
+            }
+            offset += kDirectTradeParticipantSize;
+            if (offset + static_cast<std::size_t>(itemCount)
+                    * kDirectTradeItemSize > envelope.payload.size()) {
+                result.error = GameplayWireError::InvalidLength;
+                return result;
+            }
+            for (std::uint16_t index = 0; index < itemCount; index++) {
+                participant.offer.items.push_back(DirectTradeItemOffer {
+                    EntityId { readUInt32(envelope.payload, offset) },
+                    readUInt32(envelope.payload, offset + 4),
+                });
+                offset += kDirectTradeItemSize;
+            }
+        }
+        if (offset != envelope.payload.size()) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.event.payload = std::move(trade);
+        break;
+    }
     case EventType::ItemDropped:
         if (envelope.payload.size() != kItemDropEventSize) {
             result.error = GameplayWireError::InvalidLength;
@@ -2104,59 +2328,6 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
         result.event.payload = std::move(activity);
         break;
     }
-    case EventType::DirectTradeStateChanged: {
-        if (envelope.payload.size() < 36 || envelope.payload[24] > 1
-            || envelope.payload[25] > 1 || envelope.payload[27] != 0) {
-            result.error = GameplayWireError::InvalidLength;
-            return result;
-        }
-        DirectTradeStateChangedEvent trade;
-        trade.actorId.value = readUInt32(envelope.payload, 20);
-        trade.committed = envelope.payload[24] != 0;
-        trade.cancelled = envelope.payload[25] != 0;
-        std::uint8_t count = envelope.payload[26];
-        trade.state.revision = readUInt64(envelope.payload, 28);
-        if (count != 0 && count != 2) {
-            result.error = GameplayWireError::InvalidLength;
-            return result;
-        }
-        std::size_t offset = 36;
-        for (std::uint8_t index = 0; index < count; index++) {
-            if (offset + 12 > envelope.payload.size()) {
-                result.error = GameplayWireError::InvalidLength;
-                return result;
-            }
-            DirectTradeOffer offer;
-            offer.playerId.value = readUInt32(envelope.payload, offset);
-            offer.caps = readUInt32(envelope.payload, offset + 4);
-            if (envelope.payload[offset + 8] > 1
-                || envelope.payload[offset + 9] > kMaximumDirectTradeLines
-                || readUInt16(envelope.payload, offset + 10) != 0) {
-                result.error = GameplayWireError::InvalidReservedField;
-                return result;
-            }
-            offer.confirmed = envelope.payload[offset + 8] != 0;
-            std::uint8_t lineCount = envelope.payload[offset + 9];
-            offset += 12;
-            if (offset + static_cast<std::size_t>(lineCount) * 8 > envelope.payload.size()) {
-                result.error = GameplayWireError::InvalidLength;
-                return result;
-            }
-            for (std::uint8_t line = 0; line < lineCount; line++) {
-                offer.items.push_back(DirectTradeLine {
-                    EntityId { readUInt32(envelope.payload, offset) },
-                    readUInt32(envelope.payload, offset + 4) });
-                offset += 8;
-            }
-            trade.state.offers.push_back(std::move(offer));
-        }
-        if (offset != envelope.payload.size()) {
-            result.error = GameplayWireError::InvalidLength;
-            return result;
-        }
-        result.event.payload = std::move(trade);
-        break;
-    }
     default:
         result.error = GameplayWireError::UnknownPayloadType;
         return result;
@@ -2209,6 +2380,8 @@ const char* gameplayWireErrorMessage(GameplayWireError error)
         return "invalid combat turn payload";
     case GameplayWireError::InvalidModal:
         return "invalid shared modal payload";
+    case GameplayWireError::InvalidTrade:
+        return "invalid direct trade payload";
     case GameplayWireError::InvalidQuantity:
         return "invalid inventory quantity";
     case GameplayWireError::InvalidStatus:

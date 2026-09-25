@@ -15,7 +15,7 @@ namespace {
 constexpr std::size_t kLobbyHeaderSize = 4;
 constexpr std::size_t kChatHeaderSize = 6;
 constexpr std::size_t kMaxQueuedChatMessages = 32;
-constexpr std::uint16_t kRecoveryWireVersion = 2;
+constexpr std::uint16_t kRecoveryWireVersion = 3;
 constexpr std::size_t kRecoveryHeaderSize = 4;
 
 enum class RecoveryMessageType : std::uint8_t {
@@ -23,6 +23,7 @@ enum class RecoveryMessageType : std::uint8_t {
     Snapshot = 2,
     Complete = 3,
     Applied = 4,
+    EndingApplied = 5,
 };
 
 void appendUInt16(std::vector<std::uint8_t>& bytes, std::uint16_t value)
@@ -110,6 +111,8 @@ bool isSupportedLiveEvent(const GameEventPayload& payload)
         || std::holds_alternative<SceneryTransitionedEvent>(payload)
         || std::holds_alternative<RestStateChangedEvent>(payload)
         || std::holds_alternative<InventoryTransferredEvent>(payload)
+        || std::holds_alternative<CapsDistributedEvent>(payload)
+        || std::holds_alternative<DirectTradeStateChangedEvent>(payload)
         || std::holds_alternative<ItemDroppedEvent>(payload)
         || std::holds_alternative<AttackStartedEvent>(payload)
         || std::holds_alternative<CombatTurnStateChangedEvent>(payload)
@@ -142,6 +145,7 @@ bool NetworkLobby::start(NetworkLaunchMode mode, SessionId sessionId, std::uniqu
     _nextEventSequence = 1;
     _nextExpectedEventSequence = 1;
     _lastAppliedEventSequence = {};
+    _acknowledgedEndingPhaseRevision = 0;
     _acknowledgedEvents.clear();
     _pendingCommandSequences.clear();
     _recoveryRequests.clear();
@@ -153,6 +157,7 @@ bool NetworkLobby::start(NetworkLaunchMode mode, SessionId sessionId, std::uniqu
     _authoritativeStates.clear();
     _recovering = false;
     _eventJournal.clear();
+    _diagnostics.reset();
 
     if ((mode != NetworkLaunchMode::Host && mode != NetworkLaunchMode::Join)
         || sessionId.value == 0
@@ -371,6 +376,17 @@ bool NetworkLobby::sendLocalDialogueVote(std::uint64_t revision,
         SessionPhase::Dialogue);
 }
 
+bool NetworkLobby::sendLocalDirectTrade(const DirectTradeCommand& trade,
+    std::uint32_t phaseRevision)
+{
+    if (_mode != NetworkLaunchMode::Join) return false;
+    return sendLocalAction(DirectTradeStateChangedEvent {}, trade,
+        phaseRevision,
+        trade.action == DirectTradeAction::Begin
+            ? SessionPhase::Exploration
+            : SessionPhase::Dialogue);
+}
+
 bool NetworkLobby::sendLocalSharedModal(SharedModalKind kind, bool open, SessionPhase currentPhase, std::uint32_t phaseRevision)
 {
     PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
@@ -408,14 +424,6 @@ bool NetworkLobby::sendLocalInventoryTransfer(EntityId sourceId,
         InventoryTransferredEvent { actorId, sourceId, destinationId, itemId, quantity, sourceQuantity, remainderItemId, itemDescriptor },
         InventoryTransferCommand { sourceId, destinationId, itemId, quantity, sourceQuantity, itemDescriptor },
         phaseRevision);
-}
-
-bool NetworkLobby::sendLocalDirectTrade(const DirectTradeCommand& command,
-    std::uint32_t phaseRevision)
-{
-    PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
-    return sendLocalAction(DirectTradeStateChangedEvent { EntityId { playerId.value }, {} },
-        command, phaseRevision);
 }
 
 bool NetworkLobby::sendLocalItemDrop(EntityId sourceId,
@@ -618,6 +626,7 @@ bool NetworkLobby::sendGameplayEnvelope(ProtocolEnvelope envelope)
         }
         return false;
     }
+    _diagnostics.recordEnvelope(ProtocolDiagnosticDirection::Sent, envelope);
     return true;
 }
 
@@ -764,6 +773,11 @@ bool NetworkLobby::sendRecovery(EventSequence lastApplied, const WorldSnapshot& 
             || !sendRecoveryMessage(static_cast<std::uint8_t>(RecoveryMessageType::Snapshot), encodedSnapshot)) {
             return false;
         }
+        SnapshotDigestResult digest = computeSnapshotDigest(snapshot);
+        if (digest) {
+            _diagnostics.recordStateChecksum(ProtocolDiagnosticDirection::ChecksumSent,
+                snapshot.lastIncludedEvent, digest.digest);
+        }
     } else if (replay.status == EventReplayStatus::Available) {
         for (const GameEvent& event : replay.events) {
             ProtocolEnvelope envelope;
@@ -808,6 +822,11 @@ bool NetworkLobby::sendAuthoritativeState(const WorldSnapshot& snapshot)
     envelope.sessionId = _sessionId;
     envelope.sequence = _nextSendSequence++;
     envelope.payload = std::move(payload);
+    SnapshotDigestResult digest = computeSnapshotDigest(snapshot);
+    if (digest) {
+        _diagnostics.recordStateChecksum(ProtocolDiagnosticDirection::ChecksumSent,
+            snapshot.lastIncludedEvent, digest.digest);
+    }
     return sendGameplayEnvelope(std::move(envelope));
 }
 
@@ -819,6 +838,25 @@ std::optional<WorldSnapshot> NetworkLobby::takeAuthoritativeState()
     WorldSnapshot snapshot = std::move(_authoritativeStates.front());
     _authoritativeStates.pop_front();
     return snapshot;
+}
+
+bool NetworkLobby::confirmSessionEndingApplied(std::uint32_t phaseRevision)
+{
+    if (_mode != NetworkLaunchMode::Join
+        || _state != NetworkLobbyState::Ready
+        || !_startRequested
+        || phaseRevision == 0) {
+        return false;
+    }
+    std::vector<std::uint8_t> body;
+    appendUInt32(body, phaseRevision);
+    return sendRecoveryMessage(
+        static_cast<std::uint8_t>(RecoveryMessageType::EndingApplied), body);
+}
+
+std::uint32_t NetworkLobby::acknowledgedEndingPhaseRevision() const
+{
+    return _acknowledgedEndingPhaseRevision;
 }
 
 EventSequence NetworkLobby::latestAuthoritativeEvent() const
@@ -1065,6 +1103,11 @@ std::uint64_t NetworkLobby::nextReceiveSequence() const
     return _nextReceiveSequence;
 }
 
+const ProtocolDiagnostics& NetworkLobby::diagnostics() const
+{
+    return _diagnostics;
+}
+
 std::unique_ptr<Transport> NetworkLobby::takeTransport()
 {
     if (_state != NetworkLobbyState::Ready) {
@@ -1093,6 +1136,7 @@ bool NetworkLobby::sendMessage(MessageType type, const std::vector<std::uint8_t>
         fail(NetworkLobbyError::SendFailed);
         return false;
     }
+    _diagnostics.recordEnvelope(ProtocolDiagnosticDirection::Sent, envelope);
     return true;
 }
 
@@ -1112,12 +1156,18 @@ bool NetworkLobby::sendRecoveryMessage(std::uint8_t type, const std::vector<std:
 void NetworkLobby::handlePacket(const Packet& packet)
 {
     ProtocolDecodeResult decoded = decodeEnvelope(packet);
-    if (!decoded
-        || decoded.envelope.sessionId != _sessionId
-        || decoded.envelope.sequence != _nextReceiveSequence) {
+    if (!decoded) {
+        _diagnostics.recordRejected(decoded.error, packet.size());
         fail(NetworkLobbyError::ProtocolError);
         return;
     }
+    if (decoded.envelope.sessionId != _sessionId
+        || decoded.envelope.sequence != _nextReceiveSequence) {
+        _diagnostics.recordRejected(ProtocolError::None, packet.size());
+        fail(NetworkLobbyError::ProtocolError);
+        return;
+    }
+    _diagnostics.recordEnvelope(ProtocolDiagnosticDirection::Received, decoded.envelope);
     _nextReceiveSequence++;
 
     if (decoded.envelope.kind == MessageKind::Snapshot) {
@@ -1158,6 +1208,20 @@ void NetworkLobby::handlePacket(const Packet& packet)
             _acknowledgedEvents[kGuestPlayerId] = applied;
             return;
         }
+        if (type == RecoveryMessageType::EndingApplied) {
+            if (_mode != NetworkLaunchMode::Host || body.size() != sizeof(std::uint32_t)) {
+                fail(NetworkLobbyError::UnexpectedMessage);
+                return;
+            }
+            std::uint32_t phaseRevision = readUInt32(body, 0);
+            if (phaseRevision == 0
+                || phaseRevision < _acknowledgedEndingPhaseRevision) {
+                fail(NetworkLobbyError::ProtocolError);
+                return;
+            }
+            _acknowledgedEndingPhaseRevision = phaseRevision;
+            return;
+        }
         if (type == RecoveryMessageType::Snapshot) {
             if (_mode != NetworkLaunchMode::Join || !_recovering) {
                 fail(NetworkLobbyError::UnexpectedMessage);
@@ -1173,6 +1237,11 @@ void NetworkLobby::handlePacket(const Packet& packet)
                 return;
             }
             _nextExpectedEventSequence = snapshot.snapshot.lastIncludedEvent.value + 1;
+            SnapshotDigestResult digest = computeSnapshotDigest(snapshot.snapshot);
+            if (digest) {
+                _diagnostics.recordStateChecksum(ProtocolDiagnosticDirection::ChecksumReceived,
+                    snapshot.snapshot.lastIncludedEvent, digest.digest);
+            }
             _peerSnapshots.push_back(std::move(snapshot.snapshot));
             return;
         }
@@ -1206,6 +1275,11 @@ void NetworkLobby::handlePacket(const Packet& packet)
         }
         if (_authoritativeStates.size() >= 2) {
             _authoritativeStates.pop_front();
+        }
+        SnapshotDigestResult digest = computeSnapshotDigest(state.snapshot);
+        if (digest) {
+            _diagnostics.recordStateChecksum(ProtocolDiagnosticDirection::ChecksumReceived,
+                state.snapshot.lastIncludedEvent, digest.digest);
         }
         _authoritativeStates.push_back(std::move(state.snapshot));
         return;

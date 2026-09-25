@@ -27,7 +27,9 @@ typedef enum MainMenuButton {
     MAIN_MENU_BUTTON_INTRO,
     MAIN_MENU_BUTTON_NEW_GAME,
     MAIN_MENU_BUTTON_LOAD_GAME,
+#if FALLOUT_ENABLE_MULTIPLAYER
     MAIN_MENU_BUTTON_MULTIPLAYER,
+#endif
     MAIN_MENU_BUTTON_CREDITS,
     MAIN_MENU_BUTTON_EXIT,
     MAIN_MENU_BUTTON_COUNT,
@@ -66,7 +68,9 @@ static int button_values[MAIN_MENU_BUTTON_COUNT] = {
     KEY_LOWERCASE_I,
     KEY_LOWERCASE_N,
     KEY_LOWERCASE_L,
+#if FALLOUT_ENABLE_MULTIPLAYER
     KEY_LOWERCASE_M,
+#endif
     KEY_LOWERCASE_C,
     KEY_LOWERCASE_E,
 };
@@ -76,7 +80,9 @@ static int return_values[MAIN_MENU_BUTTON_COUNT] = {
     MAIN_MENU_INTRO,
     MAIN_MENU_NEW_GAME,
     MAIN_MENU_LOAD_GAME,
+#if FALLOUT_ENABLE_MULTIPLAYER
     MAIN_MENU_MULTIPLAYER,
+#endif
     MAIN_MENU_CREDITS,
     MAIN_MENU_EXIT,
 };
@@ -202,6 +208,7 @@ int main_menu_create()
 
     for (int index = 0; index < MAIN_MENU_BUTTON_COUNT; index++) {
         const char* label = NULL;
+#if FALLOUT_ENABLE_MULTIPLAYER
         if (index == MAIN_MENU_BUTTON_MULTIPLAYER) {
             label = "MULTIPLAYER";
         } else {
@@ -210,6 +217,12 @@ int main_menu_create()
                 label = msg.text;
             }
         }
+#else
+        msg.num = 9 + index;
+        if (message_search(&misc_message_file, &msg)) {
+            label = msg.text;
+        }
+#endif
         if (label != NULL) {
             len = text_width(label);
             text_to_buf(main_window_buf + MAIN_MENU_WINDOW_WIDTH * (42 * index - index + 46) + 520 - (len / 2),

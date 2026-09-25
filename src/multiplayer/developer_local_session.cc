@@ -509,12 +509,17 @@ void developerLocalSessionConfigure(int argc, char** argv)
     pendingLoadedSave.reset();
     discardPendingGuestObject();
     discardPreservedGuestInventory();
+#if FALLOUT_ENABLE_MULTIPLAYER
     for (int index = 1; index < argc; index++) {
         if (std::strcmp(argv[index], "--multiplayer-dev") == 0) {
             enabled = true;
             break;
         }
     }
+#else
+    (void)argc;
+    (void)argv;
+#endif
 }
 
 bool developerLocalSessionIsEnabled()
@@ -578,10 +583,12 @@ MultiplayerSaveError developerLocalSessionCaptureSave(std::uint64_t generation,
 
 bool developerLocalSessionStageLoadedSave(const MultiplayerSaveSidecar& sidecar)
 {
-    const SavedPlayerCharacter* guest = findSavedPlayer(sidecar, kGuestPlayerId);
+    const SavedPlayerCharacter* guest = nullptr;
+    for (const SavedPlayerCharacter& player : sidecar.players) {
+        if (player.playerId == kGuestPlayerId) guest = &player;
+    }
     if (!enabled
         || validateMultiplayerSave(sidecar) != MultiplayerSaveError::None
-        || sidecar.players.size() != 2
         || guest == nullptr
         || (!guest->objectData.empty() && pendingLoadedGuestObject == nullptr)) {
         return false;

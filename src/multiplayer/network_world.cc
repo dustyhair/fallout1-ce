@@ -47,7 +47,7 @@
 #include "multiplayer/direct_trade_controller.h"
 #include "multiplayer/local_player_context.h"
 #include "multiplayer/local_session.h"
-#include "multiplayer/loot_policy.h"
+#include "multiplayer/loot_distribution_controller.h"
 #include "multiplayer/presentation_bridge.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/input.h"
@@ -83,8 +83,8 @@ struct PendingPickup {
 std::unordered_map<EntityId, PendingPickup, EntityIdHash> pendingPickups;
 std::deque<GameEvent> deferredEvents;
 DialogueVoteController dialogueVotes;
-DirectTradeController tradeController;
-LootPolicy lootPolicy;
+DirectTradeController directTradeController;
+LootDistributionController lootDistribution;
 std::optional<DialoguePresentationEvent> dialoguePresentation;
 struct PendingTalk {
     EntityId actorId;
@@ -99,11 +99,6 @@ std::uint64_t nextSharedActivityId = 1;
 std::uint32_t observedFirstVisits = 0;
 
 std::unordered_map<Object*, Object*> activeLootTargets;
-struct PendingLootPriority {
-    Object* target = nullptr;
-    std::chrono::steady_clock::time_point expiresAt;
-};
-std::optional<PendingLootPriority> pendingLootPriority;
 struct ActiveSharedModal {
     EntityId actorId;
     SharedModalKind kind = SharedModalKind::Dialogue;
@@ -173,29 +168,6 @@ struct PendingRestProposal {
     std::unordered_set<PlayerId, PlayerIdHash> readyPlayers;
 };
 std::optional<PendingRestProposal> pendingRestProposal;
-
-struct PreparedTradeMove {
-    Object* source = nullptr;
-    Object* destination = nullptr;
-    Object* item = nullptr;
-    Object* remainder = nullptr;
-    int quantity = 0;
-};
-
-bool reserveTradeInventory(Object* actor, std::size_t incoming)
-{
-    Inventory& inventory = actor->data.inventory;
-    if (incoming > static_cast<std::size_t>(std::numeric_limits<int>::max() - inventory.length)) return false;
-    int needed = inventory.length + static_cast<int>(incoming);
-    if (inventory.items != nullptr && inventory.capacity >= needed) return true;
-    int capacity = std::max(needed, inventory.capacity + 10);
-    auto* items = static_cast<InventoryItem*>(mem_realloc(inventory.items,
-        sizeof(InventoryItem) * static_cast<std::size_t>(capacity)));
-    if (items == nullptr) return false;
-    inventory.items = items;
-    inventory.capacity = capacity;
-    return true;
-}
 
 bool allConnectedPlayersReady(const std::unordered_set<PlayerId, PlayerIdHash>& readyPlayers)
 {
@@ -1032,10 +1004,10 @@ void attachInventory(Object* actor, Inventory& inventory)
     }
 }
 
-bool loadSharedMap(int map)
+bool loadSharedMap(int map, bool snapshotRecovery = false)
 {
     if (!session.isActive()
-        || session.phase() != SessionPhase::Transition
+        || (!snapshotRecovery && session.phase() != SessionPhase::Transition)
         || peerActor == nullptr
         || map < 0) {
         return false;
@@ -1063,7 +1035,6 @@ bool loadSharedMap(int map)
     dialogueCause = {};
     nextDialogueRevision = 1;
     activeLootTargets.clear();
-    pendingLootPriority.reset();
     activeSharedModal.reset();
     approvedWorldMapProposerActorId = {};
     approvedWorldMapProposalSequence = {};
@@ -1269,233 +1240,108 @@ bool advanceSharedRest(int minutes, bool untilHealed)
     return interrupted || (untilHealed && !sharedPlayersHealed());
 }
 
-bool commitDirectTrade(const DirectTradeState& state)
+bool validateDirectTradePlan(const DirectTradeCommitPlan& plan)
 {
-    if (!isValidDirectTradeState(state) || !isAdjacentPlayerActor(
-            session.entities().findObject(session.playerActorId(state.offers[0].playerId)),
-            session.entities().findObject(session.playerActorId(state.offers[1].playerId)))) {
-        return false;
-    }
-    std::vector<PreparedTradeMove> moves;
-    for (std::size_t side = 0; side < 2; side++) {
-        const DirectTradeOffer& offer = state.offers[side];
-        Object* source = session.entities().findObject(session.playerActorId(offer.playerId));
+    for (const DirectTradeLeg& leg : plan.legs) {
+        Object* source = session.entities().findObject(leg.sourceActorId);
         Object* destination = session.entities().findObject(
-            session.playerActorId(state.offers[1 - side].playerId));
-        if (source == nullptr || destination == nullptr) return false;
-        for (const DirectTradeLine& line : offer.items) {
-            Object* item = session.entities().findObject(line.itemId);
-            if (item == nullptr || item->owner != source || item->pid == PROTO_ID_MONEY
+            leg.destinationActorId);
+        if (source == nullptr || destination == nullptr
+            || session.playerActorId(leg.sourcePlayerId) != leg.sourceActorId
+            || session.playerActorId(leg.destinationPlayerId)
+                != leg.destinationActorId
+            || !isAdjacentPlayerActor(source, destination)
+            || leg.offer.caps
+                > static_cast<std::uint32_t>(item_caps_total(source))) {
+            return false;
+        }
+        for (const DirectTradeItemOffer& offered : leg.offer.items) {
+            Object* item = session.entities().findObject(offered.itemId);
+            if (item == nullptr || item->owner != source
+                || item->pid == PROTO_ID_MONEY
                 || (item->flags & (OBJECT_EQUIPPED | OBJECT_USED)) != 0
-                || item_count(source, item) != static_cast<int>(line.quantity)) return false;
-            moves.push_back({ source, destination, item, nullptr,
-                static_cast<int>(line.quantity) });
-        }
-        if (offer.caps != 0) {
-            Object* capStack = nullptr;
-            for (int index = 0; index < source->data.inventory.length; index++) {
-                const InventoryItem& inventoryItem = source->data.inventory.items[index];
-                if (inventoryItem.item->pid == PROTO_ID_MONEY
-                    && inventoryItem.quantity >= static_cast<int>(offer.caps)) {
-                    capStack = inventoryItem.item;
-                    break;
-                }
+                || item_count(source, item) < static_cast<int>(offered.quantity)) {
+                return false;
             }
-            if (capStack == nullptr) return false;
-            moves.push_back({ source, destination, capStack, nullptr,
-                static_cast<int>(offer.caps) });
         }
     }
-    // Allocate every object and inventory slot before the first mutation. Whole
-    // stacks can then move without a failing allocation midway through trade.
-    auto discardClones = [&moves]() {
-        for (PreparedTradeMove& move : moves) {
-            if (move.remainder != nullptr) obj_erase_object(move.remainder, nullptr);
-            move.remainder = nullptr;
-        }
-    };
-    for (PreparedTradeMove& move : moves) {
-        if (move.item->pid != PROTO_ID_MONEY
-            || item_count(move.source, move.item) == move.quantity) continue;
-        if (obj_copy(&move.remainder, move.item) != 0 || move.remainder == nullptr) {
-            discardClones();
-            return false;
-        }
-        obj_disconnect(move.remainder, nullptr);
-    }
-    std::size_t incoming[2] = { 0, 0 };
-    for (const PreparedTradeMove& move : moves) {
-        incoming[move.destination == session.entities().findObject(
-            session.playerActorId(state.offers[0].playerId)) ? 0 : 1]++;
-    }
-    for (std::size_t side = 0; side < 2; side++) {
-        Object* actor = session.entities().findObject(session.playerActorId(state.offers[side].playerId));
-        if (!reserveTradeInventory(actor, incoming[side])) {
-            discardClones();
-            return false;
-        }
-    }
-    // Checkpoints enumerate tracked items. An offered stack may already have
-    // an entity ID without being in that list (notably starting inventory).
-    for (const PreparedTradeMove& move : moves) {
-        std::optional<EntityId> id = session.entities().findEntity(move.item);
-        if (id.has_value()) {
-            trackWorldItem(*id, move.item);
-        } else if (!registerItem(move.item)) {
-            discardClones();
-            return false;
-        }
-    }
-    inventoryTransferInProgress = true;
-    // Remove both offers before adding either one. Receiving a stack can merge
-    // with (and erase) a stack that the other player is still offering.
-    for (PreparedTradeMove& move : moves) {
-        if (move.remainder != nullptr) {
-            Inventory& inventory = move.source->data.inventory;
-            for (int index = 0; index < inventory.length; index++) {
-                if (inventory.items[index].item != move.item) continue;
-                inventory.items[index].item = move.remainder;
-                inventory.items[index].quantity -= move.quantity;
-                move.remainder->owner = move.source;
-                move.item->owner = nullptr;
-                networkWorldHandleItemSplit(move.item, move.remainder);
-                move.remainder = nullptr;
-                break;
-            }
-        } else {
-            item_remove_mult(move.source, move.item, move.quantity);
-        }
-    }
-    for (const PreparedTradeMove& move : moves) {
-        item_add_force(move.destination, move.item, move.quantity);
-    }
-    inventoryTransferInProgress = false;
-    inven_refresh_inventory_window();
-    intface_redraw();
     return true;
 }
 
-struct LootCapSplitResult {
-    InventoryTransferredEvent first;
-    std::optional<InventoryTransferredEvent> second;
-};
-
-std::optional<LootCapSplitResult> splitLootCaps(Object* actor, Object* source,
-    Object* money, const InventoryTransferCommand& command, EntityId moneyId)
+bool registerUntrackedInventory(Object* owner)
 {
-    if (actor == nullptr || source == nullptr || money == nullptr
-        || money->owner != source || money->pid != PROTO_ID_MONEY
-        || item_count(source, money) != static_cast<int>(command.sourceQuantity)
-        || command.quantity == 0 || command.quantity > command.sourceQuantity) return std::nullopt;
-    Inventory& inventory = source->data.inventory;
-    int sourceIndex = -1;
-    for (int index = 0; index < inventory.length; index++) {
-        if (inventory.items[index].item == money) sourceIndex = index;
+    if (owner == nullptr) return false;
+    Inventory* inventory = &owner->data.inventory;
+    for (int index = 0; index < inventory->length; index++) {
+        Object* item = inventory->items[index].item;
+        if (!session.entities().findEntity(item).has_value()
+            && !registerItem(item)) return false;
+        if (!registerUntrackedInventory(item)) return false;
     }
-    if (sourceIndex < 0) return std::nullopt;
+    return true;
+}
 
-    std::vector<LootCapShare> shares = lootPolicy.splitCaps(command.quantity);
-    std::vector<LootCapShare> nonzero;
-    for (const LootCapShare& share : shares) {
-        if (share.quantity != 0) nonzero.push_back(share);
-    }
-    if (nonzero.empty() || nonzero.size() > 2) return std::nullopt;
-    Object* firstDestination = session.entities().findObject(
-        session.playerActorId(nonzero[0].playerId));
-    Object* secondDestination = nonzero.size() == 2
-        ? session.entities().findObject(session.playerActorId(nonzero[1].playerId)) : nullptr;
-    if (firstDestination == nullptr || (nonzero.size() == 2 && secondDestination == nullptr)
-        || !reserveTradeInventory(firstDestination, 1)
-        || (secondDestination != nullptr && !reserveTradeInventory(secondDestination, 1))) {
-        return std::nullopt;
-    }
-
-    std::optional<EntityId> registered = session.entities().findEntity(money);
-    if (!registered.has_value()) {
-        EntityRegistrationResult result = registerItem(money);
-        if (!result) return std::nullopt;
-        registered = result.entityId;
-    } else {
-        trackWorldItem(*registered, money);
-    }
-    if (*registered != moneyId) return std::nullopt;
-
-    Object* firstRemainder = nullptr;
-    Object* secondRemainder = nullptr;
-    EntityId firstRemainderId;
-    EntityId secondRemainderId;
-    bool firstPartial = command.sourceQuantity > nonzero[0].quantity;
-    bool secondPartial = nonzero.size() == 2 && command.sourceQuantity > command.quantity;
-    auto stageClone = [&](Object*& clone, EntityId& id) {
-        if (obj_copy(&clone, money) != 0 || clone == nullptr) return false;
-        if (obj_disconnect(clone, nullptr) != 0) {
-            obj_erase_object(clone, nullptr);
-            clone = nullptr;
-            return false;
-        }
-        clone->owner = nullptr;
-        EntityRegistrationResult result = registerItem(clone);
-        if (!result) {
-            obj_erase_object(clone, nullptr);
-            clone = nullptr;
-            return false;
-        }
-        id = result.entityId;
-        return true;
+bool applyDirectTradePlan(const DirectTradeCommitPlan& plan)
+{
+    if (!validateDirectTradePlan(plan)) return false;
+    struct AppliedItem {
+        Object* source = nullptr;
+        Object* destination = nullptr;
+        Object* item = nullptr;
+        std::uint32_t quantity = 0;
     };
-    if ((firstPartial && !stageClone(firstRemainder, firstRemainderId))
-        || (secondPartial && !stageClone(secondRemainder, secondRemainderId))) {
-        if (firstRemainder != nullptr) obj_erase_object(firstRemainder, nullptr);
-        return std::nullopt;
-    }
-    ItemDescriptor descriptor;
-    if (!describeItem(money, descriptor)) {
-        if (firstRemainder != nullptr) obj_erase_object(firstRemainder, nullptr);
-        if (secondRemainder != nullptr) obj_erase_object(secondRemainder, nullptr);
-        return std::nullopt;
+    std::vector<AppliedItem> applied;
+    for (const DirectTradeLeg& leg : plan.legs) {
+        Object* source = session.entities().findObject(leg.sourceActorId);
+        Object* destination = session.entities().findObject(
+            leg.destinationActorId);
+        for (const DirectTradeItemOffer& offered : leg.offer.items) {
+            Object* item = session.entities().findObject(offered.itemId);
+            if (!applyInventoryTransfer(source, destination, item,
+                    offered.quantity, true)) {
+                for (auto rollback = applied.rbegin(); rollback != applied.rend();
+                     ++rollback) {
+                    applyInventoryTransfer(rollback->destination,
+                        rollback->source, rollback->item,
+                        rollback->quantity, true);
+                }
+                return false;
+            }
+            applied.push_back({ source, destination, item, offered.quantity });
+        }
     }
 
-    inventoryTransferInProgress = true;
-    if (firstPartial) {
-        inventory.items[sourceIndex].item = firstRemainder;
-        inventory.items[sourceIndex].quantity -= static_cast<int>(nonzero[0].quantity);
-        firstRemainder->owner = source;
-        money->owner = nullptr;
-    } else {
-        item_remove_mult(source, money, static_cast<int>(nonzero[0].quantity));
+    std::array<int, 2> capDeltas {};
+    capDeltas[0] = static_cast<int>(plan.legs[1].offer.caps)
+        - static_cast<int>(plan.legs[0].offer.caps);
+    capDeltas[1] = -capDeltas[0];
+    std::size_t adjusted = 0;
+    for (; adjusted < plan.legs.size(); adjusted++) {
+        Object* actor = session.entities().findObject(
+            plan.legs[adjusted].sourceActorId);
+        if (capDeltas[adjusted] != 0
+            && item_caps_adjust(actor, capDeltas[adjusted]) != 0) break;
     }
-    item_add_force(firstDestination, money, static_cast<int>(nonzero[0].quantity));
-
-    LootCapSplitResult result;
-    result.first = InventoryTransferredEvent {
-        *session.entities().findEntity(actor), command.sourceId,
-        session.playerActorId(nonzero[0].playerId), moneyId,
-        nonzero[0].quantity, command.sourceQuantity, firstRemainderId, descriptor };
-    if (nonzero.size() == 2) {
-        int remainderIndex = -1;
-        for (int index = 0; index < inventory.length; index++) {
-            if (inventory.items[index].item == firstRemainder) remainderIndex = index;
+    if (adjusted != plan.legs.size()) {
+        while (adjusted > 0) {
+            adjusted--;
+            Object* actor = session.entities().findObject(
+                plan.legs[adjusted].sourceActorId);
+            if (capDeltas[adjusted] != 0) {
+                item_caps_adjust(actor, -capDeltas[adjusted]);
+            }
         }
-        std::uint32_t secondSourceQuantity = command.sourceQuantity - nonzero[0].quantity;
-        if (secondPartial) {
-            inventory.items[remainderIndex].item = secondRemainder;
-            inventory.items[remainderIndex].quantity -= static_cast<int>(nonzero[1].quantity);
-            secondRemainder->owner = source;
-            firstRemainder->owner = nullptr;
-        } else {
-            item_remove_mult(source, firstRemainder, static_cast<int>(nonzero[1].quantity));
+        for (auto rollback = applied.rbegin(); rollback != applied.rend();
+             ++rollback) {
+            applyInventoryTransfer(rollback->destination, rollback->source,
+                rollback->item, rollback->quantity, true);
         }
-        item_add_force(secondDestination, firstRemainder, static_cast<int>(nonzero[1].quantity));
-        result.second = InventoryTransferredEvent {
-            *session.entities().findEntity(actor), command.sourceId,
-            session.playerActorId(nonzero[1].playerId), firstRemainderId,
-            nonzero[1].quantity, secondSourceQuantity, secondRemainderId, descriptor };
+        return false;
     }
-    inventoryTransferInProgress = false;
-    lootPolicy.advanceCaps(command.quantity);
-    inven_refresh_loot_window();
-    inven_refresh_inventory_window();
-    return result;
+    return registerUntrackedInventory(session.entities().findObject(
+               plan.legs[0].sourceActorId))
+        && registerUntrackedInventory(session.entities().findObject(
+            plan.legs[1].sourceActorId));
 }
 
 class NetworkCommandExecutor : public CommandExecutor {
@@ -2156,7 +2002,8 @@ public:
                 execution.interrupted = advanceSharedRest(requestedMinutes,
                     command.minutes == kRestUntilHealed);
                 if (execution.interrupted) {
-                    display_print("Shared rest was interrupted.");
+                    char message[] = "Shared rest was interrupted.";
+                    display_print(message);
                 }
                 if (session.transitionTo(SessionPhase::Exploration) != LocalSessionError::None) {
                     return execution;
@@ -2418,67 +2265,89 @@ public:
         const DirectTradeCommand& command) override
     {
         DirectTradeExecution execution;
-        if (worldMode != NetworkLaunchMode::Host || !session.isActive()
-            || session.phase() != SessionPhase::Exploration || isInCombat()
-            || actor == nullptr || activeSharedModal.has_value()) return execution;
+        if (worldMode != NetworkLaunchMode::Host || actor == nullptr
+            || isInCombat()) return execution;
 
-        if (command.action == DirectTradeAction::Open) {
-            Object* partner = session.entities().findObject(session.playerActorId(command.partnerId));
-            if (command.revision != 0 || partner == nullptr
-                || !isAdjacentPlayerActor(actor, partner)
-                || !tradeController.begin(playerId, command.partnerId)) return execution;
-        } else {
-            if (!tradeController.active() || command.revision != tradeController.state().revision) {
+        DirectTradeResult result = DirectTradeResult::InvalidState;
+        if (command.action == DirectTradeAction::Begin) {
+            Object* other = session.entities().findObject(command.otherActorId);
+            PlayerCharacterState* otherPlayer = session.players().find(
+                command.otherPlayerId);
+            if (directTradeController.active() || activeSharedModal.has_value()
+                || session.phase() != SessionPhase::Exploration
+                || other == nullptr || otherPlayer == nullptr
+                || otherPlayer->actorId != command.otherActorId
+                || !isAdjacentPlayerActor(actor, other)) return execution;
+            result = directTradeController.begin(command.tradeId, playerId,
+                session.entities().findEntity(actor).value_or(EntityId {}),
+                command.otherPlayerId, command.otherActorId);
+            if (result != DirectTradeResult::Accepted
+                || session.transitionTo(SessionPhase::Dialogue)
+                    != LocalSessionError::None) {
+                directTradeController.clear();
                 return execution;
             }
-            const DirectTradeOffer* offer = nullptr;
-            for (const DirectTradeOffer& candidate : tradeController.state().offers) {
-                if (candidate.playerId == playerId) offer = &candidate;
+            activeSharedModal = ActiveSharedModal {
+                session.entities().findEntity(actor).value(),
+                SharedModalKind::Barter,
+            };
+        } else {
+            if (!directTradeController.active()
+                || directTradeController.state().tradeId != command.tradeId
+                || activeSharedModal == std::nullopt
+                || activeSharedModal->kind != SharedModalKind::Barter) {
+                return execution;
             }
-            if (offer == nullptr) return execution;
-            if (command.action == DirectTradeAction::SetCaps) {
-                std::uint32_t directCaps = 0;
-                for (int index = 0; index < actor->data.inventory.length; index++) {
-                    const InventoryItem& entry = actor->data.inventory.items[index];
-                    if (entry.item->pid == PROTO_ID_MONEY && entry.quantity > 0) {
-                        directCaps = std::max(directCaps, static_cast<std::uint32_t>(entry.quantity));
+            if (command.action == DirectTradeAction::SetOffer) {
+                for (const DirectTradeItemOffer& offered
+                    : command.offer.items) {
+                    Object* item = session.entities().findObject(offered.itemId);
+                    if (item == nullptr || item->owner != actor
+                        || item->pid == PROTO_ID_MONEY
+                        || (item->flags & (OBJECT_EQUIPPED | OBJECT_USED)) != 0
+                        || item_count(actor, item)
+                            < static_cast<int>(offered.quantity)) {
+                        return execution;
                     }
                 }
-                if (command.caps > directCaps
-                    || tradeController.replaceOffer(playerId, command.revision,
-                        command.caps, offer->items) != DirectTradeResult::Applied) return execution;
-            } else if (command.action == DirectTradeAction::SetItem) {
-                std::vector<DirectTradeLine> items = offer->items;
-                items.erase(std::remove_if(items.begin(), items.end(), [&](const DirectTradeLine& line) {
-                    return line.itemId == command.itemId;
-                }), items.end());
-                if (command.quantity != 0) {
-                    Object* item = session.entities().findObject(command.itemId);
-                    if (item == nullptr || item->owner != actor || item->pid == PROTO_ID_MONEY
-                        || (item->flags & (OBJECT_EQUIPPED | OBJECT_USED)) != 0
-                        || item_count(actor, item) != static_cast<int>(command.quantity)) return execution;
-                    items.push_back({ command.itemId, command.quantity });
-                }
-                if (tradeController.replaceOffer(playerId, command.revision,
-                        offer->caps, std::move(items)) != DirectTradeResult::Applied) return execution;
-            } else if (command.action == DirectTradeAction::Confirm) {
-                DirectTradeResult result = tradeController.confirm(playerId, command.revision);
-                if (result == DirectTradeResult::ReadyToCommit) {
-                    bool committed = commitDirectTrade(tradeController.state());
-                    tradeController.finishCommit(command.revision, committed);
-                    execution.committed = committed;
-                } else if (result != DirectTradeResult::Applied) {
+                if (command.offer.caps
+                    > static_cast<std::uint32_t>(item_caps_total(actor))) {
                     return execution;
                 }
+                result = directTradeController.setOffer(playerId, command.revision,
+                    command.offer);
+            } else if (command.action == DirectTradeAction::Confirm) {
+                result = directTradeController.confirm(playerId, command.revision);
+                if (result == DirectTradeResult::ReadyToCommit) {
+                    std::optional<DirectTradeCommitPlan> plan
+                        = directTradeController.commitPlan();
+                    if (!plan.has_value() || !applyDirectTradePlan(*plan)) {
+                        if (directTradeController.invalidateCommit(command.revision)
+                            != DirectTradeResult::Accepted) return execution;
+                    } else {
+                        if (directTradeController.commit(command.revision)
+                                != DirectTradeResult::Accepted
+                            || session.transitionTo(SessionPhase::Exploration)
+                                != LocalSessionError::None) return execution;
+                        activeSharedModal.reset();
+                        execution.inventoryChanged = true;
+                    }
+                    result = DirectTradeResult::Accepted;
+                }
             } else if (command.action == DirectTradeAction::Cancel) {
-                if (!tradeController.cancel(playerId)) return execution;
-                execution.cancelled = true;
-            } else {
-                return execution;
+                result = directTradeController.cancel(playerId, command.revision);
+                if (result == DirectTradeResult::Accepted) {
+                    if (session.transitionTo(SessionPhase::Exploration)
+                        != LocalSessionError::None) return execution;
+                    activeSharedModal.reset();
+                }
             }
         }
+        if (result != DirectTradeResult::Accepted) return execution;
         execution.status = CommandExecutionStatus::Applied;
-        execution.state = tradeController.state();
+        execution.state = directTradeController.state();
+        execution.phase = session.phase();
+        execution.phaseRevision = session.phaseRevision();
         return execution;
     }
 
@@ -2511,25 +2380,92 @@ public:
             return execution;
         }
 
-        bool ordinaryLoot = lootTransfer && sourceTop != actor && destination == actor
-            && item != nullptr && item->pid != PROTO_ID_MONEY;
-        if (ordinaryLoot) {
-            PlayerId priorityId = lootPolicy.itemPriority();
-            Object* priorityActor = session.entities().findObject(session.playerActorId(priorityId));
-            auto priorityLoot = activeLootTargets.find(priorityActor);
-            bool contested = priorityActor != nullptr && priorityActor != actor
-                && priorityLoot != activeLootTargets.end()
-                && priorityLoot->second == sourceTop
-                && lootTargetIsInRange(priorityActor, sourceTop);
-            if (contested) {
-                auto now = std::chrono::steady_clock::now();
-                if (!pendingLootPriority.has_value()
-                    || pendingLootPriority->target != sourceTop) {
-                    pendingLootPriority = PendingLootPriority {
-                        sourceTop, now + std::chrono::seconds(5) };
+        LootDistributionState priorDistribution = lootDistribution.state();
+        if (lootTransfer && item != nullptr && item->pid == PROTO_ID_MONEY) {
+            if (item_count(source, item) != static_cast<int>(command.sourceQuantity)
+                || command.quantity > command.sourceQuantity) return execution;
+            std::optional<std::vector<PlayerCapShare>> shares
+                = lootDistribution.splitCaps(command.quantity);
+            if (!shares.has_value()) return execution;
+            for (PlayerCapShare& share : *shares) {
+                share.actorId = session.playerActorId(share.playerId);
+                if (!isValid(share.actorId)
+                    || session.entities().findObject(share.actorId) == nullptr) {
+                    lootDistribution.restore(priorDistribution);
+                    return execution;
                 }
-                if (now < pendingLootPriority->expiresAt) return execution;
             }
+            if (item_caps_adjust(source, -static_cast<int>(command.quantity))
+                != 0) {
+                lootDistribution.restore(priorDistribution);
+                return execution;
+            }
+            std::size_t adjusted = 0;
+            for (; adjusted < shares->size(); adjusted++) {
+                Object* recipient = session.entities().findObject(
+                    (*shares)[adjusted].actorId);
+                if ((*shares)[adjusted].caps != 0
+                    && item_caps_adjust(recipient,
+                        static_cast<int>((*shares)[adjusted].caps)) != 0) {
+                    break;
+                }
+            }
+            if (adjusted != shares->size()) {
+                while (adjusted > 0) {
+                    adjusted--;
+                    if ((*shares)[adjusted].caps != 0) {
+                        item_caps_adjust(session.entities().findObject(
+                                (*shares)[adjusted].actorId),
+                            -static_cast<int>((*shares)[adjusted].caps));
+                    }
+                }
+                item_caps_adjust(source, static_cast<int>(command.quantity));
+                lootDistribution.restore(priorDistribution);
+                return execution;
+            }
+            auto rollbackDistribution = [&]() {
+                for (const PlayerCapShare& share : *shares) {
+                    if (share.caps != 0) {
+                        item_caps_adjust(session.entities().findObject(
+                                share.actorId),
+                            -static_cast<int>(share.caps));
+                    }
+                }
+                item_caps_adjust(source, static_cast<int>(command.quantity));
+                lootDistribution.restore(priorDistribution);
+            };
+            if (!registerUntrackedInventory(source)) {
+                rollbackDistribution();
+                return execution;
+            }
+            for (const PlayerCapShare& share : *shares) {
+                if (!registerUntrackedInventory(
+                        session.entities().findObject(share.actorId))) {
+                    rollbackDistribution();
+                    return execution;
+                }
+            }
+            execution.capShares = std::move(*shares);
+            execution.status = CommandExecutionStatus::Applied;
+            return execution;
+        }
+
+        if (lootTransfer && item != nullptr
+            && FID_TYPE(otherTop->fid) == OBJ_TYPE_CRITTER
+            && critter_is_dead(otherTop)) {
+            std::vector<PlayerId> eligible = lootDistribution.state().roster;
+            std::optional<PlayerId> priority
+                = lootDistribution.takeLootPriority(eligible);
+            Object* priorityActor = priority.has_value()
+                ? session.entities().findObject(
+                    session.playerActorId(*priority))
+                : nullptr;
+            if (priorityActor == nullptr) {
+                lootDistribution.restore(priorDistribution);
+                return execution;
+            }
+            destination = priorityActor;
+            execution.destinationId = session.playerActorId(*priority);
         }
 
         bool created = false;
@@ -2560,30 +2496,6 @@ public:
             execution.itemId = command.itemId;
         }
 
-        if (lootTransfer && sourceTop != actor && destination == actor
-            && item->pid == PROTO_ID_MONEY) {
-            std::optional<LootCapSplitResult> split = splitLootCaps(
-                actor, source, item, command, execution.itemId);
-            if (split.has_value()) {
-                execution.status = CommandExecutionStatus::Applied;
-                execution.primaryEvent = split->first;
-                if (split->second.has_value()) {
-                    deferredEvents.push_back(GameEvent { {}, {},
-                        *split->second });
-                }
-                return execution;
-            }
-            if (created && item->owner == source) {
-                session.entities().unregisterEntity(execution.itemId);
-                worldItems.erase(std::remove_if(worldItems.begin(), worldItems.end(), [&](const auto& entry) {
-                    return entry.first == execution.itemId;
-                }), worldItems.end());
-                item_remove_mult(source, item, static_cast<int>(command.sourceQuantity));
-                obj_erase_object(item, nullptr);
-            }
-            return execution;
-        }
-
         if (item_count(source, item) != static_cast<int>(command.sourceQuantity)
             || !describeItem(item, execution.itemDescriptor)
             || !applyInventoryTransfer(source, destination, item, command.quantity, false)) {
@@ -2595,14 +2507,11 @@ public:
                 item_remove_mult(source, item, static_cast<int>(command.sourceQuantity));
                 obj_erase_object(item, nullptr);
             }
+            lootDistribution.restore(priorDistribution);
             return execution;
         }
         execution.remainderItemId = lastSplitEntityId;
         execution.status = CommandExecutionStatus::Applied;
-        if (ordinaryLoot) {
-            lootPolicy.advanceItemPriority();
-            pendingLootPriority.reset();
-        }
         return execution;
     }
 
@@ -2690,7 +2599,6 @@ bool registerWorldObjects()
     dialogueCause = {};
     nextDialogueRevision = 1;
     activeLootTargets.clear();
-    pendingLootPriority.reset();
     activeSharedModal.reset();
     approvedWorldMapProposerActorId = {};
     approvedWorldMapProposalSequence = {};
@@ -2851,7 +2759,7 @@ Object* createPeerActor()
     return actor;
 }
 
-bool refreshPlayer(PlayerId playerId)
+bool refreshPlayer(PlayerId playerId, bool healToFull = true)
 {
     PlayerCharacterState* player = session.players().find(playerId);
     Object* actor = player != nullptr ? session.entities().findObject(player->actorId) : nullptr;
@@ -2861,9 +2769,11 @@ bool refreshPlayer(PlayerId playerId)
 
     ScopedActingPlayerContext actingPlayer(*player, actor);
     stat_recalc_derived(actor);
-    int hitPoints = critter_get_hits(actor);
-    int maximumHitPoints = stat_level(actor, STAT_MAXIMUM_HIT_POINTS);
-    critter_adjust_hits(actor, maximumHitPoints - hitPoints);
+    if (healToFull) {
+        int hitPoints = critter_get_hits(actor);
+        int maximumHitPoints = stat_level(actor, STAT_MAXIMUM_HIT_POINTS);
+        critter_adjust_hits(actor, maximumHitPoints - hitPoints);
+    }
     if (updatePlayerGenderAppearance(actor) == -1) {
         return false;
     }
@@ -2934,6 +2844,8 @@ bool networkWorldEnter(NetworkLaunchMode mode,
     remotePlayer->ownership = PlayerOwnership::RemoteControl;
     remotePlayer->connection = ConnectionState::Connected;
     if (!registerWorldObjects()
+        || lootDistribution.begin(session.players().playerIds())
+            != LootDistributionError::None
         || !refreshPlayer(kHostPlayerId)
         || !refreshPlayer(kGuestPlayerId)) {
         session.stop();
@@ -2943,11 +2855,144 @@ bool networkWorldEnter(NetworkLaunchMode mode,
 
     intface_redraw();
     commandProcessor.reset();
-    lootPolicy.reset(session.players().playerIds());
     WorldMapState initialMap;
     worldmap_capture_state(initialMap);
     observedFirstVisits = static_cast<std::uint32_t>(initialMap.firstVisits);
     return true;
+}
+
+bool networkWorldRestoreMultiplayerSave(const MultiplayerSaveSidecar& sidecar,
+    Object* savedGuestActor)
+{
+    Object* guest = networkWorldPlayerActor(kGuestPlayerId);
+    if (worldMode != NetworkLaunchMode::Host
+        || guest == nullptr
+        || savedGuestActor == nullptr
+        || PID_TYPE(savedGuestActor->pid) != OBJ_TYPE_CRITTER
+        || savedGuestActor->pid != guest->pid
+        || !hexGridTileIsValid(savedGuestActor->tile)
+        || !elevationIsValid(savedGuestActor->elevation)
+        || savedGuestActor->rotation < 0
+        || savedGuestActor->rotation >= ROTATION_COUNT) {
+        std::fprintf(stderr,
+            "Multiplayer recovery actor preflight failed: mode=%d guest=%d saved=%d saved_type=%d pid=%d/%d tile=%d elevation=%d rotation=%d.\n",
+            static_cast<int>(worldMode), guest != nullptr ? 1 : 0,
+            savedGuestActor != nullptr ? 1 : 0,
+            savedGuestActor != nullptr ? PID_TYPE(savedGuestActor->pid) : -1,
+            savedGuestActor != nullptr ? savedGuestActor->pid : -1,
+            guest != nullptr ? guest->pid : -1,
+            savedGuestActor != nullptr ? savedGuestActor->tile : -1,
+            savedGuestActor != nullptr ? savedGuestActor->elevation : -1,
+            savedGuestActor != nullptr ? savedGuestActor->rotation : -1);
+        return false;
+    }
+    MultiplayerSaveError saveError = validateMultiplayerSave(sidecar);
+    LocalSessionError playerError = saveError == MultiplayerSaveError::None
+        ? session.restorePlayerCharacters(sidecar)
+        : LocalSessionError::InvalidSaveState;
+    LootDistributionError lootError = playerError == LocalSessionError::None
+        ? lootDistribution.restore(sidecar.lootDistribution)
+        : LootDistributionError::InvalidState;
+    if (saveError != MultiplayerSaveError::None
+        || playerError != LocalSessionError::None
+        || lootError != LootDistributionError::None) {
+        std::fprintf(stderr,
+            "Multiplayer recovery metadata preflight failed: save=%d players=%d loot=%d.\n",
+            static_cast<int>(saveError), static_cast<int>(playerError),
+            static_cast<int>(lootError));
+        return false;
+    }
+
+    register_clear(guest);
+    obj_inven_free(&guest->data.inventory);
+    guest->data.critter = savedGuestActor->data.critter;
+    guest->data.critter.combat.whoHitMe = nullptr;
+    attachInventory(guest, savedGuestActor->data.inventory);
+    savedGuestActor->data.inventory = {};
+
+    int savedFid = savedGuestActor->fid;
+    int savedTile = savedGuestActor->tile;
+    int savedElevation = savedGuestActor->elevation;
+    int savedRotation = savedGuestActor->rotation;
+    if (obj_change_fid(guest, savedFid, nullptr) == -1
+        || obj_attempt_placement(guest, savedTile, savedElevation, 2) == -1) {
+        std::fprintf(stderr,
+            "Multiplayer recovery guest placement failed: fid=%d tile=%d elevation=%d.\n",
+            savedFid, savedTile, savedElevation);
+        return false;
+    }
+    dude_stand(guest, savedRotation, -1);
+
+    session.clearWorldEntities();
+    if (!registerWorldObjects()) {
+        std::fprintf(stderr,
+            "Multiplayer recovery world registration failed.\n");
+        return false;
+    }
+    Object* host = networkWorldPlayerActor(kHostPlayerId);
+
+    // Native map loading can legitimately renumber inventory objects when
+    // map scripts create or remove other entities. The save-sidecar ownership
+    // contract is therefore restored by player and inventory topology; the
+    // new session's canonical IDs are published in its first snapshot.
+    for (const auto& participant : std::array<std::pair<PlayerId, Object*>, 2> {
+             std::make_pair(kHostPlayerId, host),
+             std::make_pair(kGuestPlayerId, guest) }) {
+        bool actorOwnershipPresent = false;
+        std::size_t savedItemCount = 0;
+        for (const SavedEntityOwnership& ownership : sidecar.ownership) {
+            if (ownership.ownerId != participant.first) continue;
+            if (ownership.entityId == session.playerActorId(participant.first)) {
+                actorOwnershipPresent = true;
+            } else {
+                savedItemCount++;
+            }
+        }
+        std::size_t loadedItemCount = 0;
+        for (const auto& entry : worldItems) {
+            if (topEnvironmentOrSelf(entry.second) == participant.second) {
+                loadedItemCount++;
+            }
+        }
+        Object* actor = session.entities().findObject(
+            session.playerActorId(participant.first));
+        if (!actorOwnershipPresent
+            || actor != participant.second
+            || savedItemCount != loadedItemCount) {
+            std::fprintf(stderr,
+                "Multiplayer recovery ownership topology mismatch: owner=%u actor=%d saved_items=%zu loaded_items=%zu.\n",
+                participant.first.value,
+                actorOwnershipPresent && actor == participant.second ? 1 : 0,
+                savedItemCount, loadedItemCount);
+            return false;
+        }
+    }
+    sharedActivity.assign(sidecar.sharedActivity.begin(),
+        sidecar.sharedActivity.end());
+    nextSharedActivityId = sharedActivity.empty()
+        ? 1 : sharedActivity.back().id + 1;
+    if (!refreshPlayer(kHostPlayerId, false)
+        || !refreshPlayer(kGuestPlayerId, false)) {
+        std::fprintf(stderr,
+            "Multiplayer recovery player refresh failed.\n");
+        return false;
+    }
+    intface_redraw();
+    return true;
+}
+
+bool networkWorldBeginEnding()
+{
+    if (worldMode != NetworkLaunchMode::Host || !session.isActive()) {
+        return false;
+    }
+    combatTurns.stop();
+    directTradeController.clear();
+    dialogueVotes.clear();
+    dialoguePresentation.reset();
+    activeSharedModal.reset();
+    return session.transitionTo(SessionPhase::Ending)
+        == LocalSessionError::None;
 }
 
 bool networkWorldApplyPeerMove(const ActorMovementStartedEvent& movement)
@@ -3575,7 +3620,8 @@ bool networkWorldApplyPeerRest(const RestStateChangedEvent& rest)
         pendingRestProposal.reset();
         set_game_time(rest.gameTime);
         if (rest.interrupted) {
-            display_print("Shared rest was interrupted.");
+            char message[] = "Shared rest was interrupted.";
+            display_print(message);
         }
         return session.applyAuthoritativePhase(SessionPhase::Exploration, rest.phaseRevision) == LocalSessionError::None;
     }
@@ -4115,128 +4161,6 @@ std::optional<EntityId> networkWorldPrepareLootSmokeTest()
         }
     }
     return std::nullopt;
-}
-
-std::optional<std::pair<EntityId, EntityId>> networkWorldPrepareLootCapSmokeTest()
-{
-    std::optional<EntityId> sourceId = networkWorldPrepareLootSmokeTest();
-    Object* source = sourceId.has_value() ? session.entities().findObject(*sourceId) : nullptr;
-    Object* guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
-    Object* host = session.entities().findObject(session.playerActorId(kHostPlayerId));
-    if (source == nullptr || guest == nullptr || host == nullptr) return std::nullopt;
-    int sourceCaps = item_caps_total(source);
-    int guestCaps = item_caps_total(guest);
-    int hostCaps = item_caps_total(host);
-    if ((sourceCaps > 0 && item_caps_adjust(source, -sourceCaps) != 0)
-        || (guestCaps > 0 && item_caps_adjust(guest, -guestCaps) != 0)
-        || (hostCaps > 0 && item_caps_adjust(host, -hostCaps) != 0)
-        || item_caps_adjust(source, 7) != 0) return std::nullopt;
-    if (item_caps_total(source) != 7) {
-        std::fprintf(stderr, "Loot cap fixture total=%d after normalization.\n",
-            item_caps_total(source));
-        return std::nullopt;
-    }
-    for (int index = 0; index < source->data.inventory.length; index++) {
-        const InventoryItem& entry = source->data.inventory.items[index];
-        if (entry.item == nullptr || entry.item->pid != PROTO_ID_MONEY
-            || entry.quantity != 7) continue;
-        std::optional<EntityId> id = session.entities().findEntity(entry.item);
-        if (!id.has_value()) {
-            EntityRegistrationResult registration = registerItem(entry.item);
-            if (!registration) return std::nullopt;
-            id = registration.entityId;
-        } else {
-            trackWorldItem(*id, entry.item);
-        }
-        activeLootTargets[guest] = source;
-        return std::pair<EntityId, EntityId> { *sourceId, *id };
-    }
-    return std::nullopt;
-}
-
-bool networkWorldVerifyLootCapSmokeTest(EntityId sourceId)
-{
-    Object* source = session.entities().findObject(sourceId);
-    Object* guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
-    Object* host = session.entities().findObject(session.playerActorId(kHostPlayerId));
-    bool valid = source != nullptr && guest != nullptr && host != nullptr
-        && item_caps_total(source) == 0
-        && item_caps_total(host) == 4
-        && item_caps_total(guest) == 3
-        && lootPolicy.nextExtraCapPlayer() == kGuestPlayerId;
-    if (!valid) {
-        std::fprintf(stderr, "Loot caps smoke: source=%d host=%d guest=%d next=%u.\n",
-            source != nullptr ? item_caps_total(source) : -1,
-            host != nullptr ? item_caps_total(host) : -1,
-            guest != nullptr ? item_caps_total(guest) : -1,
-            lootPolicy.nextExtraCapPlayer().value);
-        if (source != nullptr) {
-            for (int index = 0; index < source->data.inventory.length; index++) {
-                const InventoryItem& entry = source->data.inventory.items[index];
-                if (entry.item->pid == PROTO_ID_MONEY) {
-                    std::fprintf(stderr, "Loot cap source stack: quantity=%d id=%u.\n",
-                        entry.quantity,
-                        session.entities().findEntity(entry.item).value_or(EntityId {}).value);
-                }
-            }
-        }
-    }
-    return valid;
-}
-
-std::optional<std::pair<EntityId, EntityId>> networkWorldPrepareLootPrioritySmokeTest()
-{
-    std::optional<EntityId> sourceId = networkWorldPrepareLootSmokeTest();
-    Object* source = sourceId.has_value() ? session.entities().findObject(*sourceId) : nullptr;
-    Object* guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
-    Object* host = session.entities().findObject(session.playerActorId(kHostPlayerId));
-    if (source == nullptr || guest == nullptr || host == nullptr
-        || lootPolicy.itemPriority() != kHostPlayerId) return std::nullopt;
-
-    bool hostPlaced = false;
-    for (int rotation = 0; rotation < ROTATION_COUNT && !hostPlaced; rotation++) {
-        int tile = tile_num_in_direction(source->tile, rotation, 1);
-        hostPlaced = hexGridTileIsValid(tile)
-            && obj_blocking_at(host, tile, source->elevation) == nullptr
-            && obj_move_to_tile(host, tile, source->elevation, nullptr) == 0
-            && lootTargetIsInRange(host, source);
-    }
-    if (!hostPlaced || !lootTargetIsInRange(guest, source)) return std::nullopt;
-
-    Object* stimpak = nullptr;
-    if (obj_pid_new(&stimpak, PROTO_ID_STIMPACK) != 0 || stimpak == nullptr) return std::nullopt;
-    obj_disconnect(stimpak, nullptr);
-    if (item_add_force(source, stimpak, 1) != 0) {
-        obj_erase_object(stimpak, nullptr);
-        return std::nullopt;
-    }
-    for (int index = 0; index < source->data.inventory.length; index++) {
-        const InventoryItem& entry = source->data.inventory.items[index];
-        if (entry.item == nullptr || entry.item->pid != PROTO_ID_STIMPACK
-            || entry.quantity <= 0) continue;
-        std::optional<EntityId> itemId = session.entities().findEntity(entry.item);
-        if (!itemId.has_value()) {
-            EntityRegistrationResult registration = registerItem(entry.item);
-            if (!registration) return std::nullopt;
-            itemId = registration.entityId;
-        }
-        activeLootTargets[host] = source;
-        activeLootTargets[guest] = source;
-        return std::pair<EntityId, EntityId> { *sourceId, *itemId };
-    }
-    return std::nullopt;
-}
-
-bool networkWorldVerifyLootPrioritySmokeTest(EntityId sourceId, EntityId itemId, std::uint32_t quantity)
-{
-    Object* source = session.entities().findObject(sourceId);
-    Object* item = session.entities().findObject(itemId);
-    Object* guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
-    return source != nullptr && item != nullptr && guest != nullptr
-        && item->owner == guest
-        && item_count(source, item) == 0
-        && item_count(guest, item) == static_cast<int>(quantity)
-        && lootPolicy.itemPriority() == kGuestPlayerId;
 }
 
 std::optional<EntityId> networkWorldPrepareSkillSmokeTest()
@@ -5105,6 +5029,31 @@ std::optional<EntityId> networkWorldPreparePlayerTransferSmokeTest()
     return std::nullopt;
 }
 
+bool networkWorldPrepareRecoverySmokeTest()
+{
+    if (!networkWorldPreparePlayerTransferSmokeTest().has_value()) {
+        return false;
+    }
+    if (worldMode == NetworkLaunchMode::Host) {
+        publishSharedActivity(SharedActivityKind::WorldOutcome, 77, 1,
+            "Recovery smoke checkpoint");
+    }
+    return true;
+}
+
+bool networkWorldVerifyRecoverySmokeTest()
+{
+    Object* guest = networkWorldPlayerActor(kGuestPlayerId);
+    return session.isActive()
+        && session.phase() == SessionPhase::Exploration
+        && guest != nullptr
+        && item_caps_total(guest) == 7
+        && !sharedActivity.empty()
+        && sharedActivity.back().kind == SharedActivityKind::WorldOutcome
+        && sharedActivity.back().subject == 77
+        && sharedActivity.back().text == "Recovery smoke checkpoint";
+}
+
 bool networkWorldVerifyPlayerTransferRangeSmokeTest(EntityId itemId)
 {
     Object* hostActor = session.entities().findObject(session.playerActorId(kHostPlayerId));
@@ -5214,84 +5163,6 @@ bool networkWorldVerifyPlayerTransferRangeSmokeTest(EntityId itemId)
 
     commandProcessor.reset();
     return rejected && restored && playerLootRejected && gifted && takingRejected && rolledBack;
-}
-
-std::optional<EntityId> networkWorldPrepareDirectTradeSmokeTest()
-{
-    if (!session.isActive() || session.phase() != SessionPhase::Exploration) return std::nullopt;
-    Object* host = session.entities().findObject(session.playerActorId(kHostPlayerId));
-    Object* guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
-    if (host == nullptr || guest == nullptr) return std::nullopt;
-    anim_stop();
-    bool placed = false;
-    for (int rotation = 0; rotation < ROTATION_COUNT && !placed; rotation++) {
-        int tile = tile_num_in_direction(host->tile, rotation, 1);
-        placed = hexGridTileIsValid(tile)
-            && obj_blocking_at(guest, tile, host->elevation) == nullptr
-            && obj_move_to_tile(guest, tile, host->elevation, nullptr) == 0;
-    }
-    if (!placed || !isAdjacentPlayerActor(host, guest)) return std::nullopt;
-    int hostCaps = item_caps_total(host);
-    int guestCaps = item_caps_total(guest);
-    if ((hostCaps > 0 && item_caps_adjust(host, -hostCaps) != 0)
-        || (guestCaps > 0 && item_caps_adjust(guest, -guestCaps) != 0)
-        || item_caps_adjust(host, 10) != 0
-        || item_caps_adjust(guest, 7) != 0) return std::nullopt;
-
-    Object* stimpak = nullptr;
-    if (obj_pid_new(&stimpak, PROTO_ID_STIMPACK) != 0 || stimpak == nullptr) return std::nullopt;
-    obj_disconnect(stimpak, nullptr);
-    if (item_add_force(host, stimpak, 1) != 0) {
-        obj_erase_object(stimpak, nullptr);
-        return std::nullopt;
-    }
-    for (int index = 0; index < host->data.inventory.length; index++) {
-        Object* item = host->data.inventory.items[index].item;
-        if (item != nullptr && item->pid == PROTO_ID_STIMPACK
-            && (item->flags & (OBJECT_EQUIPPED | OBJECT_USED)) == 0) {
-            stimpak = item;
-            break;
-        }
-    }
-    std::optional<EntityId> itemId = session.entities().findEntity(stimpak);
-    if (!itemId.has_value()) {
-        EntityRegistrationResult registration = registerItem(stimpak);
-        if (!registration) return std::nullopt;
-        itemId = registration.entityId;
-    }
-    tradeController.clear();
-    if (!tradeController.begin(kHostPlayerId, kGuestPlayerId)
-        || tradeController.replaceOffer(kHostPlayerId, 1, 3,
-               { DirectTradeLine { *itemId,
-                   static_cast<std::uint32_t>(item_count(host, stimpak)) } })
-            != DirectTradeResult::Applied
-        || tradeController.replaceOffer(kGuestPlayerId, 2, 2, {})
-            != DirectTradeResult::Applied
-        || tradeController.confirm(kHostPlayerId, 3) != DirectTradeResult::Applied) {
-        tradeController.clear();
-        return std::nullopt;
-    }
-    return itemId;
-}
-
-bool networkWorldVerifyDirectTradeSmokeTest(EntityId itemId)
-{
-    Object* host = session.entities().findObject(session.playerActorId(kHostPlayerId));
-    Object* guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
-    Object* item = session.entities().findObject(itemId);
-    bool valid = session.isActive() && !tradeController.active()
-        && host != nullptr && guest != nullptr && item != nullptr
-        && item->owner == guest && item_count(guest, item) > 0
-        && item_caps_total(host) == 9 && item_caps_total(guest) == 8;
-    if (!valid) {
-        std::fprintf(stderr, "Trade smoke state: active=%d item=%p owner=%p guest=%p item_count=%d host_caps=%d guest_caps=%d.\n",
-            tradeController.active(), static_cast<void*>(item),
-            item != nullptr ? static_cast<void*>(item->owner) : nullptr,
-            static_cast<void*>(guest), item != nullptr && guest != nullptr ? item_count(guest, item) : -1,
-            host != nullptr ? item_caps_total(host) : -1,
-            guest != nullptr ? item_caps_total(guest) : -1);
-    }
-    return valid;
 }
 
 bool networkWorldRunSharedModalSmokeTest()
@@ -6020,23 +5891,24 @@ bool networkWorldApplyInventoryTransfer(const InventoryTransferredEvent& transfe
     return applied;
 }
 
-bool networkWorldApplyPeerDirectTrade(const DirectTradeStateChangedEvent& trade)
+bool networkWorldApplyCapsDistribution(
+    const CapsDistributedEvent& distribution)
 {
-    return session.isActive() && tradeController.restore(trade.state);
-}
-
-const DirectTradeState& networkWorldDirectTradeState()
-{
-    return tradeController.state();
-}
-
-void networkWorldCancelDirectTrade()
-{
-    if (worldMode != NetworkLaunchMode::Host || !tradeController.active()) return;
-    tradeController.clear();
-    deferredEvents.push_back(GameEvent { {}, CommandSequence { UINT64_MAX },
-        DirectTradeStateChangedEvent {
-            session.playerActorId(kHostPlayerId), {}, false, true } });
+    if (!networkWorldReplicaSessionActive()
+        || session.entities().findObject(distribution.actorId) == nullptr
+        || session.entities().findObject(distribution.sourceId) == nullptr
+        || distribution.shares.size() < 2) return false;
+    std::uint64_t sum = 0;
+    for (const PlayerCapShare& share : distribution.shares) {
+        if (session.playerActorId(share.playerId) != share.actorId
+            || session.entities().findObject(share.actorId) == nullptr) {
+            return false;
+        }
+        sum += share.caps;
+    }
+    // The immediately following authoritative checkpoint applies all cap
+    // inventory mutations together, avoiding partial replica-side updates.
+    return sum == distribution.caps;
 }
 
 bool networkWorldApplyItemDrop(const ItemDroppedEvent& drop)
@@ -6215,17 +6087,7 @@ AuthoritativeCommandResult networkWorldProcessCommand(const GameCommand& command
         }
     }
 
-    std::size_t previousDeferredCount = deferredEvents.size();
     AuthoritativeCommandResult result = commandProcessor.process(command, session, commandExecutor);
-    if (result.result.status == CommandStatus::Accepted && !result.replayed) {
-        for (auto pending = deferredEvents.begin() + previousDeferredCount;
-             pending != deferredEvents.end(); ++pending) {
-            if (pending->causedBy.value == 0
-                && std::holds_alternative<InventoryTransferredEvent>(pending->payload)) {
-                pending->causedBy = command.sequence;
-            }
-        }
-    }
     if (result.result.status == CommandStatus::Accepted && !result.replayed
         && result.event.has_value()) {
         if (std::holds_alternative<DialogueRequestedEvent>(result.event->payload)) {
@@ -6790,14 +6652,16 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
     captured.lastIncludedEvent = lastIncludedEvent;
     captured.phase = session.phase();
     captured.phaseRevision = session.phaseRevision();
+    captured.mapId = map_data.field_34;
     if (captured.phase == SessionPhase::Combat) {
         captured.combat = combatTurns.snapshot(combatClockMilliseconds());
         captured.combatFreeMove = combat_free_move;
     }
     captured.gameTime = game_time();
     captured.sharedActivity.assign(sharedActivity.begin(), sharedActivity.end());
-    captured.nextExtraCapPlayer = lootPolicy.nextExtraCapPlayer();
-    captured.nextItemPriorityPlayer = lootPolicy.nextItemPriorityPlayer();
+    if (directTradeController.active()) {
+        captured.directTrade = directTradeController.state();
+    }
     if (captured.phase == SessionPhase::Dialogue
         && activeSharedModal.has_value()
         && activeSharedModal->kind == SharedModalKind::Dialogue) {
@@ -6967,6 +6831,16 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
     if (session.isActive()
         && snapshotError == SnapshotError::None
         && networkWorldReplicaSessionActive()
+        && snapshot.mapId != map_data.field_34
+        && (!loadSharedMap(snapshot.mapId, true) || !registerWorldObjects())) {
+        std::fprintf(stderr,
+            "Multiplayer snapshot could not load authoritative map %d.\n",
+            snapshot.mapId);
+        return false;
+    }
+    if (session.isActive()
+        && snapshotError == SnapshotError::None
+        && networkWorldReplicaSessionActive()
         && snapshot.mapLocalVariables.size() > static_cast<std::size_t>(num_map_local_vars)
         && !map_ensure_local_vars(static_cast<int>(snapshot.mapLocalVariables.size()))) {
         return false;
@@ -6992,13 +6866,81 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
         return false;
     }
 
+    bool staticRegistryMismatch = false;
+    for (std::size_t index = 0; index < snapshot.doors.size(); index++) {
+        if (session.entities().findObject(snapshot.doors[index].entityId)
+            != worldDoors[index].second) {
+            staticRegistryMismatch = true;
+            break;
+        }
+    }
+    for (std::size_t index = 0;
+         !staticRegistryMismatch && index < snapshot.scenery.size(); index++) {
+        if (session.entities().findObject(snapshot.scenery[index].entityId)
+            != worldScenery[index].second) {
+            staticRegistryMismatch = true;
+        }
+    }
+    if (staticRegistryMismatch) {
+        auto updateTrackedId = [](Object* object, EntityId entityId) {
+            auto update = [object, entityId](auto& entries) {
+                for (auto& entry : entries) {
+                    if (entry.second == object) entry.first = entityId;
+                }
+            };
+            update(worldExitGrids);
+            update(worldDoors);
+            update(worldScenery);
+            update(worldCritters);
+            update(worldItems);
+        };
+        auto assignAuthoritativeId = [&](Object* object, EntityId entityId) {
+            std::optional<EntityId> current = session.entities().findEntity(object);
+            if (!current.has_value()) return false;
+            if (*current == entityId) return true;
+            Object* displaced = session.entities().findObject(entityId);
+            if (session.entities().unregisterEntity(*current)
+                    != EntityRegistryError::None
+                || (displaced != nullptr
+                    && session.entities().unregisterEntity(entityId)
+                        != EntityRegistryError::None)
+                || session.entities().restoreObject(entityId, object)
+                    != EntityRegistryError::None) {
+                return false;
+            }
+            updateTrackedId(object, entityId);
+            if (displaced != nullptr) {
+                if (session.entities().restoreObject(*current, displaced)
+                        != EntityRegistryError::None) {
+                    return false;
+                }
+                updateTrackedId(displaced, *current);
+            }
+            return true;
+        };
+
+        for (std::size_t index = 0; index < worldDoors.size(); index++) {
+            if (!assignAuthoritativeId(worldDoors[index].second,
+                    snapshot.doors[index].entityId)) {
+                return false;
+            }
+        }
+        for (std::size_t index = 0; index < worldScenery.size(); index++) {
+            Object* scenery = worldScenery[index].second;
+            const ScenerySnapshot& state = snapshot.scenery[index];
+            if (scenery == nullptr
+                || scenery->pid != state.pid
+                || !assignAuthoritativeId(scenery, state.entityId)) {
+                std::fprintf(stderr,
+                    "Multiplayer snapshot could not rebase scenery entity %u.\n",
+                    state.entityId.value);
+                return false;
+            }
+        }
+    }
+
     if (!validateActorState(snapshot)) {
         std::fprintf(stderr, "Multiplayer snapshot actor identity preflight failed.\n");
-        return false;
-    }
-    LootPolicy restoredLootPolicy;
-    if (!restoredLootPolicy.restore(session.players().playerIds(),
-            snapshot.nextExtraCapPlayer, snapshot.nextItemPriorityPlayer)) {
         return false;
     }
     for (const DoorSnapshot& doorState : snapshot.doors) {
@@ -7006,6 +6948,11 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
         if (door == nullptr
             || !obj_is_a_portal(door)
             || doorState.open != (doorState.frame != 0)) {
+            std::fprintf(stderr,
+                "Multiplayer snapshot door preflight failed: entity=%u found=%d portal=%d open=%d frame=%d.\n",
+                doorState.entityId.value, door != nullptr ? 1 : 0,
+                door != nullptr && obj_is_a_portal(door) ? 1 : 0,
+                doorState.open ? 1 : 0, doorState.frame);
             return false;
         }
     }
@@ -7014,6 +6961,12 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
         if (scenery == nullptr
             || FID_TYPE(scenery->fid) != OBJ_TYPE_SCENERY
             || scenery->pid != sceneryState.pid) {
+            std::fprintf(stderr,
+                "Multiplayer snapshot scenery preflight failed: entity=%u found=%d type=%d/%d pid=%d/%d.\n",
+                sceneryState.entityId.value, scenery != nullptr ? 1 : 0,
+                scenery != nullptr ? FID_TYPE(scenery->fid) : -1,
+                OBJ_TYPE_SCENERY, scenery != nullptr ? scenery->pid : -1,
+                sceneryState.pid);
             return false;
         }
     }
@@ -7190,10 +7143,22 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
     }
     combat_free_move = snapshot.combatFreeMove;
     sharedActivity.assign(snapshot.sharedActivity.begin(), snapshot.sharedActivity.end());
-    lootPolicy = std::move(restoredLootPolicy);
     nextSharedActivityId = sharedActivity.empty()
         ? 1 : sharedActivity.back().id + 1;
-    if (snapshot.phase == SessionPhase::Dialogue) {
+    if (snapshot.phase == SessionPhase::Dialogue
+        && snapshot.directTrade.has_value()) {
+        if (directTradeController.restore(*snapshot.directTrade)
+                != DirectTradeResult::Accepted) {
+            return false;
+        }
+        activeSharedModal = ActiveSharedModal {
+            snapshot.directTrade->participants[0].actorId,
+            SharedModalKind::Barter,
+        };
+        dialoguePresentation.reset();
+        dialogueVotes.clear();
+    } else if (snapshot.phase == SessionPhase::Dialogue) {
+        directTradeController.clear();
         activeSharedModal = ActiveSharedModal {
             snapshot.dialogueActorId, SharedModalKind::Dialogue };
         dialoguePresentation = snapshot.dialoguePresentation;
@@ -7223,6 +7188,8 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
             }
         }
     } else {
+        directTradeController.clear();
+        activeSharedModal.reset();
         dialoguePresentation.reset();
         dialogueVotes.clear();
     }
@@ -7629,9 +7596,105 @@ Object* networkWorldPlayerActor(PlayerId playerId)
     return session.entities().findObject(session.playerActorId(playerId));
 }
 
+MultiplayerSaveError networkWorldCaptureMultiplayerSave(
+    std::uint64_t generation,
+    std::uint64_t saveDatDigest,
+    const ReconnectToken& guestReconnectToken,
+    MultiplayerSaveSidecar& sidecar)
+{
+    if (worldMode != NetworkLaunchMode::Host || !session.isActive()) {
+        return MultiplayerSaveError::PlayerMissing;
+    }
+    MultiplayerSaveSidecar captured;
+    MultiplayerSaveError error = captureMultiplayerSave(session.players(),
+        generation, saveDatDigest, captured);
+    if (error != MultiplayerSaveError::None) return error;
+    captured.lootDistribution = lootDistribution.state();
+    captured.sharedActivity.assign(sharedActivity.begin(),
+        sharedActivity.end());
+    for (SavedPlayerCharacter& player : captured.players) {
+        if (player.playerId == kGuestPlayerId) {
+            player.reconnectToken = guestReconnectToken;
+            player.replacementAllowed = true;
+        }
+    }
+    Object* host = networkWorldPlayerActor(kHostPlayerId);
+    Object* guest = networkWorldPlayerActor(kGuestPlayerId);
+    for (const auto& entry : worldItems) {
+        Object* top = topEnvironmentOrSelf(entry.second);
+        PlayerId owner = top == host ? kHostPlayerId
+            : top == guest ? kGuestPlayerId : PlayerId {};
+        if (isValid(owner)) {
+            captured.ownership.push_back({ entry.first, owner });
+        }
+    }
+    std::sort(captured.ownership.begin(), captured.ownership.end(),
+        [](const SavedEntityOwnership& lhs,
+            const SavedEntityOwnership& rhs) {
+            return lhs.entityId.value < rhs.entityId.value;
+        });
+    error = validateMultiplayerSave(captured);
+    if (error == MultiplayerSaveError::None) sidecar = std::move(captured);
+    return error;
+}
+
+bool networkWorldApplyPeerDirectTrade(
+    const DirectTradeStateChangedEvent& event)
+{
+    if (!networkWorldReplicaSessionActive()
+        || session.entities().findObject(event.actorId) == nullptr
+        || session.applyAuthoritativePhase(event.phase, event.phaseRevision)
+            != LocalSessionError::None) {
+        return false;
+    }
+
+    if (event.state.status == DirectTradeStatus::Negotiating
+        || event.state.status == DirectTradeStatus::ReadyToCommit) {
+        if (event.phase != SessionPhase::Dialogue
+            || directTradeController.restore(event.state)
+                != DirectTradeResult::Accepted) {
+            return false;
+        }
+        activeSharedModal = ActiveSharedModal {
+            event.state.participants[0].actorId,
+            SharedModalKind::Barter,
+        };
+    } else if (event.state.status == DirectTradeStatus::Committed
+        || event.state.status == DirectTradeStatus::Cancelled) {
+        if (event.phase != SessionPhase::Exploration) return false;
+        directTradeController.clear();
+        activeSharedModal.reset();
+    } else {
+        return false;
+    }
+    return true;
+}
+
+void networkWorldDirectTradeSetConnected(PlayerId playerId, bool connected)
+{
+    if (worldMode != NetworkLaunchMode::Host || connected
+        || !directTradeController.active()) return;
+    DirectTradeState state = directTradeController.state();
+    if (directTradeController.disconnect(playerId) != DirectTradeResult::Accepted
+        || session.transitionTo(SessionPhase::Exploration)
+            != LocalSessionError::None) return;
+    state = directTradeController.state();
+    activeSharedModal.reset();
+    EntityId actorId = session.playerActorId(playerId);
+    deferredEvents.push_back(GameEvent { {}, {},
+        DirectTradeStateChangedEvent { actorId, std::move(state),
+            session.phase(), session.phaseRevision(), false } });
+}
+
+std::optional<DirectTradeState> networkWorldDirectTradeState()
+{
+    return directTradeController.active()
+        ? std::optional<DirectTradeState>(directTradeController.state())
+        : std::nullopt;
+}
+
 void networkWorldLeave()
 {
-    tradeController.clear();
     combatActionResolving = false;
     combatTurns.stop();
     session.stop();
@@ -7648,12 +7711,12 @@ void networkWorldLeave()
     observedFirstVisits = 0;
     dialogueVotes.clear();
     dialoguePresentation.reset();
+    directTradeController.clear();
+    lootDistribution.clear();
     pendingTalk.reset();
     dialogueCause = {};
     nextDialogueRevision = 1;
     activeLootTargets.clear();
-    pendingLootPriority.reset();
-    lootPolicy = LootPolicy {};
     activeSharedModal.reset();
     approvedWorldMapProposerActorId = {};
     approvedWorldMapProposalSequence = {};

@@ -7,6 +7,7 @@ namespace multiplayer {
 enum class MultiplayerLobbyScreenResult {
     Back,
     StartGame,
+    ResumeRecovery,
 };
 
 MultiplayerLobbyScreenResult multiplayerLobbyScreen();

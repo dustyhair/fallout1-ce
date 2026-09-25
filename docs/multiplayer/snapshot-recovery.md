@@ -1,8 +1,8 @@
 # Snapshot recovery
 
-Snapshot version 18 contains the state needed to recover the live two-player experiment:
+Snapshot version 19 contains the state needed to recover the live two-player experiment:
 
-- Session phase, phase revision, authoritative world time, and last included event sequence.
+- Session phase, phase revision, authoritative map and world time, and last included event sequence.
 - Player actor identity, owner, tile, elevation, rotation, hit points, and complete progressing character build.
 - Registered non-player critter identity, prototype, position, rotation, hit points, action points, combat results, and team.
 - Registered door identity, open state, lock state, and animation frame.
@@ -11,8 +11,10 @@ Snapshot version 18 contains the state needed to recover the live two-player exp
 - The indexed game-global, map-global, and map-local arrays visible to scripts.
 - The ordered timed-event queue, including absolute trigger time, stable owner identity, and bounded type-specific payload.
 - Persistent world-map position, discovered grid and town entrances, visited cities, and special-encounter history. The host remains the only authority for encounter rolls.
-- The next player to receive an extra looted cap and the next player with priority for a contested item. Both cursors follow the ordered player roster.
 - Shared world-map travel planning stage, original proposer, current controller, optional approved route target, and any active travel line/counters. If a guest controller disconnects during an approved trip, the host keeps the target and takes control; a reconnecting guest recovers that ownership instead of automatically taking it back. The guest may retain the travel counters for digest/recovery but cannot advance travel rules.
+- Combat initiative, active turn, round, timeout, status, and free-move state.
+- Active dialogue presentation and ballots, bounded shared activity history, and
+  any bilateral direct-trade offers and confirmations.
 
 The wire format uses fixed-width big-endian fields. Its 28-byte header carries the format version, payload length, snapshot checksum, and last included event. The checksum covers the event sequence and payload. Decoders reject unknown versions, payloads over 512 KiB, invalid counts, duplicate entity IDs, malformed state, truncation, trailing bytes, and checksum failures. Shared object flags deliberately omit process-local discovery/selection and object-lifetime bits.
 
@@ -37,11 +39,11 @@ The comparison reports the first section that differs. This is more useful durin
 
 ## Recovery contract
 
-`SnapshotReplica::apply` validates the entire snapshot before replacing replica state. A failed validation leaves the existing state unchanged. A successful application stores actors, critters, doors, scenery, and items in canonical entity order. The engine adapter requires exact variable-array sizes for the loaded map, restores the authoritative indexed values, and restores registered scenery and item presentation/data state. Before applying item state, it rebinds local item objects to authoritative IDs by descriptor and authoritative holder or ground location, creates missing items, and removes unmatched local items. This repairs pickup, split, ground drop, or scripted consumption whose journal event has expired and also tolerates authority-only map-load scripts shifting the sequential IDs of otherwise identical destination items.
+`SnapshotReplica::apply` validates the entire snapshot before replacing replica state. A failed validation leaves the existing state unchanged. A successful application stores actors, critters, doors, scenery, and items in canonical entity order. The engine adapter requires exact variable-array sizes for the loaded map, restores the authoritative indexed values, and restores registered scenery and item presentation/data state. When a native recovery `.SAV` and a fresh replica `.MAP` assign different global entity-number ranges, the adapter first swaps the replica's door and scenery registry identities into the authoritative ranges without dropping the displaced map objects. Before applying item state, it rebinds local item objects to authoritative IDs by descriptor and authoritative holder or ground location, creates missing items, and removes unmatched local items. This repairs pickup, split, ground drop, or scripted consumption whose journal event has expired and also tolerates authority-only map-load scripts shifting the sequential IDs of otherwise identical destination items.
 
 The headless recovery test creates a host snapshot with actors and distinct progressing builds, a critter, a door, non-door scenery, an inventory stack, a ground item, script-visible variables, and timed events. It checks independent divergence in every section before applying the host state and confirming every section digest matches again. The installed-data smoke hook additionally awards party XP only on the host, converges both builds through the checkpoint, and captures, replaces, and recaptures the live engine queue before starting its two-process network checks.
 
-The item section tracks objects registered for live pickup and looting, including player or script-created items introduced through an authoritative transfer. Map-local variables cover the indexed local storage used by map scripts. Timed events encode the six integer values used by drug events, three used by withdrawal, two used by script and radiation events, and no payload for the remaining event types. Script events normalize their unused legacy owner pointer; every other owner-dependent event requires a registered `EntityId`. Unsupported payloads or missing owners fail closed. Interpreter stacks and program counters are not serialized because a network guest never resumes them. Full combat state and dialogue remain outside the recovery snapshot. Once a network guest enters the world, its interpreter background loop, direct script dispatcher, queued-event processor, and pending script requests are suppressed; only the host executes them, and snapshots correct the guest's world time and covered results.
+The item section tracks objects registered for live pickup and looting, including player or script-created items introduced through an authoritative transfer. Map-local variables cover the indexed local storage used by map scripts. Timed events encode the six integer values used by drug events, three used by withdrawal, two used by script and radiation events, and no payload for the remaining event types. Script events normalize their unused legacy owner pointer; every other owner-dependent event requires a registered `EntityId`. Unsupported payloads or missing owners fail closed. Interpreter stacks and program counters are not serialized because a network guest never resumes them. Once a network guest enters the world, its interpreter background loop, direct script dispatcher, queued-event processor, and pending script requests are suppressed; only the host executes them, and snapshots correct the guest's world time and covered results.
 
 At a shared cross-map elevator, ordinary-exit, or typed-stair boundary, Fallout's loader preserves only the
 process-local `obj_dude`. The multiplayer bridge detaches the remote actor's

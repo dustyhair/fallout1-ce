@@ -23,6 +23,13 @@ void networkRuntimeDisconnect();
 NetworkLaunchMode networkRuntimeMode();
 bool networkRuntimeIsGuestReplica();
 bool networkRuntimeConnected();
+bool networkRuntimeHostWorldActive();
+MultiplayerSaveError networkRuntimeCaptureSave(std::uint64_t generation,
+    std::uint64_t saveDatDigest,
+    MultiplayerSaveSidecar& sidecar);
+bool networkRuntimeStageLoadedSave(const MultiplayerSaveSidecar& sidecar,
+    Object* savedGuestActor);
+void networkRuntimeEndHostSession();
 bool networkRuntimeFailed();
 const char* networkRuntimeStatus();
 const CharacterCreationSheet* networkRuntimeLocalSheet();
@@ -64,7 +71,6 @@ std::string networkRuntimePendingRestProposerName();
 bool networkRuntimeLocalRestProposal();
 bool networkRuntimeHandleLocalAttack(Object* target, int hitMode, int hitLocation);
 bool networkRuntimeGiveItemToPlayer(EntityId destinationActorId, EntityId itemId, std::uint32_t quantity);
-bool networkRuntimeSubmitDirectTrade(const DirectTradeCommand& command);
 bool networkRuntimeRequestSharedModal(SharedModalKind kind, bool open);
 bool networkRuntimeSubmitLocalWorldMapRoute(std::int32_t targetX, std::int32_t targetY, bool clear = false);
 void networkRuntimeFlushWorldMapTerminalEvent();
@@ -74,6 +80,8 @@ bool networkRuntimeSubmitLocalTalk(EntityId targetId);
 bool networkRuntimeBeginDialogue();
 void networkRuntimeEndDialogue();
 bool networkRuntimeSubmitDialogueVote(std::uint64_t revision, std::uint8_t option);
+bool networkRuntimeSubmitDirectTrade(const DirectTradeCommand& trade);
+bool networkRuntimeBeginDirectTrade(EntityId otherActorId);
 void networkRuntimeObserveDialogueDecision(std::uint64_t revision, std::uint8_t option);
 void networkRuntimeProcessPendingTalk();
 bool networkRuntimeWorldPaused();

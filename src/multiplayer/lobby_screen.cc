@@ -10,6 +10,7 @@
 #include "agent_journal.h"
 #include "game/game.h"
 #include "game/gmouse.h"
+#include "game/loadsave.h"
 #include "game/gsound.h"
 #include "game/object.h"
 #include "game/options.h"
@@ -52,6 +53,7 @@ enum class LobbyOption {
     Join,
     ChooseCharacter,
     StartGame,
+    ResumeRecovery,
     Disconnect,
     Back,
     Count,
@@ -75,8 +77,9 @@ constexpr std::array<ControlDefinition, static_cast<std::size_t>(LobbyOption::Co
     { LobbyOption::Join, "JOIN", 161, 38 },
     { LobbyOption::ChooseCharacter, "CHARACTER", 214, 48 },
     { LobbyOption::StartGame, "START", 282, 48 },
+    { LobbyOption::ResumeRecovery, "RESUME", 342, 50 },
     { LobbyOption::Disconnect, "DISCONNECT", 418, 50 },
-    { LobbyOption::Back, "BACK", 468, 38 },
+    { LobbyOption::Back, "BACK", 478, 38 },
 } };
 
 constexpr int controlIndexAt(int x, int y)
@@ -100,9 +103,9 @@ static_assert(controlIndexAt(115, 267) == static_cast<int>(LobbyOption::Host));
 static_assert(controlIndexAt(161, 267) == static_cast<int>(LobbyOption::Join));
 static_assert(controlIndexAt(214, 267) == static_cast<int>(LobbyOption::ChooseCharacter));
 static_assert(controlIndexAt(282, 267) == static_cast<int>(LobbyOption::StartGame));
+static_assert(controlIndexAt(342, 267) == static_cast<int>(LobbyOption::ResumeRecovery));
 static_assert(controlIndexAt(418, 267) == static_cast<int>(LobbyOption::Disconnect));
-static_assert(controlIndexAt(468, 267) == static_cast<int>(LobbyOption::Back));
-static_assert(controlIndexAt(320, 267) == -1);
+static_assert(controlIndexAt(478, 267) == static_cast<int>(LobbyOption::Back));
 
 const CharacterCreationSheet* sheetForPlayer(PlayerId playerId)
 {
@@ -183,6 +186,8 @@ bool controlEnabled(LobbyOption option)
         return networkRuntimeConnected() && networkRuntimeLocalSheet() == nullptr;
     case LobbyOption::StartGame:
         return canStartGame();
+    case LobbyOption::ResumeRecovery:
+        return canStartGame() && MultiplayerRecoverySaveExists();
     case LobbyOption::Disconnect:
         return networkRuntimeMode() != NetworkLaunchMode::Disabled;
     case LobbyOption::Host:
@@ -660,13 +665,25 @@ MultiplayerLobbyScreenResult multiplayerLobbyScreen()
             }
             break;
         case KEY_5:
+        case KEY_UPPERCASE_R:
+        case KEY_LOWERCASE_R:
+            if (!MultiplayerRecoverySaveExists()) {
+                notice = "NO VALID RECOVERY SAVE IS AVAILABLE.";
+            } else if (canStartGame() && networkRuntimeRequestStart()) {
+                result = MultiplayerLobbyScreenResult::ResumeRecovery;
+                done = true;
+            } else {
+                notice = "BOTH PLAYERS MUST BE READY TO RESUME.";
+            }
+            break;
+        case KEY_6:
         case KEY_UPPERCASE_D:
         case KEY_LOWERCASE_D:
             networkRuntimeDisconnect();
             chatMessages.clear();
             notice.clear();
             break;
-        case KEY_6:
+        case KEY_7:
         case KEY_UPPERCASE_B:
         case KEY_LOWERCASE_B:
         case KEY_ESCAPE:

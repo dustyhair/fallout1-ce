@@ -125,6 +125,47 @@ bool parseGive(std::istringstream& input, AgentControlCommand& command, std::str
     return true;
 }
 
+bool parseTradeOffer(std::istringstream& input,
+    AgentControlCommand& command, std::string& error)
+{
+    std::uint64_t caps = 0;
+    std::uint64_t item = 0;
+    std::uint64_t quantity = 0;
+    if (!(input >> command.tradeId >> command.tradeRevision >> caps)
+        || command.tradeId == 0 || command.tradeRevision == 0
+        || caps > static_cast<std::uint64_t>(
+            std::numeric_limits<std::int32_t>::max())) {
+        error = "expected: game_trade_offer <trade id> <revision> <caps> [item id quantity]";
+        return false;
+    }
+    if (input >> item) {
+        if (!(input >> quantity) || hasTrailingInput(input)
+            || item == 0 || quantity == 0
+            || item > std::numeric_limits<std::uint32_t>::max()
+            || quantity > static_cast<std::uint64_t>(
+                std::numeric_limits<std::int32_t>::max())) {
+            error = "trade item and quantity must both be positive 32-bit values";
+            return false;
+        }
+        command.itemEntityId = static_cast<std::uint32_t>(item);
+        command.quantity = static_cast<std::uint32_t>(quantity);
+    }
+    command.caps = static_cast<std::uint32_t>(caps);
+    return true;
+}
+
+bool parseTradeRevision(std::istringstream& input,
+    AgentControlCommand& command, std::string& error)
+{
+    if (!(input >> command.tradeId >> command.tradeRevision)
+        || hasTrailingInput(input) || command.tradeId == 0
+        || command.tradeRevision == 0) {
+        error = "expected a positive trade id and revision";
+        return false;
+    }
+    return true;
+}
+
 bool parseItemUse(std::istringstream& input, AgentControlCommand& command, std::string& error)
 {
     std::uint64_t item = 0;
@@ -444,6 +485,22 @@ bool agentControlParseCommand(const std::string& line,
         command.type = AgentControlCommandType::GameGive;
         return parseGive(input, command, error);
     }
+    if (verb == "game_trade_begin") {
+        command.type = AgentControlCommandType::GameTradeBegin;
+        return parseEntityId(input, command, error);
+    }
+    if (verb == "game_trade_offer") {
+        command.type = AgentControlCommandType::GameTradeOffer;
+        return parseTradeOffer(input, command, error);
+    }
+    if (verb == "game_trade_confirm") {
+        command.type = AgentControlCommandType::GameTradeConfirm;
+        return parseTradeRevision(input, command, error);
+    }
+    if (verb == "game_trade_cancel") {
+        command.type = AgentControlCommandType::GameTradeCancel;
+        return parseTradeRevision(input, command, error);
+    }
 
     error = "unknown command";
     return false;
@@ -490,6 +547,14 @@ const char* agentControlCommandTypeName(AgentControlCommandType type)
         return "game_vote";
     case AgentControlCommandType::GameGive:
         return "game_give";
+    case AgentControlCommandType::GameTradeBegin:
+        return "game_trade_begin";
+    case AgentControlCommandType::GameTradeOffer:
+        return "game_trade_offer";
+    case AgentControlCommandType::GameTradeConfirm:
+        return "game_trade_confirm";
+    case AgentControlCommandType::GameTradeCancel:
+        return "game_trade_cancel";
     case AgentControlCommandType::GameAttack:
         return "game_attack";
     case AgentControlCommandType::GameReload:
