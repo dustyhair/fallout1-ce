@@ -21,6 +21,7 @@ struct InventoryTransferExecution {
     EntityId itemId;
     EntityId remainderItemId;
     ItemDescriptor itemDescriptor;
+    std::optional<InventoryTransferredEvent> primaryEvent;
 };
 
 struct DirectTradeExecution {

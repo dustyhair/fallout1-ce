@@ -23,6 +23,7 @@
 #include "multiplayer/gameplay_wire.h"
 #include "multiplayer/local_session.h"
 #include "multiplayer/local_player_context.h"
+#include "multiplayer/loot_policy.h"
 #include "multiplayer/loopback_transport.h"
 #include "multiplayer/network_bootstrap.h"
 #include "multiplayer/network_lobby.h"
@@ -724,6 +725,36 @@ void testDirectTradeController()
         "either participant can cancel without moving anything");
     expect(trade.begin(kHostPlayerId, PlayerId { 3 }) && !trade.cancel(kGuestPlayerId),
         "bilateral trade ignores other roster members");
+}
+
+void testLootPolicy()
+{
+    LootPolicy policy;
+    expect(policy.reset({ PlayerId { 3 }, kGuestPlayerId, kHostPlayerId }),
+        "loot policy accepts a sorted roster independent of join order");
+    std::vector<LootCapShare> first = policy.splitCaps(8);
+    expect(first.size() == 3 && first[0].playerId == kHostPlayerId
+            && first[0].quantity == 3 && first[1].quantity == 3
+            && first[2].quantity == 2,
+        "cap remainder begins at the first canonical player");
+    policy.advanceCaps(8);
+    std::vector<LootCapShare> second = policy.splitCaps(4);
+    expect(second.size() == 3 && second[0].quantity == 1
+            && second[1].quantity == 1 && second[2].quantity == 2,
+        "extra caps rotate to the next player across loot pools");
+    policy.advanceCaps(4);
+    expect(policy.nextExtraCapPlayer() == kHostPlayerId,
+        "cap remainder cursor wraps through the roster");
+    expect(policy.itemPriority() == kHostPlayerId, "item priority begins at the first player");
+    policy.advanceItemPriority();
+    expect(policy.itemPriority() == kGuestPlayerId, "contested item priority alternates");
+    LootPolicy restored;
+    expect(restored.restore({ PlayerId { 3 }, kHostPlayerId, kGuestPlayerId },
+               policy.nextExtraCapPlayer(), policy.nextItemPriorityPlayer())
+            && restored.splitCaps(4) == policy.splitCaps(4),
+        "loot cursors survive roster-based recovery");
+    expect(!restored.restore({ kHostPlayerId, kGuestPlayerId }, PlayerId { 3 }, kHostPlayerId),
+        "recovery rejects a cursor outside the roster");
 }
 
 void testDirectTradeWire()
@@ -3847,6 +3878,8 @@ void testAuthoritativeCommandProcessing()
 void testSnapshotRoundTripAndRecovery()
 {
     WorldSnapshot authoritative = sampleSnapshot();
+    authoritative.nextExtraCapPlayer = kGuestPlayerId;
+    authoritative.nextItemPriorityPlayer = kGuestPlayerId;
     std::vector<std::uint8_t> packet;
     expect(encodeSnapshot(authoritative, packet) == SnapshotError::None, "valid snapshot encodes");
     constexpr std::size_t characterBuildWireSize = (SAVEABLE_STAT_COUNT * 2
@@ -3856,7 +3889,7 @@ void testSnapshotRoundTripAndRecovery()
                                                         + PC_TRAIT_MAX
                                                         + 4)
         * sizeof(std::uint32_t);
-    expect(packet.size() == kSnapshotHeaderSize + 48 + 2 * (68 + characterBuildWireSize) + 68 + 12 + 48 + 2 * 56 + 6 * 4 + 2 * 36 + 31 * 29 + 15 * 7 + 6 * 4 + 20 + 14 * 4 + 32 + 8 + 4,
+    expect(packet.size() == kSnapshotHeaderSize + 48 + 2 * (68 + characterBuildWireSize) + 68 + 12 + 48 + 2 * 56 + 6 * 4 + 2 * 36 + 31 * 29 + 15 * 7 + 6 * 4 + 20 + 14 * 4 + 32 + 8 + 4 + 8,
         "snapshot packet declares a fixed-width payload");
     expect(packet[0] == 'F' && packet[1] == 'C' && packet[2] == 'M' && packet[3] == 'S', "snapshot magic uses network byte order");
 
@@ -3865,7 +3898,9 @@ void testSnapshotRoundTripAndRecovery()
     expect(decoded.snapshot.lastIncludedEvent == EventSequence { 41 }, "snapshot keeps the last included event");
     expect(decoded.snapshot.phase == SessionPhase::Exploration
             && decoded.snapshot.phaseRevision == 7
-            && decoded.snapshot.gameTime == 302400,
+            && decoded.snapshot.gameTime == 302400
+            && decoded.snapshot.nextExtraCapPlayer == kGuestPlayerId
+            && decoded.snapshot.nextItemPriorityPlayer == kGuestPlayerId,
         "snapshot keeps session phase and authoritative world time");
     expect(decoded.snapshot.worldMap.specialEncounters == 2
             && decoded.snapshot.worldMap.x == 1075
@@ -3924,6 +3959,15 @@ void testSnapshotRoundTripAndRecovery()
     SnapshotDigestResult decodedDigest = computeSnapshotDigest(decoded.snapshot);
     expect(static_cast<bool>(authoritativeDigest) && authoritativeDigest.digest == decodedDigest.digest, "snapshot digest is stable across wire round trip and input order");
     expect(firstDivergentSection(authoritativeDigest.digest, decodedDigest.digest) == SnapshotSection::None, "matching snapshots report no divergent section");
+    WorldSnapshot lootCursorDrift = decoded.snapshot;
+    lootCursorDrift.nextExtraCapPlayer = kHostPlayerId;
+    expect(firstDivergentSection(authoritativeDigest.digest,
+               computeSnapshotDigest(lootCursorDrift).digest) == SnapshotSection::Session,
+        "loot cursor drift reports the session section");
+    WorldSnapshot invalidLootCursor = decoded.snapshot;
+    invalidLootCursor.nextItemPriorityPlayer = PlayerId { 3 };
+    expect(validateSnapshot(invalidLootCursor) == SnapshotError::InvalidPlayerId,
+        "snapshot rejects a loot cursor outside its player roster");
 
     WorldSnapshot sessionDrift = decoded.snapshot;
     sessionDrift.phaseRevision++;
@@ -4516,6 +4560,7 @@ int main()
     fallout::multiplayer::testCharacterLobbyValidationAndWireFormat();
     fallout::multiplayer::testMultiplayerSaveSidecar();
     fallout::multiplayer::testDirectTradeController();
+    fallout::multiplayer::testLootPolicy();
     fallout::multiplayer::testDirectTradeWire();
     fallout::multiplayer::testActingPlayerContext();
     fallout::multiplayer::testLocalPlayerContext();

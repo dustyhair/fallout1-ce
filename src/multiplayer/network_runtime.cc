@@ -89,6 +89,7 @@ enum class SmokeScenario {
     Door,
     Pickup,
     Loot,
+    LootCaps,
     PlayerTransfer,
     DirectTrade,
     Skill,
@@ -174,6 +175,8 @@ const char* smokeScenarioName()
         return "pickup";
     case SmokeScenario::Loot:
         return "loot";
+    case SmokeScenario::LootCaps:
+        return "loot-caps";
     case SmokeScenario::PlayerTransfer:
         return "transfer";
     case SmokeScenario::DirectTrade:
@@ -1765,6 +1768,8 @@ bool networkRuntimeConfigure(int argc, char** argv)
             smokeScenario = SmokeScenario::Pickup;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=loot") == 0) {
             smokeScenario = SmokeScenario::Loot;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=loot-caps") == 0) {
+            smokeScenario = SmokeScenario::LootCaps;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=transfer") == 0) {
             smokeScenario = SmokeScenario::PlayerTransfer;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-scenario=trade") == 0) {
@@ -2805,6 +2810,7 @@ bool networkRuntimeRunSmokeTest()
             int scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
             int scenarioDestinationTile = -1;
             std::optional<EntityId> scenarioTargetId;
+            std::optional<EntityId> lootCapSourceId;
             std::optional<QuestSmokeFixture> questFixture;
             std::optional<ElevatorSmokeFixture> elevatorFixture;
             std::optional<MapTransitionSmokeFixture> mapTransitionFixture;
@@ -2899,6 +2905,13 @@ bool networkRuntimeRunSmokeTest()
                     && !networkWorldVerifyLootRangeSmokeTest(*scenarioTargetId)) {
                     scenarioTargetId.reset();
                 }
+            } else if (smokeScenario == SmokeScenario::LootCaps) {
+                std::optional<std::pair<EntityId, EntityId>> fixture =
+                    networkWorldPrepareLootCapSmokeTest();
+                if (fixture.has_value()) {
+                    lootCapSourceId = fixture->first;
+                    scenarioTargetId = fixture->second;
+                }
             } else if (smokeScenario == SmokeScenario::PlayerTransfer) {
                 scenarioTargetId = networkWorldPreparePlayerTransferSmokeTest();
                 scenarioStartingTile = scenarioActor != nullptr ? scenarioActor->tile : -1;
@@ -2987,6 +3000,19 @@ bool networkRuntimeRunSmokeTest()
             case SmokeScenario::Loot:
                 scenarioCommand.payload = LootCommand { *scenarioTargetId };
                 break;
+            case SmokeScenario::LootCaps: {
+                ItemDescriptor descriptor;
+                Object* item = networkWorldFindObject(*scenarioTargetId);
+                if (!lootCapSourceId.has_value() || item == nullptr
+                    || !networkWorldDescribeItem(item, descriptor)) {
+                    scenarioCommandReady = false;
+                    break;
+                }
+                scenarioCommand.payload = InventoryTransferCommand {
+                    *lootCapSourceId, EntityId { kGuestPlayerId.value },
+                    *scenarioTargetId, 7, 7, descriptor };
+                break;
+            }
             case SmokeScenario::PlayerTransfer: {
                 Object* item = networkWorldFindObject(*scenarioTargetId);
                 ItemDescriptor descriptor;
@@ -3043,8 +3069,14 @@ bool networkRuntimeRunSmokeTest()
                 break;
             }
             EventSequence scenarioFinalEventSequence {
-                smokeScenario == SmokeScenario::Pickup || smokeScenario == SmokeScenario::Rest ? 2ULL : 1ULL
+                smokeScenario == SmokeScenario::Pickup || smokeScenario == SmokeScenario::Rest
+                    || smokeScenario == SmokeScenario::LootCaps ? 2ULL : 1ULL
             };
+
+            if (smokeScenario == SmokeScenario::LootCaps) {
+                while (networkWorldTakeDeferredEvent().has_value()) {
+                }
+            }
 
             bool gameplayPassed = false;
             std::vector<GameEvent> authoritativeEvents;
@@ -3087,6 +3119,7 @@ bool networkRuntimeRunSmokeTest()
 
                 bool receivedResult = false;
                 std::uint64_t receivedEventCount = 0;
+                EntityId lootCapRemainderId;
                 bool stateConverged = false;
                 while (std::chrono::steady_clock::now() < deadline
                     && (!receivedResult || receivedEventCount < scenarioFinalEventSequence.value || !stateConverged)) {
@@ -3200,6 +3233,30 @@ bool networkRuntimeRunSmokeTest()
                                     && item_caps_total(networkWorldPlayerActor(kHostPlayerId)) == 3
                                     && item_caps_total(networkWorldPlayerActor(kGuestPlayerId)) == 4;
                             } else if (event && event.event.sequence == expectedEventSequence
+                                && smokeScenario == SmokeScenario::LootCaps) {
+                                const auto* transfer = std::get_if<InventoryTransferredEvent>(&event.event.payload);
+                                if (transfer != nullptr && transfer->sourceId == *lootCapSourceId
+                                    && transfer->itemDescriptor.pid == PROTO_ID_MONEY) {
+                                    if (receivedEventCount == 0) {
+                                        eventApplied = event.event.causedBy == scenarioCommand.sequence
+                                            && transfer->destinationId == EntityId { kHostPlayerId.value }
+                                            && transfer->itemId == *scenarioTargetId
+                                            && transfer->quantity == 4 && transfer->sourceQuantity == 7
+                                            && isValid(transfer->remainderItemId)
+                                            && networkWorldApplyInventoryTransfer(*transfer);
+                                        if (eventApplied) lootCapRemainderId = transfer->remainderItemId;
+                                    } else {
+                                        eventApplied = event.event.causedBy == scenarioCommand.sequence
+                                            && transfer->destinationId == EntityId { kGuestPlayerId.value }
+                                            && transfer->itemId == lootCapRemainderId
+                                            && transfer->quantity == 3 && transfer->sourceQuantity == 3
+                                            && !isValid(transfer->remainderItemId)
+                                            && networkWorldApplyInventoryTransfer(*transfer)
+                                            && item_caps_total(networkWorldPlayerActor(kHostPlayerId)) == 4
+                                            && item_caps_total(networkWorldPlayerActor(kGuestPlayerId)) == 3;
+                                    }
+                                }
+                            } else if (event && event.event.sequence == expectedEventSequence
                                 && event.event.causedBy == scenarioCommand.sequence
                                 && smokeScenario == SmokeScenario::DirectTrade) {
                                 const auto* trade = std::get_if<DirectTradeStateChangedEvent>(&event.event.payload);
@@ -3310,6 +3367,8 @@ bool networkRuntimeRunSmokeTest()
                                     stateConverged = networkWorldVerifyQuestSmokeTest(*questFixture);
                                 } else if (stateConverged && smokeScenario == SmokeScenario::DirectTrade) {
                                     stateConverged = networkWorldVerifyDirectTradeSmokeTest(*scenarioTargetId);
+                                } else if (stateConverged && smokeScenario == SmokeScenario::LootCaps) {
+                                    stateConverged = networkWorldVerifyLootCapSmokeTest(*lootCapSourceId);
                                 } else if (stateConverged && smokeScenario == SmokeScenario::Elevation) {
                                     stateConverged = networkWorldVerifyElevatorSmokeTest(*elevatorFixture);
                                 } else if (stateConverged && smokeScenario == SmokeScenario::MapTransition) {
@@ -3328,6 +3387,11 @@ bool networkRuntimeRunSmokeTest()
                                 }
                             }
                             if (!stateConverged) {
+                                if (smokeScenario == SmokeScenario::LootCaps) {
+                                    std::fprintf(stderr, "Loot cap checkpoint event count=%llu result=%d.\n",
+                                        static_cast<unsigned long long>(receivedEventCount),
+                                        receivedResult ? 1 : 0);
+                                }
                                 std::fprintf(stderr,
                                     "Multiplayer scenario checkpoint: decoded=%d boundary=%d applied=%d captured=%d.\n",
                                     state ? 1 : 0,
@@ -3392,6 +3456,14 @@ bool networkRuntimeRunSmokeTest()
                                     && transfer->itemId == *scenarioTargetId
                                     && transfer->quantity == 3
                                     && transfer->sourceQuantity == 7
+                                    && transfer->itemDescriptor.pid == PROTO_ID_MONEY;
+                            } else if (smokeScenario == SmokeScenario::LootCaps) {
+                                const auto* transfer = std::get_if<InventoryTransferCommand>(&command.command.payload);
+                                payloadMatches = transfer != nullptr
+                                    && transfer->sourceId == *lootCapSourceId
+                                    && transfer->destinationId == EntityId { kGuestPlayerId.value }
+                                    && transfer->itemId == *scenarioTargetId
+                                    && transfer->quantity == 7 && transfer->sourceQuantity == 7
                                     && transfer->itemDescriptor.pid == PROTO_ID_MONEY;
                             } else if (smokeScenario == SmokeScenario::DirectTrade) {
                                 const auto* trade = std::get_if<DirectTradeCommand>(&command.command.payload);
@@ -3511,6 +3583,8 @@ bool networkRuntimeRunSmokeTest()
                         case SmokeScenario::PlayerTransfer:
                             return item_caps_total(networkWorldPlayerActor(kHostPlayerId)) == 3
                                 && item_caps_total(networkWorldPlayerActor(kGuestPlayerId)) == 4;
+                        case SmokeScenario::LootCaps:
+                            return networkWorldVerifyLootCapSmokeTest(*lootCapSourceId);
                         case SmokeScenario::DirectTrade:
                             return networkWorldVerifyDirectTradeSmokeTest(*scenarioTargetId);
                         case SmokeScenario::Skill:
@@ -3607,6 +3681,12 @@ bool networkRuntimeRunSmokeTest()
                     if (pickupCompletion.has_value()) {
                         pickupCompletion->sequence = scenarioFinalEventSequence;
                         authoritativeEvents.push_back(std::move(*pickupCompletion));
+                    }
+                    if (smokeScenario == SmokeScenario::LootCaps) {
+                        if (std::optional<GameEvent> split = networkWorldTakeDeferredEvent()) {
+                            split->sequence = scenarioFinalEventSequence;
+                            authoritativeEvents.push_back(std::move(*split));
+                        }
                     }
                     WorldSnapshot state;
                     std::vector<std::uint8_t> statePayload;

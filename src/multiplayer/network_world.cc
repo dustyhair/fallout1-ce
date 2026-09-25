@@ -47,6 +47,7 @@
 #include "multiplayer/direct_trade_controller.h"
 #include "multiplayer/local_player_context.h"
 #include "multiplayer/local_session.h"
+#include "multiplayer/loot_policy.h"
 #include "multiplayer/presentation_bridge.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/input.h"
@@ -83,6 +84,7 @@ std::unordered_map<EntityId, PendingPickup, EntityIdHash> pendingPickups;
 std::deque<GameEvent> deferredEvents;
 DialogueVoteController dialogueVotes;
 DirectTradeController tradeController;
+LootPolicy lootPolicy;
 std::optional<DialoguePresentationEvent> dialoguePresentation;
 struct PendingTalk {
     EntityId actorId;
@@ -97,6 +99,11 @@ std::uint64_t nextSharedActivityId = 1;
 std::uint32_t observedFirstVisits = 0;
 
 std::unordered_map<Object*, Object*> activeLootTargets;
+struct PendingLootPriority {
+    Object* target = nullptr;
+    std::chrono::steady_clock::time_point expiresAt;
+};
+std::optional<PendingLootPriority> pendingLootPriority;
 struct ActiveSharedModal {
     EntityId actorId;
     SharedModalKind kind = SharedModalKind::Dialogue;
@@ -1056,6 +1063,7 @@ bool loadSharedMap(int map)
     dialogueCause = {};
     nextDialogueRevision = 1;
     activeLootTargets.clear();
+    pendingLootPriority.reset();
     activeSharedModal.reset();
     approvedWorldMapProposerActorId = {};
     approvedWorldMapProposalSequence = {};
@@ -1365,6 +1373,129 @@ bool commitDirectTrade(const DirectTradeState& state)
     inven_refresh_inventory_window();
     intface_redraw();
     return true;
+}
+
+struct LootCapSplitResult {
+    InventoryTransferredEvent first;
+    std::optional<InventoryTransferredEvent> second;
+};
+
+std::optional<LootCapSplitResult> splitLootCaps(Object* actor, Object* source,
+    Object* money, const InventoryTransferCommand& command, EntityId moneyId)
+{
+    if (actor == nullptr || source == nullptr || money == nullptr
+        || money->owner != source || money->pid != PROTO_ID_MONEY
+        || item_count(source, money) != static_cast<int>(command.sourceQuantity)
+        || command.quantity == 0 || command.quantity > command.sourceQuantity) return std::nullopt;
+    Inventory& inventory = source->data.inventory;
+    int sourceIndex = -1;
+    for (int index = 0; index < inventory.length; index++) {
+        if (inventory.items[index].item == money) sourceIndex = index;
+    }
+    if (sourceIndex < 0) return std::nullopt;
+
+    std::vector<LootCapShare> shares = lootPolicy.splitCaps(command.quantity);
+    std::vector<LootCapShare> nonzero;
+    for (const LootCapShare& share : shares) {
+        if (share.quantity != 0) nonzero.push_back(share);
+    }
+    if (nonzero.empty() || nonzero.size() > 2) return std::nullopt;
+    Object* firstDestination = session.entities().findObject(
+        session.playerActorId(nonzero[0].playerId));
+    Object* secondDestination = nonzero.size() == 2
+        ? session.entities().findObject(session.playerActorId(nonzero[1].playerId)) : nullptr;
+    if (firstDestination == nullptr || (nonzero.size() == 2 && secondDestination == nullptr)
+        || !reserveTradeInventory(firstDestination, 1)
+        || (secondDestination != nullptr && !reserveTradeInventory(secondDestination, 1))) {
+        return std::nullopt;
+    }
+
+    std::optional<EntityId> registered = session.entities().findEntity(money);
+    if (!registered.has_value()) {
+        EntityRegistrationResult result = registerItem(money);
+        if (!result) return std::nullopt;
+        registered = result.entityId;
+    } else {
+        trackWorldItem(*registered, money);
+    }
+    if (*registered != moneyId) return std::nullopt;
+
+    Object* firstRemainder = nullptr;
+    Object* secondRemainder = nullptr;
+    EntityId firstRemainderId;
+    EntityId secondRemainderId;
+    bool firstPartial = command.sourceQuantity > nonzero[0].quantity;
+    bool secondPartial = nonzero.size() == 2 && command.sourceQuantity > command.quantity;
+    auto stageClone = [&](Object*& clone, EntityId& id) {
+        if (obj_copy(&clone, money) != 0 || clone == nullptr) return false;
+        if (obj_disconnect(clone, nullptr) != 0) {
+            obj_erase_object(clone, nullptr);
+            clone = nullptr;
+            return false;
+        }
+        clone->owner = nullptr;
+        EntityRegistrationResult result = registerItem(clone);
+        if (!result) {
+            obj_erase_object(clone, nullptr);
+            clone = nullptr;
+            return false;
+        }
+        id = result.entityId;
+        return true;
+    };
+    if ((firstPartial && !stageClone(firstRemainder, firstRemainderId))
+        || (secondPartial && !stageClone(secondRemainder, secondRemainderId))) {
+        if (firstRemainder != nullptr) obj_erase_object(firstRemainder, nullptr);
+        return std::nullopt;
+    }
+    ItemDescriptor descriptor;
+    if (!describeItem(money, descriptor)) {
+        if (firstRemainder != nullptr) obj_erase_object(firstRemainder, nullptr);
+        if (secondRemainder != nullptr) obj_erase_object(secondRemainder, nullptr);
+        return std::nullopt;
+    }
+
+    inventoryTransferInProgress = true;
+    if (firstPartial) {
+        inventory.items[sourceIndex].item = firstRemainder;
+        inventory.items[sourceIndex].quantity -= static_cast<int>(nonzero[0].quantity);
+        firstRemainder->owner = source;
+        money->owner = nullptr;
+    } else {
+        item_remove_mult(source, money, static_cast<int>(nonzero[0].quantity));
+    }
+    item_add_force(firstDestination, money, static_cast<int>(nonzero[0].quantity));
+
+    LootCapSplitResult result;
+    result.first = InventoryTransferredEvent {
+        *session.entities().findEntity(actor), command.sourceId,
+        session.playerActorId(nonzero[0].playerId), moneyId,
+        nonzero[0].quantity, command.sourceQuantity, firstRemainderId, descriptor };
+    if (nonzero.size() == 2) {
+        int remainderIndex = -1;
+        for (int index = 0; index < inventory.length; index++) {
+            if (inventory.items[index].item == firstRemainder) remainderIndex = index;
+        }
+        std::uint32_t secondSourceQuantity = command.sourceQuantity - nonzero[0].quantity;
+        if (secondPartial) {
+            inventory.items[remainderIndex].item = secondRemainder;
+            inventory.items[remainderIndex].quantity -= static_cast<int>(nonzero[1].quantity);
+            secondRemainder->owner = source;
+            firstRemainder->owner = nullptr;
+        } else {
+            item_remove_mult(source, firstRemainder, static_cast<int>(nonzero[1].quantity));
+        }
+        item_add_force(secondDestination, firstRemainder, static_cast<int>(nonzero[1].quantity));
+        result.second = InventoryTransferredEvent {
+            *session.entities().findEntity(actor), command.sourceId,
+            session.playerActorId(nonzero[1].playerId), firstRemainderId,
+            nonzero[1].quantity, secondSourceQuantity, secondRemainderId, descriptor };
+    }
+    inventoryTransferInProgress = false;
+    lootPolicy.advanceCaps(command.quantity);
+    inven_refresh_loot_window();
+    inven_refresh_inventory_window();
+    return result;
 }
 
 class NetworkCommandExecutor : public CommandExecutor {
@@ -2380,6 +2511,27 @@ public:
             return execution;
         }
 
+        bool ordinaryLoot = lootTransfer && sourceTop != actor && destination == actor
+            && item != nullptr && item->pid != PROTO_ID_MONEY;
+        if (ordinaryLoot) {
+            PlayerId priorityId = lootPolicy.itemPriority();
+            Object* priorityActor = session.entities().findObject(session.playerActorId(priorityId));
+            auto priorityLoot = activeLootTargets.find(priorityActor);
+            bool contested = priorityActor != nullptr && priorityActor != actor
+                && priorityLoot != activeLootTargets.end()
+                && priorityLoot->second == sourceTop
+                && lootTargetIsInRange(priorityActor, sourceTop);
+            if (contested) {
+                auto now = std::chrono::steady_clock::now();
+                if (!pendingLootPriority.has_value()
+                    || pendingLootPriority->target != sourceTop) {
+                    pendingLootPriority = PendingLootPriority {
+                        sourceTop, now + std::chrono::seconds(5) };
+                }
+                if (now < pendingLootPriority->expiresAt) return execution;
+            }
+        }
+
         bool created = false;
         if (item == nullptr) {
             if (isValid(command.itemId)
@@ -2408,6 +2560,30 @@ public:
             execution.itemId = command.itemId;
         }
 
+        if (lootTransfer && sourceTop != actor && destination == actor
+            && item->pid == PROTO_ID_MONEY) {
+            std::optional<LootCapSplitResult> split = splitLootCaps(
+                actor, source, item, command, execution.itemId);
+            if (split.has_value()) {
+                execution.status = CommandExecutionStatus::Applied;
+                execution.primaryEvent = split->first;
+                if (split->second.has_value()) {
+                    deferredEvents.push_back(GameEvent { {}, {},
+                        *split->second });
+                }
+                return execution;
+            }
+            if (created && item->owner == source) {
+                session.entities().unregisterEntity(execution.itemId);
+                worldItems.erase(std::remove_if(worldItems.begin(), worldItems.end(), [&](const auto& entry) {
+                    return entry.first == execution.itemId;
+                }), worldItems.end());
+                item_remove_mult(source, item, static_cast<int>(command.sourceQuantity));
+                obj_erase_object(item, nullptr);
+            }
+            return execution;
+        }
+
         if (item_count(source, item) != static_cast<int>(command.sourceQuantity)
             || !describeItem(item, execution.itemDescriptor)
             || !applyInventoryTransfer(source, destination, item, command.quantity, false)) {
@@ -2423,6 +2599,10 @@ public:
         }
         execution.remainderItemId = lastSplitEntityId;
         execution.status = CommandExecutionStatus::Applied;
+        if (ordinaryLoot) {
+            lootPolicy.advanceItemPriority();
+            pendingLootPriority.reset();
+        }
         return execution;
     }
 
@@ -2510,6 +2690,7 @@ bool registerWorldObjects()
     dialogueCause = {};
     nextDialogueRevision = 1;
     activeLootTargets.clear();
+    pendingLootPriority.reset();
     activeSharedModal.reset();
     approvedWorldMapProposerActorId = {};
     approvedWorldMapProposalSequence = {};
@@ -2762,6 +2943,7 @@ bool networkWorldEnter(NetworkLaunchMode mode,
 
     intface_redraw();
     commandProcessor.reset();
+    lootPolicy.reset(session.players().playerIds());
     WorldMapState initialMap;
     worldmap_capture_state(initialMap);
     observedFirstVisits = static_cast<std::uint32_t>(initialMap.firstVisits);
@@ -3933,6 +4115,73 @@ std::optional<EntityId> networkWorldPrepareLootSmokeTest()
         }
     }
     return std::nullopt;
+}
+
+std::optional<std::pair<EntityId, EntityId>> networkWorldPrepareLootCapSmokeTest()
+{
+    std::optional<EntityId> sourceId = networkWorldPrepareLootSmokeTest();
+    Object* source = sourceId.has_value() ? session.entities().findObject(*sourceId) : nullptr;
+    Object* guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+    Object* host = session.entities().findObject(session.playerActorId(kHostPlayerId));
+    if (source == nullptr || guest == nullptr || host == nullptr) return std::nullopt;
+    int sourceCaps = item_caps_total(source);
+    int guestCaps = item_caps_total(guest);
+    int hostCaps = item_caps_total(host);
+    if ((sourceCaps > 0 && item_caps_adjust(source, -sourceCaps) != 0)
+        || (guestCaps > 0 && item_caps_adjust(guest, -guestCaps) != 0)
+        || (hostCaps > 0 && item_caps_adjust(host, -hostCaps) != 0)
+        || item_caps_adjust(source, 7) != 0) return std::nullopt;
+    if (item_caps_total(source) != 7) {
+        std::fprintf(stderr, "Loot cap fixture total=%d after normalization.\n",
+            item_caps_total(source));
+        return std::nullopt;
+    }
+    for (int index = 0; index < source->data.inventory.length; index++) {
+        const InventoryItem& entry = source->data.inventory.items[index];
+        if (entry.item == nullptr || entry.item->pid != PROTO_ID_MONEY
+            || entry.quantity != 7) continue;
+        std::optional<EntityId> id = session.entities().findEntity(entry.item);
+        if (!id.has_value()) {
+            EntityRegistrationResult registration = registerItem(entry.item);
+            if (!registration) return std::nullopt;
+            id = registration.entityId;
+        } else {
+            trackWorldItem(*id, entry.item);
+        }
+        activeLootTargets[guest] = source;
+        return std::pair<EntityId, EntityId> { *sourceId, *id };
+    }
+    return std::nullopt;
+}
+
+bool networkWorldVerifyLootCapSmokeTest(EntityId sourceId)
+{
+    Object* source = session.entities().findObject(sourceId);
+    Object* guest = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+    Object* host = session.entities().findObject(session.playerActorId(kHostPlayerId));
+    bool valid = source != nullptr && guest != nullptr && host != nullptr
+        && item_caps_total(source) == 0
+        && item_caps_total(host) == 4
+        && item_caps_total(guest) == 3
+        && lootPolicy.nextExtraCapPlayer() == kGuestPlayerId;
+    if (!valid) {
+        std::fprintf(stderr, "Loot caps smoke: source=%d host=%d guest=%d next=%u.\n",
+            source != nullptr ? item_caps_total(source) : -1,
+            host != nullptr ? item_caps_total(host) : -1,
+            guest != nullptr ? item_caps_total(guest) : -1,
+            lootPolicy.nextExtraCapPlayer().value);
+        if (source != nullptr) {
+            for (int index = 0; index < source->data.inventory.length; index++) {
+                const InventoryItem& entry = source->data.inventory.items[index];
+                if (entry.item->pid == PROTO_ID_MONEY) {
+                    std::fprintf(stderr, "Loot cap source stack: quantity=%d id=%u.\n",
+                        entry.quantity,
+                        session.entities().findEntity(entry.item).value_or(EntityId {}).value);
+                }
+            }
+        }
+    }
+    return valid;
 }
 
 std::optional<EntityId> networkWorldPrepareSkillSmokeTest()
@@ -5911,7 +6160,17 @@ AuthoritativeCommandResult networkWorldProcessCommand(const GameCommand& command
         }
     }
 
+    std::size_t previousDeferredCount = deferredEvents.size();
     AuthoritativeCommandResult result = commandProcessor.process(command, session, commandExecutor);
+    if (result.result.status == CommandStatus::Accepted && !result.replayed) {
+        for (auto pending = deferredEvents.begin() + previousDeferredCount;
+             pending != deferredEvents.end(); ++pending) {
+            if (pending->causedBy.value == 0
+                && std::holds_alternative<InventoryTransferredEvent>(pending->payload)) {
+                pending->causedBy = command.sequence;
+            }
+        }
+    }
     if (result.result.status == CommandStatus::Accepted && !result.replayed
         && result.event.has_value()) {
         if (std::holds_alternative<DialogueRequestedEvent>(result.event->payload)) {
@@ -6482,6 +6741,8 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
     }
     captured.gameTime = game_time();
     captured.sharedActivity.assign(sharedActivity.begin(), sharedActivity.end());
+    captured.nextExtraCapPlayer = lootPolicy.nextExtraCapPlayer();
+    captured.nextItemPriorityPlayer = lootPolicy.nextItemPriorityPlayer();
     if (captured.phase == SessionPhase::Dialogue
         && activeSharedModal.has_value()
         && activeSharedModal->kind == SharedModalKind::Dialogue) {
@@ -6680,6 +6941,11 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
         std::fprintf(stderr, "Multiplayer snapshot actor identity preflight failed.\n");
         return false;
     }
+    LootPolicy restoredLootPolicy;
+    if (!restoredLootPolicy.restore(session.players().playerIds(),
+            snapshot.nextExtraCapPlayer, snapshot.nextItemPriorityPlayer)) {
+        return false;
+    }
     for (const DoorSnapshot& doorState : snapshot.doors) {
         Object* door = session.entities().findObject(doorState.entityId);
         if (door == nullptr
@@ -6869,6 +7135,7 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot)
     }
     combat_free_move = snapshot.combatFreeMove;
     sharedActivity.assign(snapshot.sharedActivity.begin(), snapshot.sharedActivity.end());
+    lootPolicy = std::move(restoredLootPolicy);
     nextSharedActivityId = sharedActivity.empty()
         ? 1 : sharedActivity.back().id + 1;
     if (snapshot.phase == SessionPhase::Dialogue) {
@@ -7330,6 +7597,8 @@ void networkWorldLeave()
     dialogueCause = {};
     nextDialogueRevision = 1;
     activeLootTargets.clear();
+    pendingLootPriority.reset();
+    lootPolicy = LootPolicy {};
     activeSharedModal.reset();
     approvedWorldMapProposerActorId = {};
     approvedWorldMapProposalSequence = {};

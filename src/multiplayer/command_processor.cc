@@ -382,7 +382,7 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
                 item,
                 *transfer);
             executionStatus = transferExecution.status;
-            event.payload = InventoryTransferredEvent {
+            event.payload = transferExecution.primaryEvent.value_or(InventoryTransferredEvent {
                 command.actorId,
                 transfer->sourceId,
                 transfer->destinationId,
@@ -391,7 +391,7 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
                 transfer->sourceQuantity,
                 transferExecution.remainderItemId,
                 transferExecution.itemDescriptor,
-            };
+            });
         } else if (trade != nullptr) {
             DirectTradeExecution tradeExecution = executor.directTrade(actor,
                 command.playerId, *trade);

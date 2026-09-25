@@ -158,6 +158,8 @@ bool networkWorldRunPartyExperienceSmokeTest();
 std::optional<EntityId> networkWorldPrepareDoorSmokeTest();
 std::optional<EntityId> networkWorldPreparePickupSmokeTest();
 std::optional<EntityId> networkWorldPrepareLootSmokeTest();
+std::optional<std::pair<EntityId, EntityId>> networkWorldPrepareLootCapSmokeTest();
+bool networkWorldVerifyLootCapSmokeTest(EntityId sourceId);
 std::optional<EntityId> networkWorldPrepareSkillSmokeTest();
 std::optional<EntityId> networkWorldPrepareScenerySmokeTest();
 bool networkWorldMutateScenerySmokeTest(EntityId targetId);

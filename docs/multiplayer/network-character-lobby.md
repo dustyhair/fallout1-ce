@@ -20,6 +20,8 @@ Passing `--multiplayer-smoke-scenario=pickup` selects the pickup fixture. It use
 
 Passing `--multiplayer-smoke-scenario=loot` selects a registered map critter, places the guest actor beside it, first proves that a remote loot command is rejected without an event, then sends the adjacent command through the host command processor. It applies the authoritative loot-start event and verifies checkpoint and replay convergence.
 
+Passing `--multiplayer-smoke-scenario=loot-caps` gives that source seven caps. The guest requests the full stack; the host distributes four to the host and three to the guest, then advances the extra-cap cursor to the guest. Two ordered inventory events and snapshot version 18 converge on both processes and replay after reconnect. Ordinary items use a rotating priority cursor when both players have the same loot source open; the other player can take the item after a five-second priority window.
+
 Passing `--multiplayer-smoke-scenario=transfer` creates the same seven-cap guest stack on both processes. It first proves that an out-of-range gift and a forged attempt to take from the host are rejected without events. The guest then gives three caps to the adjacent host over the real command channel. Both peers must reach the same four/three cap split identities, converge at the checkpoint, and replay the transfer after reconnect.
 
 Passing `--multiplayer-smoke-scenario=skill` places the guest beside the same registered door and submits Traps through the real skill command. The host runs the asynchronous skill action under the guest character context; the guest applies only the ordered presentation boundary. Both processes then require the same complete authoritative state digest and replay the skill event after reconnect.

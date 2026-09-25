@@ -46,6 +46,8 @@ add_library(fallout-multiplayer-core STATIC
     "src/multiplayer/dialogue_vote_controller.h"
     "src/multiplayer/direct_trade_controller.cc"
     "src/multiplayer/direct_trade_controller.h"
+    "src/multiplayer/loot_policy.cc"
+    "src/multiplayer/loot_policy.h"
     "src/multiplayer/content_manifest.cc"
     "src/multiplayer/content_manifest.h"
     "src/multiplayer/command_processor.cc"

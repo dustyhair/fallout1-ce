@@ -1,6 +1,6 @@
 # Snapshot recovery
 
-Snapshot version 12 contains the state needed to recover the live two-player experiment:
+Snapshot version 18 contains the state needed to recover the live two-player experiment:
 
 - Session phase, phase revision, authoritative world time, and last included event sequence.
 - Player actor identity, owner, tile, elevation, rotation, hit points, and complete progressing character build.
@@ -11,6 +11,7 @@ Snapshot version 12 contains the state needed to recover the live two-player exp
 - The indexed game-global, map-global, and map-local arrays visible to scripts.
 - The ordered timed-event queue, including absolute trigger time, stable owner identity, and bounded type-specific payload.
 - Persistent world-map position, discovered grid and town entrances, visited cities, and special-encounter history. The host remains the only authority for encounter rolls.
+- The next player to receive an extra looted cap and the next player with priority for a contested item. Both cursors follow the ordered player roster.
 - Shared world-map travel planning stage, original proposer, current controller, optional approved route target, and any active travel line/counters. If a guest controller disconnects during an approved trip, the host keeps the target and takes control; a reconnecting guest recovers that ownership instead of automatically taking it back. The guest may retain the travel counters for digest/recovery but cannot advance travel rules.
 
 The wire format uses fixed-width big-endian fields. Its 28-byte header carries the format version, payload length, snapshot checksum, and last included event. The checksum covers the event sequence and payload. Decoders reject unknown versions, payloads over 512 KiB, invalid counts, duplicate entity IDs, malformed state, truncation, trailing bytes, and checksum failures. Shared object flags deliberately omit process-local discovery/selection and object-lifetime bits.

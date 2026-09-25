@@ -612,6 +612,10 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
             return SnapshotError::InvalidActorState;
         }
     }
+    if (playerIds.find(snapshot.nextExtraCapPlayer.value) == playerIds.end()
+        || playerIds.find(snapshot.nextItemPriorityPlayer.value) == playerIds.end()) {
+        return SnapshotError::InvalidPlayerId;
+    }
 
     for (const CritterSnapshot& critter : snapshot.critters) {
         if (!isValid(critter.entityId)
@@ -757,7 +761,8 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
         + kCombatStateBaseSize
         + snapshot.combat.initiative.size() * 8
         + dialogueSnapshotSize(snapshot)
-        + sharedActivitySnapshotSize(snapshot);
+        + sharedActivitySnapshotSize(snapshot)
+        + 2 * sizeof(std::uint32_t);
     if (payloadSize > kMaxSnapshotPayloadSize) {
         return SnapshotError::PayloadTooLarge;
     }
@@ -791,7 +796,8 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
         + kCombatStateBaseSize
         + canonical.combat.initiative.size() * 8
         + dialogueSnapshotSize(canonical)
-        + sharedActivitySnapshotSize(canonical));
+        + sharedActivitySnapshotSize(canonical)
+        + 2 * sizeof(std::uint32_t));
 
     appendUint8(payload, static_cast<std::uint8_t>(canonical.phase));
     appendUint8(payload, 0);
@@ -834,6 +840,8 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
     appendUint32(payload, static_cast<std::uint32_t>(canonical.combatFreeMove));
     appendDialogue(payload, canonical);
     appendSharedActivity(payload, canonical);
+    appendUint32(payload, canonical.nextExtraCapPlayer.value);
+    appendUint32(payload, canonical.nextItemPriorityPlayer.value);
 
     std::vector<std::uint8_t> protectedBytes;
     protectedBytes.reserve(sizeof(std::uint64_t) + payload.size());
@@ -973,7 +981,7 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
     if (combatCount > kMaximumCombatInitiative
         || payloadSize < expectedPayloadSize
             + static_cast<std::size_t>(combatCount) * 8
-            + kDialogueSnapshotBaseSize + 4) {
+            + kDialogueSnapshotBaseSize + 4 + 2 * sizeof(std::uint32_t)) {
         result.error = SnapshotError::TrailingData;
         return result;
     }
@@ -1261,6 +1269,12 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
         offset += textLength;
         result.snapshot.sharedActivity.push_back(std::move(entry));
     }
+    if (offset + 2 * sizeof(std::uint32_t) > packet.size()) {
+        result.error = SnapshotError::TruncatedPayload;
+        return result;
+    }
+    result.snapshot.nextExtraCapPlayer.value = readUint32(packet, offset);
+    result.snapshot.nextItemPriorityPlayer.value = readUint32(packet, offset);
     if (offset != packet.size()) {
         result.error = SnapshotError::TrailingData;
         return result;
@@ -1297,6 +1311,8 @@ SnapshotDigestResult computeSnapshotDigest(const WorldSnapshot& snapshot)
     appendUint32(sessionBytes, static_cast<std::uint32_t>(canonical.combatFreeMove));
     appendDialogue(sessionBytes, canonical);
     appendSharedActivity(sessionBytes, canonical);
+    appendUint32(sessionBytes, canonical.nextExtraCapPlayer.value);
+    appendUint32(sessionBytes, canonical.nextItemPriorityPlayer.value);
     result.digest.session = digestBytes(sessionBytes);
 
     std::vector<std::uint8_t> actorBytes;
