@@ -2,6 +2,18 @@
 
 Gameplay messages use the shared protocol envelope and the session established by the handshake. Each direction continues its exact envelope sequence after the character lobby hands off the connection.
 
+Current gameplay wire version is **31**. Both peers must be rebuilt together.
+Equipment commands carry the combat turn revision, three item IDs, active hand,
+and an action: set equipment, open inventory, or close inventory. Opening
+inventory charges its native AP cost once; equipment edits within that access
+are free. A turn change or disconnect invalidates the access. Equipment events
+are acknowledged only after their authoritative checkpoint is applied.
+
+The following describes the earlier command families; live combat now supports
+turn ownership, attack, movement, item use, reload, facing and end-turn commands.
+The guest now plays player attack art; full combat presentation remains incomplete. See
+[the September playtest notes](playtest-2026-09-26.md).
+
 The version 18 command payload covers movement, facing, door use, item pickup, looting, targeted exploration skills, directly owned item-on-target use, same-map and cross-map elevator travel, ordinary cross-map exit grids, script-backed scenery stairs and ladders, agreed rest, inventory transfers, inventory-to-ground drops, shared modal state, bounded world-map route targets, and reserved combat attack messages. Every command carries its own command sequence, player and actor identities, expected session phase, and phase revision. Results report acceptance or a specific rejection and identify the authoritative event range. Inventory mutations name the source, item, moved quantity, and pre-move stack quantity. A bounded prototype/state descriptor lets the host assign identity when a player-held item has not appeared in the shared registry yet.
 
 World-map route commands contain either a target within the 1400×1500 map or an explicit clear operation. The host accepts them only from the player whose approved proposal opened travel and publishes the resulting target. These events stage input only; world-map movement, time, encounters, and map loading remain disabled until the authoritative travel loop is connected.

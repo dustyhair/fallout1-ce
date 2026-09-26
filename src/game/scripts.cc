@@ -2071,6 +2071,11 @@ int scr_new(int* sidPtr, int scriptType)
 // 0x494284
 int scr_remove_local_vars(Script* script)
 {
+    // Replica script offsets describe its map load, not the host's live
+    // allocation order. Only a checkpoint may compact its authoritative array.
+    if (multiplayer::networkRuntimeIsGuestReplica()) {
+        return 0;
+    }
     if (script == NULL) {
         return -1;
     }

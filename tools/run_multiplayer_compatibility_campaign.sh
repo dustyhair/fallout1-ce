@@ -122,6 +122,10 @@ run_scenario movement
 run_scenario loot --multiplayer-smoke-scenario=loot
 run_scenario transfer --multiplayer-smoke-scenario=transfer
 run_scenario trade --multiplayer-smoke-scenario=trade
+run_scenario knife_gift --multiplayer-smoke-scenario=trade --multiplayer-smoke-knife-gift
+run_scenario knife_combat --multiplayer-smoke-scenario=combat-attack --multiplayer-smoke-weapon=knife
+run_scenario pistol_aimed_combat --multiplayer-smoke-scenario=combat-attack --multiplayer-smoke-weapon=pistol
+run_scenario rat_death --multiplayer-smoke-scenario=combat-kill
 run_scenario container --multiplayer-smoke-scenario=container
 run_scenario quest --multiplayer-smoke-scenario=quest
 run_scenario elevator --multiplayer-smoke-scenario=elevation

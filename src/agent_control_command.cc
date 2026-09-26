@@ -338,6 +338,21 @@ bool agentControlParseCommand(const std::string& line,
         }
         return true;
     }
+    if (verb == "game_equip") {
+        command.type = AgentControlCommandType::GameEquipment;
+        long long left, right, armor;
+        if (!(input >> left >> right >> armor >> command.activeHand) || hasTrailingInput(input)
+            || left < 0 || right < 0 || armor < 0
+            || left > UINT32_MAX || right > UINT32_MAX || armor > UINT32_MAX
+            || command.activeHand < 0 || command.activeHand > 1) {
+            error = "expected: game_equip <left_id_or_0> <right_id_or_0> <armor_id_or_0> <active_hand_0_or_1>";
+            return false;
+        }
+        command.leftHandId = static_cast<std::uint32_t>(left);
+        command.rightHandId = static_cast<std::uint32_t>(right);
+        command.armorId = static_cast<std::uint32_t>(armor);
+        return true;
+    }
     if (verb == "game_attack") {
         command.type = AgentControlCommandType::GameAttack;
         if (!(input >> command.entityId >> command.hitMode)
@@ -556,6 +571,8 @@ const char* agentControlCommandTypeName(AgentControlCommandType type)
         return "game_trade_confirm";
     case AgentControlCommandType::GameTradeCancel:
         return "game_trade_cancel";
+    case AgentControlCommandType::GameEquipment:
+        return "game_equip";
     case AgentControlCommandType::GameAttack:
         return "game_attack";
     case AgentControlCommandType::GameReload:

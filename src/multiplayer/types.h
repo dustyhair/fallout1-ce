@@ -393,6 +393,25 @@ struct CombatReloadCommand {
     std::int32_t hitMode = 0;
 };
 
+enum class EquipmentAction : std::int32_t {
+    Set = 0,
+    OpenInventory = 1,
+    CloseInventory = 2,
+};
+
+struct EquipmentCommand {
+    std::uint64_t turnRevision = 0; // Zero outside combat.
+    EntityId leftHand;
+    EntityId rightHand;
+    EntityId armor;
+    std::int32_t activeHand = 1;
+    EquipmentAction action = EquipmentAction::Set;
+};
+
+struct EquipmentChangedEvent {
+    EntityId actorId; // Equipment and AP arrive in the following checkpoint.
+};
+
 struct CombatFaceCommand {
     std::uint64_t turnRevision = 0;
     std::int32_t rotation = 0;
@@ -437,7 +456,7 @@ constexpr bool isValid(const WorldMapRouteCommand& route)
             && route.targetY >= 0 && route.targetY < kWorldMapHeight;
 }
 
-using GameCommandPayload = std::variant<MoveCommand, FaceCommand, InteractCommand, PickupCommand, LootCommand, UseSkillCommand, UseItemOnCommand, ElevatorCommand, ExitGridCommand, SceneryTransitionCommand, RestCommand, InventoryTransferCommand, ItemDropCommand, AttackCommand, CombatMoveCommand, CombatItemCommand, CombatReloadCommand, CombatFaceCommand, EndTurnCommand, SharedModalCommand, WorldMapRouteCommand, TalkCommand, DialogueVoteCommand, DirectTradeCommand>;
+using GameCommandPayload = std::variant<MoveCommand, FaceCommand, InteractCommand, PickupCommand, LootCommand, UseSkillCommand, UseItemOnCommand, ElevatorCommand, ExitGridCommand, SceneryTransitionCommand, RestCommand, InventoryTransferCommand, ItemDropCommand, AttackCommand, CombatMoveCommand, CombatItemCommand, CombatReloadCommand, CombatFaceCommand, EndTurnCommand, SharedModalCommand, WorldMapRouteCommand, TalkCommand, DialogueVoteCommand, DirectTradeCommand, EquipmentCommand>;
 
 struct GameCommand {
     CommandSequence sequence;
@@ -753,7 +772,7 @@ struct WorldMapRouteSelectedEvent {
     bool clear = false;
 };
 
-using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, ItemPickupCompletedEvent, LootStartedEvent, SkillUseStartedEvent, ItemUseStartedEvent, ElevatorTransitionedEvent, ExitGridTransitionedEvent, SceneryTransitionedEvent, RestStateChangedEvent, InventoryTransferredEvent, CapsDistributedEvent, DirectTradeStateChangedEvent, ItemDroppedEvent, AttackStartedEvent, CombatTurnStateChangedEvent, CombatActionResolvedEvent, PartyExperienceAwardedEvent, SharedModalStateChangedEvent, WorldMapRouteSelectedEvent, WorldMapArrivedEvent, DialogueRequestedEvent, DialogueVoteRecordedEvent, DialoguePresentationEvent, SharedActivityPublishedEvent>;
+using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, ItemPickupCompletedEvent, LootStartedEvent, SkillUseStartedEvent, ItemUseStartedEvent, ElevatorTransitionedEvent, ExitGridTransitionedEvent, SceneryTransitionedEvent, RestStateChangedEvent, InventoryTransferredEvent, CapsDistributedEvent, DirectTradeStateChangedEvent, ItemDroppedEvent, AttackStartedEvent, CombatTurnStateChangedEvent, CombatActionResolvedEvent, PartyExperienceAwardedEvent, SharedModalStateChangedEvent, WorldMapRouteSelectedEvent, WorldMapArrivedEvent, DialogueRequestedEvent, DialogueVoteRecordedEvent, DialoguePresentationEvent, SharedActivityPublishedEvent, EquipmentChangedEvent>;
 
 struct GameEvent {
     EventSequence sequence;

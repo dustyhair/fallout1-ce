@@ -29,7 +29,7 @@ enum class PartyExperienceResult {
 
 bool networkWorldEnter(NetworkLaunchMode mode,
     const CharacterCreationSheet& localSheet,
-    const CharacterCreationSheet& peerSheet);
+    const CharacterCreationSheet& peerSheet, bool seedStartingKit = true);
 bool networkWorldRestoreMultiplayerSave(const MultiplayerSaveSidecar& sidecar,
     Object* savedGuestActor);
 bool networkWorldBeginEnding();
@@ -117,7 +117,7 @@ bool networkWorldFinishWorldMapTravel(WorldMapArrivalKind kind,
 bool networkWorldWorldMapDeparted();
 void networkWorldHealRemotePlayersForTravelDay();
 bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot& snapshot);
-bool networkWorldApplySnapshot(const WorldSnapshot& snapshot);
+bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovement = false);
 bool networkWorldCaptureAuthoritativeState(EventSequence lastIncludedEvent, WorldSnapshot& snapshot);
 bool networkWorldApplyAuthoritativeState(const WorldSnapshot& snapshot);
 std::optional<EntityId> networkWorldFindEntity(const Object* object);
@@ -156,6 +156,8 @@ bool networkWorldPrepareCombatItemSmoke();
 EntityId networkWorldCombatSmokeItem();
 bool networkWorldCombatSmokeActorHealed();
 bool networkWorldPrepareCombatReloadSmoke();
+bool networkWorldPrepareEquipmentSmoke(int weaponPid);
+bool networkWorldPrepareHostWeaponAttackSmoke();
 EntityId networkWorldCombatSmokeWeapon();
 bool networkWorldCombatSmokeWeaponLoaded();
 int networkWorldCombatSmokeAmmoUnits();

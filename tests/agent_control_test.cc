@@ -27,6 +27,15 @@ int main()
     bool passed = true;
     fallout::AgentControlCommand command;
 
+    passed = expect(parse("40 game_equip 240 241 0 1", command)
+            && command.type == fallout::AgentControlCommandType::GameEquipment
+            && command.leftHandId == 240 && command.rightHandId == 241
+            && command.armorId == 0 && command.activeHand == 1,
+        "parses equipped slots and active hand") && passed;
+    passed = expect(!parse("40 game_equip -1 0 0 1", command)
+            && !parse("40 game_equip 0 0 0 2", command)
+            && !parse("40 game_equip 4294967296 0 0 1", command),
+        "rejects invalid equipment identity and hand") && passed;
     passed = expect(parse("41 click 410 220", command)
             && command.id == 41
             && command.type == fallout::AgentControlCommandType::LeftClick

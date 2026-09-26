@@ -28,6 +28,10 @@ struct AgentJournalInventoryItemState {
     std::string name;
     std::uint32_t quantity = 0;
     bool equipped = false;
+    bool leftHand = false;
+    bool rightHand = false;
+    bool armor = false;
+    int ammo = -1;
 };
 
 struct AgentJournalCritterState {
@@ -64,6 +68,8 @@ struct AgentJournalWorldState {
     std::string phase;
     bool connected = false;
     bool combat = false;
+    std::uint64_t combatTurnRevision = 0;
+    std::uint32_t combatOwnerPlayerId = 0; // Zero denotes an AI turn or no turn.
     int pendingRestMinutes = 0;
     std::uint32_t pendingRestProposerId = 0;
     std::string pendingRestProposerName;

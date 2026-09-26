@@ -81,6 +81,7 @@ public:
         std::uint32_t phaseRevision);
     bool sendLocalCombatReload(EntityId weaponId, std::int32_t hitMode,
         std::uint64_t turnRevision, std::uint32_t phaseRevision);
+    bool sendLocalEquipment(const EquipmentCommand& equipment, std::uint32_t phaseRevision);
     bool sendLocalCombatFace(std::int32_t rotation, std::uint64_t turnRevision,
         std::uint32_t phaseRevision);
     bool sendLocalEndTurn(std::uint64_t turnRevision, std::uint32_t phaseRevision);

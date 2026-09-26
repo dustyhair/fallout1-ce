@@ -52,6 +52,7 @@ bool networkRuntimeSubmitLocalMove(int destinationTile, int elevation, bool runn
 bool networkRuntimeSubmitLocalFacing(int rotation);
 bool networkRuntimeSubmitCombatAttack(EntityId targetId, std::int32_t hitMode, std::int32_t hitLocation);
 bool networkRuntimeSubmitCombatItem(EntityId itemId, EntityId targetId = {});
+bool networkRuntimeSubmitEquipment(const EquipmentCommand& equipment);
 bool networkRuntimeSubmitCombatReload(EntityId weaponId, std::int32_t hitMode);
 bool networkRuntimeHandleCombatItemUse(Object* item);
 bool networkRuntimeHandleCombatReload(Object* weapon, std::int32_t hitMode);

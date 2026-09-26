@@ -98,7 +98,8 @@ EntityId eventActorId(const GameEventPayload& payload)
 
 bool isSupportedLiveEvent(const GameEventPayload& payload)
 {
-    return std::holds_alternative<ActorMovementStartedEvent>(payload)
+    return std::holds_alternative<EquipmentChangedEvent>(payload)
+        || std::holds_alternative<ActorMovementStartedEvent>(payload)
         || std::holds_alternative<ActorFacingChangedEvent>(payload)
         || std::holds_alternative<DoorUseStartedEvent>(payload)
         || std::holds_alternative<ItemPickupStartedEvent>(payload)
@@ -347,6 +348,13 @@ bool NetworkLobby::sendLocalCombatReload(EntityId weaponId,
             weaponId, turnRevision, phaseRevision },
         CombatReloadCommand { turnRevision, weaponId, hitMode },
         phaseRevision, SessionPhase::Combat);
+}
+
+bool NetworkLobby::sendLocalEquipment(const EquipmentCommand& equipment, std::uint32_t phaseRevision)
+{
+    return sendLocalAction(EquipmentChangedEvent { EntityId { kGuestPlayerId.value } },
+        equipment, phaseRevision, equipment.turnRevision == 0
+            ? SessionPhase::Exploration : SessionPhase::Combat);
 }
 
 bool NetworkLobby::sendLocalCombatFace(std::int32_t rotation,
@@ -758,7 +766,8 @@ bool NetworkLobby::sendRecovery(EventSequence lastApplied, const WorldSnapshot& 
     }
     bool combatEffectsRequireSnapshot = replay.status == EventReplayStatus::Available
         && std::any_of(replay.events.begin(), replay.events.end(), [](const GameEvent& event) {
-            return std::holds_alternative<AttackStartedEvent>(event.payload)
+            return std::holds_alternative<EquipmentChangedEvent>(event.payload)
+                || std::holds_alternative<AttackStartedEvent>(event.payload)
                 || std::holds_alternative<CombatTurnStateChangedEvent>(event.payload)
                 || std::holds_alternative<CombatActionResolvedEvent>(event.payload)
                 || std::holds_alternative<PartyExperienceAwardedEvent>(event.payload);

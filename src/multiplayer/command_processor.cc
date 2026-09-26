@@ -40,7 +40,10 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
 
     const SharedModalCommand* modal = std::get_if<SharedModalCommand>(&command.payload);
     const DirectTradeCommand* directTrade = std::get_if<DirectTradeCommand>(&command.payload);
-    SessionPhase requiredPhase = (std::holds_alternative<AttackCommand>(command.payload)
+    const EquipmentCommand* equipment = std::get_if<EquipmentCommand>(&command.payload);
+    SessionPhase requiredPhase = equipment != nullptr
+        ? (equipment->turnRevision == 0 ? SessionPhase::Exploration : SessionPhase::Combat)
+        : (std::holds_alternative<AttackCommand>(command.payload)
             || std::holds_alternative<CombatMoveCommand>(command.payload)
             || std::holds_alternative<CombatItemCommand>(command.payload)
             || std::holds_alternative<CombatReloadCommand>(command.payload)
@@ -368,6 +371,9 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
             event.payload = CombatActionResolvedEvent { command.actorId,
                 CombatActionKind::Reload, combatReload->weaponId,
                 combatReload->turnRevision, session.phaseRevision() };
+        } else if (equipment != nullptr) {
+            executionStatus = executor.setEquipment(actor, *equipment);
+            event.payload = EquipmentChangedEvent { command.actorId };
         } else if (combatFace != nullptr) {
             executionStatus = executor.combatFace(actor, *combatFace);
             event.payload = CombatActionResolvedEvent { command.actorId,

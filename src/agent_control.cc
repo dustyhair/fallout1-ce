@@ -161,6 +161,20 @@ void executeCommand(const AgentControlCommand& command)
             agentJournalWriteAgentCommand(command.id, commandName, "rejected", "semantic facing is unavailable or invalid");
         }
         return;
+    case AgentControlCommandType::GameEquipment: {
+        multiplayer::EquipmentCommand equipment;
+        equipment.leftHand = multiplayer::EntityId { command.leftHandId };
+        equipment.rightHand = multiplayer::EntityId { command.rightHandId };
+        equipment.armor = multiplayer::EntityId { command.armorId };
+        equipment.activeHand = command.activeHand;
+        if (multiplayer::networkWorldPhase() == multiplayer::SessionPhase::Combat) {
+            equipment.turnRevision = multiplayer::networkWorldCombatTurnRevision();
+        }
+        bool accepted = multiplayer::networkRuntimeSubmitEquipment(equipment);
+        agentJournalWriteAgentCommand(command.id, commandName,
+            accepted ? "accepted" : "rejected", "equipment change submitted to authority");
+        return;
+    }
     case AgentControlCommandType::GameAttack: {
         if (multiplayer::networkRuntimeSubmitCombatAttack(
                 multiplayer::EntityId { command.entityId }, command.hitMode,
@@ -169,7 +183,7 @@ void executeCommand(const AgentControlCommand& command)
                 "accepted", "combat attack submitted");
         } else {
             agentJournalWriteAgentCommand(command.id, commandName,
-                "rejected", "combat target or active turn is unavailable");
+                "rejected", "attack rejected; check turn, AP, range, ammo and weapon readiness");
         }
         return;
     }

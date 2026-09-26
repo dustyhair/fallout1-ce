@@ -97,6 +97,7 @@ int map_set_local_var(int var, ProgramValue& value);
 int map_get_local_var(int var, ProgramValue& value);
 int map_malloc_local_var(int a1);
 bool map_ensure_local_vars(int count);
+bool map_resize_local_vars(int count);
 void map_set_entrance_hex(int a1, int a2, int a3);
 void map_set_name(const char* name);
 void map_get_name(char* name);

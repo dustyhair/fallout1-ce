@@ -30,6 +30,7 @@ enum class AgentControlCommandType {
     GameTradeOffer,
     GameTradeConfirm,
     GameTradeCancel,
+    GameEquipment,
     GameAttack,
     GameReload,
     GameCombatItem,
@@ -45,6 +46,10 @@ struct AgentControlCommand {
     int tile = -1;
     int elevation = -1;
     int rotation = -1;
+    int activeHand = 1;
+    std::uint32_t leftHandId = 0;
+    std::uint32_t rightHandId = 0;
+    std::uint32_t armorId = 0;
     int hitMode = -1;
     int hitLocation = 8;
     int skill = -1;

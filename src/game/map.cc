@@ -579,8 +579,18 @@ int map_malloc_local_var(int a1)
 
 bool map_ensure_local_vars(int count)
 {
-    if (count < num_map_local_vars || count < 0) {
+    return count >= num_map_local_vars && map_resize_local_vars(count);
+}
+
+// Replicas replace this array with the authority's compacted script locals.
+bool map_resize_local_vars(int count)
+{
+    if (count < 0) {
         return false;
+    }
+    if (count == 0) {
+        map_free_local_vars();
+        return true;
     }
     if (count == num_map_local_vars) {
         return true;
@@ -590,7 +600,9 @@ bool map_ensure_local_vars(int count)
     if (vars == nullptr) {
         return false;
     }
-    memset(vars + num_map_local_vars, 0, sizeof(*vars) * (count - num_map_local_vars));
+    if (count > num_map_local_vars) {
+        memset(vars + num_map_local_vars, 0, sizeof(*vars) * (count - num_map_local_vars));
+    }
     map_local_vars = vars;
     num_map_local_vars = count;
     map_local_pointers.resize(count);

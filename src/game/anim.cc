@@ -26,6 +26,7 @@
 #include "game/textobj.h"
 #include "game/tile.h"
 #include "game/trait.h"
+#include "multiplayer/network_world.h"
 #include "plib/color/color.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/input.h"
@@ -3136,6 +3137,12 @@ int dude_run(int action_points)
 // 0x417AB0
 void dude_fidget()
 {
+    // The host supplies idle poses through snapshots. A replica must not run
+    // a second frame-offset animation over those authoritative frames.
+    if (multiplayer::networkWorldReplicaSessionActive()) {
+        return;
+    }
+
     // 0x4FEAAC
     static unsigned int last_time = 0;
 

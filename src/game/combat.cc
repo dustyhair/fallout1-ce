@@ -33,6 +33,7 @@
 #include "game/trait.h"
 #include "multiplayer/acting_player_context.h"
 #include "multiplayer/local_player_context.h"
+#include "multiplayer/presentation_bridge.h"
 #include "multiplayer/network_runtime.h"
 #include "multiplayer/network_world.h"
 #include "platform_compat.h"
@@ -84,7 +85,7 @@ static char* combat_get_loc_name(Object* critter, int hitLocation);
 static void draw_loc_off(int a1, int a2);
 static void draw_loc_on(int a1, int a2);
 static void draw_loc(int eventCode, int color);
-static int get_called_shot_location(Object* critter, int* hitLocation, int hitMode);
+int combat_select_hit_location(Object* critter, int* hitLocation, int hitMode);
 
 // TODO: Remove.
 //
@@ -2229,7 +2230,11 @@ static int combat_input()
         } else {
             scripts_check_state_in_combat();
             if (!multiplayer::networkWorldActive()
-                || input == -2 || input == -20) {
+                || input == -2 || input == -20
+                || input == KEY_LOWERCASE_I || input == KEY_UPPERCASE_I
+                || input == KEY_LOWERCASE_B || input == KEY_UPPERCASE_B
+                || input == KEY_LOWERCASE_N || input == KEY_UPPERCASE_N
+                || input == KEY_LOWERCASE_M || input == KEY_UPPERCASE_M) {
                 game_handle_input(input, true);
             }
         }
@@ -2266,6 +2271,12 @@ void combat_end_turn()
 // 0x420798
 static int combat_turn(Object* a1, bool a2)
 {
+    // AP and perks must come from this player's build, including the remote
+    // player's turn. The shared critter prototype is not their character sheet.
+    std::optional<multiplayer::ScopedActingPlayerContext> playerContext;
+    if (auto* player = multiplayer::playerStateForActor(a1)) {
+        playerContext.emplace(*player, a1);
+    }
     int action_points;
     bool script_override = false;
     Script* script;
@@ -2628,7 +2639,9 @@ int combat_attack(Object* attacker, Object* defender, int hitMode, int hitLocati
         }
     }
 
-    if (main_ctd.defenderHitLocation == HIT_LOCATION_TORSO || main_ctd.defenderHitLocation == HIT_LOCATION_UNCALLED) {
+    if (multiplayer::networkWorldActive() && multiplayer::networkWorldCombatOwner(attacker).has_value()) {
+        aiming = hitLocation != HIT_LOCATION_UNCALLED;
+    } else if (main_ctd.defenderHitLocation == HIT_LOCATION_TORSO || main_ctd.defenderHitLocation == HIT_LOCATION_UNCALLED) {
         if (attacker == obj_dude) {
             intface_get_attack(&hitMode, &aiming);
         } else {
@@ -4331,8 +4344,10 @@ static void draw_loc(int input, int color)
 }
 
 // 0x42382C
-static int get_called_shot_location(Object* critter, int* hit_location, int hit_mode)
+int combat_select_hit_location(Object* critter, int* hit_location, int hit_mode)
 {
+    multiplayer::ScopedLocalPlayerContext localPlayerContext;
+    Object* shooter = multiplayer::localPlayerActorOrStoryActor();
     call_target = critter;
 
     int calledShotWindowX = (screenGetWidth() - CALLED_SHOT_WINDOW_WIDTH) / 2;
@@ -4418,7 +4433,7 @@ static int get_called_shot_location(Object* critter, int* hit_location, int hit_
         char* hit_location_name;
         int hit_location_name_width;
 
-        probability = determine_to_hit(obj_dude, critter, hit_loc_left[index], hit_mode);
+        probability = determine_to_hit(shooter, critter, hit_loc_left[index], hit_mode);
         print_tohit(windowBuffer + CALLED_SHOT_WINDOW_WIDTH * (call_ty[index] - 86) + 33, CALLED_SHOT_WINDOW_WIDTH, probability);
 
         btn = win_register_button(call_win,
@@ -4437,7 +4452,7 @@ static int get_called_shot_location(Object* critter, int* hit_location, int hit_
         win_register_button_func(btn, draw_loc_on, draw_loc_off, NULL, NULL);
         draw_loc_off(btn, index);
 
-        probability = determine_to_hit(obj_dude, critter, hit_loc_right[index], hit_mode);
+        probability = determine_to_hit(shooter, critter, hit_loc_right[index], hit_mode);
         print_tohit(windowBuffer + CALLED_SHOT_WINDOW_WIDTH * (call_ty[index] - 86) + 373, CALLED_SHOT_WINDOW_WIDTH, probability);
 
         hit_location_name = combat_get_loc_name(critter, hit_loc_right[index]);
@@ -4684,7 +4699,7 @@ void combat_attack_this(Object* a1)
     }
 
     int hitLocation;
-    if (get_called_shot_location(a1, &hitLocation, hitMode) != -1) {
+    if (combat_select_hit_location(a1, &hitLocation, hitMode) != -1) {
         if (multiplayer::networkRuntimeHandleLocalAttack(a1, hitMode, hitLocation)) {
             return;
         }

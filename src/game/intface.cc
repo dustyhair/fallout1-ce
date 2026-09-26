@@ -27,6 +27,7 @@
 #include "game/tile.h"
 #include "multiplayer/local_player_context.h"
 #include "multiplayer/network_runtime.h"
+#include "multiplayer/network_world.h"
 #include "multiplayer/presentation_bridge.h"
 #include "platform_compat.h"
 #include "plib/color/color.h"
@@ -1066,6 +1067,25 @@ void intface_redraw()
         intface_update_items(false);
         intface_update_hit_points(false);
         intface_update_ac(false);
+        if (multiplayer::networkWorldReplicaSessionActive()) {
+            if (multiplayer::networkWorldPhase() == multiplayer::SessionPhase::Combat) {
+                intface_end_window_open(false);
+                bool ownsTurn = multiplayer::networkWorldActiveCombatOwner()
+                    == multiplayer::networkWorldCombatOwner(intface_player());
+                if (ownsTurn) intface_end_buttons_enable();
+                else intface_end_buttons_disable();
+                intface_update_move_points(ownsTurn
+                    ? intface_player()->data.critter.combat.ap : -1, 0);
+            } else {
+                intface_end_window_close(false);
+            }
+        }
+        if (multiplayer::networkWorldActive()
+            && multiplayer::networkWorldPhase() == multiplayer::SessionPhase::Combat
+            && multiplayer::networkWorldActiveCombatOwner()
+                == multiplayer::networkWorldCombatOwner(intface_player())) {
+            intface_update_move_points(intface_player()->data.critter.combat.ap, 0);
+        }
         refresh_box_bar_win();
         win_draw(interfaceWindow);
     }
@@ -1354,6 +1374,13 @@ int intface_update_items(bool animated)
 }
 
 // 0x454C28
+void intface_select_item(int hand)
+{
+    if (hand != HAND_LEFT && hand != HAND_RIGHT) return;
+    itemCurrentItem = hand;
+    if (interfaceWindow != -1) intface_redraw_items();
+}
+
 int intface_toggle_items(bool animated)
 {
     multiplayer::ScopedLocalPlayerContext localPlayerContext;
@@ -1364,7 +1391,19 @@ int intface_toggle_items(bool animated)
 
     itemCurrentItem = 1 - itemCurrentItem;
 
-    if (animated) {
+    if (multiplayer::networkWorldActive()) {
+        Object* actor = intface_player();
+        multiplayer::EquipmentCommand equipment;
+        equipment.leftHand = multiplayer::networkWorldFindEntity(inven_left_hand(actor)).value_or(multiplayer::EntityId {});
+        equipment.rightHand = multiplayer::networkWorldFindEntity(inven_right_hand(actor)).value_or(multiplayer::EntityId {});
+        equipment.armor = multiplayer::networkWorldFindEntity(inven_worn(actor)).value_or(multiplayer::EntityId {});
+        equipment.activeHand = itemCurrentItem;
+        if (multiplayer::networkWorldPhase() == multiplayer::SessionPhase::Combat) {
+            equipment.turnRevision = multiplayer::networkWorldCombatTurnRevision();
+        }
+        multiplayer::networkRuntimeSubmitEquipment(equipment);
+        intface_redraw_items();
+    } else if (animated) {
         Object* item = itemButtonItems[itemCurrentItem].item;
         int animationCode = 0;
         if (item != NULL) {

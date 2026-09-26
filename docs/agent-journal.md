@@ -59,6 +59,7 @@ When a multiplayer world is active, prefer the semantic commands below. They ent
 32 game_trade_offer 1 1 10 88 2
 33 game_trade_confirm 1 2
 34 game_trade_cancel 1 2
+35 game_equip 0 90 0 1
 ```
 
 `game_move` takes a map tile, elevation from 0 through 2, and optional `walk` or `run`. Entity commands take an entity ID reported by the journal. `game_skill` takes one of `first_aid`, `doctor`, `lockpick`, `steal`, `traps`, `science`, or `repair`, followed by a registered target ID. `game_use_item` takes a registered item ID from `local_inventory` followed by a registered target ID; the item must be directly owned by the acting player. `game_give` takes the destination player's actor entity ID, a registered item ID from `local_inventory`, and a positive quantity. It can give ordinary items or caps, but only from the sender's direct inventory to an adjacent player. `game_elevator` takes Fallout's elevator type from 0 through 11 and a one-based level from 1 through 4; the host accepts it only when that type exists on the acting player's map/elevation and that player is at its source. For a same-map destination, a nearby player rides along automatically and a farther player remains on the original floor. A cross-map destination requires both players at the source and carries both through the synchronized map-load boundary. `game_exit` takes an `exit` entity ID from `visible_interactables`; the acting player must stand on that exit and every connected player must be within four hexes on the same elevation. Stepping onto a ready exit also submits this command automatically for human play. `game_stairs` takes a `stairs` or `ladder` entity ID and requires the acting player within four hexes. Same-map use moves only that player; cross-map typed stairs require every connected player nearby. `game_rest` takes 10 or 30 minutes, an integer number of hours from 60 through 360 minutes, `until_morning`, `until_noon`, `until_evening`, `until_midnight`, `until_healed`, or `cancel`. The first player proposes; the other must submit the same choice within 90 seconds. `pending_rest` in `world_state` names the proposer and includes the numeric choice and readable name. World-map exits use shared travel consent.
@@ -70,6 +71,15 @@ takes the trade ID, displayed revision, cap amount, and an optional item ID and
 quantity. `game_trade_confirm` and `game_trade_cancel` take the trade ID and
 revision. `world_state.trade` exposes the negotiation; edits clear both
 confirmations, and both players must confirm the same revision before assets move.
+
+`game_equip` takes left-hand, right-hand and armor entity IDs, followed by the
+active hand, 0 for left or 1 for right. Zero clears a slot. The host validates
+ownership and applies the normal inventory access AP cost for a combat loadout
+change. Changing only the active hand is free. Equipment remains selected after
+attacks. `local_inventory` includes `left_hand`, `right_hand`, `armor` and
+`ammo`, with -1 for non-weapons. Combat records include
+`combat_owner_player_id` and `combat_turn_revision`; their `combat` field follows
+the shared phase even on the guest, which does not run the combat engine.
 
 During an owned combat turn, `game_move` and `game_face` route to their combat variants. `game_attack` takes a target entity ID, hit mode 0–19 except reload modes 6 and 7, and optional hit location 0–8. `game_reload` takes an equipped weapon entity ID and `left` or `right`. `game_combat_item` takes a directly owned item ID and, for use-on-target items, an optional distinct target ID within one hex. `game_end_turn` ends only the actor's current revision-keyed turn. A syntactically accepted command can still be rejected by authority checks for phase, ownership, AP, range, target state, or another gameplay rule.
 

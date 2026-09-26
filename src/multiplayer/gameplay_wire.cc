@@ -36,6 +36,7 @@ enum class CommandType : std::uint8_t {
     Talk = 22,
     DialogueVote = 23,
     DirectTrade = 24,
+    Equipment = 25,
 };
 
 enum class EventType : std::uint8_t {
@@ -66,6 +67,7 @@ enum class EventType : std::uint8_t {
     SharedActivityPublished = 25,
     DirectTradeStateChanged = 26,
     CapsDistributed = 27,
+    EquipmentChanged = 28,
 };
 
 constexpr std::size_t kCommandHeaderSize = 28;
@@ -400,6 +402,16 @@ GameplayWireError validateCommand(const GameCommand& command)
                 && (reload->hitMode == 6 || reload->hitMode == 7)
             ? GameplayWireError::None : GameplayWireError::InvalidCombatTurn;
     }
+    if (const auto* equipment = std::get_if<EquipmentCommand>(&command.payload)) {
+        bool combat = command.expectedPhase == SessionPhase::Combat;
+        return equipment->activeHand >= 0 && equipment->activeHand <= 1
+            && equipment->action >= EquipmentAction::Set
+            && equipment->action <= EquipmentAction::CloseInventory
+            && ((combat && equipment->turnRevision != 0)
+                   || (command.expectedPhase == SessionPhase::Exploration
+                       && equipment->turnRevision == 0))
+            ? GameplayWireError::None : GameplayWireError::InvalidCombatTurn;
+    }
     if (const auto* face = std::get_if<CombatFaceCommand>(&command.payload)) {
         return face->turnRevision != 0 && face->rotation >= 0
                 && face->rotation < kActorRotationCount
@@ -544,6 +556,10 @@ GameplayWireError validateEvent(const GameEvent& event)
             }
         }
         return GameplayWireError::None;
+    }
+    if (const auto* equipment = std::get_if<EquipmentChangedEvent>(&event.payload)) {
+        return isValid(equipment->actorId)
+            ? GameplayWireError::None : GameplayWireError::InvalidEntityId;
     }
     if (const auto* facing = std::get_if<ActorFacingChangedEvent>(&event.payload)) {
         if (!isValid(facing->actorId)) {
@@ -1066,6 +1082,14 @@ GameplayWireError encodeGameCommand(const GameCommand& command, ProtocolEnvelope
         appendUInt64(envelope.payload, reload->turnRevision);
         appendUInt32(envelope.payload, reload->weaponId.value);
         appendInt32(envelope.payload, reload->hitMode);
+    } else if (const auto* equipment = std::get_if<EquipmentCommand>(&command.payload)) {
+        appendCommandHeader(command, CommandType::Equipment, envelope.payload);
+        appendUInt64(envelope.payload, equipment->turnRevision);
+        appendUInt32(envelope.payload, equipment->leftHand.value);
+        appendUInt32(envelope.payload, equipment->rightHand.value);
+        appendUInt32(envelope.payload, equipment->armor.value);
+        appendInt32(envelope.payload, equipment->activeHand);
+        appendInt32(envelope.payload, static_cast<std::int32_t>(equipment->action));
     } else if (const auto* face = std::get_if<CombatFaceCommand>(&command.payload)) {
         appendCommandHeader(command, CommandType::CombatFace, envelope.payload);
         appendUInt64(envelope.payload, face->turnRevision);
@@ -1265,6 +1289,20 @@ GameCommandDecodeResult decodeGameCommand(const ProtocolEnvelope& envelope)
             readInt32(envelope.payload, 40),
         };
         break;
+    case CommandType::Equipment:
+        if (envelope.payload.size() != kCommandHeaderSize + 28) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.command.payload = EquipmentCommand {
+            readUInt64(envelope.payload, 28),
+            EntityId { readUInt32(envelope.payload, 36) },
+            EntityId { readUInt32(envelope.payload, 40) },
+            EntityId { readUInt32(envelope.payload, 44) },
+            readInt32(envelope.payload, 48),
+            static_cast<EquipmentAction>(readInt32(envelope.payload, 52)),
+        };
+        break;
     case CommandType::CombatFace:
         if (envelope.payload.size() != kCombatFaceCommandSize) {
             result.error = GameplayWireError::InvalidLength;
@@ -1454,6 +1492,9 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
         envelope.payload.push_back(0);
         appendUInt16(envelope.payload, static_cast<std::uint16_t>(movement->path.size()));
         envelope.payload.insert(envelope.payload.end(), movement->path.begin(), movement->path.end());
+    } else if (const auto* equipment = std::get_if<EquipmentChangedEvent>(&event.payload)) {
+        appendEventHeader(event, EventType::EquipmentChanged, envelope.payload);
+        appendUInt32(envelope.payload, equipment->actorId.value);
     } else if (const auto* facing = std::get_if<ActorFacingChangedEvent>(&event.payload)) {
         appendEventHeader(event, EventType::ActorFacingChanged, envelope.payload);
         appendUInt32(envelope.payload, facing->actorId.value);
@@ -1765,6 +1806,13 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
                 std::vector<std::uint8_t>(envelope.payload.begin() + kMovementEventHeaderSize, envelope.payload.end()),
             };
         }
+        break;
+    case EventType::EquipmentChanged:
+        if (envelope.payload.size() != kEventHeaderSize + 4) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.event.payload = EquipmentChangedEvent { EntityId { readUInt32(envelope.payload, 20) } };
         break;
     case EventType::ActorFacingChanged:
         if (envelope.payload.size() != kFacingEventSize) {

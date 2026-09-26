@@ -37,6 +37,7 @@
 #include "int/dialog.h"
 #include "multiplayer/local_player_context.h"
 #include "multiplayer/network_runtime.h"
+#include "multiplayer/network_world.h"
 #include "multiplayer/presentation_bridge.h"
 #include "platform_compat.h"
 #include "plib/color/color.h"
@@ -396,13 +397,69 @@ static int inventry_msg_unload()
     return 0;
 }
 
+// The original inventory keeps held items outside the inventory array while
+// its modal window is open. Network snapshots must always see the real owned
+// items, so the same UI renders a filtered view instead.
+static bool networkInventory = false;
+static std::uint64_t networkInventoryTurn = 0;
+static std::vector<InventoryItem> networkInventoryItems;
+static Inventory networkInventoryView {};
+
+static multiplayer::EquipmentCommand inventory_equipment()
+{
+    using namespace multiplayer;
+    EquipmentCommand command;
+    command.turnRevision = networkInventoryTurn;
+    command.leftHand = networkWorldFindEntity(inven_left_hand(inven_dude)).value_or(EntityId {});
+    command.rightHand = networkWorldFindEntity(inven_right_hand(inven_dude)).value_or(EntityId {});
+    command.armor = networkWorldFindEntity(inven_worn(inven_dude)).value_or(EntityId {});
+    command.activeHand = intface_is_item_right_hand() ? 1 : 0;
+    return command;
+}
+
+static bool network_inventory_current()
+{
+    using namespace multiplayer;
+    return networkWorldActive()
+        && (networkInventoryTurn == 0
+            ? networkWorldPhase() == SessionPhase::Exploration
+            : networkWorldPhase() == SessionPhase::Combat
+                && networkWorldCombatTurnRevision() == networkInventoryTurn
+                && networkWorldActiveCombatOwner() == networkWorldCombatOwner(inven_dude));
+}
+
+static void network_inventory_refresh()
+{
+    i_lhand = inven_left_hand(inven_dude);
+    i_rhand = inven_right_hand(inven_dude);
+    i_worn = inven_worn(inven_dude);
+    networkInventoryItems.clear();
+    Inventory& owned = inven_dude->data.inventory;
+    for (int index = 0; index < owned.length; ++index) {
+        const InventoryItem& entry = owned.items[index];
+        if (entry.item != i_lhand && entry.item != i_rhand && entry.item != i_worn) {
+            networkInventoryItems.push_back(entry);
+        }
+    }
+    networkInventoryView.length = static_cast<int>(networkInventoryItems.size());
+    networkInventoryView.items = networkInventoryItems.data();
+    pud = &networkInventoryView;
+    stack_offset[0] = std::clamp(stack_offset[0], 0, std::max(0, pud->length - inven_cur_disp));
+    adjust_fid();
+}
+
 // 0x462480
 void handle_inventory()
 {
     multiplayer::ScopedLocalPlayerContext localPlayerContext;
     inven_reset_dude();
 
-    if (isInCombat()) {
+    bool network = multiplayer::networkWorldActive();
+    networkInventoryTurn = network && multiplayer::networkWorldPhase() == multiplayer::SessionPhase::Combat
+        ? multiplayer::networkWorldCombatTurnRevision() : 0;
+    if (network && !network_inventory_current()) return;
+
+    if (!network && isInCombat()) {
         if (combat_whose_turn() != inven_dude) {
             return;
         }
@@ -412,7 +469,7 @@ void handle_inventory()
         return;
     }
 
-    if (isInCombat()) {
+    if (!network && isInCombat()) {
         if (inven_dude == inventory_player()) {
             int actionPointsRequired = 4 - perk_level(PERK_QUICK_POCKETS);
             if (actionPointsRequired > 0 && actionPointsRequired > inven_dude->data.critter.combat.ap) {
@@ -434,6 +491,17 @@ void handle_inventory()
         }
     }
 
+    if (network) {
+        multiplayer::EquipmentCommand command = inventory_equipment();
+        command.action = multiplayer::EquipmentAction::OpenInventory;
+        if ((networkInventoryTurn != 0
+                && inven_dude->data.critter.combat.ap < std::max(0, 4 - perk_level(PERK_QUICK_POCKETS)))
+            || !multiplayer::networkRuntimeSubmitEquipment(command)) {
+            inven_exit();
+            return;
+        }
+        networkInventory = true;
+    }
     Object* oldArmor = inven_worn(inven_dude);
     bool isoWasEnabled = setup_inventory(INVENTORY_WINDOW_TYPE_NORMAL);
     register_clear(inven_dude);
@@ -445,6 +513,12 @@ void handle_inventory()
         sharedFpsLimiter.mark();
 
         int keyCode = get_input();
+        if (networkInventory) {
+            if (!network_inventory_current()) break;
+            network_inventory_refresh();
+            display_inventory(stack_offset[0], -1, INVENTORY_WINDOW_TYPE_NORMAL);
+            if (immode == INVENTORY_WINDOW_CURSOR_HAND) display_stats();
+        }
 
         if (keyCode == KEY_ESCAPE || keyCode == KEY_UPPERCASE_I || keyCode == KEY_LOWERCASE_I) {
             break;
@@ -516,9 +590,10 @@ void handle_inventory()
     }
 
     inven_dude = stack[0];
+    if (networkInventory) network_inventory_refresh();
     adjust_fid();
 
-    if (inven_dude == inventory_player()) {
+    if (!networkInventory && inven_dude == inventory_player()) {
         Rect rect;
         obj_change_fid(inven_dude, i_fid, &rect);
         tile_refresh_rect(&rect, inven_dude->elevation);
@@ -531,7 +606,14 @@ void handle_inventory()
         }
     }
 
+    if (networkInventory) {
+        multiplayer::EquipmentCommand command = inventory_equipment();
+        command.action = multiplayer::EquipmentAction::CloseInventory;
+        multiplayer::networkRuntimeSubmitEquipment(command);
+    }
     exit_inventory(isoWasEnabled);
+    networkInventory = false;
+    networkInventoryItems.clear();
 
     // NOTE: Uninline.
     inven_exit();
@@ -1231,16 +1313,20 @@ bool setup_inventory(int inventoryWindowType)
         }
     }
 
-    if (i_lhand != NULL) {
-        item_remove_mult(inven_dude, i_lhand, 1);
-    }
+    if (networkInventory) {
+        network_inventory_refresh();
+    } else {
+        if (i_lhand != NULL) {
+            item_remove_mult(inven_dude, i_lhand, 1);
+        }
 
-    if (i_rhand != NULL && i_rhand != i_lhand) {
-        item_remove_mult(inven_dude, i_rhand, 1);
-    }
+        if (i_rhand != NULL && i_rhand != i_lhand) {
+            item_remove_mult(inven_dude, i_rhand, 1);
+        }
 
-    if (i_worn != NULL) {
-        item_remove_mult(inven_dude, i_worn, 1);
+        if (i_worn != NULL) {
+            item_remove_mult(inven_dude, i_worn, 1);
+        }
     }
 
     adjust_fid();
@@ -1257,23 +1343,25 @@ void exit_inventory(bool shouldEnableIso)
 {
     inven_dude = stack[0];
 
-    if (i_lhand != NULL) {
-        i_lhand->flags |= OBJECT_IN_LEFT_HAND;
-        if (i_lhand == i_rhand) {
-            i_lhand->flags |= OBJECT_IN_RIGHT_HAND;
+    if (!networkInventory) {
+        if (i_lhand != NULL) {
+            i_lhand->flags |= OBJECT_IN_LEFT_HAND;
+            if (i_lhand == i_rhand) {
+                i_lhand->flags |= OBJECT_IN_RIGHT_HAND;
+            }
+
+            item_add_force(inven_dude, i_lhand, 1);
         }
 
-        item_add_force(inven_dude, i_lhand, 1);
-    }
+        if (i_rhand != NULL && i_rhand != i_lhand) {
+            i_rhand->flags |= OBJECT_IN_RIGHT_HAND;
+            item_add_force(inven_dude, i_rhand, 1);
+        }
 
-    if (i_rhand != NULL && i_rhand != i_lhand) {
-        i_rhand->flags |= OBJECT_IN_RIGHT_HAND;
-        item_add_force(inven_dude, i_rhand, 1);
-    }
-
-    if (i_worn != NULL) {
-        i_worn->flags |= OBJECT_WORN;
-        item_add_force(inven_dude, i_worn, 1);
+        if (i_worn != NULL) {
+            i_worn->flags |= OBJECT_WORN;
+            item_add_force(inven_dude, i_worn, 1);
+        }
     }
 
     i_rhand = NULL;
@@ -1970,6 +2058,8 @@ void inven_pickup(int keyCode, int first_item_index)
         return;
     }
 
+    multiplayer::EntityId draggedId = networkInventory
+        ? multiplayer::networkWorldFindEntity(a1a).value_or(multiplayer::EntityId {}) : multiplayer::EntityId {};
     int v3 = -1;
     Rect rect;
 
@@ -2061,6 +2151,37 @@ void inven_pickup(int keyCode, int first_item_index)
     if (itemInventoryFrm != NULL) {
         art_ptr_unlock(itemInventoryFrmHandle);
         gsound_play_sfx_file("iputdown");
+    }
+
+    if (networkInventory) {
+        network_inventory_refresh();
+        a1a = multiplayer::networkWorldFindObject(draggedId);
+        if (network_inventory_current() && a1a != nullptr && a1a->owner == inven_dude) {
+            auto command = inventory_equipment();
+            multiplayer::EntityId* slots[] = { &command.leftHand, &command.rightHand, &command.armor };
+            int source = keyCode == 1007 ? 0 : keyCode == 1006 ? 1 : keyCode == 1008 ? 2 : -1;
+            int destination = -2;
+            if (mouseHitTestInWindow(i_wid, INVENTORY_SCROLLER_X, INVENTORY_SCROLLER_Y, INVENTORY_SCROLLER_MAX_X, INVENTORY_SLOT_HEIGHT * inven_cur_disp + INVENTORY_SCROLLER_Y)) destination = -1;
+            if (mouseHitTestInWindow(i_wid, INVENTORY_LEFT_HAND_SLOT_X, INVENTORY_LEFT_HAND_SLOT_Y, INVENTORY_LEFT_HAND_SLOT_MAX_X, INVENTORY_LEFT_HAND_SLOT_MAX_Y)) destination = 0;
+            if (mouseHitTestInWindow(i_wid, INVENTORY_RIGHT_HAND_SLOT_X, INVENTORY_RIGHT_HAND_SLOT_Y, INVENTORY_RIGHT_HAND_SLOT_MAX_X, INVENTORY_RIGHT_HAND_SLOT_MAX_Y)) destination = 1;
+            if (mouseHitTestInWindow(i_wid, INVENTORY_ARMOR_SLOT_X, INVENTORY_ARMOR_SLOT_Y, INVENTORY_ARMOR_SLOT_MAX_X, INVENTORY_ARMOR_SLOT_MAX_Y)
+                && item_get_type(a1a) == ITEM_TYPE_ARMOR) destination = 2;
+            if (destination != -2 && destination != source) {
+                auto displaced = destination >= 0 ? *slots[destination] : multiplayer::EntityId {};
+                Object* displacedItem = multiplayer::networkWorldFindObject(displaced);
+                if (source >= 0) {
+                    *slots[source] = source != 2 || displacedItem == nullptr || item_get_type(displacedItem) == ITEM_TYPE_ARMOR
+                        ? displaced : multiplayer::EntityId {};
+                }
+                if (destination >= 0) *slots[destination] = draggedId;
+                multiplayer::networkRuntimeSubmitEquipment(command);
+            }
+        }
+        network_inventory_refresh();
+        display_stats();
+        display_inventory(first_item_index, -1, INVENTORY_WINDOW_TYPE_NORMAL);
+        inven_set_mouse(INVENTORY_WINDOW_CURSOR_HAND);
+        return;
     }
 
     if (mouseHitTestInWindow(i_wid, INVENTORY_SCROLLER_X, INVENTORY_SCROLLER_Y, INVENTORY_SCROLLER_MAX_X, INVENTORY_SLOT_HEIGHT * inven_cur_disp + INVENTORY_SCROLLER_Y)) {
@@ -2430,7 +2551,7 @@ Object* inven_right_hand(Object* critter)
     Inventory* inventory;
     Object* item;
 
-    if (i_rhand != NULL && critter == inven_dude) {
+    if (!networkInventory && i_rhand != NULL && critter == inven_dude) {
         return i_rhand;
     }
 
@@ -2452,7 +2573,7 @@ Object* inven_left_hand(Object* critter)
     Inventory* inventory;
     Object* item;
 
-    if (i_lhand != NULL && critter == inven_dude) {
+    if (!networkInventory && i_lhand != NULL && critter == inven_dude) {
         return i_lhand;
     }
 
@@ -2474,7 +2595,7 @@ Object* inven_worn(Object* critter)
     Inventory* inventory;
     Object* item;
 
-    if (i_worn != NULL && critter == inven_dude) {
+    if (!networkInventory && i_worn != NULL && critter == inven_dude) {
         return i_worn;
     }
 
@@ -3005,6 +3126,7 @@ int inven_unwield(Object* critter, int a2)
 // 0x465DC4
 int inven_from_button(int keyCode, Object** a2, Object*** a3, Object** a4)
 {
+    if (networkInventory) network_inventory_refresh();
     Object** slot_ptr;
     Object* owner;
     Object* item;
@@ -3304,6 +3426,7 @@ void inven_action_cursor(int keyCode, int inventoryWindowType)
         return;
     }
 
+    auto selectedId = networkInventory ? multiplayer::networkWorldFindEntity(item) : std::nullopt;
     int itemType = item_get_type(item);
 
     int mouseState;
@@ -3311,6 +3434,14 @@ void inven_action_cursor(int keyCode, int inventoryWindowType)
         sharedFpsLimiter.mark();
 
         get_input();
+        if (networkInventory) {
+            network_inventory_refresh();
+            item = selectedId.has_value() ? multiplayer::networkWorldFindObject(*selectedId) : nullptr;
+            if (item == nullptr || item->owner != inven_dude || !network_inventory_current()) {
+                inven_set_mouse(INVENTORY_WINDOW_CURSOR_ARROW);
+                return;
+            }
+        }
 
         if (inventoryWindowType == INVENTORY_WINDOW_TYPE_NORMAL) {
             display_body(-1, INVENTORY_WINDOW_TYPE_NORMAL);
@@ -3484,9 +3615,32 @@ void inven_action_cursor(int keyCode, int inventoryWindowType)
 
     mouse_set_position(x, y);
 
+    if (networkInventory) {
+        network_inventory_refresh();
+        item = selectedId.has_value() ? multiplayer::networkWorldFindObject(*selectedId) : nullptr;
+        if (item == nullptr || item->owner != inven_dude || !network_inventory_current()) {
+            inven_set_mouse(INVENTORY_WINDOW_CURSOR_ARROW);
+            return;
+        }
+    }
     display_inventory(stack_offset[curr_stack], -1, inventoryWindowType);
 
     int actionMenuItem = actionMenuItems[menuItemIndex];
+    if (networkInventory && actionMenuItem != GAME_MOUSE_ACTION_MENU_ITEM_LOOK) {
+        if (actionMenuItem == GAME_MOUSE_ACTION_MENU_ITEM_DROP) {
+            obj_drop(inven_dude, item);
+        } else if (actionMenuItem == GAME_MOUSE_ACTION_MENU_ITEM_USE && itemType != ITEM_TYPE_CONTAINER) {
+            multiplayer::networkRuntimeHandleLocalItemUse(inven_dude, item, inven_dude);
+        } else if (actionMenuItem != GAME_MOUSE_ACTION_MENU_ITEM_CANCEL) {
+            char message[] = "This inventory action is not available in multiplayer yet.";
+            display_print(message);
+        }
+        network_inventory_refresh();
+        display_stats();
+        display_inventory(stack_offset[0], -1, inventoryWindowType);
+        inven_set_mouse(INVENTORY_WINDOW_CURSOR_ARROW);
+        return;
+    }
     switch (actionMenuItem) {
     case GAME_MOUSE_ACTION_MENU_ITEM_DROP:
         if (v43 != NULL) {

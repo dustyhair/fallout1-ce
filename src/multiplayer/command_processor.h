@@ -141,6 +141,10 @@ public:
     {
         return CommandExecutionStatus::InvalidAction;
     }
+    virtual CommandExecutionStatus setEquipment(Object*, const EquipmentCommand&)
+    {
+        return CommandExecutionStatus::InvalidAction;
+    }
     virtual CommandExecutionStatus combatFace(Object*, const CombatFaceCommand&)
     {
         return CommandExecutionStatus::InvalidAction;

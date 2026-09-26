@@ -40,6 +40,8 @@ int main(int argc, char** argv)
     state.map = "VAULT13.MAP";
     state.phase = "exploration";
     state.connected = true;
+    state.combatTurnRevision = 17;
+    state.combatOwnerPlayerId = 2;
     state.host.playerId = 1;
     state.host.entityId = 1;
     state.host.name = "Albert";
@@ -101,6 +103,10 @@ int main(int argc, char** argv)
     for (std::string line; std::getline(input, line);) {
         lines.push_back(std::move(line));
     }
+    passed = expect(lines.size() > 4
+            && lines[4].find("\"combat_turn_revision\":17") != std::string::npos
+            && lines[4].find("\"combat_owner_player_id\":2") != std::string::npos,
+        "journal reports authoritative turn owner and revision") && passed;
     passed = expect(lines.size() == 9, "journal suppresses duplicate world states") && passed;
     passed = expect(lines.size() > 1
             && lines[1].find("Vault \\\"door\\\"\\nopened") != std::string::npos,

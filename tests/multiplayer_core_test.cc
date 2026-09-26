@@ -3541,6 +3541,79 @@ void testCombatTurnCommandsAndReplication()
         "combat snapshot rejects mismatched player ownership");
 }
 
+void testEquipmentCommands()
+{
+    TestObject host, guest;
+    LocalSession session;
+    expect(session.start(asGameObject(host), asGameObject(guest)) == LocalSessionError::None,
+        "equipment session starts");
+    submitBothCharacterSheets(session);
+    session.transitionTo(SessionPhase::Loading);
+    session.transitionTo(SessionPhase::Exploration);
+    class EquipmentExecutor : public RecordingCommandExecutor {
+    public:
+        int calls = 0;
+        CommandExecutionStatus setEquipment(Object*, const EquipmentCommand&) override
+        {
+            ++calls;
+            return CommandExecutionStatus::Applied;
+        }
+    } executor;
+    CommandProcessor processor;
+    GameCommand command { CommandSequence { 1 }, kGuestPlayerId,
+        session.playerActorId(kGuestPlayerId), SessionPhase::Exploration,
+        session.phaseRevision(), EquipmentCommand { 0, EntityId { 42 }, EntityId { 43 }, {}, 1 } };
+    ProtocolEnvelope envelope = gameplayEnvelope(1);
+    expect(encodeGameCommand(command, envelope) == GameplayWireError::None, "equipment command encodes");
+    auto decoded = decodeGameCommand(envelope);
+    const auto* equipment = decoded ? std::get_if<EquipmentCommand>(&decoded.command.payload) : nullptr;
+    expect(equipment != nullptr && equipment->leftHand.value == 42
+            && equipment->rightHand.value == 43 && !isValid(equipment->armor)
+            && equipment->activeHand == 1 && equipment->turnRevision == 0,
+        "equipment slots and active hand survive transport");
+    auto result = processor.process(command, session, executor);
+    expect(result.result.status == CommandStatus::Accepted && executor.calls == 1
+            && result.event.has_value()
+            && std::holds_alternative<EquipmentChangedEvent>(result.event->payload),
+        "guest equipment routes through authority and publishes checkpoint boundary");
+    expect(encodeGameEvent(*result.event, envelope) == GameplayWireError::None
+            && decodeGameEvent(envelope), "equipment event round trips");
+    auto replay = processor.process(command, session, executor);
+    expect(replay.replayed && executor.calls == 1, "equipment retransmit cannot charge AP twice");
+    command.sequence.value++;
+    command.actorId = session.playerActorId(kHostPlayerId);
+    expect(processor.process(command, session, executor).result.rejection == CommandRejection::NotOwner
+            && executor.calls == 1, "guest cannot equip host actor");
+    command.sequence.value++;
+    command.actorId = session.playerActorId(kGuestPlayerId);
+    session.transitionTo(SessionPhase::Combat);
+    expect(processor.process(command, session, executor).result.rejection == CommandRejection::WrongPhase
+            && executor.calls == 1, "equipment selected before combat cannot bypass AP cost");
+    command.expectedPhase = SessionPhase::Combat;
+    command.expectedPhaseRevision = session.phaseRevision();
+    expect(encodeGameCommand(command, envelope) == GameplayWireError::InvalidCombatTurn,
+        "combat equipment requires a turn revision");
+    command.payload = EquipmentCommand { 9, {}, EntityId { 43 }, {}, 2 };
+    expect(encodeGameCommand(command, envelope) == GameplayWireError::InvalidCombatTurn,
+        "invalid active hand rejected before transport");
+    command.payload = EquipmentCommand { 9, {}, EntityId { 43 }, {}, 0 };
+    expect(encodeGameCommand(command, envelope) == GameplayWireError::None,
+        "combat loadout carries its turn revision");
+    envelope.payload.pop_back();
+    expect(!decodeGameCommand(envelope), "truncated equipment packet is rejected");
+    for (EquipmentAction action : { EquipmentAction::OpenInventory, EquipmentAction::CloseInventory }) {
+        command.payload = EquipmentCommand { 9, {}, {}, {}, 1, action };
+        expect(encodeGameCommand(command, envelope) == GameplayWireError::None,
+            "native inventory access encodes");
+        auto access = decodeGameCommand(envelope);
+        expect(access && std::get<EquipmentCommand>(access.command.payload).action == action,
+            "native inventory access survives transport");
+    }
+    command.payload = EquipmentCommand { 9, {}, {}, {}, 1, static_cast<EquipmentAction>(3) };
+    expect(encodeGameCommand(command, envelope) == GameplayWireError::InvalidCombatTurn,
+        "unknown inventory action rejected");
+}
+
 void testCombatActionCommandsAndReplication()
 {
     TestObject hostActor;
@@ -4913,6 +4986,7 @@ void testDialogueAndActivityWireRecovery()
 int main()
 {
     fallout::multiplayer::testCoreTypes();
+    fallout::multiplayer::testEquipmentCommands();
     fallout::multiplayer::testCombatTurnController();
     fallout::multiplayer::testDirectTradeController();
     fallout::multiplayer::testLootDistributionController();

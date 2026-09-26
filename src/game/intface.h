@@ -49,6 +49,7 @@ void intface_update_move_points(int actionPoints, int bonusMove);
 int intface_get_attack(int* hitMode, bool* aiming);
 int intface_update_items(bool animated);
 int intface_toggle_items(bool animated);
+void intface_select_item(int hand);
 int intface_toggle_item_state();
 void intface_use_item();
 int intface_is_item_right_hand();

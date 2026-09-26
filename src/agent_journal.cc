@@ -117,6 +117,10 @@ std::string inventoryItemJson(const AgentJournalInventoryItemState& item)
            << ",\"name\":" << jsonString(item.name.c_str())
            << ",\"quantity\":" << item.quantity
            << ",\"equipped\":" << booleanValue(item.equipped)
+           << ",\"left_hand\":" << booleanValue(item.leftHand)
+           << ",\"right_hand\":" << booleanValue(item.rightHand)
+           << ",\"armor\":" << booleanValue(item.armor)
+           << ",\"ammo\":" << item.ammo
            << '}';
     return output.str();
 }
@@ -283,6 +287,8 @@ void agentJournalWriteWorldState(const AgentJournalWorldState& state)
            << ",\"phase\":" << jsonString(state.phase.c_str())
            << ",\"connected\":" << booleanValue(state.connected)
            << ",\"combat\":" << booleanValue(state.combat)
+           << ",\"combat_turn_revision\":" << state.combatTurnRevision
+           << ",\"combat_owner_player_id\":" << state.combatOwnerPlayerId
            << ",\"pending_rest\":";
     if (state.pendingRestMinutes != 0) {
         fields << "{\"minutes\":" << state.pendingRestMinutes
