@@ -663,7 +663,7 @@ bool applyTimedEvents(const WorldSnapshot& snapshot)
 
 bool validateActorState(const WorldSnapshot& snapshot)
 {
-    if (snapshot.actors.size() != 2) {
+    if (snapshot.actors.size() != session.players().playerIds().size()) {
         return false;
     }
     for (const ActorSnapshot& actorState : snapshot.actors) {
@@ -1114,7 +1114,17 @@ bool loadSharedMap(int map, bool snapshotRecovery = false)
     }
 
     PlayerId peerPlayerId = worldMode == NetworkLaunchMode::Host ? kGuestPlayerId : kHostPlayerId;
-    if (session.rebindPlayerActor(peerPlayerId, replacement) != LocalSessionError::None) {
+    EntityId peerActorId = session.playerActorId(peerPlayerId);
+    // Native map teardown really destroyed the old peer body. Its registry
+    // entry is now absent, just like its pointer. Restore the known player
+    // identity for this map replacement before using the normal rebind path.
+    // Respawn would require a distinct body identity and a separate policy.
+    if ((session.entities().findObject(peerActorId) == nullptr
+            && session.entities().restoreObject(peerActorId, replacement, peerPlayerId)
+                != EntityRegistryError::None)
+        || session.rebindPlayerActor(peerPlayerId, replacement) != LocalSessionError::None) {
+        std::fprintf(stderr, "Multiplayer map replacement could not restore player %u actor %u.\n",
+            peerPlayerId.value, peerActorId.value);
         obj_erase_object(replacement, nullptr);
         return false;
     }
@@ -2902,6 +2912,12 @@ bool registerWorldObjects()
         if (!registerInventory(registerInventory, critter)) {
             return false;
         }
+    }
+    for (Object* door : doors) {
+        if (!registerInventory(registerInventory, door)) return false;
+    }
+    for (Object* object : scenery) {
+        if (!registerInventory(registerInventory, object)) return false;
     }
     return true;
 }
@@ -6935,6 +6951,31 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
 {
     if (!session.isActive()) {
         return false;
+    }
+
+    // Native dialogue scripts can create rewards directly in an inventory.
+    // Register them before capturing so the checkpoint carries the complete
+    // inventory, including rewards created outside command execution.
+    if (worldMode == NetworkLaunchMode::Host) {
+        for (PlayerId playerId : session.players().playerIds()) {
+            if (!registerUntrackedInventory(networkWorldPlayerActor(playerId))) return false;
+        }
+        for (const auto& entry : worldCritters) {
+            if (!registerUntrackedInventory(entry.second)) return false;
+        }
+        for (const auto& entry : worldDoors) {
+            if (!registerUntrackedInventory(entry.second)) return false;
+        }
+        for (const auto& entry : worldScenery) {
+            if (!registerUntrackedInventory(entry.second)) return false;
+        }
+        // Registration can append worldItems; index the original owners so
+        // recursion does not invalidate iterators over that vector.
+        std::size_t ownerCount = worldItems.size();
+        for (std::size_t index = 0; index < ownerCount; ++index) {
+            Object* owner = worldItems[index].second;
+            if (!registerUntrackedInventory(owner)) return false;
+        }
     }
 
     WorldSnapshot captured;

@@ -3124,6 +3124,18 @@ void testLocalSessionLifecycle()
     expect(session.players().find(kGuestPlayerId)->build == guestBuild, "guest character build survives object replacement");
     expect(session.rebindPlayerActor(PlayerId { 99 }, asGameObject(guestActor)) == LocalSessionError::InvalidPlayer, "unknown player actor cannot be rebound");
 
+    TestObject loadedGuest;
+    expect(session.entities().unregisterEntity(guestId) == EntityRegistryError::None
+            && !session.entities().findEntity(asGameObject(replacementGuest)).has_value(),
+        "native map teardown forgets the destroyed peer body's pointer");
+    expect(session.entities().restoreObject(guestId, asGameObject(loadedGuest), kGuestPlayerId)
+                == EntityRegistryError::None
+            && session.rebindPlayerActor(kGuestPlayerId, asGameObject(loadedGuest)) == LocalSessionError::None
+            && session.owns(kGuestPlayerId, guestId) && session.players().bindingsMatch(session.entities())
+            && session.players().find(kGuestPlayerId)->build == guestBuild
+            && !session.entities().findEntity(asGameObject(replacementGuest)).has_value(),
+        "map replacement restores the stable player identity, ownership and build after actual body destruction");
+
     session.stop();
     expect(!session.isActive(), "stopped local session is inactive");
     expect(session.entities().size() == 0, "stopping clears the local entity registry");

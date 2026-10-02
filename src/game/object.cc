@@ -1969,8 +1969,6 @@ int obj_erase_object(Object* object, Rect* rect)
         return -1;
     }
 
-    multiplayer::networkWorldHandleObjectDestroyed(object);
-
     gmouse_remove_item_outline(object);
 
     ObjectListNode* node;
@@ -3656,6 +3654,11 @@ static int obj_remove(ObjectListNode* a1, ObjectListNode* a2)
     if ((a1->obj->flags & OBJECT_NO_REMOVE) != 0) {
         return -1;
     }
+
+    // Inventory teardown calls obj_remove directly for every child. Notify
+    // after native removal is allowed, before freeing any nested objects, so
+    // multiplayer never retains their pointers or unregisters a kept object.
+    multiplayer::networkWorldHandleObjectDestroyed(a1->obj);
 
     obj_inven_free(&(a1->obj->data.inventory));
 
