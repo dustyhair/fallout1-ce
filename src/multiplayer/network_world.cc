@@ -1325,6 +1325,53 @@ bool validateDirectTradePlan(const DirectTradeCommitPlan& plan)
     return true;
 }
 
+bool discoverUntrackedWorldObjects()
+{
+    std::vector<Object*> discovered;
+    std::size_t newCritters = 0;
+    std::size_t newScenery = 0;
+    std::size_t newItems = 0;
+    for (Object* object = obj_find_first(); object != nullptr; object = obj_find_next()) {
+        if (session.entities().findEntity(object).has_value()
+            || !hexGridTileIsValid(object->tile) || !elevationIsValid(object->elevation)
+            || isExitGrid(object)) continue;
+        int type = FID_TYPE(object->fid);
+        if (type == OBJ_TYPE_CRITTER && PID_TYPE(object->pid) == OBJ_TYPE_CRITTER) {
+            ++newCritters;
+        } else if (type == OBJ_TYPE_SCENERY && !obj_is_a_portal(object)) {
+            ++newScenery;
+        } else if (type == OBJ_TYPE_ITEM && object->owner == nullptr) {
+            ++newItems;
+        } else {
+            continue;
+        }
+        discovered.push_back(object);
+    }
+    if (worldCritters.size() + newCritters > kMaxSnapshotCritters
+        || worldScenery.size() + newScenery > kMaxSnapshotScenery
+        || worldItems.size() + newItems > kMaxSnapshotItems) return false;
+    std::sort(discovered.begin(), discovered.end(), [](const Object* lhs, const Object* rhs) {
+        return std::tie(lhs->elevation, lhs->tile, lhs->pid, lhs->id, lhs->fid)
+            < std::tie(rhs->elevation, rhs->tile, rhs->pid, rhs->id, rhs->fid);
+    });
+    for (Object* object : discovered) {
+        EntityRegistrationResult registration = session.registerWorldObject(object);
+        if (!registration) return false;
+        switch (FID_TYPE(object->fid)) {
+        case OBJ_TYPE_CRITTER:
+            worldCritters.emplace_back(registration.entityId, object);
+            break;
+        case OBJ_TYPE_SCENERY:
+            worldScenery.emplace_back(registration.entityId, object);
+            break;
+        case OBJ_TYPE_ITEM:
+            trackWorldItem(registration.entityId, object);
+            break;
+        }
+    }
+    return true;
+}
+
 bool registerUntrackedInventory(Object* owner)
 {
     if (owner == nullptr) return false;
@@ -3972,6 +4019,100 @@ Object* networkWorldScriptedSceneryTransitionActor(Object* requestedActor)
         : requestedActor;
 }
 
+static bool runScriptCreatedWorldObjectSmokeTest()
+{
+    if (worldMode != NetworkLaunchMode::Host || worldScenery.empty()) return false;
+    Object* host = networkWorldPlayerActor(kHostPlayerId);
+    if (host == nullptr) return false;
+    Object* ground = nullptr;
+    Object* child = nullptr;
+    Object* npc = nullptr;
+    Object* scenery = nullptr;
+    struct Cleanup {
+        Object*& ground;
+        Object*& npc;
+        Object*& scenery;
+        ~Cleanup()
+        {
+            for (Object* object : { ground, npc, scenery }) {
+                if (object != nullptr) {
+                    queue_remove(object);
+                    obj_erase_object(object, nullptr);
+                }
+            }
+        }
+    } cleanup { ground, npc, scenery };
+    if (obj_pid_new(&ground, 211) != 0 || ground == nullptr
+        || obj_pid_new(&child, kAntidotePid) != 0 || child == nullptr) return false;
+    if (item_add_force(ground, child, 3) != 0) {
+        obj_erase_object(child, nullptr);
+        return false;
+    }
+    if (obj_disconnect(child, nullptr) != 0) return false;
+    if (obj_move_to_tile(ground, host->tile, host->elevation, nullptr) != 0
+        || obj_pid_new(&npc, 0x0100000B) != 0 || npc == nullptr
+        || obj_move_to_tile(npc, host->tile, host->elevation, nullptr) != 0
+        || obj_pid_new(&scenery, worldScenery.front().second->pid) != 0 || scenery == nullptr
+        || obj_move_to_tile(scenery, host->tile, host->elevation, nullptr) != 0) return false;
+    // This matches a native create_object call with no script attached. Keep
+    // destruction cleanup from running unrelated prototype scripts.
+    for (Object* object : { ground, npc, scenery }) {
+        if (object->sid != -1) {
+            scr_remove(object->sid);
+            object->sid = -1;
+        }
+    }
+    bool initiallyUntracked = !session.entities().findEntity(ground).has_value()
+        && !session.entities().findEntity(child).has_value()
+        && !session.entities().findEntity(npc).has_value()
+        && !session.entities().findEntity(scenery).has_value();
+    if (!initiallyUntracked || queue_add(100, npc, nullptr, EVENT_TYPE_KNOCKOUT) != 0) return false;
+    auto phase = session.phase();
+    auto revision = session.phaseRevision();
+    auto roster = playerActorRoster();
+    auto combatRevision = combatTurns.revision();
+    WorldSnapshot snapshot;
+    bool captured = networkWorldCaptureSnapshot({}, snapshot);
+    auto groundId = session.entities().findEntity(ground);
+    auto childId = session.entities().findEntity(child);
+    auto npcId = session.entities().findEntity(npc);
+    auto sceneryId = session.entities().findEntity(scenery);
+    auto hasItem = [&](std::optional<EntityId> id, EntityId holder, std::uint32_t quantity) {
+        return id.has_value() && std::any_of(snapshot.items.begin(), snapshot.items.end(),
+            [&](const ItemSnapshot& item) {
+                return item.entityId == *id && item.holderId == holder && item.quantity == quantity;
+            });
+    };
+    bool sections = captured && groundId.has_value() && childId.has_value()
+        && npcId.has_value() && sceneryId.has_value()
+        && hasItem(groundId, {}, 1) && hasItem(childId, *groundId, 3)
+        && std::any_of(snapshot.critters.begin(), snapshot.critters.end(),
+            [&](const CritterSnapshot& critter) { return critter.entityId == *npcId; })
+        && std::any_of(snapshot.scenery.begin(), snapshot.scenery.end(),
+            [&](const ScenerySnapshot& state) { return state.entityId == *sceneryId; })
+        && std::any_of(snapshot.timedEvents.begin(), snapshot.timedEvents.end(),
+            [&](const TimedEventSnapshot& timer) {
+                return timer.ownerId == *npcId && timer.eventType == EVENT_TYPE_KNOCKOUT;
+            });
+    Packet packet;
+    bool wire = sections && encodeSnapshot(snapshot, packet) == SnapshotError::None && decodeSnapshot(packet);
+    auto afterRoster = playerActorRoster();
+    bool preserved = session.phase() == phase && session.phaseRevision() == revision
+        && combatTurns.revision() == combatRevision && roster.has_value() && afterRoster.has_value()
+        && roster->size() == afterRoster->size();
+    for (std::size_t index = 0; preserved && index < roster->size(); ++index) {
+        preserved = (*roster)[index].playerId == (*afterRoster)[index].playerId
+            && (*roster)[index].actorId == (*afterRoster)[index].actorId
+            && (*roster)[index].actor == (*afterRoster)[index].actor;
+    }
+    std::fprintf(stderr,
+        "NATIVE_SCRIPT_CREATED_WORLD_OBJECTS_%s untracked=%d captured=%d sections=%d wire=%d phase_roster_preserved=%d timer_owner=%u.\n",
+        sections && wire && preserved ? "PASS" : "FAIL", initiallyUntracked ? 1 : 0,
+        captured ? 1 : 0, sections ? 1 : 0, wire ? 1 : 0, preserved ? 1 : 0,
+        npcId.value_or(EntityId {}).value);
+    return sections && wire && preserved;
+}
+
 bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts)
 {
     counts = {};
@@ -4015,6 +4156,7 @@ bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts)
     targetId = *registeredTarget;
 
     if (worldMode == NetworkLaunchMode::Host) {
+        if (!runScriptCreatedWorldObjectSmokeTest()) return false;
         engineExecutionProbeBegin();
         int doorRc = obj_use_door(hostActor, scriptedDoor, 0);
         EngineExecutionProbeCounts doorCounts = engineExecutionProbeEnd();
@@ -7002,6 +7144,9 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
     // Register them before capturing so the checkpoint carries the complete
     // inventory, including rewards created outside command execution.
     if (worldMode == NetworkLaunchMode::Host) {
+        // Map registration resets active interactions. Discover native script
+        // spawns incrementally so a checkpoint preserves combat and dialogue.
+        if (!discoverUntrackedWorldObjects()) return false;
         for (PlayerId playerId : session.players().playerIds()) {
             if (!registerUntrackedInventory(networkWorldPlayerActor(playerId))) return false;
         }
