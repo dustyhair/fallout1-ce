@@ -70,14 +70,21 @@ int main(int argc, char** argv)
     bool retryBackups = readValue("SAVEGAME\\SLOT01\\SAVE.BAK")
         && readValue("SAVEGAME\\SLOT01\\MAP.BAK")
         && readValue("SAVEGAME\\SLOT01\\AUTOMAP.BAK");
+    int saveRetryBlocked = SaveBackup();
+    bool retryBackupsAfterSave = readValue("SAVEGAME\\SLOT01\\SAVE.BAK")
+        && readValue("SAVEGAME\\SLOT01\\MAP.BAK")
+        && readValue("SAVEGAME\\SLOT01\\AUTOMAP.BAK");
     std::filesystem::remove_all(blockedRestore);
+    int resumedBackup = SaveBackup();
     int restoreResult = RestoreSave();
     bool restoreIntact = true;
     for (const char* path : originals) restoreIntact = readValue(path) && restoreIntact;
-    std::printf("NATIVE_SAVE_RESTORE_RETRY refused=%d backups_intact=%d\n", refusedRestore, retryBackups);
+    std::printf("NATIVE_SAVE_RESTORE_RETRY refused=%d backups_intact=%d blocked_save=%d retained_after_save=%d resumed_backup=%d\n",
+        refusedRestore, retryBackups, saveRetryBlocked, retryBackupsAfterSave, resumedBackup);
     db_exit();
     std::printf("NATIVE_SAVE_BACKUP failure=%d originals_intact=%d normal=%d backups_intact=%d originals_after_backup=%d restore=%d restore_intact=%d\n",
         result, intact, normal, backupIntact, originalsAfterBackup, restoreResult, restoreIntact);
     return result == -1 && intact && normal == 0 && backupIntact && originalsAfterBackup
-        && refusedRestore == -1 && retryBackups && restoreResult == 0 && restoreIntact ? 0 : 1;
+        && refusedRestore == -1 && retryBackups && saveRetryBlocked == -1
+        && retryBackupsAfterSave && resumedBackup == 0 && restoreResult == 0 && restoreIntact ? 0 : 1;
 }

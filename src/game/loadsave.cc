@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <limits>
+#include <map>
+#include <string>
 #include <vector>
 
 #include "game/automap.h"
@@ -193,6 +195,8 @@ static bool bk_enable = false;
 
 // 0x505968
 static int map_backup_count = -1;
+// Keep failed rollback backups until that directory is restored successfully.
+static std::map<std::string, int> failedSaveRestorations;
 
 // 0x50596C
 static int automap_db_flag = 0;
@@ -2707,6 +2711,13 @@ static int SaveBackup()
     debug_printf("\nLOADSAVE: Backing up save slot files..\n");
     automap_db_flag = 0;
 
+    SaveDirectoryPath(gmpath, true, true);
+    auto pendingRestore = failedSaveRestorations.find(gmpath);
+    if (pendingRestore != failedSaveRestorations.end()) {
+        map_backup_count = pendingRestore->second;
+        if (RestoreSave() == -1) return -1;
+    }
+
     // Database paths are relative to the configured patches directory. Copy
     // backups without moving the live slot, so a failed later copy leaves the
     // original SAVE.DAT, maps and multiplayer sidecar usable together.
@@ -2750,6 +2761,8 @@ static int RestoreSave()
     debug_printf("\nLOADSAVE: Restoring save file backup...\n");
 
     SaveDirectoryPath(gmpath, true, true);
+    const std::string restoreDirectory = gmpath;
+    failedSaveRestorations[restoreDirectory] = map_backup_count;
     snprintf(str0, sizeof(str0), "%s*.%s", gmpath, "BAK");
     char** fileList;
     int fileListLength = db_get_file_list(str0, &fileList, NULL, 0);
@@ -2784,6 +2797,7 @@ static int RestoreSave()
         }
     }
     db_free_file_list(&fileList, NULL);
+    failedSaveRestorations.erase(restoreDirectory);
     return 0;
 }
 
