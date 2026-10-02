@@ -141,6 +141,15 @@ ScopedActorPlayerContext::ScopedActorPlayerContext(Object* actor)
     }
 }
 
+ScopedBackgroundPlayerContext::ScopedBackgroundPlayerContext()
+{
+    Object* actor = actingPlayerActor();
+    PlayerCharacterState* registered = playerStateForActor(actor);
+    if (registered != nullptr && registered != actingPlayerState()) {
+        _actingPlayer.emplace(*registered, actor);
+    }
+}
+
 ScopedLocalPlayerContext::ScopedLocalPlayerContext()
 {
     PlayerCharacterState* player = localPlayerState();

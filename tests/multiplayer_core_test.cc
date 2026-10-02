@@ -982,6 +982,98 @@ void testActingPlayerContext()
     expect(actingPlayerState() == nullptr && actingPlayerActor() == nullptr, "leaving the outer scope clears the acting player");
 }
 
+void testBackgroundPlayerContext()
+{
+    LocalSession session;
+    TestObject actors[4];
+    TestObject npc;
+    expect(session.start(asGameObject(actors[0]), asGameObject(actors[1])) == LocalSessionError::None,
+        "background context session starts with host and guest");
+    for (std::uint32_t index = 2; index < 4; ++index) {
+        PlayerId id { index + 1 };
+        auto registered = session.entities().registerObject(asGameObject(actors[index]), id);
+        PlayerCharacterState player;
+        player.id = id;
+        player.actorId = registered.entityId;
+        expect(registered && session.players().registerPlayer(player, session.entities()) == PlayerStateError::None,
+            "background context registers third and fourth players");
+    }
+    expect(bindLocalPlayer(session, kHostPlayerId) == LocalPlayerError::None,
+        "background context keeps host presentation selected while other actors act");
+    for (std::uint32_t index = 0; index < 4; ++index) {
+        PlayerId id { index + 1 };
+        auto* actual = session.players().find(id);
+        Object* actor = asGameObject(actors[index]);
+        if (actual == nullptr) {
+            expect(false, "background context fixture has all four registered actors");
+            continue;
+        }
+        PlayerCharacterState draft = *actual;
+        draft.build.bonusStats[0] = 99;
+        {
+            ScopedActingPlayerContext editorScope(draft, actor);
+            {
+                ScopedBackgroundPlayerContext background;
+                expect(actingPlayerState() == actual && actingPlayerActor() == actor
+                        && actingCharacterBuild() == &actual->build && localPlayerId() == kHostPlayerId,
+                    "background rules use the acting actor's registered build without changing presentation");
+                {
+                    ScopedBackgroundPlayerContext nested;
+                    actingCharacterBuild()->bonusStats[0] += 2;
+                    actingCharacterBuild()->prototypeFlags |= 1U << 1;
+                    expect(actingPlayerState() == actual,
+                        "nested background dispatch stays on registered character state");
+                }
+                expect(actingPlayerState() == actual && actual->build.bonusStats[0] == 2,
+                    "leaving nested dispatch retains registered timer mutations");
+                {
+                    ScopedActorPlayerContext explicitActor(actor);
+                    expect(actingCharacterBuildFor(actor) == &actual->build,
+                        "explicit actor queries inside background see registered state instead of the editor draft");
+                }
+            }
+            expect(actingPlayerState() == &draft && actingPlayerActor() == actor
+                    && draft.build.bonusStats[0] == 99 && (draft.build.prototypeFlags & (1U << 1)) == 0,
+                "background exit restores the untouched editor draft while actual effects persist");
+        }
+        expect(actingPlayerState() == nullptr && actual->build.bonusStats[0] == 2
+                && (actual->build.prototypeFlags & (1U << 1)) != 0,
+            "closing each player's editor leaves its background effects on registered state");
+        for (std::uint32_t other = 0; other < 4; ++other) {
+            auto* separate = session.players().find(PlayerId { other + 1 });
+            expect(separate && separate->build.bonusStats[0] == (other <= index ? 2 : 0),
+                "background mutations stay isolated across all four registered players");
+        }
+    }
+    {
+        ScopedBackgroundPlayerContext noActingPlayer;
+        expect(actingPlayerState() == nullptr && actingPlayerActor() == nullptr,
+            "background dispatch without an acting player does not select the local presentation actor");
+    }
+    auto npcRegistration = session.registerWorldObject(asGameObject(npc));
+    expect(static_cast<bool>(npcRegistration), "background context fixture registers a nonplayer actor");
+    auto* host = session.players().find(kHostPlayerId);
+    if (host != nullptr) {
+        PlayerCharacterState draft = *host;
+        {
+            ScopedActingPlayerContext nonplayerScope(draft, asGameObject(npc));
+            ScopedBackgroundPlayerContext background;
+            expect(actingPlayerState() == &draft && actingPlayerActor() == asGameObject(npc),
+                "background dispatch preserves a nonplayer acting context");
+        }
+        clearLocalPlayer();
+        {
+            ScopedActingPlayerContext unboundScope(draft, asGameObject(actors[0]));
+            ScopedBackgroundPlayerContext background;
+            expect(actingPlayerState() == &draft && actingPlayerActor() == asGameObject(actors[0]),
+                "background dispatch without a bound session preserves its existing context");
+        }
+    }
+    session.stop();
+    expect(actingPlayerState() == nullptr && actingPlayerActor() == nullptr,
+        "background context tests leave no acting scope or session binding");
+}
+
 void testLocalPlayerContext()
 {
     LocalSession session;
@@ -5404,6 +5496,7 @@ int main()
     fallout::multiplayer::testMultiplayerSaveSidecar();
     fallout::multiplayer::testActingPlayerContext();
     fallout::multiplayer::testLocalPlayerContext();
+    fallout::multiplayer::testBackgroundPlayerContext();
     fallout::multiplayer::testProtocolRoundTrip();
     fallout::multiplayer::testProtocolRejectsInvalidPackets();
     fallout::multiplayer::testProtocolDiagnostics();

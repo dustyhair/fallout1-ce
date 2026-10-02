@@ -55,6 +55,17 @@ private:
     std::optional<ScopedActingPlayerContext> _actingPlayer;
 };
 
+// Native background rules use registered character state rather than a local
+// editor's uncommitted draft. The UI's prior scope resumes after dispatch.
+class ScopedBackgroundPlayerContext {
+public:
+    ScopedBackgroundPlayerContext();
+    ScopedBackgroundPlayerContext(const ScopedBackgroundPlayerContext&) = delete;
+    ScopedBackgroundPlayerContext& operator=(const ScopedBackgroundPlayerContext&) = delete;
+private:
+    std::optional<ScopedActingPlayerContext> _actingPlayer;
+};
+
 class ScopedLocalPlayerContext {
 public:
     ScopedLocalPlayerContext();

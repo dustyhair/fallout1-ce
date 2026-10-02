@@ -4,6 +4,7 @@
 #include <stdio.h>
 
 #include "audio_engine.h"
+#include "multiplayer/local_player_context.h"
 #include "platform_compat.h"
 #include "plib/color/color.h"
 #include "plib/gnw/button.h"
@@ -191,6 +192,7 @@ void GNW_input_exit()
 // 0x4B33C8
 int get_input()
 {
+    multiplayer::ScopedBackgroundPlayerContext backgroundPlayerContext;
     int v3;
 
     GNW95_process_message();
@@ -321,6 +323,7 @@ void flush_input_buffer()
 // 0x4B3564
 void GNW_do_bk_process()
 {
+    multiplayer::ScopedBackgroundPlayerContext backgroundPlayerContext;
     if (game_paused) {
         return;
     }
