@@ -607,16 +607,26 @@ bool captureVariables(const int* variables, int count, std::vector<std::int32_t>
     return true;
 }
 
-bool validateVariableState(const WorldSnapshot& snapshot)
+bool validateGameGlobalVariables(const WorldSnapshot& snapshot)
 {
     return num_game_global_vars >= 0
-        && num_map_global_vars >= 0
-        && num_map_local_vars >= 0
         && snapshot.gameGlobalVariables.size() == static_cast<std::size_t>(num_game_global_vars)
+        && (num_game_global_vars == 0 || game_global_vars != nullptr);
+}
+
+bool validateMapGlobalVariables(const WorldSnapshot& snapshot)
+{
+    return num_map_global_vars >= 0
         && snapshot.mapGlobalVariables.size() == static_cast<std::size_t>(num_map_global_vars)
+        && (num_map_global_vars == 0 || map_global_vars != nullptr);
+}
+
+bool validateVariableState(const WorldSnapshot& snapshot)
+{
+    return validateGameGlobalVariables(snapshot)
+        && validateMapGlobalVariables(snapshot)
+        && num_map_local_vars >= 0
         && snapshot.mapLocalVariables.size() == static_cast<std::size_t>(num_map_local_vars)
-        && (num_game_global_vars == 0 || game_global_vars != nullptr)
-        && (num_map_global_vars == 0 || map_global_vars != nullptr)
         && (num_map_local_vars == 0 || map_local_vars != nullptr);
 }
 
@@ -4341,6 +4351,50 @@ bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts)
     WorldSnapshot unavailableItem = rejectionBaseline;
     unavailableItem.items.back().itemDescriptor.pid = 0x000FFFFF;
     if (!rejectsWithoutMutation(unavailableItem, "unavailable_item_prototype")) return false;
+    if (rejectionBaseline.gameGlobalVariables.empty() || rejectionBaseline.doors.empty()) return false;
+    WorldSnapshot incompatibleGlobals = rejectionBaseline;
+    incompatibleGlobals.gameGlobalVariables.pop_back();
+    incompatibleGlobals.mapLocalVariables.push_back(123456);
+    if (!rejectsWithoutMutation(incompatibleGlobals, "globals_before_local_resize")) return false;
+    // The same invariant also prevents replacing the current map on rejection.
+    incompatibleGlobals.mapId = rejectionBaseline.mapId == 0 ? 1 : 0;
+    if (!rejectsWithoutMutation(incompatibleGlobals, "globals_before_map_load")) return false;
+    WorldSnapshot incompatibleMapGlobals = rejectionBaseline;
+    if (incompatibleMapGlobals.mapGlobalVariables.empty()) {
+        incompatibleMapGlobals.mapGlobalVariables.push_back(123456);
+    } else {
+        incompatibleMapGlobals.mapGlobalVariables.pop_back();
+    }
+    incompatibleMapGlobals.mapLocalVariables.push_back(123456);
+    if (!rejectsWithoutMutation(incompatibleMapGlobals, "map_globals_before_local_resize")) return false;
+    WorldSnapshot incompatibleDoors = rejectionBaseline;
+    incompatibleDoors.doors.pop_back();
+    incompatibleDoors.mapLocalVariables.push_back(123456);
+    if (!rejectsWithoutMutation(incompatibleDoors, "doors_before_local_resize")) return false;
+    WorldSnapshot expandedLocals = rejectionBaseline;
+    expandedLocals.mapLocalVariables.push_back(123456);
+    std::vector<std::uint8_t> expandedPacket;
+    if (encodeSnapshot(expandedLocals, expandedPacket) != SnapshotError::None) return false;
+    auto decodedExpanded = decodeSnapshot(expandedPacket);
+    if (!decodedExpanded) return false;
+    engineExecutionProbeBegin();
+    bool expansionApplied = networkWorldApplySnapshot(decodedExpanded.snapshot);
+    WorldSnapshot expandedCapture;
+    bool expansionCaptured = networkWorldCaptureSnapshot({}, expandedCapture);
+    bool localsExpanded = expansionApplied && expansionCaptured
+        && expandedCapture.mapLocalVariables == expandedLocals.mapLocalVariables;
+    bool expansionRestored = networkWorldApplySnapshot(rejectionBaseline);
+    WorldSnapshot restoredCapture;
+    bool restoredCaptured = networkWorldCaptureSnapshot({}, restoredCapture);
+    EngineExecutionProbeCounts expansionCounts = engineExecutionProbeEnd();
+    auto restoredDigest = computeSnapshotDigest(restoredCapture);
+    bool localsRestored = expansionRestored && restoredCaptured && restoredDigest
+        && restoredDigest.digest.overall == rejectionDigest.digest.overall
+        && expansionCounts.scriptProcedures == 0 && expansionCounts.combatAttacks == 0
+        && expansionCounts.randomDraws == 0;
+    std::fprintf(stderr, "NATIVE_SNAPSHOT_LOCAL_VARIABLE_EXPANSION_PASS expanded=%d restored=%d.\n",
+        localsExpanded ? 1 : 0, localsRestored ? 1 : 0);
+    if (!localsExpanded || !localsRestored) return false;
     std::fprintf(stderr, "NATIVE_SNAPSHOT_REJECTION_PREFLIGHT_PASS\n");
 
     engineExecutionProbeBegin();
@@ -7489,6 +7543,15 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
             snapshot.phaseRevision, session.phaseRevision());
         return false;
     }
+    // Game globals belong to the loaded game rather than a particular map.
+    // Reject their incompatible shape before replacing the native map.
+    if (session.isActive() && snapshotError == SnapshotError::None
+        && !validateGameGlobalVariables(snapshot)) {
+        std::fprintf(stderr,
+            "Multiplayer snapshot game globals rejected before native mutation: count=%zu/%d.\n",
+            snapshot.gameGlobalVariables.size(), num_game_global_vars);
+        return false;
+    }
     // Prototype creation can fail after registry reconciliation has started.
     // Reject unavailable native resources before replacing maps, variables or
     // any object identity. Allocation/placement failures remain separate.
@@ -7504,6 +7567,19 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
         std::fprintf(stderr,
             "Multiplayer snapshot could not load authoritative map %d.\n",
             snapshot.mapId);
+        return false;
+    }
+    // Map globals and static doors must match the authoritative target map.
+    // Check them before resizing locals, which may free or expand native data.
+    // Loading a different map above remains a separate rollback boundary.
+    if (session.isActive() && snapshotError == SnapshotError::None
+        && (!validateMapGlobalVariables(snapshot)
+            || snapshot.doors.size() != worldDoors.size()
+            || (!networkWorldReplicaSessionActive() && snapshot.scenery.size() != worldScenery.size()))) {
+        std::fprintf(stderr,
+            "Multiplayer snapshot map layout rejected before local resize: map_globals=%zu/%d doors=%zu/%zu scenery=%zu/%zu.\n",
+            snapshot.mapGlobalVariables.size(), num_map_global_vars,
+            snapshot.doors.size(), worldDoors.size(), snapshot.scenery.size(), worldScenery.size());
         return false;
     }
     if (session.isActive()
