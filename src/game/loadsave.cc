@@ -6,6 +6,7 @@
 #include <time.h>
 
 #include <algorithm>
+#include <filesystem>
 #include <limits>
 #include <map>
 #include <string>
@@ -162,6 +163,7 @@ static int LoadObjDudeCid(DB_FILE* stream);
 static int SaveObjDudeCid(DB_FILE* stream);
 static int EraseSave();
 static bool SaveMultiplayerSidecar();
+static bool RecoverMultiplayerSidecarBackup();
 static void LoadMultiplayerSidecar();
 static void SaveDirectoryPath(char* path, bool relative, bool trailingSeparator);
 
@@ -1558,9 +1560,7 @@ static int SaveSlot()
     compat_mkdir(gmpath);
 
     if (SaveBackup() == -1) {
-        debug_printf("\nLOADSAVE: ** Error backing up save files; original slot retained! **\n");
-        SaveDirectoryPath(gmpath, true, true);
-        MapDirErase(gmpath, "BAK");
+        debug_printf("\nLOADSAVE: ** Backup preparation failed; existing slot and backups retained! **\n");
         gsound_background_unpause();
         return -1;
     }
@@ -2708,6 +2708,7 @@ int MapDirEraseFile(const char* a1, const char* a2)
 // 0x471D38
 static int SaveBackup()
 {
+    if (!RecoverMultiplayerSidecarBackup()) return -1;
     debug_printf("\nLOADSAVE: Backing up save slot files..\n");
     automap_db_flag = 0;
 
@@ -2763,6 +2764,7 @@ static int RestoreSave()
     SaveDirectoryPath(gmpath, true, true);
     const std::string restoreDirectory = gmpath;
     failedSaveRestorations[restoreDirectory] = map_backup_count;
+    if (!RecoverMultiplayerSidecarBackup()) return -1;
     snprintf(str0, sizeof(str0), "%s*.%s", gmpath, "BAK");
     char** fileList;
     int fileListLength = db_get_file_list(str0, &fileList, NULL, 0);
@@ -2931,27 +2933,53 @@ static void MultiplayerSidecarPath(char* path, const char* fileName, bool relati
     strcat(path, fileName);
 }
 
-static bool FileExists(const char* path)
+static bool SaveFileExists(const char* path, bool& exists)
 {
-    FILE* stream = compat_fopen(path, "rb");
-    if (stream == nullptr) {
-        return false;
+    char nativePath[COMPAT_MAX_PATH];
+    strcpy(nativePath, path);
+    compat_windows_path_to_native(nativePath);
+    compat_resolve_path(nativePath);
+    std::error_code error;
+    auto status = std::filesystem::status(nativePath, error);
+    if (error && error != std::errc::no_such_file_or_directory) return false;
+    exists = std::filesystem::exists(status);
+    return !exists || std::filesystem::is_regular_file(status);
+}
+
+static bool RecoverMultiplayerSidecarBackup()
+{
+    char destination[COMPAT_MAX_PATH];
+    char backup[COMPAT_MAX_PATH];
+    MultiplayerSidecarPath(destination, "MULTI.DAT", false);
+    // OLD stays outside the native map-backup wildcard. Recover the legacy
+    // BAK before native backup enumeration or cleanup can touch it.
+    for (const char* name : { "MULTI.OLD", "MULTI.BAK" }) {
+        MultiplayerSidecarPath(backup, name, false);
+        bool hasBackup;
+        bool hasDestination;
+        if (!SaveFileExists(backup, hasBackup)) return false;
+        if (!hasBackup) continue;
+        if (!SaveFileExists(destination, hasDestination)) return false;
+        if (hasDestination) {
+            if (compat_remove(backup) != 0) return false;
+        } else if (compat_rename(backup, destination) != 0) {
+            return false;
+        }
     }
-    fclose(stream);
     return true;
 }
 
 static bool PublishMultiplayerSidecar(const std::vector<std::uint8_t>& bytes)
 {
+    if (!RecoverMultiplayerSidecarBackup()) return false;
     char destination[COMPAT_MAX_PATH];
     char temporary[COMPAT_MAX_PATH];
     char backup[COMPAT_MAX_PATH];
     MultiplayerSidecarPath(destination, "MULTI.DAT", false);
     MultiplayerSidecarPath(temporary, "MULTI.TMP", false);
-    MultiplayerSidecarPath(backup, "MULTI.BAK", false);
+    MultiplayerSidecarPath(backup, "MULTI.OLD", false);
 
     compat_remove(temporary);
-    compat_remove(backup);
     FILE* stream = compat_fopen(temporary, "wb");
     if (stream == nullptr) {
         return false;
@@ -2964,7 +2992,11 @@ static bool PublishMultiplayerSidecar(const std::vector<std::uint8_t>& bytes)
         return false;
     }
 
-    bool hadPrevious = FileExists(destination);
+    bool hadPrevious;
+    if (!SaveFileExists(destination, hadPrevious)) {
+        compat_remove(temporary);
+        return false;
+    }
     if (hadPrevious && compat_rename(destination, backup) != 0) {
         compat_remove(temporary);
         return false;
@@ -2988,6 +3020,8 @@ static void RemoveMultiplayerSidecar()
     MultiplayerSidecarPath(path, "MULTI.TMP", false);
     compat_remove(path);
     MultiplayerSidecarPath(path, "MULTI.BAK", false);
+    compat_remove(path);
+    MultiplayerSidecarPath(path, "MULTI.OLD", false);
     compat_remove(path);
 }
 

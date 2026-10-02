@@ -17,6 +17,8 @@ def main():
                       help='exercise native save backup copying, including its close failure')
     mode.add_argument('--save-backup', action='store_true',
                       help='exercise failed backup creation without changing original slot files')
+    mode.add_argument('--sidecar-publish', action='store_true',
+                      help='check interrupted metadata publication preserves its backup on retry')
     args = parser.parse_args()
     if not sys.platform.startswith('linux') or not pathlib.Path('/dev/full').exists():
         parser.error('this native kernel failure probe requires Linux /dev/full')
@@ -35,7 +37,7 @@ def main():
     if len(main_objects) != 1:
         parser.error('could not identify the desktop entry point')
     compiler = link[0]
-    if args.save_copy or args.save_backup:
+    if args.save_copy or args.save_backup or args.sidecar_publish:
         main_objects += [arg for arg in link if arg.endswith('/game/loadsave.cc.o')]
     link = [arg for arg in link if arg not in main_objects
             and not arg.startswith('-Wl,--dependency-file=')]
@@ -48,12 +50,13 @@ def main():
             (root / 'SAVEGAME' / 'SLOT01' / 'MAP.BAK' / 'blocker').write_text('backup destination unavailable\n')
         obj = root / 'probe.o'
         binary = root / 'probe'
-        if args.save_copy or args.save_backup:
+        if args.save_copy or args.save_backup or args.sidecar_publish:
             compile_line = next(line for line in commands.splitlines()
                                 if ' -c ' in line and line.endswith('/src/game/loadsave.cc'))
             compile_args = shlex.split(compile_line)
             compile_args[compile_args.index('-o') + 1] = str(obj)
-            test_name = 'native_save_backup_test.cc' if args.save_backup else 'native_save_copy_test.cc'
+            test_name = ('native_sidecar_publish_test.cc' if args.sidecar_publish else
+                         'native_save_backup_test.cc' if args.save_backup else 'native_save_copy_test.cc')
             compile_args[compile_args.index('-c') + 1] = str(source / 'tests' / test_name)
             compile_args[compile_args.index('-MF') + 1] = str(root / 'probe.d')
             # Prefer this checkout's loadsave.cc over the build's source tree.
@@ -66,9 +69,11 @@ def main():
         link.insert(1, str(obj))
         subprocess.run(link, cwd=build, check=True, timeout=60)
         subprocess.run([str(binary), str(root)], check=True, timeout=30)
-    label = ('NATIVE_SAVE_BACKUP_PASS' if args.save_backup else
+    label = ('NATIVE_SIDECAR_PUBLICATION_PASS' if args.sidecar_publish else
+             'NATIVE_SAVE_BACKUP_PASS' if args.save_backup else
              'NATIVE_SAVE_COPY_PASS' if args.save_copy else 'NATIVE_DB_CLOSE_PASS')
-    detail = ('backup_failure=reported originals=intact rollback=intact' if args.save_backup else
+    detail = ('interrupted_publish=retained retry=safe legacy_backup=recovered' if args.sidecar_publish else
+              'backup_failure=reported originals=intact rollback=intact' if args.save_backup else
               'buffered_failure=reported subsequent_io=intact')
     print(f'{label} {detail}')
 
