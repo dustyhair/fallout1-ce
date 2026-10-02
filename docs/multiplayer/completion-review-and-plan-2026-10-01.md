@@ -1025,3 +1025,17 @@ resources. The full candidate-81 regression and actual HP-changing alarm redraw
 acceptance remain pending. Source bundle is
 `/var/tmp/fallout-visible-pinned81-src`; HAL binary SHA256 is
 `b6b3c9ba2a7e56861375997b10f8f567911ebcdef4e743b6ac57dec8a0d4ae7d`.
+
+
+Accepted follow-up checkpoints, 2 October
+
+- [x] Builds 81 and 83 complete all 50 compatibility scenarios plus the core gate, with both processes exiting zero throughout. Each emits 28 matching final digests; 22 scenarios emit none. Evidence: `/var/tmp/fallout-five-goals-regression83-full/{summary,digests}.tsv`.
+- [x] Commit `69a7529` rejects invalid native global/layout counts before local-variable resizing or entity mutation. Four invalid checkpoints preserve state; legitimate local expansion applies and restores the original digest.
+- [x] Commit `a02bb5b` preflights required actor art frames and catalog bounds. Invalid art/frame checkpoints preserve state; actual fallback animation and burned-corpse aliases apply and restore correctly. Build 83 passes all five dense maps and disk/authenticated recovery.
+- [x] Commit `97a5f7b` re-resolves script slots after native procedures delete or compact them. Permanent native ASAN cases verify self-removal and retained source ownership without stale-pointer access.
+- [x] Commit `81780cb` binds actual NPC companion ambient/timed callbacks to the shared leader while preserving human, unrelated and ownerless script contexts. Six permanent native ASAN cases pass. A real guest-approved ten-minute rest dispatches 600 queued Ian callbacks, all following the host and restoring the caller context.
+- [x] Commit `7909f76` preflights stable, reconciled and newly created NPC frames using the same native matching rules as application. All three oversized-frame cases reject without mutation; unchanged hidden art and newly created frame-zero controls apply and restore. Isolated build/CTest pass 3/3; combined build 85 passes movement, disk/authenticated recovery and all five dense maps.
+- [ ] Complete equivalent door, scenery and item frame rejection guards. Private checksummed native cases reproduce earlier actor HP mutation before each rejection. Allocation, placement and cross-map rollback remain separate open gates.
+- [ ] Accept the visible Pip-Boy proposal layout and already-open alarm HP/time refresh on matched build 85. The earlier rest completed after 57 seconds; a retry requested a second rest, completing after 90 seconds. No approval failure is established by those observations.
+
+Visible build 81 ordinary Junktown testing completes Kenji's assassination encounter, Killian's gratitude and investigation assignment. Natalia earns native 400 quest XP and 250 combat XP; both peers agree on the death and rewards. The host receives the bug and tape recorder. This is additional story acceptance, not completion of the full campaign. Build 85 source and binary are pinned at `/var/tmp/fallout-visible-pinned85-src` for the next safe matched deployment.
