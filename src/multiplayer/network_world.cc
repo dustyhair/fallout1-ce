@@ -762,6 +762,48 @@ bool validateSnapshotPrototypes(const WorldSnapshot& snapshot)
     return true;
 }
 
+bool validateCritterArtCatalog(std::int32_t fid, const char* section)
+{
+    // Native death/electrify art aliases index anon_alias before art_get_name
+    // checks the catalog bound. Validate that input before any art cache call.
+    char baseName[14];
+    if (art_get_base_name(OBJ_TYPE_CRITTER, fid & 0xFFF, baseName) != 0) {
+        std::fprintf(stderr,
+            "Multiplayer snapshot art catalog preflight failed: section=%s fid=%d.\n",
+            section, fid);
+        return false;
+    }
+    return true;
+}
+
+bool validateSnapshotActorArt(const WorldSnapshot& snapshot)
+{
+    for (const ActorSnapshot& state : snapshot.actors) {
+        if (!validateCritterArtCatalog(state.fid, "actors")) return false;
+        Object* actor = session.entities().findObject(state.entityId);
+        // Roster identity has already been checked. Unchanged presentation
+        // does not call obj_set_frame and may intentionally have no artwork.
+        if (actor != nullptr && actor->fid == state.fid && actor->frame == state.frame) continue;
+        CacheEntry* handle = nullptr;
+        Art* frames = art_ptr_lock(state.fid, &handle);
+        bool available = frames != nullptr && state.frame < art_frame_max_frame(frames);
+        if (frames != nullptr) art_ptr_unlock(handle);
+        if (!available) {
+            std::fprintf(stderr,
+                "Multiplayer snapshot actor art preflight failed: entity=%u fid=%d frame=%d.\n",
+                state.entityId.value, state.fid, state.frame);
+            return false;
+        }
+    }
+    // NPC identities may be rebuilt, so entity ID alone cannot establish an
+    // unchanged presentation exemption. Only protect native alias indexing
+    // here; NPC frame/resource reconciliation remains a separate boundary.
+    for (const CritterSnapshot& state : snapshot.critters) {
+        if (!validateCritterArtCatalog(state.fid, "critters")) return false;
+    }
+    return true;
+}
+
 bool applyActorAndCritterState(const WorldSnapshot& snapshot, bool preserveMovement)
 {
     for (const ActorSnapshot& actorState : snapshot.actors) {
@@ -4395,6 +4437,56 @@ bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts)
     std::fprintf(stderr, "NATIVE_SNAPSHOT_LOCAL_VARIABLE_EXPANSION_PASS expanded=%d restored=%d.\n",
         localsExpanded ? 1 : 0, localsRestored ? 1 : 0);
     if (!localsExpanded || !localsRestored) return false;
+    WorldSnapshot unavailableActorArt = rejectionBaseline;
+    ++unavailableActorArt.actors.front().hitPoints;
+    unavailableActorArt.actors.back().fid = (OBJ_TYPE_CRITTER << 24) | 0xFFF;
+    ++unavailableActorArt.actors.back().frame;
+    if (!rejectsWithoutMutation(unavailableActorArt, "unavailable_actor_art")) return false;
+    WorldSnapshot unavailableActorFrame = rejectionBaseline;
+    ++unavailableActorFrame.actors.front().hitPoints;
+    unavailableActorFrame.actors.back().frame = 0x7FFFFFFF;
+    if (!rejectsWithoutMutation(unavailableActorFrame, "actor_frame_out_of_bounds")) return false;
+    WorldSnapshot unavailableCritterAlias = rejectionBaseline;
+    unavailableCritterAlias.critters.back().fid = (OBJ_TYPE_CRITTER << 24)
+        | (ANIM_ELECTRIFY << 16) | 0xFFF;
+    if (!rejectsWithoutMutation(unavailableCritterAlias, "critter_alias_catalog_out_of_bounds")) return false;
+    for (int animation : { ANIM_FALL_BACK, ANIM_BURNED_TO_NOTHING }) {
+        WorldSnapshot nativePose = rejectionBaseline;
+        ActorSnapshot& pose = nativePose.actors.back();
+        pose.fid = art_id(OBJ_TYPE_CRITTER, pose.fid & 0xFFF, animation, 0, pose.rotation + 1);
+        CacheEntry* handle = nullptr;
+        Art* frames = art_ptr_lock(pose.fid, &handle);
+        if (frames == nullptr) return false;
+        pose.frame = art_frame_max_frame(frames) - 1;
+        art_ptr_unlock(handle);
+        pose.hitPoints = 0;
+        pose.combatResults |= DAM_DEAD;
+        std::vector<std::uint8_t> posePacket;
+        if (encodeSnapshot(nativePose, posePacket) != SnapshotError::None) return false;
+        auto decodedPose = decodeSnapshot(posePacket);
+        if (!decodedPose) return false;
+        engineExecutionProbeBegin();
+        bool poseApplied = networkWorldApplySnapshot(decodedPose.snapshot);
+        WorldSnapshot poseCapture;
+        bool poseCaptured = networkWorldCaptureSnapshot({}, poseCapture);
+        auto poseDigest = computeSnapshotDigest(nativePose);
+        auto capturedPoseDigest = computeSnapshotDigest(poseCapture);
+        bool poseMatched = poseApplied && poseCaptured && poseDigest && capturedPoseDigest
+            && poseDigest.digest.overall == capturedPoseDigest.digest.overall;
+        bool poseRestored = networkWorldApplySnapshot(rejectionBaseline);
+        WorldSnapshot poseRestoreCapture;
+        bool poseRestoreCaptured = networkWorldCaptureSnapshot({}, poseRestoreCapture);
+        auto poseRestoreDigest = computeSnapshotDigest(poseRestoreCapture);
+        EngineExecutionProbeCounts poseCounts = engineExecutionProbeEnd();
+        bool poseRestoreMatched = poseRestored && poseRestoreCaptured && poseRestoreDigest
+            && rejectionDigest.digest.overall == poseRestoreDigest.digest.overall
+            && poseCounts.scriptProcedures == 0 && poseCounts.combatAttacks == 0
+            && poseCounts.randomDraws == 0;
+        std::fprintf(stderr,
+            "NATIVE_SNAPSHOT_ACTOR_ART_CONTROL animation=%d applied=%d restored=%d.\n",
+            animation, poseMatched ? 1 : 0, poseRestoreMatched ? 1 : 0);
+        if (!poseMatched || !poseRestoreMatched) return false;
+    }
     std::fprintf(stderr, "NATIVE_SNAPSHOT_REJECTION_PREFLIGHT_PASS\n");
 
     engineExecutionProbeBegin();
@@ -7557,6 +7649,10 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
     // any object identity. Allocation/placement failures remain separate.
     if (session.isActive() && snapshotError == SnapshotError::None
         && !validateSnapshotPrototypes(snapshot)) {
+        return false;
+    }
+    if (session.isActive() && snapshotError == SnapshotError::None
+        && !validateSnapshotActorArt(snapshot)) {
         return false;
     }
     if (session.isActive()
