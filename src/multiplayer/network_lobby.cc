@@ -882,7 +882,10 @@ bool NetworkLobby::recoveryInProgress() const
 
 void NetworkLobby::abortRecovery()
 {
-    if (_mode == NetworkLaunchMode::Join) {
+    // A failed Applied ACK can already have disconnected the stream. Preserve
+    // its reconstructed cursor and reconnectable state instead of replacing
+    // that transport failure with a fatal protocol error.
+    if (_mode == NetworkLaunchMode::Join && _state == NetworkLobbyState::Ready) {
         _recovering = false;
         fail(NetworkLobbyError::ProtocolError);
     }

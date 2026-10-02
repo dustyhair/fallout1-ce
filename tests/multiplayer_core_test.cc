@@ -2520,6 +2520,69 @@ void testSnapshotCapacityAbort()
         "capacity failure remains explicit after further polling");
 }
 
+void testCheckpointAcknowledgementDisconnect()
+{
+    auto pair = createLoopbackTransportPair();
+    Transport* hostWire = pair.first.get();
+    NetworkLobby host, guest;
+    SessionId sessionId { 0xACCE551ULL };
+    expect(host.start(NetworkLaunchMode::Host, sessionId, std::move(pair.first))
+            && guest.start(NetworkLaunchMode::Join, sessionId, std::move(pair.second)),
+        "checkpoint acknowledgement peers start");
+    host.submitLocalSheet(sampleCharacterSheet(kHostPlayerId, "Host"));
+    guest.submitLocalSheet(sampleCharacterSheet(kGuestPlayerId, "Guest"));
+    pollNetworkLobbies(host, guest);
+    expect(host.requestStart(), "checkpoint acknowledgement session starts");
+    guest.poll();
+    for (int rotation = 1; rotation <= 3; ++rotation) {
+        expect(host.sendLocalFacing(rotation), "checkpoint acknowledgement host advances authority");
+    }
+    WorldSnapshot snapshot = sampleSnapshot();
+    snapshot.lastIncludedEvent = host.latestAuthoritativeEvent();
+    expect(host.sendAuthoritativeState(snapshot), "checkpoint acknowledgement checkpoint is published");
+    guest.poll();
+    auto checkpoint = guest.takeAuthoritativeState();
+    expect(checkpoint.has_value() && checkpoint->lastIncludedEvent == EventSequence { 3 }
+            && guest.lastAppliedEvent() == EventSequence {},
+        "checkpoint acknowledgement remains unapplied until native reconstruction");
+    // Native reconstruction has finished. The host disappears at the exact
+    // boundary before the guest's Applied ACK can be written.
+    hostWire->close();
+    expect(checkpoint && !guest.confirmSnapshotApplied(checkpoint->lastIncludedEvent)
+            && guest.state() == NetworkLobbyState::Disconnected
+            && guest.lastAppliedEvent() == EventSequence { 3 },
+        "failed checkpoint ACK preserves the actual applied boundary");
+    guest.abortRecovery(); // Runtime uses this after a failed confirmation.
+    expect(guest.state() == NetworkLobbyState::Disconnected
+            && guest.error() == NetworkLobbyError::Disconnected,
+        "recovery abort preserves a reconnectable transport disconnect");
+    host.poll();
+    auto reconnect = createLoopbackTransportPair();
+    expect(host.reattachTransport(std::move(reconnect.first))
+            && guest.reattachTransport(std::move(reconnect.second)),
+        "failed checkpoint ACK allows a fresh authenticated stream");
+    expect(host.queueRecovery(EventSequence { 3 })
+            && guest.beginReconnectRecovery(EventSequence { 3 }),
+        "failed checkpoint ACK resumes from the reconstructed boundary");
+    auto request = host.takeRecoveryRequest();
+    expect(request && host.sendRecovery(*request, snapshot),
+        "failed checkpoint ACK receives recovery completion");
+    guest.poll();
+    expect(guest.state() == NetworkLobbyState::Ready && !guest.recoveryInProgress()
+            && guest.lastAppliedEvent() == EventSequence { 3 },
+        "failed checkpoint ACK completes recovery without replaying applied work");
+    expect(host.sendLocalFacing(4), "failed checkpoint ACK permits later authority");
+    guest.poll();
+    auto next = guest.takePeerEvent();
+    expect(next && next->sequence == EventSequence { 4 }
+            && guest.confirmPeerEventApplied(next->sequence),
+        "failed checkpoint ACK delivers the next event once");
+    guest.abortRecovery();
+    expect(guest.state() == NetworkLobbyState::Failed
+            && guest.error() == NetworkLobbyError::ProtocolError,
+        "native application failure on a connected stream remains fatal");
+}
+
 void testNetworkCombatTurnTransport()
 {
     SessionId sessionId { 0xACCE5510ULL };
@@ -5336,6 +5399,7 @@ int main()
     fallout::multiplayer::testNetworkLaunchAndBootstrap();
     fallout::multiplayer::testNetworkCharacterLobby();
     fallout::multiplayer::testSnapshotCapacityAbort();
+    fallout::multiplayer::testCheckpointAcknowledgementDisconnect();
     fallout::multiplayer::testNetworkCombatTurnTransport();
     fallout::multiplayer::testLocalSessionLifecycle();
     fallout::multiplayer::testCombatTurnCommandsAndReplication();
