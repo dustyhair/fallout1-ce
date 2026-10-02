@@ -5169,6 +5169,23 @@ void testNetworkSessionRecoveryPrimitives()
 void testDialogueVotingPolicies()
 {
     DialogueVoteController votes;
+    for (DialogueVotingPolicy policy : { DialogueVotingPolicy::TalkerDecides,
+             DialogueVotingPolicy::HostDecides, DialogueVotingPolicy::MajorityHostTie,
+             DialogueVotingPolicy::MajorityStatsRandomTie }) {
+        std::vector<PlayerId> roster { kHostPlayerId, kGuestPlayerId, PlayerId { 3 }, PlayerId { 4 } };
+        expect(votes.begin(6, kGuestPlayerId, kHostPlayerId, roster, 3, policy, 1000)
+                && !votes.resolve(1000).has_value()
+                && !votes.resolve(61000, 2).has_value()
+                && !votes.needsRandomTie(),
+            "an idle four-player dialogue never invents a ballot or requests RNG");
+        for (PlayerId player : roster) votes.setConnected(player, false);
+        expect(!votes.resolve(61000).has_value(),
+            "disconnecting every voter cannot choose an unrequested reply");
+        expect(votes.setConnected(kHostPlayerId, true)
+                && votes.vote(kHostPlayerId, 6, 1)
+                && votes.resolve(61000) == std::optional<std::uint8_t> { 1 },
+            "a real ballot still resolves after idle or disconnected dialogue");
+    }
     std::vector<PlayerId> threePlayers { PlayerId { 3 }, kGuestPlayerId, kHostPlayerId };
     expect(votes.begin(7, kGuestPlayerId, kHostPlayerId, threePlayers, 3,
                DialogueVotingPolicy::MajorityHostTie, 1000),

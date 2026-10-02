@@ -93,6 +93,11 @@ std::optional<std::uint8_t> DialogueVoteController::resolve(
     std::uint64_t nowMilliseconds, std::optional<std::uint32_t> randomDraw)
 {
     if (!_active || _selected.has_value()) return _selected;
+    // A timeout can settle actual ballots, but cannot create a player choice.
+    if (std::none_of(_ballots.begin(), _ballots.end(),
+            [](const DialogueBallot& ballot) { return ballot.option.has_value(); })) {
+        return std::nullopt;
+    }
     auto ballotFor = [this](PlayerId id) -> const DialogueBallot* {
         auto found = std::find_if(_ballots.begin(), _ballots.end(),
             [id](const DialogueBallot& ballot) { return ballot.playerId == id; });
@@ -175,6 +180,11 @@ std::optional<std::uint8_t> DialogueVoteController::resolve(
         }
     }
     return _selected;
+}
+
+void DialogueVoteController::deferDeadlineUntil(std::uint64_t deadlineMilliseconds)
+{
+    if (_active && !_selected.has_value()) _deadlineMilliseconds = std::max(_deadlineMilliseconds, deadlineMilliseconds);
 }
 
 void DialogueVoteController::clear()

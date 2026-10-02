@@ -38,6 +38,7 @@ public:
     bool setTieBreakStats(PlayerId playerId, int charisma, int intelligence);
     std::optional<std::uint8_t> resolve(std::uint64_t nowMilliseconds,
         std::optional<std::uint32_t> randomDraw = std::nullopt);
+    void deferDeadlineUntil(std::uint64_t deadlineMilliseconds);
     void clear();
 
     bool active() const { return _active; }

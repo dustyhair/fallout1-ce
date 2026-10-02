@@ -7383,6 +7383,12 @@ std::optional<std::uint8_t> networkWorldResolveDialogue()
 {
     if (worldMode != NetworkLaunchMode::Host || !dialogueVotes.active()) return std::nullopt;
     std::uint64_t now = combatClockMilliseconds();
+    // Start the voting timeout when a player participates, keeping the other
+    // players' response window after a long idle conversation.
+    if (std::none_of(dialogueVotes.ballots().begin(), dialogueVotes.ballots().end(),
+            [](const DialogueBallot& ballot) { return ballot.option.has_value(); })) {
+        dialogueVotes.deferDeadlineUntil(now + 60000);
+    }
     std::optional<std::uint8_t> selected = dialogueVotes.resolve(now);
     if (!selected.has_value() && dialogueVotes.needsRandomTie()) {
         selected = dialogueVotes.resolve(now,
