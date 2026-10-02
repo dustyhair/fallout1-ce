@@ -445,6 +445,11 @@ bool map_disable_bk_processes()
     return true;
 }
 
+bool map_bk_processes_enabled()
+{
+    return map_bk_enabled;
+}
+
 // 0x473D5C
 int map_set_elevation(int elevation)
 {

@@ -18,6 +18,7 @@
 #include "game/gmouse.h"
 #include "game/gsound.h"
 #include "game/item.h"
+#include "game/map.h"
 #include "game/object.h"
 #include "game/protinst.h"
 #include "game/proto.h"
@@ -1352,7 +1353,9 @@ int intface_update_items(bool animated)
         }
     }
 
-    if (animated) {
+    // Shared dialogue can consume a script-owned item with the map paused.
+    // A HUD refresh must not wait for an animation that cannot advance there.
+    if (animated && (!multiplayer::networkWorldActive() || map_bk_processes_enabled())) {
         Object* newCurrentItem = itemButtonItems[itemCurrentItem].item;
         if (newCurrentItem != oldCurrentItem) {
             int animationCode = 0;
