@@ -727,6 +727,31 @@ bool validateCritterState(const WorldSnapshot& snapshot)
     return true;
 }
 
+bool validateSnapshotPrototypes(const WorldSnapshot& snapshot)
+{
+    auto available = [](int pid, int type, const char* section) {
+        Proto* prototype = nullptr;
+        if (proto_ptr(pid, &prototype) != 0 || prototype == nullptr
+            || FID_TYPE(prototype->fid) != type) {
+            std::fprintf(stderr,
+                "Multiplayer snapshot prototype preflight failed: section=%s pid=%d type=%d.\n",
+                section, pid, type);
+            return false;
+        }
+        return true;
+    };
+    for (const CritterSnapshot& critter : snapshot.critters) {
+        if (!available(critter.pid, OBJ_TYPE_CRITTER, "critters")) return false;
+    }
+    for (const ScenerySnapshot& scenery : snapshot.scenery) {
+        if (!available(scenery.pid, OBJ_TYPE_SCENERY, "scenery")) return false;
+    }
+    for (const ItemSnapshot& item : snapshot.items) {
+        if (!available(item.itemDescriptor.pid, OBJ_TYPE_ITEM, "items")) return false;
+    }
+    return true;
+}
+
 bool applyActorAndCritterState(const WorldSnapshot& snapshot, bool preserveMovement)
 {
     for (const ActorSnapshot& actorState : snapshot.actors) {
@@ -4265,10 +4290,13 @@ bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts)
     auto rejectionDigest = computeSnapshotDigest(rejectionBaseline);
     if (!rejectionDigest || rejectionBaseline.items.empty()) return false;
     auto rejectsWithoutMutation = [&](const WorldSnapshot& invalid, const char* reason) {
-        if (validateSnapshot(invalid) != SnapshotError::None) return false;
+        std::vector<std::uint8_t> packet;
+        if (encodeSnapshot(invalid, packet) != SnapshotError::None) return false;
+        auto decoded = decodeSnapshot(packet);
+        if (!decoded) return false;
         std::size_t registrySize = session.entities().size();
         engineExecutionProbeBegin();
-        bool rejected = !networkWorldApplySnapshot(invalid);
+        bool rejected = !networkWorldApplySnapshot(decoded.snapshot);
         WorldSnapshot after;
         bool captured = networkWorldCaptureSnapshot({}, after);
         EngineExecutionProbeCounts mutations = engineExecutionProbeEnd();
@@ -4303,6 +4331,16 @@ bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts)
     std::swap(wrongActor.actors[0].ownerId, wrongActor.actors[1].ownerId);
     wrongActor.mapId = rejectionBaseline.mapId == 0 ? 1 : 0;
     if (!rejectsWithoutMutation(wrongActor, "actor_before_map_load")) return false;
+    if (rejectionBaseline.critters.empty() || rejectionBaseline.scenery.empty()) return false;
+    WorldSnapshot unavailableCritter = rejectionBaseline;
+    unavailableCritter.critters.back().pid = 0x010FFFFF;
+    if (!rejectsWithoutMutation(unavailableCritter, "unavailable_critter_prototype")) return false;
+    WorldSnapshot unavailableScenery = rejectionBaseline;
+    unavailableScenery.scenery.back().pid = 0x020FFFFF;
+    if (!rejectsWithoutMutation(unavailableScenery, "unavailable_scenery_prototype")) return false;
+    WorldSnapshot unavailableItem = rejectionBaseline;
+    unavailableItem.items.back().itemDescriptor.pid = 0x000FFFFF;
+    if (!rejectsWithoutMutation(unavailableItem, "unavailable_item_prototype")) return false;
     std::fprintf(stderr, "NATIVE_SNAPSHOT_REJECTION_PREFLIGHT_PASS\n");
 
     engineExecutionProbeBegin();
@@ -7449,6 +7487,13 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
             validateActorState(snapshot) ? 1 : 0,
             static_cast<int>(snapshot.phase), static_cast<int>(session.phase()),
             snapshot.phaseRevision, session.phaseRevision());
+        return false;
+    }
+    // Prototype creation can fail after registry reconciliation has started.
+    // Reject unavailable native resources before replacing maps, variables or
+    // any object identity. Allocation/placement failures remain separate.
+    if (session.isActive() && snapshotError == SnapshotError::None
+        && !validateSnapshotPrototypes(snapshot)) {
         return false;
     }
     if (session.isActive()
