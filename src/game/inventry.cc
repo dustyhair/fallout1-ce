@@ -1331,7 +1331,9 @@ bool setup_inventory(int inventoryWindowType)
 
     adjust_fid();
 
-    bool isoWasEnabled = map_disable_bk_processes();
+    // Inventory is local in multiplayer; keep remote movement and native
+    // actions advancing even while this player's window remains open.
+    bool isoWasEnabled = multiplayer::networkWorldActive() ? false : map_disable_bk_processes();
 
     gmouse_disable(0);
 

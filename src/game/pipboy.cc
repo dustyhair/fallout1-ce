@@ -262,6 +262,7 @@ static const short holodisks[HOLODISK_COUNT] = {
 
 // 0x507224
 static bool bk_enable = false;
+static bool multiplayerBackgroundKept = false;
 
 // NOTE: Quest location indexes match town, I'm not sure if that was intentional
 // or just a coincedence.
@@ -688,7 +689,10 @@ int pipboy(int intent)
 // 0x486C5C
 static int StartPipboy(int intent)
 {
-    bk_enable = map_disable_bk_processes();
+    // A player's local screen must not freeze other players' native actions.
+    multiplayerBackgroundKept = multiplayer::networkWorldActive();
+    bk_enable = multiplayerBackgroundKept ? false : map_disable_bk_processes();
+    if (multiplayerBackgroundKept) gmouse_disable(0);
 
     cycle_disable();
     gmouse_3d_off();
@@ -914,6 +918,10 @@ static void EndPipboy()
 
     if (bk_enable) {
         map_enable_bk_processes();
+    }
+    if (multiplayerBackgroundKept) {
+        gmouse_enable();
+        multiplayerBackgroundKept = false;
     }
 
     cycle_enable();

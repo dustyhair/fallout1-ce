@@ -13,7 +13,7 @@ import time
 
 import test_native_multiplayer_snapshot_creation as native
 
-def run_fixture(binary, data, port, root, mode, expect_negative):
+def run_fixture(binary, data, port, root, mode, expect_negative, markers=None, result_label="NATIVE_INVENTORY_EVENTS_PASS"):
     processes = []
     env = dict(os.environ, SDL_AUDIODRIVER='dummy', SDL_RENDER_DRIVER='software', FALLOUT_TTS_ENABLED='0', FALLOUT_INVENTORY_EVENT_BOUNDARY=mode)
     if expect_negative:
@@ -71,11 +71,13 @@ def run_fixture(binary, data, port, root, mode, expect_negative):
                   else f'NATIVE_INVENTORY_EVENT_REJECTION mode={mode} preserved=1')
         if mode in ('missing-transfer', 'missing-drop'):
             marker = f'NATIVE_INVENTORY_EVENT_POSITIVE mode={mode} codec=1 applied=1 exact=1 replay=1 counts=1 restored=1'
-        if marker not in guest:
+        if markers is None:
+            markers = (marker,)
+        if any(required not in guest for required in markers):
             raise RuntimeError(f'boundary control did not pass:\n{guest[-7000:]}')
         if not expect_negative and any('MULTIPLAYER_SMOKE_TEST_PASS ' not in log for log in logs.values()):
             raise RuntimeError('normal multiplayer smoke continuation is missing')
-        print(f'NATIVE_INVENTORY_EVENTS_PASS mode={mode} exits={expected}/{expected}', flush=True)
+        print(f'{result_label} mode={mode} exits={expected}/{expected}', flush=True)
     finally:
         for _, process in processes:
             if process.poll() is None:
