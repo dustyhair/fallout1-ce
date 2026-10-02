@@ -4,6 +4,8 @@
 #include <limits>
 #include <unordered_set>
 
+#include "game/map_defs.h"
+#include "game/object_types.h"
 #include "multiplayer/combat_turn_controller.h"
 
 namespace fallout {
@@ -694,12 +696,13 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
         if (!entityIds.insert(actor.entityId.value).second) {
             return SnapshotError::DuplicateEntityId;
         }
-        if (actor.tile < 0
+        if (!hexGridTileIsValid(actor.tile)
             || actor.elevation < 0 || actor.elevation > 2
             || actor.rotation < 0 || actor.rotation > 5
             || actor.hitPoints < 0
             || actor.actionPoints < 0
             || actor.fid < 0
+            || FID_TYPE(actor.fid) != OBJ_TYPE_CRITTER
             || actor.frame < 0
             || (actor.objectFlags & ~kSharedObjectFlagMask) != 0
             || actor.lightDistance < 0 || actor.lightDistance > 8) {
@@ -713,12 +716,14 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
             return !isValid(critter.entityId) ? SnapshotError::InvalidEntityId : SnapshotError::DuplicateEntityId;
         }
         if (critter.pid < 0
-            || critter.tile < 0
+            || PID_TYPE(critter.pid) != OBJ_TYPE_CRITTER
+            || !hexGridTileIsValid(critter.tile)
             || critter.elevation < 0 || critter.elevation > 2
             || critter.rotation < 0 || critter.rotation > 5
             || critter.hitPoints < 0
             || critter.actionPoints < 0
             || critter.fid < 0
+            || FID_TYPE(critter.fid) != OBJ_TYPE_CRITTER
             || critter.frame < 0
             || (critter.objectFlags & ~kSharedObjectFlagMask) != 0
             || critter.lightDistance < 0 || critter.lightDistance > 8) {
@@ -781,7 +786,7 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
             || (static_cast<std::uint32_t>(scenery.pid) >> 24) != 2
             || scenery.fid < 0
             || ((static_cast<std::uint32_t>(scenery.fid) & 0x0F000000) >> 24) != 2
-            || scenery.tile < 0
+            || !hexGridTileIsValid(scenery.tile)
             || scenery.elevation < 0 || scenery.elevation > 2
             || scenery.rotation < 0 || scenery.rotation > 5
             || scenery.frame < 0
@@ -811,7 +816,7 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
             || (item.objectFlags & ~kSharedObjectFlagMask) != 0
             || item.lightDistance < 0 || item.lightDistance > 8
             || item.lightIntensity < 0 || item.lightIntensity > 65536
-            || (onGround && (item.quantity != 1 || item.tile < 0 || item.elevation < 0 || item.elevation > 2))
+            || (onGround && (item.quantity != 1 || !hexGridTileIsValid(item.tile) || item.elevation < 0 || item.elevation > 2))
             || (!onGround && (item.tile != -1 || item.elevation != -1 || item.holderId == item.entityId))) {
             return SnapshotError::InvalidItemState;
         }

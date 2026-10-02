@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "game/map_defs.h"
 #include "game/object_types.h"
 #include "multiplayer/acting_player_context.h"
 #include "multiplayer/character_lobby.h"
@@ -111,6 +112,7 @@ WorldSnapshot sampleSnapshot()
     snapshot.actors[0].build.unspentSkillPoints = 7;
     snapshot.actors[0].build.prototypeFlags = 1 << 3; // PC_FLAG_LEVEL_UP_AVAILABLE.
     snapshot.actors[1].build.experience = 125;
+    snapshot.actors[1].fid = 0x01000000;
     snapshot.actors[0].fid = 0x01000002;
     snapshot.actors[0].frame = 2;
     snapshot.actors[0].objectFlags = 0x10;
@@ -4492,6 +4494,86 @@ void testAuthoritativeCommandProcessing()
     expect(later.entityId.value > registeredDoor.entityId.value, "world entity IDs are not reused after a reset");
 }
 
+void testSnapshotNativeDescriptorValidation()
+{
+    WorldSnapshot empty = sampleSnapshot();
+    empty.actors.clear();
+    empty.critters.clear();
+    empty.doors.clear();
+    empty.scenery.clear();
+    empty.items.clear();
+    empty.timedEvents.clear();
+    auto rejectChecksumValidField = [](const WorldSnapshot& valid, std::size_t fieldOffset,
+                                       std::uint32_t value, SnapshotError expected,
+                                       const std::string& message) {
+        Packet packet;
+        expect(encodeSnapshot(valid, packet) == SnapshotError::None,
+            "native descriptor fixture starts with a valid checkpoint");
+        std::size_t offset = kSnapshotHeaderSize + 52 + fieldOffset;
+        for (int byte = 0; byte < 4; ++byte) {
+            packet[offset + byte] = static_cast<std::uint8_t>(value >> (24 - 8 * byte));
+        }
+        std::uint64_t digest = 14695981039346656037ULL;
+        for (std::size_t index = 20; index < packet.size(); ++index) {
+            digest ^= packet[index];
+            digest *= 1099511628211ULL;
+        }
+        for (int byte = 0; byte < 8; ++byte) {
+            packet[12 + byte] = static_cast<std::uint8_t>(digest >> (56 - 8 * byte));
+        }
+        expect(decodeSnapshot(packet).error == expected, message);
+    };
+    WorldSnapshot actor = empty;
+    actor.actors.push_back(sampleSnapshot().actors[0]);
+    actor.actors[0].whoHitMeId = {};
+    // Art encodes weapon, animation and facing in the higher bits. Death and
+    // armor art must still pass the critter category check.
+    actor.actors[0].fid = 0x61303123;
+    actor.actors[0].rotation = 5;
+    actor.actors[0].tile = HEX_GRID_SIZE - 1;
+    actor.actors[0].hitPoints = 0;
+    actor.actors[0].combatResults = 0x80;
+    Packet packet;
+    expect(encodeSnapshot(actor, packet) == SnapshotError::None && decodeSnapshot(packet),
+        "dead armored actor art with native facing bits and last legal tile round trips");
+    for (std::uint32_t fid : { 0x00000001u, 0x02000001u }) {
+        rejectChecksumValidField(actor, 32, fid, SnapshotError::InvalidActorState,
+            "checksum-valid actor cannot change native art category");
+    }
+    for (std::uint32_t tile : { static_cast<std::uint32_t>(HEX_GRID_SIZE), 0x7FFFFFFFu }) {
+        rejectChecksumValidField(actor, 8, tile, SnapshotError::InvalidActorState,
+            "checksum-valid actor cannot leave the native hex grid");
+    }
+    actor.actors[0].tile = HEX_GRID_SIZE;
+    expect(encodeSnapshot(actor, packet) == SnapshotError::InvalidActorState && packet.empty(),
+        "authority rejects an invalid actor tile without publishing a partial checkpoint");
+
+    WorldSnapshot critter = empty;
+    critter.critters.push_back(sampleSnapshot().critters[0]);
+    critter.critters[0].whoHitMeId = {};
+    critter.critters[0].fid = 0x61303123;
+    critter.critters[0].rotation = 5;
+    critter.critters[0].tile = HEX_GRID_SIZE - 1;
+    critter.critters[0].hitPoints = 0;
+    expect(encodeSnapshot(critter, packet) == SnapshotError::None && decodeSnapshot(packet),
+        "native corpse critter art retains facing bits and a legal edge tile");
+    rejectChecksumValidField(critter, 4, 0x02000001, SnapshotError::InvalidCritterState,
+        "checksum-valid critter cannot request a scenery prototype");
+    rejectChecksumValidField(critter, 36, 0x00000001, SnapshotError::InvalidCritterState,
+        "checksum-valid critter cannot become item art");
+    rejectChecksumValidField(critter, 8, HEX_GRID_SIZE, SnapshotError::InvalidCritterState,
+        "checksum-valid critter cannot leave the native hex grid");
+
+    WorldSnapshot scenery = empty;
+    scenery.scenery.push_back(sampleSnapshot().scenery[0]);
+    rejectChecksumValidField(scenery, 12, HEX_GRID_SIZE, SnapshotError::InvalidSceneryState,
+        "checksum-valid scenery cannot leave the native hex grid");
+    WorldSnapshot item = empty;
+    item.items.push_back(sampleSnapshot().items[1]);
+    rejectChecksumValidField(item, 8, HEX_GRID_SIZE, SnapshotError::InvalidItemState,
+        "checksum-valid ground item cannot leave the native hex grid");
+}
+
 void testSnapshotRoundTripAndRecovery()
 {
     WorldSnapshot authoritative = sampleSnapshot();
@@ -5227,6 +5309,7 @@ int main()
     fallout::multiplayer::testPendingCommandsAcrossTlsReconnect();
     fallout::multiplayer::testCombatActionCommandsAndReplication();
     fallout::multiplayer::testAuthoritativeCommandProcessing();
+    fallout::multiplayer::testSnapshotNativeDescriptorValidation();
     fallout::multiplayer::testSnapshotRoundTripAndRecovery();
     fallout::multiplayer::testNetworkSessionRecoveryPrimitives();
 
