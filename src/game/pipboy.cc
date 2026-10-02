@@ -30,6 +30,7 @@
 #include "multiplayer/network_runtime.h"
 #include "multiplayer/network_world.h"
 #include "multiplayer/local_player_context.h"
+#include "multiplayer/presentation_bridge.h"
 #include "platform_compat.h"
 #include "plib/color/color.h"
 #include "plib/gnw/button.h"
@@ -572,6 +573,10 @@ int pipboy(int intent)
     int shownRestMinutes = multiplayer::networkRuntimePendingRestMinutes();
     std::string shownRestProposer = multiplayer::networkRuntimePendingRestProposerName();
     std::uint64_t shownActivityId = 0;
+    Object* shownRestActor = multiplayer::localPlayerActorOrStoryActor();
+    int shownRestHp = critter_get_hits(shownRestActor);
+    int shownRestMaxHp = stat_level(shownRestActor, STAT_MAXIMUM_HIT_POINTS);
+    unsigned int shownRestTime = game_time() / 600;
 
     while (true) {
         sharedFpsLimiter.mark();
@@ -588,9 +593,15 @@ int pipboy(int intent)
 
         int pendingRestMinutes = multiplayer::networkRuntimePendingRestMinutes();
         std::string pendingRestProposer = multiplayer::networkRuntimePendingRestProposerName();
+        Object* restActor = multiplayer::localPlayerActorOrStoryActor();
+        int restHp = critter_get_hits(restActor);
+        int restMaxHp = stat_level(restActor, STAT_MAXIMUM_HIT_POINTS);
+        unsigned int restTime = game_time() / 600;
         if (crnt_func == 4
             && (pendingRestMinutes != shownRestMinutes
-                || pendingRestProposer != shownRestProposer)) {
+                || pendingRestProposer != shownRestProposer
+                || restHp != shownRestHp || restMaxHp != shownRestMaxHp
+                || restTime != shownRestTime)) {
             DrawAlarmText(0);
             pip_num(game_time_hour(), 4, PIPBOY_WINDOW_TIME_X, PIPBOY_WINDOW_TIME_Y);
             pip_date();
@@ -599,6 +610,9 @@ int pipboy(int intent)
         }
         shownRestMinutes = pendingRestMinutes;
         shownRestProposer = pendingRestProposer;
+        shownRestHp = restHp;
+        shownRestMaxHp = restMaxHp;
+        shownRestTime = restTime;
 
         if (intent == PIPBOY_OPEN_INTENT_REST) {
             keyCode = 504;
@@ -2010,12 +2024,14 @@ static void DrawAlarmText(int a1)
         } else {
             snprintf(proposalText, sizeof(proposalText), "%.20s proposes rest - select red time", proposer.c_str());
         }
-        cursor_line = 2;
+        // Line 2 is the fixed HP redraw strip. Keep the proposal below the
+        // co-op instructions and above the first clickable rest option.
+        cursor_line = 4;
         pip_print(proposalText, 0, colorTable[32747]);
     }
     if (multiplayer::networkRuntimeSharedRestEnabled()) {
         cursor_line = 3;
-        pip_print("Co-op: both players must choose the same rest option", 0, colorTable[992]);
+        pip_print("Co-op: everyone must choose the same rest option", 0, colorTable[992]);
     }
 
     if (bottom_line >= 5) {
@@ -2130,8 +2146,9 @@ static void DrawAlrmHitPnts()
         scrn_buf + 66 * PIPBOY_WINDOW_WIDTH + 254,
         PIPBOY_WINDOW_WIDTH);
 
-    max_hp = stat_level(obj_dude, STAT_MAXIMUM_HIT_POINTS);
-    cur_hp = critter_get_hits(obj_dude);
+    Object* player = multiplayer::localPlayerActorOrStoryActor();
+    max_hp = stat_level(player, STAT_MAXIMUM_HIT_POINTS);
+    cur_hp = critter_get_hits(player);
     text = getmsg(&pipboy_message_file, &pipmesg, 301); // Hit Points
     snprintf(msg, sizeof(msg), "%s %d/%d", text, cur_hp, max_hp);
     len = text_width(msg);
