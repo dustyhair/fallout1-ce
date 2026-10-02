@@ -312,10 +312,166 @@ runtime stop. A native included-translation-unit probe selects the stopped
 state and counts a substituted elevator selector, so it does not open a modal
 window. The old dispatcher reaches the selector; the fixed dispatcher clears
 the request without calling it. Ordinary unstopped dispatch still reaches the
-selector. This follow-up passes the scoped ASAN probe and awaits the next
-combined engine gate.
+selector. This follow-up passes the scoped ASAN probe and the subsequent combined
+builds 80 and 81.
+
+## Native prototype rejection and metadata publication retries
+
+A checksum-valid checkpoint can describe an unavailable native NPC prototype.
+On a private copy of build 79, application rejected that checkpoint after
+clearing the item registry. Capture still succeeded afterward, but all thirteen
+tracked items had disappeared and the registry shrank from 252 to 238 entries.
+The prototype preflight in `54b8a26` checks native prototype availability and
+object category before replacing maps, variables or identities. Actual native
+build 81 rejects unavailable NPC, scenery and item prototypes while preserving
+the full digest, registry and zero guest script, attack and RNG execution.
+Movement and disk/reconnect recovery finish with both process exits zero.
+This closes unavailable-prototype rejection, while native allocation and
+placement rollback remain open.
+
+The metadata publication probe also reproduced data loss across retries. The
+first interrupted publication retained the original `MULTI.BAK` when both
+publication and restoration renames failed. The next attempt removed that
+backup before trying another rename, losing the original metadata. The
+fix in `4c9d651` uses `MULTI.OLD`, which native `*.BAK` processing does
+not erase, and recovers outstanding metadata before starting another publish
+or native backup. It also recovers legacy `MULTI.BAK` and rejects nonregular
+paths without discarding a retained backup.
+
+The permanent native fault probe forces a failed publication and failed
+restoration, then a failed retry, then successful recovery. It checks exact
+bytes after each attempt. Legacy-backup recovery before native backup and a
+blocked directory destination also pass. All nine assertions pass against
+build 81's source. These tests prove the injected rename failures and retry
+behavior. They do not establish atomic recovery from every kernel or disk
+failure.
+
+A further private build-81 proof found that an incompatible fixed global count
+can reject after map-local storage has already expanded from zero entries to
+one. The ordering fix in `69a7529` checks game globals before replacing a map and
+checks target-map globals and static counts before resizing locals. Build 82
+passes checksum-valid rejection cases for game globals, map globals and doors,
+including a proposed map change, with unchanged digest and registry. Legitimate
+local expansion and restoration also pass. Movement and disk/reconnect
+recovery finish with both peers exiting successfully. Cross-map load rollback
+remains open.
+
+A separate private build-81 test confirms missing actor art and an oversized
+frame can reject after an earlier actor's health changes from 30 to 31. The
+missing-art case also leaves the rejected actor with the invalid FID. Actor art/frame preflight now runs before native mutation and checks the
+actual FRM frame count. An unchanged roster actor's exact FID/frame pair is
+permitted without requiring its art to load. All actor and NPC catalog indices
+are checked before native death-art alias indexing. NPC, scenery and item
+frame availability still require safe reconciliation-specific checks.
+
+Build 83 rejects missing actor art, oversized actor frames and an out-of-range
+NPC electrify alias while preserving the full native digest and registry.
+Native fall-back and burned-to-nothing alias poses apply with their actual
+final frames and restore the original digest. Guest script, attack and RNG
+counts stay zero. Movement and disk/reconnect recovery also pass. All five dense installed maps also pass against the same pinned build 83,
+including actual guest application, disk load and authenticated reconnect
+with exact section, timer and recovered digest equality.
+
+The next private build-83 test confirms an oversized NPC frame can reject
+after an earlier actor's health changes from 30 to 31. Its checksum-valid
+packet leaves the registry size unchanged while changing the full digest.
+NPC frame preflight now uses the same side-effect-free exact PID/location and
+sole-PID matching helper as actual reconciliation. Stable equal-count native
+identities retain the existing registry-ID path. Art availability is checked
+when the selected native frame differs, including a new object's initial
+frame zero. This check runs after any target-map load and before local resize;
+it does not provide rollback for a map replacement that already completed.
+Build 85 passes stable, reconciled and newly created NPC oversized-frame
+rejection with unchanged digest and registry. Unchanged hidden presentation
+with unavailable artwork and a reconstructed hidden NPC at frame zero both
+apply and restore the original digest. Movement and disk/reconnect recovery
+exit cleanly. The first build-84 fixture wrongly assumed different NPC PIDs;
+the corrected reconciliation test supports a same-PID encounter population.
+All five dense-map compatibility checks pass against pinned build 85,
+including actual guest application, native disk load and authenticated
+reconnect with exact recovered section, timer and digest equality.
+
+A private build-85 batch also confirms late frame failures for doors, scenery
+and items. Each checksum-valid oversized frame rejects after an earlier
+actor's health changes from 30 to 31. Native capture succeeds afterward, with
+an unchanged registry size but a changed full digest. The preflight now uses the actual door FID and shared scenery/item
+reconciliation matchers. It checks required frames before resizing locals or
+changing objects. Parent-first item ordering also resolves native container
+bodies before their children. The isolated patch includes the existing main
+code's ordinary-scenery reconstruction and parent-first holder transfer as
+self-contained dependencies, without changing the schema.
+
+Build 86 passes six checksum-valid rejection cases, preserving the full digest
+and registry for static frames, a reconstructed scenery object, a rebased
+item and a new item. The native door's final valid FRM frame applies and
+restores, as do unchanged hidden scenery/items with missing art and newly
+reconstructed hidden scenery/items at frame zero. Those accepted paths match
+actual setter behavior. Movement, disk/reconnect, all five dense maps and the
+TLS script-created-object reconstruction test pass. Allocation, native
+placement and cross-map rollback remain open.
+
+The later isolated shutdown failure was a duplicate ground-item list node,
+corrected by `286bc5a`. Builds 90 and 91 then pass native recovery and clean
+shutdown on both peers. `f12a224` stages missing bodies and required scripts
+before reconciliation; `0c85393` also reserves native inventory arrays before
+changing existing holders. Permanent allocator controls reject fourth-body,
+new-container storage and existing-character storage failures with unchanged
+digest, registry, body/script counts and event queue. Corrected build 94 exits
+0/0; old storage code leaves four bodies, one script and rebased IDs behind,
+with explicit failure exits 1/1. Existing holder storage remains unchanged on
+rejection. Later timer allocation and cross-map replacement remain open.
+
+`9664697` closes process-interrupted native/metadata publication recovery,
+including interruption before rollback starts. Checked native file cleanup
+retains the recovery record on blocked directories. It does not establish
+power-loss durability or platform fsync ordering. `6b9c01b` fixes the reproduced
+immediate Tycho hostility attribution, with thirteen native VM ASAN controls.
+`7047a65` prevents unvoted idle dialogue from selecting a reply. Matched visible
+build 93 holds an actual Ian conversation unchanged for 90.697 seconds, then
+accepts both players' later ballots. These scopes are recorded in the completion
+plan and do not close the ordinary full-story or long-session release gates.
 
 ## Validation artifacts
+
+- `/var/tmp/fallout-object-frame-recovery86-20261002/guest/movement.log`:
+  six object-frame rejection cases preserve state, and all five native
+  presentation controls apply and restore; disk recovery also passes.
+- `/var/tmp/fallout-native-dense-maps86-20261002.log`: all five actual dense
+  maps pass with door, scenery and item frame preflight.
+- `/var/tmp/fallout-native-world-discovery86-20261002.log`: real TLS new
+  objects and timers apply, disappear and reconstruct with exact digest.
+
+- `/var/tmp/fallout-native-dense-maps85-20261002.log`: all five actual dense
+  maps pass with NPC frame preflight and shared reconciliation matching.
+- `/var/tmp/fallout-snapshot-object-frames-negative85-native-20261002.log`:
+  door, scenery and item frame failures each change earlier actor health.
+
+- `/var/tmp/fallout-npc-frame-recovery85-20261002/guest/movement.log`:
+  stable/reconciled/new NPC frames reject unchanged; hidden/native-frame-zero
+  controls apply and restore. Disk recovery also passes.
+
+- `/var/tmp/fallout-snapshot-npc-frame-negative83-native-20261002.log`:
+  oversized NPC frame rejects after changing an earlier actor's health.
+
+- `/var/tmp/fallout-native-dense-maps83-20261002.log`: all five actual dense
+  maps pass guest application, native disk load and authenticated reconnect.
+- `/var/tmp/fallout-art-recovery83-20261002/guest/movement.log`: unavailable
+  actor art, oversized frames and unsafe NPC alias index reject unchanged;
+  native death/alias controls apply and restore. Disk recovery also passes.
+
+- `/var/tmp/fallout-variable-recovery82-20261002.log`: native layout rejection,
+  legitimate local expansion/restoration, movement and disk/reconnect pass.
+- `/var/tmp/fallout-snapshot-art-negative81-native-20261002.log`: unavailable
+  actor art and oversized frame reject after changing health or FID.
+
+- `/var/tmp/fallout-snapshot-variable-atomicity-negative81-native-20261002.log`:
+  checksum-valid incompatible globals reject after native local count changes.
+- `/var/tmp/fallout-native-sidecar-publish-positive-20261002.log`:
+  all nine interrupted publication, retry and legacy recovery assertions pass.
+- `/var/tmp/fallout-sidecar-publish-negative79-20261002/result.log`:
+  a second failed publication removes the only retained original metadata.
+- `/var/tmp/fallout-snapshot-atomicity-negative79-native-default-20261002.log`:
+  unavailable NPC rejection loses all thirteen tracked items before preflight.
 
 - `/var/tmp/fallout-stopped-script-entry-before-20261002.log` and its `after`
   counterpart: native stopped combat dispatcher rejects the pending elevator
