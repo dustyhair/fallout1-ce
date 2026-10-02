@@ -4108,7 +4108,8 @@ bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts)
         if (!rejectsWithoutMutation(stale, "stale_phase")) return false;
     }
     WorldSnapshot wrongActor = rejectionBaseline;
-    wrongActor.actors.front().ownerId = PlayerId { 3 };
+    if (wrongActor.actors.size() < 2) return false;
+    std::swap(wrongActor.actors[0].ownerId, wrongActor.actors[1].ownerId);
     wrongActor.mapId = rejectionBaseline.mapId == 0 ? 1 : 0;
     if (!rejectsWithoutMutation(wrongActor, "actor_before_map_load")) return false;
     std::fprintf(stderr, "NATIVE_SNAPSHOT_REJECTION_PREFLIGHT_PASS\n");
