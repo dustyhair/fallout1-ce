@@ -4069,6 +4069,50 @@ bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts)
         return false;
     }
 
+    WorldSnapshot rejectionBaseline;
+    if (!networkWorldCaptureSnapshot({}, rejectionBaseline)) return false;
+    auto rejectionDigest = computeSnapshotDigest(rejectionBaseline);
+    if (!rejectionDigest || rejectionBaseline.items.empty()) return false;
+    auto rejectsWithoutMutation = [&](const WorldSnapshot& invalid, const char* reason) {
+        if (validateSnapshot(invalid) != SnapshotError::None) return false;
+        std::size_t registrySize = session.entities().size();
+        engineExecutionProbeBegin();
+        bool rejected = !networkWorldApplySnapshot(invalid);
+        WorldSnapshot after;
+        bool captured = networkWorldCaptureSnapshot({}, after);
+        EngineExecutionProbeCounts mutations = engineExecutionProbeEnd();
+        auto afterDigest = computeSnapshotDigest(after);
+        bool preserved = rejected && captured && afterDigest
+            && rejectionDigest.digest.overall == afterDigest.digest.overall
+            && registrySize == session.entities().size()
+            && mutations.scriptProcedures == 0 && mutations.combatAttacks == 0
+            && mutations.randomDraws == 0;
+        std::fprintf(stderr,
+            "NATIVE_SNAPSHOT_REJECTION_PRESERVES_STATE reason=%s rejected=%d preserved=%d.\n",
+            reason, rejected ? 1 : 0, preserved ? 1 : 0);
+        return preserved;
+    };
+    WorldSnapshot phaseMismatch = rejectionBaseline;
+    phaseMismatch.phase = rejectionBaseline.phase == SessionPhase::Exploration
+        ? SessionPhase::Transition : SessionPhase::Exploration;
+    // Without entry preflight, this valid item section deletes every item
+    // before the later phase check rejects the checkpoint.
+    phaseMismatch.items.clear();
+    phaseMismatch.timedEvents.clear();
+    if (!rejectsWithoutMutation(phaseMismatch, "phase_mismatch")) return false;
+    if (rejectionBaseline.phaseRevision > 1) {
+        WorldSnapshot stale = rejectionBaseline;
+        --stale.phaseRevision;
+        stale.items.clear();
+        stale.timedEvents.clear();
+        if (!rejectsWithoutMutation(stale, "stale_phase")) return false;
+    }
+    WorldSnapshot wrongActor = rejectionBaseline;
+    wrongActor.actors.front().ownerId = PlayerId { 3 };
+    wrongActor.mapId = rejectionBaseline.mapId == 0 ? 1 : 0;
+    if (!rejectsWithoutMutation(wrongActor, "actor_before_map_load")) return false;
+    std::fprintf(stderr, "NATIVE_SNAPSHOT_REJECTION_PREFLIGHT_PASS\n");
+
     engineExecutionProbeBegin();
     bool doorApplied = networkWorldApplyPeerDoorUse(DoorUseStartedEvent {
         hostActorId,
@@ -7158,6 +7202,20 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
 bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovement)
 {
     SnapshotError snapshotError = validateSnapshot(snapshot);
+    // Identity and phase checks must precede map replacement or object
+    // reconciliation. A rejected checkpoint must not delete native items.
+    if (session.isActive() && snapshotError == SnapshotError::None
+        && (!validateActorState(snapshot)
+            || snapshot.phaseRevision < session.phaseRevision()
+            || (snapshot.phaseRevision == session.phaseRevision()
+                && snapshot.phase != session.phase()))) {
+        std::fprintf(stderr,
+            "Multiplayer snapshot rejected before native mutation: actors=%d phase=%d/%d revision=%u/%u.\n",
+            validateActorState(snapshot) ? 1 : 0,
+            static_cast<int>(snapshot.phase), static_cast<int>(session.phase()),
+            snapshot.phaseRevision, session.phaseRevision());
+        return false;
+    }
     if (session.isActive()
         && snapshotError == SnapshotError::None
         && networkWorldReplicaSessionActive()
