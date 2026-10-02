@@ -159,6 +159,8 @@ static int mygets(char* dest, DB_FILE* stream);
 static int copy_file(const char* a1, const char* a2);
 static int SaveBackup();
 static int RestoreSave();
+static bool RecoverPendingSaveRollback();
+static bool SaveFileExists(const char* path, bool& exists);
 static int LoadObjDudeCid(DB_FILE* stream);
 static int SaveObjDudeCid(DB_FILE* stream);
 static int EraseSave();
@@ -1674,6 +1676,7 @@ int isLoadingGame()
 // 0x46FCCC
 static int LoadSlot(int slot)
 {
+    if (!RecoverPendingSaveRollback()) return -1;
     gmouse_set_cursor(MOUSE_CURSOR_WAIT_PLANET);
 
     if (isInCombat()) {
@@ -2708,6 +2711,7 @@ int MapDirEraseFile(const char* a1, const char* a2)
 // 0x471D38
 static int SaveBackup()
 {
+    if (!RecoverPendingSaveRollback()) return -1;
     if (!RecoverMultiplayerSidecarBackup()) return -1;
     debug_printf("\nLOADSAVE: Backing up save slot files..\n");
     automap_db_flag = 0;
@@ -2756,6 +2760,62 @@ static int SaveBackup()
     return 0;
 }
 
+// This record protects a failed rollback after the process exits. It is
+// separate from map backups and remains until every old file is restored.
+static void SaveRollbackPath(char* path, const char* name)
+{
+    SaveDirectoryPath(path, false, true);
+    strcat(path, name);
+}
+
+static bool ReadPendingSaveRollback(int& count, bool& exists)
+{
+    char path[COMPAT_MAX_PATH];
+    SaveRollbackPath(path, "SAVE.RBK");
+    if (!SaveFileExists(path, exists)) return false;
+    if (!exists) return true;
+    FILE* stream = compat_fopen(path, "rb");
+    if (stream == nullptr) return false;
+    count = -1;
+    char extra;
+    bool valid = fscanf(stream, "FALLOUT-ROLLBACK-1 %9d %c", &count, &extra) == 1
+        && count >= 0;
+    valid = fclose(stream) == 0 && valid;
+    return valid;
+}
+
+static bool RecoverPendingSaveRollback()
+{
+    int count;
+    bool exists;
+    if (!ReadPendingSaveRollback(count, exists)) return false;
+    if (!exists) return true;
+    map_backup_count = count;
+    return RestoreSave() == 0;
+}
+
+static bool RecordPendingSaveRollback()
+{
+    int recordedCount;
+    bool exists;
+    if (!ReadPendingSaveRollback(recordedCount, exists)) return false;
+    if (exists) return recordedCount == map_backup_count;
+    char path[COMPAT_MAX_PATH];
+    char temporary[COMPAT_MAX_PATH];
+    SaveRollbackPath(path, "SAVE.RBK");
+    SaveRollbackPath(temporary, "SAVE.RBT");
+    FILE* stream = compat_fopen(temporary, "wb");
+    if (stream == nullptr) return false;
+    bool written = fprintf(stream, "FALLOUT-ROLLBACK-1 %d\n", map_backup_count) > 0;
+    written = fflush(stream) == 0 && written;
+    written = fclose(stream) == 0 && written;
+    if (!written || compat_rename(temporary, path) != 0) {
+        compat_remove(temporary);
+        return false;
+    }
+    return true;
+}
+
 // 0x47200C
 static int RestoreSave()
 {
@@ -2781,7 +2841,7 @@ static int RestoreSave()
         db_free_file_list(&fileList, NULL);
         return -1;
     }
-    if (EraseSave() == -1) {
+    if (!RecordPendingSaveRollback() || EraseSave() == -1) {
         db_free_file_list(&fileList, NULL);
         return -1;
     }
@@ -2799,6 +2859,9 @@ static int RestoreSave()
         }
     }
     db_free_file_list(&fileList, NULL);
+    char rollbackPath[COMPAT_MAX_PATH];
+    SaveRollbackPath(rollbackPath, "SAVE.RBK");
+    if (compat_remove(rollbackPath) != 0) return -1;
     failedSaveRestorations.erase(restoreDirectory);
     return 0;
 }
