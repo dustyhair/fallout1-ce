@@ -66,7 +66,7 @@ The next five goals (current work):
 - [x] 2. Shared story movies and actual ending presentation. Both clients render the destruction movies, identical host-selected settlement slides, departure and credits. Independent skipping, reconnect after playback, missing movie assets and unfocused guest playback pass. This validates presentation, not completion of the underlying quests.
 - [x] 3. Real recruited Ian lifecycle: recruitment, dismissal, gear, native retaliation, battle, death, travel and fresh-session recovery pass. Other companions and quest-specific loyalty remain content acceptance in goal 5.
 - [x] 4. Independent active hand. Save format 8 retains each actor's hand, versions 1–7 default to left, snapshot/wire formats reject invalid values, rejected requests leave the HUD unchanged. The 50-scenario interim run includes native disk/reconnect recovery with host left and guest right.
-- [ ] 5. Complete content acceptance and final release gates on the final code. Builds 45, 51, 62, 64 and 66 each passed all 50 scenarios. Build 72 final regression is running; ordinary full-story acceptance remains open.
+- [ ] 5. Complete content acceptance and final release gates on the final code. Builds 45, 51, 62, 64, 66 and 72 each passed all 50 scenarios. The subsequent capacity-stop and backup changes need final-code release checks; ordinary full-story acceptance remains open.
 
 Evidence for this batch: `/var/tmp/fallout-five-goals-interim22-campaign/summary.tsv`, `/var/tmp/fallout-five-goals-dialogue-script-host22-20261001.log`, `/var/tmp/fallout-five-goals-barter-guest22-20261001.log`, `/var/tmp/fallout-five-goals-quantity-death23-20261001.log`, `/var/tmp/fallout-five-goals-simultaneous-death-20261001.log`, and `/var/tmp/fallout-five-goals-reconnect-death-20261001.log`. The script-death fixture invokes `action_dmg`, the native action called by `op_critter_damage`; it is not a claim that every installed lethal script has been played.
 
@@ -915,3 +915,11 @@ Post-damage shared-rest HUD acceptance remains pending. Candidate 73's native
 capacity-stop fixture found save preparation could still mutate the stopped
 world before the later save rejection. Early native-save rejection and stopped
 simulation guards are in progress and are not yet accepted.
+
+Pinned build 72 completed all 50 live compatibility scenarios plus the core gate
+with no failures and both peers exiting zero throughout. All 28 emitted final
+digests match; 22 scenarios do not emit a final digest and are not counted as
+independent digest witnesses. Evidence is in
+`/var/tmp/fallout-five-goals-regression72-campaign/summary.tsv` and `digests.tsv`.
+This verifies build 72. Later capacity-stop and backup changes still need their
+own focused acceptance and final-source release checks.
