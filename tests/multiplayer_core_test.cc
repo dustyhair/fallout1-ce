@@ -3473,6 +3473,147 @@ public:
     std::unordered_set<Object*> reservedPickupTargets;
 };
 
+void testPendingCommandsAcrossTlsReconnect()
+{
+    auto listening = listenTcp(0);
+    if (!listening) { expect(false, "pending command fixture listens"); return; }
+    std::optional<TransportPeerIdentity> pin;
+    auto connectPair = [&]() {
+        auto joined = connectTcp("127.0.0.1", listening.listener->port(), 5000, pin);
+        auto accepted = acceptTcpPeer(*listening.listener);
+        if (joined && accepted) {
+            // Complete TLS before handing the stream to the lobby.
+            joined.transport->send(Packet { 0xA5 });
+            if (receiveTcpPacket(*accepted, joined.transport.get()) != Packet({ 0xA5 }))
+                accepted.reset();
+            pin = joined.transport->peerIdentity();
+        }
+        return std::make_pair(std::move(accepted), std::move(joined.transport));
+    };
+    auto pair = connectPair();
+    if (!pair.first || !pair.second) { expect(false, "pending command fixture connects TLS"); return; }
+    Transport* guestStream = pair.second.get();
+    NetworkLobby host, guest;
+    SessionId sessionId { 71 };
+    expect(host.start(NetworkLaunchMode::Host, sessionId, std::move(pair.first))
+            && guest.start(NetworkLaunchMode::Join, sessionId, std::move(pair.second)),
+        "pending command lobbies accept the authenticated TLS streams");
+    host.submitLocalSheet(sampleCharacterSheet(kHostPlayerId, "Host"));
+    guest.submitLocalSheet(sampleCharacterSheet(kGuestPlayerId, "Guest"));
+    pollNetworkLobbies(host, guest);
+    expect(host.requestStart(), "pending command host starts");
+    pollNetworkLobbies(host, guest);
+
+    TestObject hostActor, guestActor, resource;
+    LocalSession session;
+    session.start(asGameObject(hostActor), asGameObject(guestActor));
+    submitBothCharacterSheets(session);
+    session.transitionTo(SessionPhase::Loading);
+    session.transitionTo(SessionPhase::Exploration);
+    auto target = session.registerWorldObject(asGameObject(resource));
+    class ResourceExecutor : public RecordingCommandExecutor {
+    public:
+        int stock = 3;
+        int inventory = 0;
+        CommandExecutionStatus pickup(Object* actor, Object* target) override
+        {
+            auto result = RecordingCommandExecutor::pickup(actor, target);
+            if (result == CommandExecutionStatus::Applied && stock > 0) {
+                --stock;
+                ++inventory;
+            } else result = CommandExecutionStatus::InvalidAction;
+            return result;
+        }
+    } executor;
+    CommandProcessor processor;
+
+    // Fill the socket and TLS send queue while authority never reads. These
+    // old-stream filler frames are deliberately discarded on disconnect.
+    bool backpressured = true;
+    for (int index = 0; index < 20 && backpressured; ++index)
+        backpressured = guestStream->send(Packet(kMaxTransportPacketSize, 0)) == TransportSendResult::Sent;
+    expect(backpressured && guest.sendLocalPickup(target.entityId, session.phaseRevision()),
+        "guest queues a real command behind TLS backpressure without authority receiving it");
+
+    auto interrupt = [&]() {
+        bool closed = host.disconnectForReconnect();
+        for (int index = 0; index < 10000 && guest.state() == NetworkLobbyState::Ready; ++index) guest.poll();
+        return closed && guest.state() == NetworkLobbyState::Disconnected;
+    };
+    auto reconnect = [&]() {
+        auto fresh = connectPair();
+        return fresh.first && fresh.second && host.reattachTransport(std::move(fresh.first))
+            && guest.reattachTransport(std::move(fresh.second));
+    };
+    expect(interrupt() && reconnect(), "queued but unread command survives pinned TLS stream replacement");
+    pollNetworkLobbies(host, guest);
+    auto command = host.takePeerCommand();
+    expect(command && command->sequence == CommandSequence { 1 }
+            && command->expectedPhaseRevision == session.phaseRevision()
+            && command->actorId == session.playerActorId(kGuestPlayerId)
+            && std::get<PickupCommand>(command->payload).targetId == target.entityId,
+        "reconnect resends the original unexecuted intent and its exact ownership/revision");
+    if (!command) return;
+    auto result = processor.process(*command, session, executor);
+    expect(result.result.status == CommandStatus::Accepted && executor.stock == 2 && executor.inventory == 1,
+        "unread intent executes once after reconnect with conserved resources");
+    host.sendCommandOutcome(result);
+    pollNetworkLobbies(host, guest);
+    auto outcome = guest.takeCommandResult();
+    auto event = guest.takePeerEvent();
+    expect(outcome && event && guest.confirmPeerEventApplied(event->sequence),
+        "resumed command result consumes its pending intent and applies one authoritative event");
+    host.poll();
+
+    expect(guest.sendLocalPickup(target.entityId, session.phaseRevision()), "guest submits the next resource command");
+    host.poll();
+    command = host.takePeerCommand();
+    if (!command) { expect(false, "authority receives the second command"); return; }
+    result = processor.process(*command, session, executor);
+    expect(result.result.status == CommandStatus::Accepted && command->sequence == CommandSequence { 2 },
+        "guest command sequence continues after an unread-command reconnect");
+    host.sendCommandOutcome(result);
+    // Neither result nor event is read before authority's stream is closed.
+    expect(guest.disconnectForReconnect() && host.disconnectForReconnect()
+            && reconnect() && guest.beginReconnectRecovery(guest.lastAppliedEvent()),
+        "an executed command with a lost result survives another pinned reconnect");
+    host.poll();
+    command = host.takePeerCommand();
+    if (!command) { expect(false, "authority receives the unconfirmed executed intent again"); return; }
+    auto replay = processor.process(*command, session, executor);
+    expect(replay.replayed && replay.result.status == CommandStatus::Accepted
+            && executor.pickupCalls == 2 && executor.stock == 1 && executor.inventory == 2,
+        "lost-result replay returns the recorded outcome without collecting resources twice");
+    host.sendCommandOutcome(replay);
+    WorldSnapshot checkpoint = sampleSnapshot();
+    checkpoint.lastIncludedEvent = host.latestAuthoritativeEvent();
+    host.sendRecovery(guest.lastAppliedEvent(), checkpoint);
+    pollNetworkLobbies(host, guest);
+    outcome = guest.takeCommandResult();
+    event = guest.takePeerEvent();
+    expect(outcome && event && guest.confirmPeerEventApplied(event->sequence) && !guest.recoveryInProgress(),
+        "lost-result command and event recovery complete together");
+    host.poll();
+    expect(guest.sendLocalPickup(target.entityId, session.phaseRevision()), "guest remains usable after lost-result recovery");
+    host.poll();
+    command = host.takePeerCommand();
+    if (!command) { expect(false, "authority receives the third command"); return; }
+    result = processor.process(*command, session, executor);
+    expect(result.result.status == CommandStatus::Accepted && command->sequence == CommandSequence { 3 }
+            && executor.pickupCalls == 3 && executor.stock == 0 && executor.inventory == 3,
+        "all three resource commands execute exactly once across both disconnect boundaries");
+    host.sendCommandOutcome(result);
+    pollNetworkLobbies(host, guest);
+    guest.takeCommandResult();
+    bool bounded = true;
+    for (int index = 0; index < 64 && bounded; ++index)
+        bounded = guest.sendLocalFacing(index % 6, session.phaseRevision());
+    auto next = guest.nextLocalCommandSequence();
+    expect(bounded && !guest.sendLocalFacing(0, session.phaseRevision())
+            && guest.nextLocalCommandSequence() == next && guest.state() == NetworkLobbyState::Ready,
+        "pending intent capacity rejects new input without consuming a sequence or disconnecting");
+}
+
 void testCombatTurnCommandsAndReplication()
 {
     TestObject hostActor;
@@ -5083,6 +5224,7 @@ int main()
     fallout::multiplayer::testNetworkCombatTurnTransport();
     fallout::multiplayer::testLocalSessionLifecycle();
     fallout::multiplayer::testCombatTurnCommandsAndReplication();
+    fallout::multiplayer::testPendingCommandsAcrossTlsReconnect();
     fallout::multiplayer::testCombatActionCommandsAndReplication();
     fallout::multiplayer::testAuthoritativeCommandProcessing();
     fallout::multiplayer::testSnapshotRoundTripAndRecovery();

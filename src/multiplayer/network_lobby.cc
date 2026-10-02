@@ -15,6 +15,7 @@ namespace {
 constexpr std::size_t kLobbyHeaderSize = 4;
 constexpr std::size_t kChatHeaderSize = 6;
 constexpr std::size_t kMaxQueuedChatMessages = 32;
+constexpr std::size_t kMaxPendingGameplayCommands = 64;
 constexpr std::uint16_t kRecoveryWireVersion = 3;
 constexpr std::size_t kRecoveryHeaderSize = 4;
 
@@ -148,7 +149,7 @@ bool NetworkLobby::start(NetworkLaunchMode mode, SessionId sessionId, std::uniqu
     _lastAppliedEventSequence = {};
     _acknowledgedEndingPhaseRevision = 0;
     _acknowledgedEvents.clear();
-    _pendingCommandSequences.clear();
+    _pendingCommands.clear();
     _recoveryRequests.clear();
     _peerCommands.clear();
     _commandResults.clear();
@@ -479,6 +480,7 @@ bool NetworkLobby::sendLocalAction(
 
     PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
     if (_mode == NetworkLaunchMode::Join) {
+        if (_pendingCommands.size() >= kMaxPendingGameplayCommands) return false;
         GameCommand command;
         command.sequence.value = _nextLocalCommandSequence;
         command.playerId = playerId;
@@ -504,13 +506,13 @@ bool NetworkLobby::sendLocalAction(
         ProtocolEnvelope envelope;
         envelope.sessionId = _sessionId;
         envelope.sequence = _nextSendSequence++;
-        if (encodeGameCommand(command, envelope) != GameplayWireError::None
-            || !sendGameplayEnvelope(std::move(envelope))) {
-            return false;
-        }
-        _pendingCommandSequences.push_back(command.sequence);
+        if (encodeGameCommand(command, envelope) != GameplayWireError::None) return false;
+        // A nonblocking write can fail after releasing some bytes. Retain the
+        // intent before sending so either side of that boundary can recover.
+        _pendingCommands.push_back(std::move(command));
         _nextLocalCommandSequence++;
-        return true;
+        bool sent = sendGameplayEnvelope(std::move(envelope));
+        return sent || _state == NetworkLobbyState::Disconnected;
     }
 
     GameEvent event;
@@ -900,10 +902,18 @@ bool NetworkLobby::reattachTransport(std::unique_ptr<Transport> transport)
     _nextSendSequence = 2;
     _nextReceiveSequence = 2;
     _error = NetworkLobbyError::None;
-    _pendingCommandSequences.clear();
     _commandResults.clear();
     _recovering = false;
     _state = NetworkLobbyState::Ready;
+    if (_mode == NetworkLaunchMode::Join) {
+        for (const GameCommand& command : _pendingCommands) {
+            ProtocolEnvelope envelope;
+            envelope.sessionId = _sessionId;
+            envelope.sequence = _nextSendSequence++;
+            if (encodeGameCommand(command, envelope) != GameplayWireError::None
+                || !sendGameplayEnvelope(std::move(envelope))) return false;
+        }
+    }
     return true;
 }
 
@@ -1059,7 +1069,7 @@ void NetworkLobby::stop()
         _transport.reset();
     }
     _startRequested = false;
-    _pendingCommandSequences.clear();
+    _pendingCommands.clear();
     _recoveryRequests.clear();
     _peerCommands.clear();
     _commandResults.clear();
@@ -1110,6 +1120,11 @@ std::uint64_t NetworkLobby::nextSendSequence() const
 std::uint64_t NetworkLobby::nextReceiveSequence() const
 {
     return _nextReceiveSequence;
+}
+
+CommandSequence NetworkLobby::nextLocalCommandSequence() const
+{
+    return CommandSequence { _nextLocalCommandSequence };
 }
 
 const ProtocolDiagnostics& NetworkLobby::diagnostics() const
@@ -1315,12 +1330,12 @@ void NetworkLobby::handlePacket(const Packet& packet)
             || _state != NetworkLobbyState::Ready
             || !_startRequested
             || !result
-            || _pendingCommandSequences.empty()
-            || result.result.commandSequence != _pendingCommandSequences.front()) {
+            || _pendingCommands.empty()
+            || result.result.commandSequence != _pendingCommands.front().sequence) {
             fail(NetworkLobbyError::UnexpectedMessage);
             return;
         }
-        _pendingCommandSequences.pop_front();
+        _pendingCommands.pop_front();
         _commandResults.push_back(result.result);
         return;
     }
@@ -1481,7 +1496,6 @@ void NetworkLobby::markDisconnected()
         _transport->close();
         _transport.reset();
     }
-    _pendingCommandSequences.clear();
     _recoveryRequests.clear();
     _peerCommands.clear();
     _commandResults.clear();

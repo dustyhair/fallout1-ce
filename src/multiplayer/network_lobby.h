@@ -145,6 +145,7 @@ public:
     bool startRequested() const;
     std::uint64_t nextSendSequence() const;
     std::uint64_t nextReceiveSequence() const;
+    CommandSequence nextLocalCommandSequence() const;
     const ProtocolDiagnostics& diagnostics() const;
     std::unique_ptr<Transport> takeTransport();
 
@@ -185,7 +186,9 @@ private:
     EventSequence _lastAppliedEventSequence;
     std::uint32_t _acknowledgedEndingPhaseRevision = 0;
     std::unordered_map<PlayerId, EventSequence, PlayerIdHash> _acknowledgedEvents;
-    std::deque<CommandSequence> _pendingCommandSequences;
+    // Retain unconfirmed intents across stream replacement. Replaying their
+    // original IDs/revisions lets authority consume every command sequence.
+    std::deque<GameCommand> _pendingCommands;
     std::deque<EventSequence> _recoveryRequests;
     std::deque<GameCommand> _peerCommands;
     std::deque<CommandResult> _commandResults;
