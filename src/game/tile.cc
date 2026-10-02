@@ -532,7 +532,16 @@ int tile_set_center(int tile, int flags)
     int new_tile_y = tile / grid_width;
 
     if (borderInitialized) {
-        if (new_tile_x <= tile_border.ulx || new_tile_x >= tile_border.lrx || new_tile_y <= tile_border.uly || new_tile_y >= tile_border.lry) {
+        if ((flags & TILE_SET_CENTER_FLAG_CLAMP_BOUNDS) != 0) {
+            // An actor can stand closer to the map edge than the camera can
+            // center. Move to the nearest legal center instead of staying on
+            // an unrelated part of the map.
+            if (tile_border.ulx + 1 >= tile_border.lrx
+                || tile_border.uly + 1 >= tile_border.lry) return -1;
+            new_tile_x = std::clamp(new_tile_x, tile_border.ulx + 1, tile_border.lrx - 1);
+            new_tile_y = std::clamp(new_tile_y, tile_border.uly + 1, tile_border.lry - 1);
+            tile = (grid_width - 1 - new_tile_x) + new_tile_y * grid_width;
+        } else if (new_tile_x <= tile_border.ulx || new_tile_x >= tile_border.lrx || new_tile_y <= tile_border.uly || new_tile_y >= tile_border.lry) {
             return -1;
         }
     }

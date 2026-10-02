@@ -47,6 +47,7 @@
 #include "game/worldmap.h"
 #include "multiplayer/developer_local_session.h"
 #include "multiplayer/network_world.h"
+#include "multiplayer/presentation_bridge.h"
 #include "tts.h"
 #include "int/movie.h"
 #include "int/window.h"
@@ -710,14 +711,20 @@ int game_handle_input(int eventCode, bool isInCombatMode)
         }
         break;
     case KEY_HOME:
-        if (obj_dude->elevation != map_elevation) {
-            map_set_elevation(obj_dude->elevation);
+        if (multiplayer::localPlayerActorOrStoryActor()->elevation != map_elevation) {
+            map_set_elevation(multiplayer::localPlayerActorOrStoryActor()->elevation);
         }
 
-        if (game_in_mapper) {
-            tile_set_center(obj_dude->tile, TILE_SET_CENTER_REFRESH_WINDOW);
+        if (multiplayer::networkWorldActive()) {
+            // A replicated move can place the local actor beyond a blocked
+            // camera scroll path. Home should center on its destination.
+            tile_set_center(multiplayer::localPlayerActorOrStoryActor()->tile,
+                TILE_SET_CENTER_REFRESH_WINDOW | TILE_SET_CENTER_FLAG_IGNORE_SCROLL_RESTRICTIONS
+                    | TILE_SET_CENTER_FLAG_CLAMP_BOUNDS);
+        } else if (game_in_mapper) {
+            tile_set_center(multiplayer::localPlayerActorOrStoryActor()->tile, TILE_SET_CENTER_REFRESH_WINDOW);
         } else {
-            tile_scroll_to(obj_dude->tile, 2);
+            tile_scroll_to(multiplayer::localPlayerActorOrStoryActor()->tile, 2);
         }
 
         break;
