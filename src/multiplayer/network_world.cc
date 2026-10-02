@@ -1331,7 +1331,11 @@ bool discoverUntrackedWorldObjects()
     std::size_t newCritters = 0;
     std::size_t newScenery = 0;
     std::size_t newItems = 0;
+    // The native iterator revisits its first occupied tile. Treat the scan
+    // as a set so a placed object receives only one snapshot section entry.
+    std::unordered_set<Object*> seenObjects;
     for (Object* object = obj_find_first(); object != nullptr; object = obj_find_next()) {
+        if (!seenObjects.insert(object).second) continue;
         if (session.entities().findEntity(object).has_value()
             || !hexGridTileIsValid(object->tile) || !elevationIsValid(object->elevation)
             || isExitGrid(object)) continue;
@@ -2848,7 +2852,11 @@ bool registerWorldObjects()
     std::vector<Object*> exitGrids;
     std::vector<Object*> items;
     std::vector<Object*> critters;
+    // The native iterator revisits its first occupied tile. Treat the scan
+    // as a set so a placed object receives only one snapshot section entry.
+    std::unordered_set<Object*> seenObjects;
     for (Object* object = obj_find_first(); object != nullptr; object = obj_find_next()) {
+        if (!seenObjects.insert(object).second) continue;
         if (object == obj_dude || object == peerActor) {
             continue;
         }
@@ -4049,11 +4057,13 @@ static bool runScriptCreatedWorldObjectSmokeTest()
         return false;
     }
     if (obj_disconnect(child, nullptr) != 0) return false;
-    if (obj_move_to_tile(ground, host->tile, host->elevation, nullptr) != 0
+    if (obj_move_to_tile(ground, 0, host->elevation, nullptr) != 0
         || obj_pid_new(&npc, 0x0100000B) != 0 || npc == nullptr
-        || obj_move_to_tile(npc, host->tile, host->elevation, nullptr) != 0
+        || obj_move_to_tile(npc, 0, host->elevation, nullptr) != 0
         || obj_pid_new(&scenery, worldScenery.front().second->pid) != 0 || scenery == nullptr
-        || obj_move_to_tile(scenery, host->tile, host->elevation, nullptr) != 0) return false;
+        || obj_move_to_tile(scenery, 0, host->elevation, nullptr) != 0) return false;
+    // Tile zero makes the new objects part of the iterator's repeated first
+    // tile, exercising discovery deduplication before the wire validation.
     // This matches a native create_object call with no script attached. Keep
     // destruction cleanup from running unrelated prototype scripts.
     for (Object* object : { ground, npc, scenery }) {
