@@ -16,7 +16,7 @@ def main():
     mode.add_argument('--save-copy', action='store_true',
                       help='exercise native save backup copying, including its close failure')
     mode.add_argument('--save-backup', action='store_true',
-                      help='exercise failed backup creation without changing original slot files')
+                      help='exercise native checkpoint backup, interrupted publication and rollback recovery')
     mode.add_argument('--sidecar-publish', action='store_true',
                       help='check interrupted metadata publication preserves its backup on retry')
     args = parser.parse_args()
@@ -73,7 +73,7 @@ def main():
              'NATIVE_SAVE_BACKUP_PASS' if args.save_backup else
              'NATIVE_SAVE_COPY_PASS' if args.save_copy else 'NATIVE_DB_CLOSE_PASS')
     detail = ('interrupted_publish=retained retry=safe legacy_backup=recovered' if args.sidecar_publish else
-              'backup_failure=reported originals=intact rollback=intact' if args.save_backup else
+              'backup_failure=reported originals=intact process_restart=retained checkpoint_commit=coherent' if args.save_backup else
               'buffered_failure=reported subsequent_io=intact')
     print(f'{label} {detail}')
 

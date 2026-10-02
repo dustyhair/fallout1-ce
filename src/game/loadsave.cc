@@ -160,6 +160,9 @@ static int copy_file(const char* a1, const char* a2);
 static int SaveBackup();
 static int RestoreSave();
 static bool RecoverPendingSaveRollback();
+static bool RecordPendingSaveRollback();
+static bool ClearPendingSaveRollback();
+static void SaveRollbackPath(char* path, const char* name);
 static bool SaveFileExists(const char* path, bool& exists);
 static int LoadObjDudeCid(DB_FILE* stream);
 static int SaveObjDudeCid(DB_FILE* stream);
@@ -1567,6 +1570,12 @@ static int SaveSlot()
         return -1;
     }
 
+    // Publish the recovery record before any live checkpoint file is changed.
+    if (!RecordPendingSaveRollback()) {
+        gsound_background_unpause();
+        return -1;
+    }
+
     SaveDirectoryPath(gmpath, true, true);
     strcat(gmpath, "SAVE.DAT");
 
@@ -1646,6 +1655,17 @@ static int SaveSlot()
             debug_printf("\nLOADSAVE: Backup restoration failed; backup files retained.\n");
         }
         partyMemberUnPrepSave();
+        gsound_background_unpause();
+        return -1;
+    }
+
+    // Removing the record commits the complete native files and sidecar.
+    // Backups remain available until that commit succeeds.
+    if (!ClearPendingSaveRollback()) {
+        if (RestoreSave() == 0) {
+            SaveDirectoryPath(gmpath, true, true);
+            MapDirErase(gmpath, "BAK");
+        }
         gsound_background_unpause();
         return -1;
     }
@@ -1965,6 +1985,19 @@ static int GetSlotList()
     dir_entry de;
     int index = 0;
     for (; index < 10; index += 1) {
+        // Recover before reading the header. Otherwise an interrupted write can
+        // mark the old checkpoint corrupt and prevent the UI from loading it.
+        int selectedSlot = slot_cursor;
+        bool selectedRecovery = recovery_slot_active;
+        slot_cursor = index;
+        recovery_slot_active = false;
+        bool recovered = RecoverPendingSaveRollback();
+        slot_cursor = selectedSlot;
+        recovery_slot_active = selectedRecovery;
+        if (!recovered) {
+            LSstatus[index] = SLOT_STATE_ERROR;
+            continue;
+        }
         snprintf(str, sizeof(str), "%s\\%s%.2d\\%s", "SAVEGAME", "SLOT", index + 1, "SAVE.DAT");
 
         if (db_dir_entry(str, &de) != 0) {
@@ -2756,19 +2789,36 @@ static int SaveBackup()
     db_free_file_list(&fileList, NULL);
     // AUTOMAP.SAV is included in the map list. Restoring it twice would consume
     // its backup on the first rename and fail the second restore.
+    char metadata[COMPAT_MAX_PATH];
+    char metadataBackup[COMPAT_MAX_PATH];
+    SaveRollbackPath(metadata, "MULTI.DAT");
+    SaveRollbackPath(metadataBackup, "MULTI.RSV");
+    bool hasMetadata;
+    bool hasMetadataBackup;
+    if (!SaveFileExists(metadata, hasMetadata)
+        || !SaveFileExists(metadataBackup, hasMetadataBackup)) return -1;
+    if (hasMetadata) {
+        SaveDirectoryPath(str0, true, true);
+        strcat(str0, "MULTI.DAT");
+        SaveDirectoryPath(str1, true, true);
+        strcat(str1, "MULTI.RSV");
+        if (copy_file(str0, str1) == -1) return -1;
+    } else if (hasMetadataBackup && compat_remove(metadataBackup) != 0) {
+        return -1;
+    }
     debug_printf("\nLOADSAVE: %d map files backed up.\n", fileListLength);
     return 0;
 }
 
-// This record protects a failed rollback after the process exits. It is
-// separate from map backups and remains until every old file is restored.
+// This record protects interrupted publication and rollback after process exit.
+// It is separate from map backups and remains until restoration or commit.
 static void SaveRollbackPath(char* path, const char* name)
 {
     SaveDirectoryPath(path, false, true);
     strcat(path, name);
 }
 
-static bool ReadPendingSaveRollback(int& count, bool& exists)
+static bool ReadPendingSaveRollback(int& count, int& metadataState, bool& exists)
 {
     char path[COMPAT_MAX_PATH];
     SaveRollbackPath(path, "SAVE.RBK");
@@ -2777,9 +2827,19 @@ static bool ReadPendingSaveRollback(int& count, bool& exists)
     FILE* stream = compat_fopen(path, "rb");
     if (stream == nullptr) return false;
     count = -1;
+    metadataState = -1;
     char extra;
-    bool valid = fscanf(stream, "FALLOUT-ROLLBACK-1 %9d %c", &count, &extra) == 1
-        && count >= 0;
+    int version = 0;
+    bool valid = fscanf(stream, "FALLOUT-ROLLBACK-%1d", &version) == 1;
+    if (valid && version == 1) {
+        valid = fscanf(stream, " %9d %c", &count, &extra) == 1;
+    } else if (valid && version == 2) {
+        valid = fscanf(stream, " %9d %1d %c", &count, &metadataState, &extra) == 2
+            && (metadataState == 0 || metadataState == 1);
+    } else {
+        valid = false;
+    }
+    valid = valid && count >= 0 && ferror(stream) == 0;
     valid = fclose(stream) == 0 && valid;
     return valid;
 }
@@ -2787,8 +2847,9 @@ static bool ReadPendingSaveRollback(int& count, bool& exists)
 static bool RecoverPendingSaveRollback()
 {
     int count;
+    int metadataState;
     bool exists;
-    if (!ReadPendingSaveRollback(count, exists)) return false;
+    if (!ReadPendingSaveRollback(count, metadataState, exists)) return false;
     if (!exists) return true;
     map_backup_count = count;
     return RestoreSave() == 0;
@@ -2797,22 +2858,38 @@ static bool RecoverPendingSaveRollback()
 static bool RecordPendingSaveRollback()
 {
     int recordedCount;
+    int metadataState;
     bool exists;
-    if (!ReadPendingSaveRollback(recordedCount, exists)) return false;
+    if (!ReadPendingSaveRollback(recordedCount, metadataState, exists)) return false;
     if (exists) return recordedCount == map_backup_count;
     char path[COMPAT_MAX_PATH];
     char temporary[COMPAT_MAX_PATH];
     SaveRollbackPath(path, "SAVE.RBK");
     SaveRollbackPath(temporary, "SAVE.RBT");
+    char metadataBackup[COMPAT_MAX_PATH];
+    SaveRollbackPath(metadataBackup, "MULTI.RSV");
+    bool hasMetadataBackup;
+    if (!SaveFileExists(metadataBackup, hasMetadataBackup)) return false;
     FILE* stream = compat_fopen(temporary, "wb");
     if (stream == nullptr) return false;
-    bool written = fprintf(stream, "FALLOUT-ROLLBACK-1 %d\n", map_backup_count) > 0;
+    bool written = fprintf(stream, "FALLOUT-ROLLBACK-2 %d %d\n", map_backup_count,
+        hasMetadataBackup ? 1 : 0) > 0;
     written = fflush(stream) == 0 && written;
     written = fclose(stream) == 0 && written;
     if (!written || compat_rename(temporary, path) != 0) {
         compat_remove(temporary);
         return false;
     }
+    return true;
+}
+
+static bool ClearPendingSaveRollback()
+{
+    char path[COMPAT_MAX_PATH];
+    SaveRollbackPath(path, "SAVE.RBK");
+    if (compat_remove(path) != 0) return false;
+    SaveRollbackPath(path, "MULTI.RSV");
+    compat_remove(path);
     return true;
 }
 
@@ -2841,7 +2918,18 @@ static int RestoreSave()
         db_free_file_list(&fileList, NULL);
         return -1;
     }
-    if (!RecordPendingSaveRollback() || EraseSave() == -1) {
+    int recordedCount;
+    int metadataState;
+    bool hasRecord;
+    bool metadataReady = RecordPendingSaveRollback()
+        && ReadPendingSaveRollback(recordedCount, metadataState, hasRecord) && hasRecord;
+    if (metadataReady && metadataState == 1) {
+        char metadataBackup[COMPAT_MAX_PATH];
+        SaveRollbackPath(metadataBackup, "MULTI.RSV");
+        bool exists;
+        metadataReady = SaveFileExists(metadataBackup, exists) && exists;
+    }
+    if (!metadataReady || EraseSave() == -1) {
         db_free_file_list(&fileList, NULL);
         return -1;
     }
@@ -2859,9 +2947,20 @@ static int RestoreSave()
         }
     }
     db_free_file_list(&fileList, NULL);
-    char rollbackPath[COMPAT_MAX_PATH];
-    SaveRollbackPath(rollbackPath, "SAVE.RBK");
-    if (compat_remove(rollbackPath) != 0) return -1;
+    if (metadataState == 1) {
+        SaveDirectoryPath(str0, true, true);
+        strcat(str0, "MULTI.RSV");
+        SaveDirectoryPath(str1, true, true);
+        strcat(str1, "MULTI.DAT");
+        if (copy_file(str0, str1) == -1) return -1;
+    } else if (metadataState == 0) {
+        char metadata[COMPAT_MAX_PATH];
+        SaveRollbackPath(metadata, "MULTI.DAT");
+        bool exists;
+        if (!SaveFileExists(metadata, exists)
+            || (exists && compat_remove(metadata) != 0)) return -1;
+    }
+    if (!ClearPendingSaveRollback()) return -1;
     failedSaveRestorations.erase(restoreDirectory);
     return 0;
 }
@@ -2890,38 +2989,31 @@ static int SaveObjDudeCid(DB_FILE* stream)
 static int EraseSave()
 {
     debug_printf("\nLOADSAVE: Erasing save(bad) slot...\n");
-
-    SaveDirectoryPath(gmpath, false, true);
-    strcpy(str0, gmpath);
-    strcat(str0, "SAVE.DAT");
-    compat_remove(str0);
-
-    SaveDirectoryPath(gmpath, true, true);
-    snprintf(str0, sizeof(str0), "%s*.%s", gmpath, "SAV");
-
-    char** fileList;
-    int fileListLength = db_get_file_list(str0, &fileList, NULL, 0);
-    if (fileListLength == -1) {
-        return -1;
+    char directory[COMPAT_MAX_PATH];
+    SaveDirectoryPath(directory, false, false);
+    compat_windows_path_to_native(directory);
+    compat_resolve_path(directory);
+    std::error_code error;
+    std::filesystem::directory_iterator iterator(directory, error);
+    if (error) return -1;
+    std::vector<std::filesystem::path> outputs;
+    for (const auto end = std::filesystem::directory_iterator(); iterator != end;
+        iterator.increment(error)) {
+        if (error) return -1;
+        const auto& entry = *iterator;
+        std::string name = entry.path().filename().string();
+        std::string extension = entry.path().extension().string();
+        if (compat_stricmp(name.c_str(), "SAVE.DAT") != 0
+            && compat_stricmp(extension.c_str(), ".SAV") != 0) continue;
+        // Validate the entire output set first, including directory names that
+        // native file enumeration omits. A blocked cleanup must retain the record.
+        if (!entry.is_regular_file(error) || error) return -1;
+        outputs.push_back(entry.path());
     }
-
-    SaveDirectoryPath(gmpath, false, true);
-    for (int index = fileListLength - 1; index >= 0; index--) {
-        strcpy(str0, gmpath);
-        strcat(str0, fileList[index]);
-        compat_remove(str0);
+    if (error) return -1;
+    for (const auto& output : outputs) {
+        if (!std::filesystem::remove(output, error) || error) return -1;
     }
-
-    db_free_file_list(&fileList, NULL);
-
-    SaveDirectoryPath(gmpath, false, true);
-
-    char* v1 = strmfe(str1, "AUTOMAP.DB", "SAV");
-    strcpy(str0, gmpath);
-    strcat(str0, v1);
-
-    compat_remove(str0);
-
     return 0;
 }
 
