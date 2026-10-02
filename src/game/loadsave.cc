@@ -1569,9 +1569,12 @@ static int SaveSlot()
     flptr = db_fopen(gmpath, "wb");
     if (flptr == NULL) {
         debug_printf("\nLOADSAVE: ** Error opening save game for writing! **\n");
-        RestoreSave();
-        SaveDirectoryPath(gmpath, true, true);
-        MapDirErase(gmpath, "BAK");
+        if (RestoreSave() == 0) {
+            SaveDirectoryPath(gmpath, true, true);
+            MapDirErase(gmpath, "BAK");
+        } else {
+            debug_printf("\nLOADSAVE: Backup restoration failed; backup files retained.\n");
+        }
         partyMemberUnPrepSave();
         gsound_background_unpause();
         return -1;
@@ -1582,9 +1585,12 @@ static int SaveSlot()
         debug_printf("\nLOADSAVE: ** Error writing save game header! **\n");
         debug_printf("LOADSAVE: Save file header size written: %d bytes.\n", db_ftell(flptr) - pos);
         db_fclose(flptr);
-        RestoreSave();
-        SaveDirectoryPath(gmpath, true, true);
-        MapDirErase(gmpath, "BAK");
+        if (RestoreSave() == 0) {
+            SaveDirectoryPath(gmpath, true, true);
+            MapDirErase(gmpath, "BAK");
+        } else {
+            debug_printf("\nLOADSAVE: Backup restoration failed; backup files retained.\n");
+        }
         partyMemberUnPrepSave();
         gsound_background_unpause();
         return -1;
@@ -1596,9 +1602,12 @@ static int SaveSlot()
         if (handler(flptr) == -1) {
             debug_printf("\nLOADSAVE: ** Error writing save function #%d data! **\n", index);
             db_fclose(flptr);
-            RestoreSave();
-            SaveDirectoryPath(gmpath, true, true);
-            MapDirErase(gmpath, "BAK");
+            if (RestoreSave() == 0) {
+                SaveDirectoryPath(gmpath, true, true);
+                MapDirErase(gmpath, "BAK");
+            } else {
+                debug_printf("\nLOADSAVE: Backup restoration failed; backup files retained.\n");
+            }
             partyMemberUnPrepSave();
             gsound_background_unpause();
             return -1;
@@ -1611,9 +1620,12 @@ static int SaveSlot()
 
     if (db_fclose(flptr) != 0) {
         debug_printf("\nLOADSAVE: ** Error closing save game data! **\n");
-        RestoreSave();
-        SaveDirectoryPath(gmpath, true, true);
-        MapDirErase(gmpath, "BAK");
+        if (RestoreSave() == 0) {
+            SaveDirectoryPath(gmpath, true, true);
+            MapDirErase(gmpath, "BAK");
+        } else {
+            debug_printf("\nLOADSAVE: Backup restoration failed; backup files retained.\n");
+        }
         partyMemberUnPrepSave();
         gsound_background_unpause();
         return -1;
@@ -1621,9 +1633,12 @@ static int SaveSlot()
 
     if (!SaveMultiplayerSidecar()) {
         debug_printf("\nLOADSAVE: ** Error writing multiplayer save metadata! **\n");
-        RestoreSave();
-        SaveDirectoryPath(gmpath, true, true);
-        MapDirErase(gmpath, "BAK");
+        if (RestoreSave() == 0) {
+            SaveDirectoryPath(gmpath, true, true);
+            MapDirErase(gmpath, "BAK");
+        } else {
+            debug_printf("\nLOADSAVE: Backup restoration failed; backup files retained.\n");
+        }
         partyMemberUnPrepSave();
         gsound_background_unpause();
         return -1;
@@ -2734,68 +2749,41 @@ static int RestoreSave()
 {
     debug_printf("\nLOADSAVE: Restoring save file backup...\n");
 
-    EraseSave();
-
-    SaveDirectoryPath(gmpath, false, true);
-    strcpy(str0, gmpath);
-    strcat(str0, "SAVE.DAT");
-    strmfe(str1, str0, "BAK");
-    compat_remove(str0);
-
-    if (compat_rename(str1, str0) != 0) {
-        EraseSave();
-        return -1;
-    }
-
     SaveDirectoryPath(gmpath, true, true);
     snprintf(str0, sizeof(str0), "%s*.%s", gmpath, "BAK");
-
     char** fileList;
     int fileListLength = db_get_file_list(str0, &fileList, NULL, 0);
-    if (fileListLength == -1) {
+    if (fileListLength == -1) return -1;
+    bool hasSaveBackup = false;
+    int mapBackups = 0;
+    for (int index = 0; index < fileListLength; index++) {
+        if (compat_stricmp(fileList[index], "SAVE.BAK") == 0) hasSaveBackup = true;
+        else mapBackups++;
+    }
+    // Check the backup set before deleting any partial output. A failed
+    // rollback must retain all backup files for a later retry or recovery.
+    if (mapBackups != map_backup_count || (!hasSaveBackup && mapBackups != 0)) {
+        db_free_file_list(&fileList, NULL);
         return -1;
     }
-
-    if (fileListLength != map_backup_count) {
-        // FIXME: Probably leaks fileList.
-        EraseSave();
+    if (EraseSave() == -1) {
+        db_free_file_list(&fileList, NULL);
         return -1;
     }
-
-    SaveDirectoryPath(gmpath, false, true);
-
+    SaveDirectoryPath(gmpath, true, true);
     for (int index = fileListLength - 1; index >= 0; index--) {
         strcpy(str0, gmpath);
         strcat(str0, fileList[index]);
-        strmfe(str1, str0, "SAV");
-        compat_remove(str1);
-        if (compat_rename(str0, str1) != 0) {
-            // FIXME: Probably leaks fileList.
-            EraseSave();
+        strmfe(str1, str0,
+            compat_stricmp(fileList[index], "SAVE.BAK") == 0 ? "DAT" : "SAV");
+        // Copy rather than consume backups. If one output fails, the complete
+        // previous save remains available even after earlier copies succeeded.
+        if (copy_file(str0, str1) == -1) {
+            db_free_file_list(&fileList, NULL);
             return -1;
         }
     }
-
     db_free_file_list(&fileList, NULL);
-
-    if (!automap_db_flag) {
-        return 0;
-    }
-
-    SaveDirectoryPath(gmpath, false, true);
-    char* v1 = strmfe(str2, "AUTOMAP.DB", "BAK");
-    strcpy(str0, gmpath);
-    strcat(str0, v1);
-
-    char* v2 = strmfe(str2, "AUTOMAP.DB", "SAV");
-    strcpy(str1, gmpath);
-    strcat(str1, v2);
-
-    if (compat_rename(str0, str1) != 0) {
-        EraseSave();
-        return -1;
-    }
-
     return 0;
 }
 

@@ -1,4 +1,5 @@
 #include "game/loadsave.cc"
+#include <filesystem>
 
 namespace fallout {
 bool GNW95_isActive = false;
@@ -57,12 +58,26 @@ int main(int argc, char** argv)
         written = db_fclose(stream) == 0 && written;
         if (!written) { db_exit(); return 7; }
     }
+    // A nonempty map destination refuses replacement during rollback. Every
+    // backup must survive the failed restore so it can be retried safely.
+    std::filesystem::path blockedRestore = std::filesystem::path(argv[1]) / "SAVEGAME/SLOT01/MAP.SAV";
+    std::filesystem::remove(blockedRestore);
+    std::filesystem::create_directory(blockedRestore);
+    std::FILE* blocker = std::fopen((blockedRestore / "blocker").c_str(), "wb");
+    if (blocker == nullptr) { db_exit(); return 8; }
+    std::fclose(blocker);
+    int refusedRestore = RestoreSave();
+    bool retryBackups = readValue("SAVEGAME\\SLOT01\\SAVE.BAK")
+        && readValue("SAVEGAME\\SLOT01\\MAP.BAK")
+        && readValue("SAVEGAME\\SLOT01\\AUTOMAP.BAK");
+    std::filesystem::remove_all(blockedRestore);
     int restoreResult = RestoreSave();
     bool restoreIntact = true;
     for (const char* path : originals) restoreIntact = readValue(path) && restoreIntact;
+    std::printf("NATIVE_SAVE_RESTORE_RETRY refused=%d backups_intact=%d\n", refusedRestore, retryBackups);
     db_exit();
     std::printf("NATIVE_SAVE_BACKUP failure=%d originals_intact=%d normal=%d backups_intact=%d originals_after_backup=%d restore=%d restore_intact=%d\n",
         result, intact, normal, backupIntact, originalsAfterBackup, restoreResult, restoreIntact);
     return result == -1 && intact && normal == 0 && backupIntact && originalsAfterBackup
-        && restoreResult == 0 && restoreIntact ? 0 : 1;
+        && refusedRestore == -1 && retryBackups && restoreResult == 0 && restoreIntact ? 0 : 1;
 }
