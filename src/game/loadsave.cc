@@ -353,6 +353,11 @@ void ResetLoadSave()
 // 0x46D9C4
 int SaveGame(int mode)
 {
+    if (!multiplayer::networkRuntimeSaveAllowed()) {
+        char message[] = "Multiplayer stopped. Return to the main menu and load the last successful save.";
+        display_print(message);
+        return 0;
+    }
     MessageListItem messageListItem;
 
     ls_error_code = 0;
@@ -1535,6 +1540,7 @@ static void SaveDirectoryPath(char* path, bool relative, bool trailingSeparator)
 // 0x46F978
 static int SaveSlot()
 {
+    if (!multiplayer::networkRuntimeSaveAllowed()) return -1;
     ls_error_code = 0;
     map_backup_count = -1;
     gmouse_set_cursor(MOUSE_CURSOR_WAIT_PLANET);
@@ -3169,7 +3175,8 @@ bool MultiplayerRecoverySaveExists()
 
 bool SaveMultiplayerRecoveryGame()
 {
-    if (!multiplayer::networkRuntimeHostWorldActive()) {
+    if (!multiplayer::networkRuntimeSaveAllowed()
+        || !multiplayer::networkRuntimeHostWorldActive()) {
         return false;
     }
     if (!config_get_string(&game_config, GAME_CONFIG_SYSTEM_KEY,

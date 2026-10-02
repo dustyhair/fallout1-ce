@@ -2488,6 +2488,38 @@ void pollNetworkLobbies(NetworkLobby& host, NetworkLobby& guest)
     }
 }
 
+void testSnapshotCapacityAbort()
+{
+    auto pair = createLoopbackTransportPair();
+    NetworkLobby host, guest;
+    expect(host.start(NetworkLaunchMode::Host, SessionId { 0xCA9010 }, std::move(pair.first))
+            && guest.start(NetworkLaunchMode::Join, SessionId { 0xCA9010 }, std::move(pair.second)),
+        "capacity abort peers start");
+    expect(host.submitLocalSheet(sampleCharacterSheet(kHostPlayerId, "Host")) == CharacterLobbyError::None
+            && guest.submitLocalSheet(sampleCharacterSheet(kGuestPlayerId, "Guest")) == CharacterLobbyError::None,
+        "capacity abort peers submit sheets");
+    pollNetworkLobbies(host, guest);
+    expect(host.requestStart(), "capacity abort starts world");
+    pollNetworkLobbies(host, guest);
+    guest.abortSnapshotCapacity();
+    expect(guest.state() == NetworkLobbyState::Ready, "guest cannot declare host capture capacity failure");
+    expect(guest.sendLocalFacing(1), "queue guest gameplay before capacity abort");
+    host.poll();
+    host.abortSnapshotCapacity();
+    expect(host.state() == NetworkLobbyState::Failed
+            && host.error() == NetworkLobbyError::SnapshotCapacityExceeded && !host.takePeerCommand(),
+        "capacity abort clears queued gameplay and fails explicitly");
+    guest.poll();
+    expect(guest.state() == NetworkLobbyState::Disconnected && !guest.sendLocalFacing(2),
+        "capacity abort closes transport and stops guest submissions");
+    auto fresh = createLoopbackTransportPair();
+    expect(!host.reattachTransport(std::move(fresh.first)), "capacity failure cannot silently reconnect and retry");
+    host.poll();
+    expect(host.error() == NetworkLobbyError::SnapshotCapacityExceeded
+            && std::string(networkLobbyErrorMessage(host.error())).find("capacity") != std::string::npos,
+        "capacity failure remains explicit after further polling");
+}
+
 void testNetworkCombatTurnTransport()
 {
     SessionId sessionId { 0xACCE5510ULL };
@@ -5303,6 +5335,7 @@ int main()
     fallout::multiplayer::testTcpTransportAndHandshake();
     fallout::multiplayer::testNetworkLaunchAndBootstrap();
     fallout::multiplayer::testNetworkCharacterLobby();
+    fallout::multiplayer::testSnapshotCapacityAbort();
     fallout::multiplayer::testNetworkCombatTurnTransport();
     fallout::multiplayer::testLocalSessionLifecycle();
     fallout::multiplayer::testCombatTurnCommandsAndReplication();

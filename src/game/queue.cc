@@ -406,7 +406,7 @@ bool queue_find(Object* owner, int eventType)
 // 0x4909E4
 int queue_process()
 {
-    if (multiplayer::networkRuntimeIsGuestReplica()) {
+    if (multiplayer::networkRuntimeIsGuestReplica() || multiplayer::networkRuntimeSimulationStopped()) {
         return 0;
     }
 

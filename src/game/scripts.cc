@@ -564,7 +564,8 @@ static void doBkProcesses()
     }
 
     int v0 = get_bk_time();
-    bool guestReplica = multiplayer::networkRuntimeIsGuestReplica();
+    bool guestReplica = multiplayer::networkRuntimeIsGuestReplica()
+        || multiplayer::networkRuntimeSimulationStopped();
     if (script_engine_running && !guestReplica) {
         lasttime = v0;
 
@@ -767,6 +768,10 @@ int scripts_clear_combat_requests(Script* script)
 // 0x492250
 int scripts_check_state()
 {
+    if (multiplayer::networkRuntimeSimulationStopped()) {
+        scriptState.requests = 0;
+        return 0;
+    }
     WorldMapContext ctx;
 
     if (multiplayer::networkRuntimeIsGuestReplica()) {
@@ -1094,7 +1099,7 @@ void script_make_path(char* path)
 // 0x492924
 int exec_script_proc(int sid, int action)
 {
-    if (multiplayer::networkRuntimeIsGuestReplica()) {
+    if (multiplayer::networkRuntimeIsGuestReplica() || multiplayer::networkRuntimeSimulationStopped()) {
         return 0;
     }
     if (!script_engine_running) {

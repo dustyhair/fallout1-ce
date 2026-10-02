@@ -1,4 +1,5 @@
 #include "game/combatai.h"
+#include "multiplayer/network_runtime.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1190,6 +1191,7 @@ void combat_ai_over()
 // 0x425C2C
 Object* combat_ai(Object* critter, Object* target)
 {
+    if (multiplayer::networkRuntimeSimulationStopped()) return nullptr;
     AiPacket* ai;
     CritterCombatData* combatData;
 

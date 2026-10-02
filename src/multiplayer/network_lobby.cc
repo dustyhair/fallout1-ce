@@ -888,6 +888,16 @@ void NetworkLobby::abortRecovery()
     }
 }
 
+void NetworkLobby::abortSnapshotCapacity()
+{
+    if (_mode != NetworkLaunchMode::Host) return;
+    if (_transport != nullptr) _transport->close();
+    _peerCommands.clear();
+    _recoveryRequests.clear();
+    _recovering = false;
+    fail(NetworkLobbyError::SnapshotCapacityExceeded);
+}
+
 bool NetworkLobby::reattachTransport(std::unique_ptr<Transport> transport)
 {
     if (_state != NetworkLobbyState::Disconnected
@@ -1518,6 +1528,8 @@ const char* networkLobbyErrorMessage(NetworkLobbyError error)
     switch (error) {
     case NetworkLobbyError::None:
         return "no error";
+    case NetworkLobbyError::SnapshotCapacityExceeded:
+        return "world checkpoint exceeds supported capacity; load the last successful save";
     case NetworkLobbyError::InvalidStart:
         return "the network lobby could not start";
     case NetworkLobbyError::EncodeFailed:

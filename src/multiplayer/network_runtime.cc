@@ -506,6 +506,53 @@ void setStatus(const std::string& status)
     debug_printf("%s\n", runtimeStatus.c_str());
 }
 
+void discardReconnectTransport();
+
+bool snapshotCapacityFailed()
+{
+    return lobby.state() == NetworkLobbyState::Failed
+        && lobby.error() == NetworkLobbyError::SnapshotCapacityExceeded;
+}
+
+void handleSnapshotCaptureFailure()
+{
+    const auto& diagnostic = networkWorldLastSnapshotCaptureDiagnostic();
+    if (diagnostic.failure != SnapshotCaptureFailure::SnapshotValidation) return;
+    switch (diagnostic.snapshotError) {
+    case SnapshotError::PayloadTooLarge:
+    case SnapshotError::TooManyActors:
+    case SnapshotError::TooManyCritters:
+    case SnapshotError::TooManyDoors:
+    case SnapshotError::TooManyScenery:
+    case SnapshotError::TooManyItems:
+    case SnapshotError::TooManyVariables:
+    case SnapshotError::TooManyTimedEvents:
+        if (snapshotCapacityFailed()) return;
+        lobby.abortSnapshotCapacity();
+        bootstrap.stop();
+        discardReconnectTransport();
+        pendingRecoveryRequest.reset();
+        pendingLocalRestRequest.reset();
+        deferredPeerRestCommand.reset();
+        setStatus("MULTIPLAYER STOPPED: WORLD CHECKPOINT EXCEEDS CAPACITY. LOAD THE LAST SUCCESSFUL SAVE.");
+        {
+            char message[] = "Multiplayer stopped: world checkpoint exceeds capacity. Load the last successful save.";
+            display_print(message);
+        }
+        return;
+    default:
+        return;
+    }
+}
+
+bool captureRuntimeCheckpoint(EventSequence boundary, WorldSnapshot& snapshot)
+{
+    if (snapshotCapacityFailed()) return false;
+    if (networkWorldCaptureAuthoritativeState(boundary, snapshot)) return true;
+    handleSnapshotCaptureFailure();
+    return false;
+}
+
 std::string playerLabel(PlayerId playerId)
 {
     return playerId == kHostPlayerId ? "HOST" : "GUEST";
@@ -907,6 +954,7 @@ void reportAgentWorldState()
 
 void reportLobbyStatus()
 {
+    if (snapshotCapacityFailed()) return;
     NetworkLobbyState state = lobby.state();
     const CharacterCreationSheet* local = lobby.localSheet();
     const CharacterCreationSheet* peer = lobby.peerSheet();
@@ -1163,7 +1211,7 @@ SessionPhase commandExpectedPhase(const GameCommandPayload& payload)
 
 bool submitHostCommand(GameCommandPayload payload)
 {
-    if (launchOptions.mode != NetworkLaunchMode::Host || !networkWorldActive()) {
+    if (launchOptions.mode != NetworkLaunchMode::Host || !networkWorldActive() || snapshotCapacityFailed()) {
         return false;
     }
     GameCommand command;
@@ -1192,7 +1240,7 @@ bool submitHostCommand(GameCommandPayload payload)
     }
     if (accepted && needsStateCheckpoint && lobby.state() == NetworkLobbyState::Ready) {
         WorldSnapshot state;
-        if (!networkWorldCaptureAuthoritativeState(lobby.latestAuthoritativeEvent(), state)
+        if (!captureRuntimeCheckpoint(lobby.latestAuthoritativeEvent(), state)
             || !lobby.sendAuthoritativeState(state)) {
             debug_printf("Multiplayer combat result checkpoint could not be sent.\n");
             return false;
@@ -1205,6 +1253,10 @@ bool submitHostCommand(GameCommandPayload payload)
 
 void networkRuntimeBackgroundProcess()
 {
+    if (snapshotCapacityFailed()) {
+        reportAgentWorldState();
+        return;
+    }
     if (networkWorldCombatActionResolving()) {
         return;
     }
@@ -1238,7 +1290,7 @@ void networkRuntimeBackgroundProcess()
             && !smokeCombatScriptStatusSeeded
             && networkWorldPrepareCombatScriptStatusSmoke()) {
             WorldSnapshot statusState;
-            if (networkWorldCaptureAuthoritativeState(
+            if (captureRuntimeCheckpoint(
                     lobby.latestAuthoritativeEvent(), statusState)
                 && lobby.sendAuthoritativeState(statusState)) {
                 smokeCombatScriptStatusSeeded = true;
@@ -1348,7 +1400,7 @@ void networkRuntimeBackgroundProcess()
                 if (needsProgressionCheckpoint
                     && lobby.state() == NetworkLobbyState::Ready) {
                     WorldSnapshot state;
-                    if (!networkWorldCaptureAuthoritativeState(
+                    if (!captureRuntimeCheckpoint(
                             lobby.latestAuthoritativeEvent(), state)
                         || !lobby.sendAuthoritativeState(state)) {
                         std::fprintf(stderr,
@@ -1364,7 +1416,7 @@ void networkRuntimeBackgroundProcess()
             }
             if (pendingRecoveryRequest.has_value()) {
                 WorldSnapshot snapshot;
-                bool snapshotReady = networkWorldCaptureSnapshot(
+                bool snapshotReady = captureRuntimeCheckpoint(
                     lobby.latestAuthoritativeEvent(), snapshot);
                 if (snapshotReady) {
                     if (!lobby.sendRecovery(*pendingRecoveryRequest, snapshot)) {
@@ -1373,6 +1425,7 @@ void networkRuntimeBackgroundProcess()
                     pendingRecoveryRequest.reset();
                 }
             }
+            if (snapshotCapacityFailed()) return;
             while (std::optional<GameCommand> command = deferredPeerRestCommand.has_value()
                     ? std::exchange(deferredPeerRestCommand, std::nullopt)
                     : lobby.takePeerCommand()) {
@@ -1435,7 +1488,7 @@ void networkRuntimeBackgroundProcess()
                 }
                 if (needsStateCheckpoint && lobby.state() == NetworkLobbyState::Ready) {
                     WorldSnapshot state;
-                    if (!networkWorldCaptureAuthoritativeState(lobby.latestAuthoritativeEvent(), state)
+                    if (!captureRuntimeCheckpoint(lobby.latestAuthoritativeEvent(), state)
                         || !lobby.sendAuthoritativeState(state)) {
                         debug_printf("Multiplayer combat result checkpoint could not be sent.\n");
                         break;
@@ -1449,11 +1502,12 @@ void networkRuntimeBackgroundProcess()
                     combat_over_from_load();
                 }
             }
+            if (snapshotCapacityFailed()) return;
             auto now = std::chrono::steady_clock::now();
             if (lobby.state() == NetworkLobbyState::Ready
                 && (nextAuthoritativeState.time_since_epoch().count() == 0 || now >= nextAuthoritativeState)) {
                 WorldSnapshot state;
-                if (networkWorldCaptureAuthoritativeState(lobby.latestAuthoritativeEvent(), state)
+                if (captureRuntimeCheckpoint(lobby.latestAuthoritativeEvent(), state)
                     && !lobby.sendAuthoritativeState(state)) {
                     debug_printf("Multiplayer authoritative state could not be sent.\n");
                 }
@@ -4419,10 +4473,25 @@ bool networkRuntimeHostWorldActive()
         && networkWorldActive();
 }
 
+bool networkRuntimeSaveAllowed()
+{
+#if !FALLOUT_ENABLE_MULTIPLAYER
+    return true;
+#else
+    return !snapshotCapacityFailed();
+#endif
+}
+
+bool networkRuntimeSimulationStopped()
+{
+    return !networkRuntimeSaveAllowed();
+}
+
 MultiplayerSaveError networkRuntimeCaptureSave(std::uint64_t generation,
     std::uint64_t saveDatDigest,
     MultiplayerSaveSidecar& sidecar)
 {
+    if (snapshotCapacityFailed()) return MultiplayerSaveError::PayloadTooLarge;
     if (!networkRuntimeHostWorldActive()) {
         return MultiplayerSaveError::PlayerMissing;
     }

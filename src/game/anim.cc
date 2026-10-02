@@ -27,6 +27,7 @@
 #include "game/tile.h"
 #include "game/trait.h"
 #include "multiplayer/network_world.h"
+#include "multiplayer/network_runtime.h"
 #include "plib/color/color.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/input.h"
@@ -2855,6 +2856,7 @@ static int anim_animate(Object* obj, int anim, int animationSequenceIndex, int f
 // 0x417498
 void object_animate()
 {
+    if (multiplayer::networkRuntimeSimulationStopped()) return;
     if (curr_sad == 0) {
         return;
     }

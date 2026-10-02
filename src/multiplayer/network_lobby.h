@@ -48,6 +48,7 @@ enum class NetworkLobbyError {
     UnexpectedMessage,
     PeerSheetRejected,
     Disconnected,
+    SnapshotCapacityExceeded,
 };
 
 class NetworkLobby {
@@ -129,6 +130,7 @@ public:
     EventSequence latestAuthoritativeEvent() const;
     bool recoveryInProgress() const;
     void abortRecovery();
+    void abortSnapshotCapacity();
     bool reattachTransport(std::unique_ptr<Transport> transport);
     bool queueRecovery(EventSequence lastApplied);
     EventSequence lastAppliedEvent() const;

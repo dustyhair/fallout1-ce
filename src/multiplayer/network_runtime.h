@@ -24,6 +24,8 @@ NetworkLaunchMode networkRuntimeMode();
 bool networkRuntimeIsGuestReplica();
 bool networkRuntimeConnected();
 bool networkRuntimeHostWorldActive();
+bool networkRuntimeSaveAllowed();
+bool networkRuntimeSimulationStopped();
 MultiplayerSaveError networkRuntimeCaptureSave(std::uint64_t generation,
     std::uint64_t saveDatDigest,
     MultiplayerSaveSidecar& sidecar);

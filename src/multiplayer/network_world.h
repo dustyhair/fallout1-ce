@@ -116,6 +116,33 @@ bool networkWorldFinishWorldMapTravel(WorldMapArrivalKind kind,
     int forcedMap = -1);
 bool networkWorldWorldMapDeparted();
 void networkWorldHealRemotePlayersForTravelDay();
+enum class SnapshotCaptureFailure {
+    None,
+    InactiveSession,
+    WorldRegistration,
+    BusyObject,
+    MissingObject,
+    ItemDescriptor,
+    InvalidItemOwner,
+    VariableState,
+    NativeQueue,
+    MissingTimerOwner,
+    SnapshotValidation,
+};
+struct SnapshotCaptureDiagnostic {
+    SnapshotCaptureFailure failure = SnapshotCaptureFailure::None;
+    SnapshotError snapshotError = SnapshotError::None;
+    const char* section = "none";
+    EntityId entityId;
+    int mapId = -1;
+    SessionPhase phase = SessionPhase::Lobby;
+    std::size_t actors = 0;
+    std::size_t critters = 0;
+    std::size_t doors = 0;
+    std::size_t scenery = 0;
+    std::size_t items = 0;
+};
+const SnapshotCaptureDiagnostic& networkWorldLastSnapshotCaptureDiagnostic();
 bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot& snapshot);
 bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovement = false);
 bool networkWorldCaptureAuthoritativeState(EventSequence lastIncludedEvent, WorldSnapshot& snapshot);

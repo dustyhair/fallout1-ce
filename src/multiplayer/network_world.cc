@@ -1,4 +1,5 @@
 #include "multiplayer/network_world.h"
+#include "multiplayer/network_runtime.h"
 
 #include <algorithm>
 #include <array>
@@ -60,6 +61,8 @@ namespace multiplayer {
 namespace {
 
 LocalSession session;
+SnapshotCaptureDiagnostic lastCaptureDiagnostic;
+SnapshotCaptureDiagnostic lastReportedCaptureDiagnostic;
 Object* peerActor = nullptr;
 CommandProcessor commandProcessor;
 CombatTurnController combatTurns;
@@ -207,6 +210,28 @@ struct PlayerActorSlot {
     EntityId actorId;
     Object* actor = nullptr;
 };
+
+bool captureFailure(SnapshotCaptureFailure failure, const char* section,
+    EntityId entityId = {}, SnapshotError error = SnapshotError::None)
+{
+    lastCaptureDiagnostic = { failure, error, section, entityId,
+        map_data.field_34, session.phase(), session.players().playerIds().size(),
+        worldCritters.size(), worldDoors.size(), worldScenery.size(), worldItems.size() };
+    if (lastReportedCaptureDiagnostic.failure != failure
+        || lastReportedCaptureDiagnostic.snapshotError != error
+        || lastReportedCaptureDiagnostic.section != section
+        || lastReportedCaptureDiagnostic.entityId != entityId
+        || lastReportedCaptureDiagnostic.mapId != map_data.field_34) {
+        std::fprintf(stderr,
+            "MULTIPLAYER_SNAPSHOT_CAPTURE_FAILED reason=%d section=%s error=%d entity=%u map=%d phase=%d actors=%zu critters=%zu doors=%zu scenery=%zu items=%zu.\n",
+            static_cast<int>(failure), section, static_cast<int>(error), entityId.value,
+            lastCaptureDiagnostic.mapId, static_cast<int>(lastCaptureDiagnostic.phase),
+            lastCaptureDiagnostic.actors, lastCaptureDiagnostic.critters, lastCaptureDiagnostic.doors,
+            lastCaptureDiagnostic.scenery, lastCaptureDiagnostic.items);
+        lastReportedCaptureDiagnostic = lastCaptureDiagnostic;
+    }
+    return false;
+}
 
 std::optional<std::vector<PlayerActorSlot>> playerActorRoster()
 {
@@ -611,8 +636,11 @@ void applyVariableState(const WorldSnapshot& snapshot)
 bool captureTimedEvents(WorldSnapshot& snapshot)
 {
     std::vector<QueueEventState> queueEvents;
-    if (!queue_capture_state(queueEvents) || queueEvents.size() > kMaxSnapshotTimedEvents) {
-        return false;
+    if (!queue_capture_state(queueEvents)) {
+        return captureFailure(SnapshotCaptureFailure::NativeQueue, "timers");
+    }
+    if (queueEvents.size() > kMaxSnapshotTimedEvents) {
+        return captureFailure(SnapshotCaptureFailure::SnapshotValidation, "timers", {}, SnapshotError::TooManyTimedEvents);
     }
     snapshot.timedEvents.reserve(queueEvents.size());
     for (const QueueEventState& queueEvent : queueEvents) {
@@ -629,7 +657,12 @@ bool captureTimedEvents(WorldSnapshot& snapshot)
         if (queueEvent.owner != nullptr && queueEvent.eventType != EVENT_TYPE_SCRIPT) {
             std::optional<EntityId> ownerId = session.entities().findEntity(queueEvent.owner);
             if (!ownerId.has_value()) {
-                return false;
+                if (lastReportedCaptureDiagnostic.failure != SnapshotCaptureFailure::MissingTimerOwner
+                    || lastReportedCaptureDiagnostic.mapId != map_data.field_34) {
+                    std::fprintf(stderr, "MULTIPLAYER_SNAPSHOT_TIMER_OWNER_MISSING type=%d time=%d.\n",
+                        queueEvent.eventType, queueEvent.time);
+                }
+                return captureFailure(SnapshotCaptureFailure::MissingTimerOwner, "timers");
             }
             event.ownerId = *ownerId;
         }
@@ -1245,6 +1278,7 @@ void healRemotePlayersForHours(int hours)
 // queue event or a safety bound. The final clock and all effects still publish.
 bool advanceSharedRest(int minutes, bool untilHealed)
 {
+    if (networkRuntimeSimulationStopped()) return true;
     constexpr int kTicksPerMinute = GAME_TIME_TICKS_PER_HOUR / 60;
     int endTime = game_time() + minutes * kTicksPerMinute;
     int nextHealingTime = game_time() + 3 * GAME_TIME_TICKS_PER_HOUR;
@@ -1256,6 +1290,7 @@ bool advanceSharedRest(int minutes, bool untilHealed)
     bool interrupted = false;
     while (game_time() < endTime
         && (!untilHealed || !sharedPlayersHealed())
+        && !networkRuntimeSimulationStopped()
         && boundaries++ < kMaximumRestQueueBoundaries) {
         int nextTime = endTime;
         int nextEventTime = queue_next_time();
@@ -1276,7 +1311,7 @@ bool advanceSharedRest(int minutes, bool untilHealed)
         set_game_time(nextTime);
         if (nextEventTime > 0 && nextEventTime <= game_time()) {
             int queueResult = queue_process();
-            if (queueResult != 0 || game_user_wants_to_quit != 0) {
+            if (queueResult != 0 || game_user_wants_to_quit != 0 || networkRuntimeSimulationStopped()) {
                 std::fprintf(stderr,
                     "Multiplayer rest interrupted by queue at time=%d result=%d quit=%d.\n",
                     game_time(), queueResult, game_user_wants_to_quit);
@@ -1284,6 +1319,7 @@ bool advanceSharedRest(int minutes, bool untilHealed)
                 break;
             }
         }
+        if (networkRuntimeSimulationStopped()) { interrupted = true; break; }
         if (game_time() >= nextHealingTime) {
             partyMemberRestingHeal(3);
             healRemotePlayersForHours(3);
@@ -1294,7 +1330,7 @@ bool advanceSharedRest(int minutes, bool untilHealed)
         std::fprintf(stderr, "Multiplayer rest stopped at the queue boundary limit, time=%d.\n", game_time());
         interrupted = true;
     }
-    return interrupted || (untilHealed && !sharedPlayersHealed());
+    return interrupted || networkRuntimeSimulationStopped() || (untilHealed && !sharedPlayersHealed());
 }
 
 bool validateDirectTradePlan(const DirectTradeCommitPlan& plan)
@@ -1351,16 +1387,19 @@ bool discoverUntrackedWorldObjects()
         }
         discovered.push_back(object);
     }
-    if (worldCritters.size() + newCritters > kMaxSnapshotCritters
-        || worldScenery.size() + newScenery > kMaxSnapshotScenery
-        || worldItems.size() + newItems > kMaxSnapshotItems) return false;
+    if (worldCritters.size() + newCritters > kMaxSnapshotCritters)
+        return captureFailure(SnapshotCaptureFailure::SnapshotValidation, "discovery", {}, SnapshotError::TooManyCritters);
+    if (worldScenery.size() + newScenery > kMaxSnapshotScenery)
+        return captureFailure(SnapshotCaptureFailure::SnapshotValidation, "discovery", {}, SnapshotError::TooManyScenery);
+    if (worldItems.size() + newItems > kMaxSnapshotItems)
+        return captureFailure(SnapshotCaptureFailure::SnapshotValidation, "discovery", {}, SnapshotError::TooManyItems);
     std::sort(discovered.begin(), discovered.end(), [](const Object* lhs, const Object* rhs) {
         return std::tie(lhs->elevation, lhs->tile, lhs->pid, lhs->id, lhs->fid)
             < std::tie(rhs->elevation, rhs->tile, rhs->pid, rhs->id, rhs->fid);
     });
     for (Object* object : discovered) {
         EntityRegistrationResult registration = session.registerWorldObject(object);
-        if (!registration) return false;
+        if (!registration) return captureFailure(SnapshotCaptureFailure::WorldRegistration, "discovery");
         switch (FID_TYPE(object->fid)) {
         case OBJ_TYPE_CRITTER:
             worldCritters.emplace_back(registration.entityId, object);
@@ -7144,10 +7183,16 @@ bool networkWorldFinishWorldMapTravel(WorldMapArrivalKind kind, int specialEncou
     return true;
 }
 
+const SnapshotCaptureDiagnostic& networkWorldLastSnapshotCaptureDiagnostic()
+{
+    return lastCaptureDiagnostic;
+}
+
 bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot& snapshot)
 {
+    lastCaptureDiagnostic = {};
     if (!session.isActive()) {
-        return false;
+        return captureFailure(SnapshotCaptureFailure::InactiveSession, "session");
     }
 
     // Native dialogue scripts can create rewards directly in an inventory.
@@ -7158,23 +7203,23 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
         // spawns incrementally so a checkpoint preserves combat and dialogue.
         if (!discoverUntrackedWorldObjects()) return false;
         for (PlayerId playerId : session.players().playerIds()) {
-            if (!registerUntrackedInventory(networkWorldPlayerActor(playerId))) return false;
+            if (!registerUntrackedInventory(networkWorldPlayerActor(playerId))) return captureFailure(SnapshotCaptureFailure::WorldRegistration, "player_inventory");
         }
         for (const auto& entry : worldCritters) {
-            if (!registerUntrackedInventory(entry.second)) return false;
+            if (!registerUntrackedInventory(entry.second)) return captureFailure(SnapshotCaptureFailure::WorldRegistration, "npc_inventory", entry.first);
         }
         for (const auto& entry : worldDoors) {
-            if (!registerUntrackedInventory(entry.second)) return false;
+            if (!registerUntrackedInventory(entry.second)) return captureFailure(SnapshotCaptureFailure::WorldRegistration, "door_inventory", entry.first);
         }
         for (const auto& entry : worldScenery) {
-            if (!registerUntrackedInventory(entry.second)) return false;
+            if (!registerUntrackedInventory(entry.second)) return captureFailure(SnapshotCaptureFailure::WorldRegistration, "scenery_inventory", entry.first);
         }
         // Registration can append worldItems; index the original owners so
         // recursion does not invalidate iterators over that vector.
         std::size_t ownerCount = worldItems.size();
         for (std::size_t index = 0; index < ownerCount; ++index) {
             Object* owner = worldItems[index].second;
-            if (!registerUntrackedInventory(owner)) return false;
+            if (!registerUntrackedInventory(owner)) return captureFailure(SnapshotCaptureFailure::WorldRegistration, "item_inventory", worldItems[index].first);
         }
     }
 
@@ -7220,7 +7265,9 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
         Object* actor = session.entities().findObject(actorId);
         PlayerCharacterState* player = session.players().find(playerId);
         if (actor == nullptr || player == nullptr || anim_busy(actor) == -1) {
-            return false;
+            return captureFailure(actor != nullptr && player != nullptr
+                    ? SnapshotCaptureFailure::BusyObject : SnapshotCaptureFailure::MissingObject,
+                "actors", actorId);
         }
         captured.actors.push_back(ActorSnapshot {
             actorId,
@@ -7250,7 +7297,9 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
             || session.entities().findObject(entry.first) != scenery
             || anim_busy(scenery) == -1
             || scenery->tile < 0) {
-            return false;
+            return captureFailure(scenery != nullptr && session.entities().findObject(entry.first) == scenery
+                    && anim_busy(scenery) == -1 ? SnapshotCaptureFailure::BusyObject : SnapshotCaptureFailure::MissingObject,
+                "scenery", entry.first);
         }
         captured.scenery.push_back(ScenerySnapshot {
             entry.first,
@@ -7272,7 +7321,7 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
         if (critter == nullptr
             || session.entities().findObject(entry.first) != critter
             || critter->tile < 0) {
-            return false;
+            return captureFailure(SnapshotCaptureFailure::MissingObject, "critters", entry.first);
         }
         captured.critters.push_back(CritterSnapshot {
             entry.first,
@@ -7300,7 +7349,9 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
         if (door == nullptr
             || session.entities().findObject(entry.first) != door
             || anim_busy(door) == -1) {
-            return false;
+            return captureFailure(door != nullptr && session.entities().findObject(entry.first) == door
+                    && anim_busy(door) == -1 ? SnapshotCaptureFailure::BusyObject : SnapshotCaptureFailure::MissingObject,
+                "doors", entry.first);
         }
         captured.doors.push_back(DoorSnapshot {
             entry.first,
@@ -7312,16 +7363,16 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
     for (const auto& entry : worldItems) {
         Object* item = entry.second;
         if (item == nullptr || session.entities().findObject(entry.first) != item) {
-            return false;
+            return captureFailure(SnapshotCaptureFailure::MissingObject, "items", entry.first);
         }
         ItemSnapshot itemState;
         itemState.entityId = entry.first;
         if (!describeItem(item, itemState.itemDescriptor)) {
-            return false;
+            return captureFailure(SnapshotCaptureFailure::ItemDescriptor, "items", entry.first);
         }
         if (item->owner == nullptr) {
             if (item->tile < 0 || !elevationIsValid(item->elevation)) {
-                return false;
+                return captureFailure(SnapshotCaptureFailure::InvalidItemOwner, "ground_item", entry.first);
             }
             itemState.tile = item->tile;
             itemState.elevation = item->elevation;
@@ -7330,7 +7381,7 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
             std::optional<EntityId> holderId = session.entities().findEntity(item->owner);
             int quantity = item_count(item->owner, item);
             if (!holderId.has_value() || quantity <= 0) {
-                return false;
+                return captureFailure(SnapshotCaptureFailure::InvalidItemOwner, "inventory_item", entry.first);
             }
             itemState.holderId = *holderId;
             itemState.quantity = static_cast<std::uint32_t>(quantity);
@@ -7342,15 +7393,43 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
         itemState.lightIntensity = item->lightIntensity;
         captured.items.push_back(itemState);
     }
+    if (num_game_global_vars > static_cast<int>(kMaxSnapshotVariables)
+        || num_map_global_vars > static_cast<int>(kMaxSnapshotVariables)
+        || num_map_local_vars > static_cast<int>(kMaxSnapshotVariables)) {
+        return captureFailure(SnapshotCaptureFailure::SnapshotValidation, "variables", {}, SnapshotError::TooManyVariables);
+    }
     if (!captureVariables(game_global_vars, num_game_global_vars, captured.gameGlobalVariables)
         || !captureVariables(map_global_vars, num_map_global_vars, captured.mapGlobalVariables)
-        || !captureVariables(map_local_vars, num_map_local_vars, captured.mapLocalVariables)
-        || !captureTimedEvents(captured)) {
-        return false;
+        || !captureVariables(map_local_vars, num_map_local_vars, captured.mapLocalVariables)) {
+        return captureFailure(SnapshotCaptureFailure::VariableState, "variables");
     }
-    if (validateSnapshot(captured) != SnapshotError::None) {
-        return false;
+    if (!captureTimedEvents(captured)) return false;
+    SnapshotError error = validateSnapshot(captured);
+    if (error != SnapshotError::None) {
+        if (lastReportedCaptureDiagnostic.failure != SnapshotCaptureFailure::SnapshotValidation
+            || lastReportedCaptureDiagnostic.snapshotError != error
+            || lastReportedCaptureDiagnostic.mapId != map_data.field_34) {
+            std::fprintf(stderr, "MULTIPLAYER_SNAPSHOT_VALIDATION_FAILED error=%d globals=%zu map_globals=%zu locals=%zu timers=%zu.\n",
+                static_cast<int>(error), captured.gameGlobalVariables.size(), captured.mapGlobalVariables.size(),
+                captured.mapLocalVariables.size(), captured.timedEvents.size());
+            if (error == SnapshotError::InvalidSceneryState) {
+                for (const auto& state : captured.scenery) {
+                    if (state.pid < 0 || PID_TYPE(state.pid) != OBJ_TYPE_SCENERY
+                        || state.fid < 0 || FID_TYPE(state.fid) != OBJ_TYPE_SCENERY
+                        || !hexGridTileIsValid(state.tile) || !elevationIsValid(state.elevation)
+                        || state.rotation < 0 || state.rotation >= ROTATION_COUNT || state.frame < 0
+                        || state.lightDistance < 0 || state.lightDistance > 8
+                        || state.lightIntensity < 0 || state.lightIntensity > 65536) {
+                        std::fprintf(stderr, "MULTIPLAYER_SNAPSHOT_SCENERY_INVALID entity=%u pid=%d fid=%d tile=%d elevation=%d rotation=%d frame=%d light=%d/%d.\n",
+                            state.entityId.value, state.pid, state.fid, state.tile, state.elevation,
+                            state.rotation, state.frame, state.lightDistance, state.lightIntensity);
+                    }
+                }
+            }
+        }
+        return captureFailure(SnapshotCaptureFailure::SnapshotValidation, "validation", {}, error);
     }
+    lastReportedCaptureDiagnostic = {};
     snapshot = std::move(captured);
     return true;
 }

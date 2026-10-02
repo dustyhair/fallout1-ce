@@ -2174,7 +2174,7 @@ void combat_end()
 // 0x420698
 void combat_turn_run()
 {
-    while (combat_turn_running > 0) {
+    while (combat_turn_running > 0 && !multiplayer::networkRuntimeSimulationStopped()) {
         sharedFpsLimiter.mark();
 
         process_bk();
@@ -2190,7 +2190,7 @@ static int combat_input()
     int input;
     std::uint64_t turnRevision = multiplayer::networkWorldCombatTurnRevision();
 
-    while ((combat_state & COMBAT_STATE_0x02) != 0) {
+    while ((combat_state & COMBAT_STATE_0x02) != 0 && !multiplayer::networkRuntimeSimulationStopped()) {
         sharedFpsLimiter.mark();
 
         if ((combat_state & COMBAT_STATE_0x08) != 0) {
@@ -2271,6 +2271,7 @@ void combat_end_turn()
 // 0x420798
 static int combat_turn(Object* a1, bool a2)
 {
+    if (multiplayer::networkRuntimeSimulationStopped()) return -1;
     // AP and perks must come from this player's build, including the remote
     // player's turn. The shared critter prototype is not their character sheet.
     std::optional<multiplayer::ScopedActingPlayerContext> playerContext;
@@ -2305,7 +2306,8 @@ static int combat_turn(Object* a1, bool a2)
         }
         while (!unableToAct && multiplayer::networkWorldCombatTurnMatches(a1)
             && multiplayer::networkWorldCombatTurnRevision() == turnRevision
-            && game_user_wants_to_quit == 0 && combat_end_due_to_load == 0) {
+            && game_user_wants_to_quit == 0 && combat_end_due_to_load == 0
+            && !multiplayer::networkRuntimeSimulationStopped()) {
             sharedFpsLimiter.mark();
             get_input();
             renderPresent();
@@ -2483,7 +2485,7 @@ void combat(STRUCT_664980* attack)
 {
     // Replica combat is presentation-only. Its local engine may receive a
     // scripted combat trigger, but only the host may run the combat loop.
-    if (multiplayer::networkRuntimeIsGuestReplica()) {
+    if (multiplayer::networkRuntimeIsGuestReplica() || multiplayer::networkRuntimeSimulationStopped()) {
         return;
     }
     if (attack == NULL
@@ -2601,6 +2603,7 @@ void combat_ctd_init(Attack* attack, Object* attacker, Object* defender, int hit
 // 0x420CFC
 int combat_attack(Object* attacker, Object* defender, int hitMode, int hitLocation)
 {
+    if (multiplayer::networkRuntimeSimulationStopped()) return -1;
     engineExecutionProbeRecordCombatAttack();
 
     bool aiming;

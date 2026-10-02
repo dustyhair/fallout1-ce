@@ -1078,7 +1078,7 @@ WorldMapTravelStepResult worldmap_authoritative_travel_step()
     result.y = world_ypos;
     result.gameTime = game_time();
     if (multiplayer::networkRuntimeMode() != multiplayer::NetworkLaunchMode::Host
-        || !authoritative_travel_active) {
+        || multiplayer::networkRuntimeSimulationStopped() || !authoritative_travel_active) {
         return result;
     }
 
@@ -1222,7 +1222,8 @@ void worldmap_multiplayer_open()
     bool followParty = true;
     std::optional<WorldMapArrivalKind> arrivalKind;
     int specialEncounter = 0;
-    while (networkWorldWorldMapTravelApproved() && game_user_wants_to_quit == 0) {
+    while (networkWorldWorldMapTravelApproved() && !networkRuntimeSimulationStopped()
+        && game_user_wants_to_quit == 0) {
         sharedFpsLimiter.mark();
         int input = get_input(); // pumps the lobby and authoritative snapshots
         if (!networkWorldWorldMapTravelApproved()) break;
