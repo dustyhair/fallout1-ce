@@ -3,6 +3,8 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <unordered_set>
+#include <vector>
 
 #include "game/anim.h"
 #include "game/combatai.h"
@@ -792,10 +794,14 @@ static int partyFixMultipleMembers()
 
     critterCount = 0;
 
-    // TODO: This loop is wrong. Looks like it can restart itself from the
-    // beginning. Probably was implemented with two nested loops.
-    object = obj_find_first();
-    while (object != NULL) {
+    // Erasing an object invalidates the native object's list iterator. Collect
+    // pointers first so duplicate removal cannot dereference a freed node.
+    std::vector<Object*> objects;
+    std::unordered_set<Object*> seenObjects;
+    for (object = obj_find_first(); object != NULL; object = obj_find_next()) {
+        if (seenObjects.insert(object).second) objects.push_back(object);
+    }
+    for (Object* object : objects) {
         v1 = false;
 
         if (PID_TYPE(object->pid) == OBJ_TYPE_CRITTER) {
@@ -812,16 +818,16 @@ static int partyFixMultipleMembers()
             break;
         }
 
-        if (v1) {
+        // Death removes a companion's script and party membership. That does
+        // not make the retained body a duplicate: its inventory is still loot.
+        // Keep ordinary native corpse aging responsible for its lifetime.
+        if (v1 && !critter_is_dead(object)) {
             debug_printf("\n   PM: %s", critter_name(object));
 
             v2 = false;
             if (object->sid != -1) {
                 candidate = partyMemberFindObjFromPid(object->pid);
                 if (candidate != NULL && candidate != object) {
-                    if (candidate->sid != object->sid) {
-                        object->sid = -1;
-                    }
                     v2 = true;
                 }
             } else {
@@ -833,15 +839,19 @@ static int partyFixMultipleMembers()
                 if (candidate != object) {
                     debug_printf("\nDestroying evil critter doppleganger!");
 
-                    if (object->sid != -1) {
+                    // A stale duplicate can share the retained member's SID.
+                    // Remove only a script owned by the object being discarded.
+                    Script* duplicateScript = nullptr;
+                    if (object->sid != -1
+                        && (candidate == nullptr || candidate->sid != object->sid)
+                        && scr_ptr(object->sid, &duplicateScript) == 0
+                        && duplicateScript->owner == object) {
+                        duplicateScript->scr_flags &= ~(SCRIPT_FLAG_0x08 | SCRIPT_FLAG_0x10);
                         scr_remove(object->sid);
-                        object->sid = -1;
-                    } else {
-                        if (queue_remove_this(object, EVENT_TYPE_SCRIPT) == -1) {
-                            debug_printf("\nERROR Removing Timed Events on FIX remove!!\n");
-                        }
                     }
-
+                    queue_remove(object);
+                    // Discarding a duplicate is not an actual companion death.
+                    object->sid = -1;
                     obj_erase_object(object, NULL);
                 } else {
                     debug_printf("\nError: Attempting to destroy evil critter doppleganger FAILED!");
@@ -849,7 +859,6 @@ static int partyFixMultipleMembers()
             }
         }
 
-        object = obj_find_next();
     }
 
     for (index = 0; index < partyMemberCount; index++) {

@@ -18,6 +18,7 @@
 #include "game/party.h"
 #include "game/protinst.h"
 #include "game/proto.h"
+#include "game/queue.h"
 #include "game/scripts.h"
 #include "game/textobj.h"
 #include "game/tile.h"
@@ -3666,6 +3667,9 @@ static int obj_remove(ObjectListNode* a1, ObjectListNode* a2)
         exec_script_proc(a1->obj->sid, SCRIPT_PROC_DESTROY);
         scr_remove(a1->obj->sid);
     }
+    // Unscripted inventory objects and non-script events also own timers.
+    // Remove them after DESTROY, which may schedule one, before freeing owner.
+    queue_remove(a1->obj);
 
     if (a1 != a2) {
         if (a2 != NULL) {
