@@ -1368,6 +1368,19 @@ bool isAdjacentPlayerActor(Object* actor, Object* target)
     return isPlayerActor(target);
 }
 
+bool inventoryTransferWouldCycle(Object* destination, Object* item)
+{
+    for (Object* holder = destination; holder != nullptr; holder = holder->owner) {
+        if (holder == item) return true;
+    }
+    return false;
+}
+
+bool remainderIdAvailable(EntityId remainderId)
+{
+    return !isValid(remainderId) || !session.entities().contains(remainderId);
+}
+
 bool applyInventoryTransfer(Object* source,
     Object* destination,
     Object* item,
@@ -1382,7 +1395,11 @@ bool applyInventoryTransfer(Object* source,
         || source == destination
         || quantity == 0
         || item->owner != source
-        || item_count(source, item) < static_cast<int>(quantity)) {
+        || inventoryTransferWouldCycle(destination, item)
+        || item_count(source, item) < static_cast<int>(quantity)
+        || (validateRemainder
+            && (isValid(expectedRemainderId) != (item_count(source, item) > static_cast<int>(quantity))
+                || !remainderIdAvailable(expectedRemainderId)))) {
         return false;
     }
 
@@ -1410,7 +1427,10 @@ bool applyItemDrop(Object* source,
         || item == nullptr
         || quantity == 0
         || quantity > static_cast<std::uint32_t>(item_count(source, item))
-        || (quantity > 1 && item->pid != PROTO_ID_MONEY)) {
+        || (quantity > 1 && item->pid != PROTO_ID_MONEY)
+        || (validateRemainder
+            && (isValid(expectedRemainderId) != (item_count(source, item) > static_cast<int>(quantity))
+                || !remainderIdAvailable(expectedRemainderId)))) {
         return false;
     }
 
@@ -7054,9 +7074,21 @@ bool networkWorldApplyInventoryTransfer(const InventoryTransferredEvent& transfe
     Object* source = session.entities().findObject(sourceId);
     Object* destination = session.entities().findObject(destinationId);
     Object* item = session.entities().findObject(transfer.itemId);
-    if (source == nullptr || destination == nullptr) {
+    if (source == nullptr || destination == nullptr || source == destination) {
         return false;
     }
+    // A completed event may already have registered its remainder. Recognize
+    // replay before requiring a fresh ID for an event that still needs applying.
+    if (item != nullptr && item->owner == destination) {
+        ItemDescriptor descriptor;
+        if (!describeItem(item, descriptor)
+            || !itemDescriptorsEqual(descriptor, transfer.itemDescriptor)) return false;
+        inven_refresh_loot_window();
+        inven_refresh_inventory_window();
+        return true;
+    }
+    if ((!reverse && !remainderIdAvailable(transfer.remainderItemId))
+        || (item != nullptr && inventoryTransferWouldCycle(destination, item))) return false;
     if (item == nullptr && !reverse) {
         Inventory* inventory = &source->data.inventory;
         bool descriptorMatchFound = false;
@@ -7074,6 +7106,7 @@ bool networkWorldApplyInventoryTransfer(const InventoryTransferredEvent& transfe
                 item = candidate;
             }
         }
+        if (item != nullptr && inventoryTransferWouldCycle(destination, item)) return false;
         bool created = false;
         if (item == nullptr) {
             item = createItem(transfer.itemDescriptor);
@@ -7082,6 +7115,13 @@ bool networkWorldApplyInventoryTransfer(const InventoryTransferredEvent& transfe
                 if (item != nullptr) {
                     obj_erase_object(item, nullptr);
                 }
+                return false;
+            }
+            // Native inventory adoption leaves a newly created floating node
+            // behind. Remove it before transfer or shutdown traverses both roots.
+            if (obj_disconnect(item, nullptr) != 0) {
+                item_remove_mult(source, item, static_cast<int>(transfer.sourceQuantity));
+                obj_erase_object(item, nullptr);
                 return false;
             }
             created = true;
@@ -7168,6 +7208,17 @@ bool networkWorldApplyItemDrop(const ItemDroppedEvent& drop)
         return false;
     }
 
+    if (item != nullptr && item->owner == nullptr
+        && item->tile == drop.tile && item->elevation == drop.elevation) {
+        ItemDescriptor descriptor;
+        if (!describeItem(item, descriptor)
+            || !itemDescriptorsEqual(descriptor, drop.itemDescriptor)) return false;
+        inven_refresh_inventory_window();
+        inven_refresh_loot_window();
+        return true;
+    }
+    if (!remainderIdAvailable(drop.remainderItemId)) return false;
+
     if (item == nullptr) {
         Inventory* inventory = &source->data.inventory;
         bool descriptorMatchFound = false;
@@ -7197,6 +7248,11 @@ bool networkWorldApplyItemDrop(const ItemDroppedEvent& drop)
                 if (item != nullptr) {
                     obj_erase_object(item, nullptr);
                 }
+                return false;
+            }
+            if (obj_disconnect(item, nullptr) != 0) {
+                item_remove_mult(source, item, static_cast<int>(drop.sourceQuantity));
+                obj_erase_object(item, nullptr);
                 return false;
             }
             created = true;
