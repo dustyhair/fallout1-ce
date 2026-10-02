@@ -51,7 +51,8 @@ item does not imply that the full campaign acceptance gate has passed.
 - [ ] F09: shared death/knockout policy and recovery behavior under the three planned modes below.
 - [ ] Future persistent corpse piles: each death retains a distinct body or remains; empty corpses can stay visible.
 - [ ] Future death-mode selector: any-player death ends the run, cooperative downing/revival, or corpse-and-gear respawn.
-- [ ] F10: real companion recruitment and lifecycle.
+- [x] F10 Ian slice: real recruitment, dismissal, gear, combat, corpse and recovery. Other companions remain under content acceptance.
+- [ ] F10 remaining companion and quest-specific loyalty acceptance.
 - [x] F11: independent active-hand persistence, authority-confirmed HUD changes, versioned save migration and native disk/reconnect recovery.
 - [ ] F12: scaling, disconnect/recovery, and checkpoint retry hardening.
 - [ ] F13: final documentation and expanded acceptance coverage.
@@ -65,7 +66,7 @@ The next five goals (current work):
 - [x] 2. Shared story movies and actual ending presentation. Both clients render the destruction movies, identical host-selected settlement slides, departure and credits. Independent skipping, reconnect after playback, missing movie assets and unfocused guest playback pass. This validates presentation, not completion of the underlying quests.
 - [x] 3. Real recruited Ian lifecycle: recruitment, dismissal, gear, native retaliation, battle, death, travel and fresh-session recovery pass. Other companions and quest-specific loyalty remain content acceptance in goal 5.
 - [x] 4. Independent active hand. Save format 8 retains each actor's hand, versions 1–7 default to left, snapshot/wire formats reject invalid values, rejected requests leave the HUD unchanged. The 50-scenario interim run includes native disk/reconnect recovery with host left and guest right.
-- [ ] 5. Complete content acceptance and final release gates on the final code. Builds 45, 51, 62 and 64 each passed all 50 scenarios. The latest reconnect and snapshot validation changes require final regression; ordinary full-story acceptance remains open.
+- [ ] 5. Complete content acceptance and final release gates on the final code. Builds 45, 51, 62, 64 and 66 each passed all 50 scenarios. Build 72 final regression is running; ordinary full-story acceptance remains open.
 
 Evidence for this batch: `/var/tmp/fallout-five-goals-interim22-campaign/summary.tsv`, `/var/tmp/fallout-five-goals-dialogue-script-host22-20261001.log`, `/var/tmp/fallout-five-goals-barter-guest22-20261001.log`, `/var/tmp/fallout-five-goals-quantity-death23-20261001.log`, `/var/tmp/fallout-five-goals-simultaneous-death-20261001.log`, and `/var/tmp/fallout-five-goals-reconnect-death-20261001.log`. The script-death fixture invokes `action_dmg`, the native action called by `op_critter_damage`; it is not a claim that every installed lethal script has been played.
 
@@ -832,3 +833,85 @@ non-critter NPC prototypes, or positions outside the native 40,000-tile grid.
 The regression tests preserve legal edge tile 39,999, death animations and facing
 bits. Before the fix ten new assertions fail; the isolated corrected commit
 builds and passes all three CTest checks. Native final regression remains pending.
+
+Native snapshot rejection passed all three cases on copied build 66: same-revision
+phase mismatch, older phase revision and wrong actor ownership before map loading.
+Each preserves the complete digest and registry size with no script, combat or
+random execution. Movement, elevator, shared map transition and fresh native
+recovery all pass in `/var/tmp/fallout-release-review-focused66-20261001`.
+Commit `9cc29a6` moves those checks ahead of native mutation; `26cccfe` keeps the
+owner test compatible with existing valid player IDs.
+
+Commit `30fa624` defers queued-event owner flags until the entire replacement
+passes validation and allocation. An invalid later event now leaves the old
+queue and earlier owner flags intact. The isolated commit builds, passes all
+three CTest checks and both native movement peers in
+`/var/tmp/fallout-verified-queue-campaign2-20261001`.
+
+Build 67 passed the ten-family native weapon matrix, both players attacking
+with SMG, assault rifle, minigun, grenade, rocket, laser/plasma pistols, flamer
+and laser/plasma rifles. Native ammunition/AP, unload/reload conservation and
+friendly extras agree; the guest executes no rules. See
+`/var/tmp/fallout-native-weapons67-all-20261001.log`. Native ending/reconnect,
+scripted defeat during barter quantity input with terminal reconnect, and combat
+Take All also pass in the build-67 story, terminal and loot logs. Weapon setup
+pads native health and skills explicitly; it is acceptance of weapon mechanics,
+not ordinary campaign acquisition or story completion.
+
+Build 72 passed native capture/apply, disk save/load and authenticated reconnect
+on Gun Runners, Hub Downtown, Necropolis Hall of the Dead, Mariposa storage and
+the Cathedral. All snapshot sections, timer owners and final digests agree.
+See `dense-map-acceptance-2026-10-01.md` and
+`/var/tmp/fallout-native-dense-maps72-20261002.log`. These fixtures use approved
+native arrivals; they do not prove ordinary quest completion on those maps.
+
+Commit `cf5f99e` discovers script-created NPCs, supported scenery, ground items
+and nested resources during host capture. Actual TLS reconstruction and
+reconnect preserve the created objects and native timer without guest rule
+execution. Commit `719e0cf` deduplicates native iterator visits before initial
+registration and discovery. Gun Runners previously failed below capacity because
+its first occupied tile was returned twice; the corrected native gate passes.
+
+Commit `1dcd388` resolves native prototype names through the acting player.
+Visible Natalia dialogue previously introduced her as Max Stone. The installed
+Ian script obtains the name through `proto_data`, which bypassed the guest
+context. Native guest-name acceptance on build 71 now introduces Smoke Guest
+and receives Ian's reply with the same name; lifecycle and recovery also pass.
+Visible campaign confirmation after deployment remains pending.
+
+Commit `483e80f` reports buffered native file-close failures before publishing
+save metadata. The real Linux `/dev/full` probe reproduces the prior false
+success and proves subsequent normal I/O remains usable. Ordinary native save
+and authenticated recovery pass in the isolated checkpoint build. Further review
+found the private save-file copying helper also discarded its final output-close
+result; its native kernel probe now reports failure and preserves normal copying.
+Partial backup-rename failure and complete failed-save rollback still require
+fault-injected acceptance before the disrupted-save release gate is closed.
+
+Visible ordinary progress is preserved in SLOT09, `Shady cured safe six kills`,
+and a separate backup. Six radscorpions were killed and looted; three remain.
+Natalia earned the real Razlo antidote and Jarvis cure rewards, 250 and 400 XP.
+Both players rested to full native HP, 49 and 36, with zero poison. Ian remains
+unrecruited in this ordinary run. The name and post-rest host HUD fixes are
+awaiting deployment; the full cave quest and full-story content gate remain open.
+
+Commit `57c98b7` checks output-close failure in the native map/automap copying
+helper. The old implementation reports success copying four buffered bytes to
+`/dev/full`; the fixed implementation returns failure and copies normal bytes
+intact. Commit `76d5f87` uses relative database paths and copies slot backups
+without moving the original files. Failed backup creation now aborts saving.
+The native private-helper probe covers an unavailable backup destination,
+successful SAVE.DAT/map/automap backup, and restoration after simulated partial
+native output while retaining multiplayer metadata. The old code fails the same
+backup/restore assertions. Isolated build and CTest pass 3/3; actual native disk
+load/authenticated reconnect also pass in
+`/var/tmp/fallout-verified-save-backup-campaign-20261002`.
+
+Candidate 73 builds with multiplayer enabled and disabled, with CTest 3/3 and
+2/2 respectively. Muted HAL/testbox role 93 restored ordinary SLOT09 on matching
+source and agree on both actors' resources. Natalia's actual Ian reply now says
+`So, Natalia, what can I do for you?`; the name regression is visibly resolved.
+Post-damage shared-rest HUD acceptance remains pending. Candidate 73's native
+capacity-stop fixture found save preparation could still mutate the stopped
+world before the later save rejection. Early native-save rejection and stopped
+simulation guards are in progress and are not yet accepted.
