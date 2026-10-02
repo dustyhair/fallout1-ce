@@ -827,6 +827,12 @@ struct SnapshotReconciliationPlan {
     std::unordered_map<EntityId, Object*, EntityIdHash> objects;
     std::vector<const ItemSnapshot*> orderedItems;
     std::vector<Object*> created;
+    struct InventoryStorage {
+        Object* holder;
+        InventoryItem* items;
+        int capacity;
+    };
+    std::vector<InventoryStorage> inventories;
     bool reconstructScenery = false;
     bool reconstructCritters = false;
 
@@ -843,6 +849,14 @@ struct SnapshotReconciliationPlan {
 
     void commit()
     {
+        // Reserve native holder storage before any reconciliation mutation.
+        for (const InventoryStorage& storage : inventories) {
+            Inventory& inventory = storage.holder->data.inventory;
+            mem_free(inventory.items);
+            inventory.items = storage.items;
+            inventory.capacity = storage.capacity;
+        }
+        inventories.clear();
         // Native lifetime callbacks own every body after reconciliation starts.
         created.clear();
     }
@@ -1175,6 +1189,7 @@ Object* createItem(const ItemDescriptor& descriptor)
 
 SnapshotReconciliationPlan::~SnapshotReconciliationPlan()
 {
+    for (const InventoryStorage& storage : inventories) mem_free(storage.items);
     for (Object* object : created) {
         // Staged bodies keep their native list node and never own inventory.
         // Remove scripts directly so cleanup cannot execute a DESTROY proc.
@@ -1255,6 +1270,30 @@ bool stageSnapshotBodies(const WorldSnapshot& snapshot, SnapshotReconciliationPl
         bool missing = plan.find(state->entityId) == nullptr;
         if (!create(state->entityId, state->itemDescriptor.pid, OBJ_TYPE_ITEM)
             || (missing && !applyItemDescriptor(plan.find(state->entityId), state->itemDescriptor))) return false;
+    }
+    // Stage native inventory capacity without changing current holder arrays.
+    // Include all incoming bodies as an upper bound, even if native stacking
+    // later reduces the number of entries required.
+    std::unordered_map<Object*, int> incoming;
+    for (const ItemSnapshot* state : plan.orderedItems) {
+        if (!isValid(state->holderId)) continue;
+        Object* holder = plan.find(state->holderId);
+        Object* item = plan.find(state->entityId);
+        if (holder == nullptr || item == nullptr) return false;
+        if (item->owner != holder) ++incoming[holder];
+    }
+    plan.inventories.reserve(incoming.size());
+    for (const auto& entry : incoming) {
+        Inventory& inventory = entry.first->data.inventory;
+        if (inventory.length < 0 || inventory.capacity < inventory.length
+            || (inventory.length > 0 && inventory.items == nullptr)) return false;
+        int required = inventory.length + entry.second;
+        if (inventory.items != nullptr && inventory.capacity >= required) continue;
+        int capacity = ((required + 9) / 10) * 10;
+        auto* items = static_cast<InventoryItem*>(mem_malloc(sizeof(InventoryItem) * capacity));
+        if (items == nullptr) return false;
+        if (inventory.length > 0) std::copy_n(inventory.items, inventory.length, items);
+        plan.inventories.push_back({ entry.first, items, capacity });
     }
     // Move only newly created bodies. obj_move_to_tile reuses their creation
     // node and reports failure; obj_attempt_placement discards that result.

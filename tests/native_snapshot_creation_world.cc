@@ -37,7 +37,7 @@ bool sameQueue(const std::vector<QueueEventState>& left, const std::vector<Queue
     return true;
 }
 
-bool runNativeSnapshotCreationControl()
+bool runNativeSnapshotCreationControl(bool inventoryFailure = false, bool existingHolder = false)
 {
     WorldSnapshot baseline;
     if (!networkWorldCaptureSnapshot({}, baseline)
@@ -84,9 +84,10 @@ bool runNativeSnapshotCreationControl()
     control.items.push_back(bag);
     ItemSnapshot child;
     child.entityId = EntityId { nextId++ };
-    child.itemDescriptor.pid = PROTO_ID_STIMPACK;
-    child.fid = childPrototype->fid;
-    child.holderId = bag.entityId;
+    // Containers stay distinct in native inventory instead of merging stacks.
+    child.itemDescriptor.pid = existingHolder ? 211 : PROTO_ID_STIMPACK;
+    child.fid = existingHolder ? bagPrototype->fid : childPrototype->fid;
+    child.holderId = existingHolder ? baseline.actors.front().entityId : bag.entityId;
     child.tile = -1;
     child.elevation = -1;
     child.quantity = 1;
@@ -138,9 +139,17 @@ bool runNativeSnapshotCreationControl()
     std::size_t registryBefore = session.entities().size();
     std::vector<QueueEventState> queueBefore;
     if (!queue_capture_state(queueBefore)) { stagedPrototype->sid = originalSid; return false; }
+    Object* existingOwner = session.entities().findObject(baseline.actors.front().entityId);
+    InventoryItem* existingArray = existingOwner->data.inventory.items;
+    // Declare the existing native array full while preserving its actual entries.
+    // This forces storage growth for the incoming item without changing a body.
+    if (existingHolder) existingOwner->data.inventory.capacity = existingOwner->data.inventory.length;
+    int existingCapacity = existingOwner->data.inventory.capacity;
+    int requiredCapacity = ((existingOwner->data.inventory.length + 10) / 10) * 10;
     int attemptsBefore = snapshotPlacementAttempts;
     engineExecutionProbeBegin();
-    nativeSnapshotArmObjectFailure(3);
+    if (inventoryFailure) nativeSnapshotArmInventoryFailure(4, existingHolder ? requiredCapacity : 10);
+    else nativeSnapshotArmObjectFailure(3);
     bool rejected = !networkWorldApplySnapshot(decoded.snapshot);
     NativeSnapshotAllocationFailure fault = nativeSnapshotDisarmObjectFailure();
     stagedPrototype->sid = originalSid;
@@ -160,12 +169,16 @@ bool runNativeSnapshotCreationControl()
     bool preserved = rejected && captured && afterDigest
         && afterDigest.digest.overall == baselineDigest.digest.overall && registryUnchanged
         && bodiesBefore == nativeSnapshotBodyCount() && scriptsBefore == nativeSnapshotScriptCount()
-        && fault.requests == 4 && fault.failures == 1 && fault.bodiesAtFailure == bodiesBefore + 3
+        && fault.requests == (inventoryFailure ? 1 : 4) && fault.failures == 1 && fault.bodiesAtFailure == bodiesBefore + (inventoryFailure ? 4 : 3)
         && fault.scriptsAtFailure == scriptsBefore + 1 && queueUnchanged
         && snapshotPlacementAttempts == attemptsBefore
+        && (!existingHolder || (existingOwner->data.inventory.items == existingArray
+            && existingOwner->data.inventory.capacity == existingCapacity))
         && effects.scriptProcedures == 0 && effects.combatAttacks == 0 && effects.randomDraws == 0;
     std::fprintf(stderr,
-        "NATIVE_SNAPSHOT_CREATION_FAILURE_CONTROL fourth_object=1 nested_item=1 requests=%d faults=%d rejected=%d preserved=%d captured=%d registry=%zu/%zu mappings=%d bodies=%d/%d bodies_at_fault=%d scripts=%d/%d scripts_at_fault=%d queue=%d attempts=%d scripts_run=%u attacks=%u rng=%u\n",
+        "%s nested_item=1 requests=%d faults=%d rejected=%d preserved=%d captured=%d registry=%zu/%zu mappings=%d bodies=%d/%d bodies_at_fault=%d scripts=%d/%d scripts_at_fault=%d queue=%d attempts=%d scripts_run=%u attacks=%u rng=%u\n",
+        existingHolder ? "NATIVE_SNAPSHOT_EXISTING_INVENTORY_FAILURE_CONTROL"
+            : inventoryFailure ? "NATIVE_SNAPSHOT_INVENTORY_FAILURE_CONTROL" : "NATIVE_SNAPSHOT_CREATION_FAILURE_CONTROL",
         fault.requests, fault.failures, rejected, preserved, captured,
         registryBefore, session.entities().size(), registryUnchanged, bodiesBefore, nativeSnapshotBodyCount(),
         fault.bodiesAtFailure, scriptsBefore, nativeSnapshotScriptCount(), fault.scriptsAtFailure, queueUnchanged,
@@ -184,7 +197,7 @@ bool runNativeSnapshotCreationControl()
     Object* placedNpc = session.entities().findObject(npc.entityId);
     Object* placedChild = session.entities().findObject(child.entityId);
     bool exactPlacement = placedNpc != nullptr && placedNpc->tile == npc.tile && placedNpc->elevation == npc.elevation;
-    bool nestedHolder = placedChild != nullptr && placedChild->owner == session.entities().findObject(bag.entityId);
+    bool nestedHolder = placedChild != nullptr && placedChild->owner == session.entities().findObject(child.holderId);
     bool restored = networkWorldApplySnapshot(baseline);
     WorldSnapshot restoredSnapshot;
     bool restoredCaptured = networkWorldCaptureSnapshot({}, restoredSnapshot);
@@ -209,7 +222,8 @@ bool runNativeSnapshotCreationControl()
 bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts)
 {
     if (!nativeSnapshotOriginalAuthoritySmokeTest(counts)) return false;
-    return worldMode != NetworkLaunchMode::Join || runNativeSnapshotCreationControl();
+    return worldMode != NetworkLaunchMode::Join || (runNativeSnapshotCreationControl() && runNativeSnapshotCreationControl(true)
+        && runNativeSnapshotCreationControl(true, true));
 }
 
 } // namespace multiplayer

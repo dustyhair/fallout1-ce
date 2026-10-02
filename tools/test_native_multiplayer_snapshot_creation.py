@@ -78,7 +78,7 @@ def installed_file(data, name):
     raise RuntimeError(f'installed game is missing {name}: {data}')
 
 
-def run_fixture(binary, data, port, root, expect_negative):
+def run_fixture(binary, data, port, root, expect_negative, expect_inventory_negative):
     processes = []
     env = dict(os.environ, SDL_AUDIODRIVER='dummy', SDL_RENDER_DRIVER='software')
 
@@ -126,12 +126,35 @@ def run_fixture(binary, data, port, root, expect_negative):
         guest = logs['guest']
         fault = next((line for line in guest.splitlines()
                       if line.startswith('NATIVE_SNAPSHOT_CREATION_FAILURE_CONTROL ')), '')
+        inventory = next((line for line in guest.splitlines()
+                          if line.startswith('NATIVE_SNAPSHOT_INVENTORY_FAILURE_CONTROL ')), '')
+        existing_inventory = next((line for line in guest.splitlines()
+                          if line.startswith('NATIVE_SNAPSHOT_EXISTING_INVENTORY_FAILURE_CONTROL ')), '')
         placement = next((line for line in guest.splitlines()
                           if line.startswith('NATIVE_SNAPSHOT_CREATION_PLACEMENT_CONTROL ')), '')
         print(fault or 'NATIVE_SNAPSHOT_CREATION_FAILURE_CONTROL_MISSING', flush=True)
+        if inventory:
+            print(inventory, flush=True)
+        if existing_inventory:
+            print(existing_inventory, flush=True)
         if placement:
             print(placement, flush=True)
         print(f'NATIVE_SNAPSHOT_CREATION_EXITS host={exits["host"]} guest={exits["guest"]}', flush=True)
+        if expect_inventory_negative:
+            if exits != {'host': 1, 'guest': 1} or not re.search(
+                    r'requests=1 faults=1 rejected=1 preserved=0', inventory):
+                raise RuntimeError(f'inventory allocation negative was not reproduced:\n{guest[-7000:]}')
+            counts = re.search(r'bodies=(\d+)/(\d+) bodies_at_fault=(\d+) scripts=(\d+)/(\d+) scripts_at_fault=(\d+)', inventory)
+            registry = re.search(r'registry=(\d+)/(\d+) mappings=0', inventory)
+            if counts is None or registry is None:
+                raise RuntimeError('inventory allocation corruption evidence is missing')
+            before_bodies, after_bodies, fault_bodies, before_scripts, after_scripts, fault_scripts = map(int, counts.groups())
+            if (after_bodies != before_bodies + 4 or fault_bodies != after_bodies
+                    or after_scripts != before_scripts + 1 or fault_scripts != after_scripts
+                    or int(registry[2]) != int(registry[1]) + 4):
+                raise RuntimeError('inventory allocation negative has unexpected native counts')
+            print('NATIVE_MULTIPLAYER_SNAPSHOT_INVENTORY_NEGATIVE_CONFIRMED', flush=True)
+            return
         if expect_negative:
             if exits != {'host': 1, 'guest': 1} or not re.search(
                     r'requests=4 faults=1 rejected=1 preserved=0', fault):
@@ -152,6 +175,10 @@ def run_fixture(binary, data, port, root, expect_negative):
             raise RuntimeError(f'fixture requires clean exits from both processes:\n{guest[-7000:]}')
         if not re.search(r'requests=4 faults=1 rejected=1 preserved=1 captured=1', fault):
             raise RuntimeError('native allocation rejection did not preserve state')
+        if not re.search(r'requests=1 faults=1 rejected=1 preserved=1 captured=1', inventory):
+            raise RuntimeError('native inventory allocation rejection did not preserve state')
+        if not re.search(r'requests=1 faults=1 rejected=1 preserved=1 captured=1', existing_inventory):
+            raise RuntimeError('existing holder storage was not preserved on allocation failure')
         if not re.search(r'applied=1 matched=1 exact=1 nested_holder=1 restored=1 attempts=0', placement):
             raise RuntimeError('authoritative placement/nested holder control did not pass')
         if any('MULTIPLAYER_SMOKE_TEST_PASS ' not in content for content in logs.values()):
@@ -176,10 +203,14 @@ def main():
                         help='native source matching the built game; defaults to this checkout')
     parser.add_argument('--expect-negative', action='store_true',
                         help='require old-code corruption and explicit host/guest exits 1/1')
+    parser.add_argument('--expect-inventory-negative', action='store_true',
+                        help='require late inventory corruption and explicit host/guest exits 1/1')
     parser.add_argument('--port', type=int, default=0)
     args = parser.parse_args()
     if args.port != 0 and not 1024 <= args.port <= 65535:
         parser.error('port must be 0 for automatic selection or between 1024 and 65535')
+    if args.expect_negative and args.expect_inventory_negative:
+        parser.error('select only one negative control')
     checkout = pathlib.Path(__file__).resolve().parents[1]
     source = (args.source_root or checkout).resolve()
     root = pathlib.Path(tempfile.mkdtemp(prefix='fallout-native-snapshot-creation-', dir='/var/tmp'))
@@ -190,7 +221,7 @@ def main():
         with socket.socket() as reservation:
             reservation.bind(('127.0.0.1', 0))
             port = reservation.getsockname()[1]
-    run_fixture(binary, args.data_root.resolve(), port, root, args.expect_negative)
+    run_fixture(binary, args.data_root.resolve(), port, root, args.expect_negative, args.expect_inventory_negative)
 
 
 if __name__ == '__main__':

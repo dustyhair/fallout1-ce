@@ -13,6 +13,7 @@ struct NativeSnapshotAllocationFailure {
 int nativeSnapshotBodyCount();
 int nativeSnapshotScriptCount();
 void nativeSnapshotArmObjectFailure(int successfulRequests);
+void nativeSnapshotArmInventoryFailure(int stagedBodies, int capacity = 10);
 NativeSnapshotAllocationFailure nativeSnapshotDisarmObjectFailure();
 
 } // namespace fallout
