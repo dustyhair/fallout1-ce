@@ -10,6 +10,10 @@
 namespace fallout {
 namespace multiplayer {
 
+// Keep a stalled peer bounded while allowing bursts of complete checkpoints.
+constexpr std::size_t kMaxTcpQueuedBytes = 32 * 1024 * 1024;
+constexpr std::size_t kMaxTcpReceivedPackets = 8192;
+
 enum class TcpError {
     None,
     InvalidArgument,

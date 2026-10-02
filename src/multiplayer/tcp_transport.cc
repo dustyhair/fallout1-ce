@@ -360,7 +360,16 @@ public:
         if (packet.size() > kMaxTransportPacketSize) {
             return TransportSendResult::PacketTooLarge;
         }
+        poll();
+        if (!_connected) return TransportSendResult::Disconnected;
         compactOutbound();
+        if (packet.size() + sizeof(std::uint32_t) > kMaxTcpQueuedBytes - _outbound.size()) {
+            // Dropping a queued frame would break protocol ordering. End this
+            // stream instead; authenticated recovery starts from the peer's
+            // last applied checkpoint, not from these unsent bytes.
+            disconnect();
+            return TransportSendResult::Disconnected;
+        }
         appendFrameSize(_outbound, packet.size());
         _outbound.insert(_outbound.end(), packet.begin(), packet.end());
         poll();
@@ -392,6 +401,7 @@ public:
         }
         Packet packet = std::move(_received.front());
         _received.pop_front();
+        _receivedBytes -= packet.size();
         return packet;
     }
 
@@ -409,6 +419,7 @@ public:
         _outbound.clear();
         _outboundOffset = 0;
         _received.clear();
+        _receivedBytes = 0;
     }
 
 private:
@@ -483,12 +494,19 @@ private:
     void flushOutbound()
     {
         while (_connected && _outboundOffset < _outbound.size()) {
-            std::size_t remaining = std::min<std::size_t>(
-                _outbound.size() - _outboundOffset,
-                MBEDTLS_SSL_OUT_CONTENT_LEN);
-            int written = mbedtls_ssl_write(&_ssl, _outbound.data() + _outboundOffset, remaining);
+            if (_pendingWrite.empty()) {
+                std::size_t remaining = std::min<std::size_t>(
+                    _outbound.size() - _outboundOffset,
+                    MBEDTLS_SSL_OUT_CONTENT_LEN);
+                _pendingWrite.assign(_outbound.begin() + _outboundOffset,
+                    _outbound.begin() + _outboundOffset + remaining);
+            }
+            // WANT_READ/WRITE requires exactly the same bytes, pointer and
+            // length on retry. send() can append or compact _outbound meanwhile.
+            int written = mbedtls_ssl_write(&_ssl, _pendingWrite.data(), _pendingWrite.size());
             if (written > 0) {
                 _outboundOffset += static_cast<std::size_t>(written);
+                _pendingWrite.clear();
                 continue;
             }
             if (written == MBEDTLS_ERR_SSL_WANT_READ || written == MBEDTLS_ERR_SSL_WANT_WRITE) {
@@ -502,7 +520,13 @@ private:
     void pumpInbound()
     {
         std::array<std::uint8_t, 16384> buffer;
+        parseFrames();
         for (;;) {
+            // Leave data in TLS/the socket when the consumer falls behind.
+            // Draining a packet lets the next poll resume reading in order.
+            if (!_connected || _received.size() >= kMaxTcpReceivedPackets
+                || _receivedBytes >= kMaxTcpQueuedBytes
+                || _inbound.size() >= kMaxTransportPacketSize + sizeof(std::uint32_t)) return;
             int received = mbedtls_ssl_read(&_ssl, buffer.data(), buffer.size());
             if (received > 0) {
                 _inbound.insert(_inbound.end(), buffer.begin(), buffer.begin() + received);
@@ -528,13 +552,17 @@ private:
                 disconnect();
                 _inbound.clear();
                 _received.clear();
+                _receivedBytes = 0;
                 return;
             }
             std::size_t encodedSize = sizeof(std::uint32_t) + frameSize;
             if (_inbound.size() < encodedSize) {
                 return;
             }
+            if (_received.size() >= kMaxTcpReceivedPackets
+                || frameSize > kMaxTcpQueuedBytes - _receivedBytes) return;
             _received.emplace_back(_inbound.begin() + sizeof(std::uint32_t), _inbound.begin() + encodedSize);
+            _receivedBytes += frameSize;
             _inbound.erase(_inbound.begin(), _inbound.begin() + encodedSize);
         }
     }
@@ -548,6 +576,7 @@ private:
         _connected = false;
         _outbound.clear();
         _outboundOffset = 0;
+        _pendingWrite.clear();
     }
 
     SocketHandle _socket = kInvalidSocket;
@@ -564,7 +593,9 @@ private:
     std::vector<std::uint8_t> _inbound;
     std::vector<std::uint8_t> _outbound;
     std::size_t _outboundOffset = 0;
+    std::vector<std::uint8_t> _pendingWrite;
     std::deque<Packet> _received;
+    std::size_t _receivedBytes = 0;
 };
 
 std::unique_ptr<Transport> makeTlsTransport(SocketHandle socket,

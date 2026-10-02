@@ -2113,6 +2113,64 @@ std::optional<Packet> receiveTcpPacket(Transport& transport, Transport* peer = n
     return std::nullopt;
 }
 
+void testTcpQueueBounds()
+{
+    TcpListenResult listening = listenTcp(0);
+    if (!listening) { expect(false, "bounded TCP fixture listens"); return; }
+    auto joining = connectTcp("127.0.0.1", listening.listener->port());
+    auto host = acceptTcpPeer(*listening.listener);
+    if (!joining || !host) { expect(false, "bounded TCP fixture connects"); return; }
+    expect(joining.transport->send(Packet { 1 }) == TransportSendResult::Sent
+            && receiveTcpPacket(*host, joining.transport.get()) == Packet({ 1 }),
+        "bounded TCP fixture completes TLS before applying queue pressure");
+    auto pin = joining.transport->peerIdentity();
+
+    // More than the packet-count bound, with no payload bytes. The receiver
+    // must pause reads without dropping frames or counting only payload size.
+    bool queued = true;
+    for (std::size_t index = 0; index < kMaxTcpReceivedPackets + 100 && queued; ++index) {
+        queued = host->send(Packet {}) == TransportSendResult::Sent;
+        joining.transport->poll();
+    }
+    bool drained = queued;
+    for (std::size_t index = 0; index < kMaxTcpReceivedPackets + 100 && drained; ++index) {
+        auto packet = receiveTcpPacket(*joining.transport, host.get());
+        drained = packet.has_value() && packet->empty();
+    }
+    expect(drained && host->isConnected() && joining.transport->isConnected(),
+        "TCP packet-count pressure pauses reads and resumes without dropping empty frames");
+
+    Packet large(kMaxTransportPacketSize, 0xA5);
+    queued = true;
+    const std::size_t largeCount = kMaxTcpQueuedBytes / large.size() + 8;
+    for (std::size_t index = 0; index < largeCount && queued; ++index) {
+        large.front() = static_cast<std::uint8_t>(index);
+        queued = host->send(large) == TransportSendResult::Sent;
+        joining.transport->poll();
+    }
+    drained = queued;
+    for (std::size_t index = 0; index < largeCount && drained; ++index) {
+        large.front() = static_cast<std::uint8_t>(index);
+        drained = receiveTcpPacket(*joining.transport, host.get()) == large;
+    }
+    expect(drained && host->isConnected() && joining.transport->isConnected(),
+        "TCP byte pressure preserves maximum-sized frames across read pause and write retries");
+
+    // Stop polling the receiver entirely. Outbound overload must end the
+    // stream explicitly instead of allocating forever or silently dropping it.
+    std::size_t accepted = 0;
+    while (accepted < 128 && host->send(large) == TransportSendResult::Sent) ++accepted;
+    expect(accepted > 0 && accepted < 128 && !host->isConnected(),
+        "an idle TCP peer cannot grow the outbound queue without bound");
+    joining.transport->close();
+    auto reconnecting = connectTcp("127.0.0.1", listening.listener->port(), 5000, pin);
+    auto resumed = acceptTcpPeer(*listening.listener);
+    expect(reconnecting && resumed
+            && reconnecting.transport->send(Packet { 4, 2 }) == TransportSendResult::Sent
+            && receiveTcpPacket(*resumed, reconnecting.transport.get()) == Packet({ 4, 2 }),
+        "outbound overload leaves the listener available for a pinned fresh connection");
+}
+
 void testTcpTransportAndHandshake()
 {
     TcpListenResult listening = listenTcp(0);
@@ -5006,6 +5064,7 @@ int main()
     fallout::multiplayer::testGameplayWireFormat();
     fallout::multiplayer::testLoopbackTransport();
     fallout::multiplayer::testImpairedLoopbackTransport();
+    fallout::multiplayer::testTcpQueueBounds();
     fallout::multiplayer::testTcpTransportAndHandshake();
     fallout::multiplayer::testNetworkLaunchAndBootstrap();
     fallout::multiplayer::testNetworkCharacterLobby();
