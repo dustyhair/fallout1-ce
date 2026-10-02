@@ -2443,8 +2443,9 @@ static int db_delete_fp_rec(DB_FILE* stream)
         return -1;
     }
 
+    int closeResult = 0;
     if ((stream->flags & 0x4) != 0) {
-        fclose(stream->uncompressed_file_stream);
+        closeResult = fclose(stream->uncompressed_file_stream);
     } else {
         switch (stream->flags & 0xF0) {
         case 16:
@@ -2465,7 +2466,7 @@ static int db_delete_fp_rec(DB_FILE* stream)
     stream->database->files_length -= 1;
     memset(stream, 0, sizeof(*stream));
 
-    return 0;
+    return closeResult;
 }
 
 // 0x4B26D0

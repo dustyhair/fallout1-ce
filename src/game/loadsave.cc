@@ -1599,7 +1599,15 @@ static int SaveSlot()
 
     debug_printf("LOADSAVE: Total save data written: %ld bytes.\n", db_ftell(flptr));
 
-    db_fclose(flptr);
+    if (db_fclose(flptr) != 0) {
+        debug_printf("\nLOADSAVE: ** Error closing save game data! **\n");
+        RestoreSave();
+        SaveDirectoryPath(gmpath, true, true);
+        MapDirErase(gmpath, "BAK");
+        partyMemberUnPrepSave();
+        gsound_background_unpause();
+        return -1;
+    }
 
     if (!SaveMultiplayerSidecar()) {
         debug_printf("\nLOADSAVE: ** Error writing multiplayer save metadata! **\n");
