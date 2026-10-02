@@ -16,6 +16,8 @@ def main():
                       help='check pending combat script requests obey the runtime stop')
     mode.add_argument('--destructive-procedure', action='store_true',
                       help='check a native procedure can remove or compact its own script')
+    mode.add_argument('--timed-companion-context', action='store_true',
+                      help='check NPC timers use the leader and retain player timer contexts')
     args = parser.parse_args()
     build = args.build_directory.resolve()
     source = pathlib.Path(__file__).resolve().parents[1]
@@ -43,7 +45,8 @@ def main():
         binary = root / 'probe'
         compile_args = shlex.split(compile_line)
         compile_args[1:1] = ['-I', str(source / 'src')]
-        test_name = ('native_script_procedure_lifetime_test.cc' if args.destructive_procedure else
+        test_name = ('native_timed_companion_context_test.cc' if args.timed_companion_context else
+                     'native_script_procedure_lifetime_test.cc' if args.destructive_procedure else
                      'native_stopped_script_entry_test.cc' if args.stopped_combat
                      else 'native_script_cleanup_test.cc')
         compile_args[compile_args.index('-c') + 1] = str(source / 'tests' / test_name)
@@ -57,7 +60,9 @@ def main():
         subprocess.run(link, cwd=build, check=True, timeout=60)
         subprocess.run([str(binary)], check=True, timeout=5,
                        env=dict(os.environ, ASAN_OPTIONS='detect_leaks=0'))
-    if args.destructive_procedure:
+    if args.timed_companion_context:
+        print('NATIVE_TIMED_COMPANION_CONTEXT_PASS npc=leader player_and_other=unchanged scope=restored')
+    elif args.destructive_procedure:
         print('NATIVE_SCRIPT_PROCEDURE_LIFETIME_PASS retained_source=intact self_removal=safe')
     elif args.stopped_combat:
         print('NATIVE_STOPPED_SCRIPT_ENTRY_PASS pending_elevator=blocked ordinary_request=preserved')

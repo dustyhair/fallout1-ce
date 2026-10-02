@@ -218,3 +218,95 @@ The build-71 guest lifecycle run passed with native name assertions:
 - Recruit, dismiss, recruit again, native gear, travel, disk load and
   authenticated reconnect passed. Both recovery digests were
   `10288845579586349245`.
+
+## Timed following during shared rest, 2026-10-02
+
+The installed Ian `timed_event_p_proc` calls `follow_player`. That procedure
+reads `dude_obj`, writes its VM destination variable 16 and schedules another
+one-second native script timer. Its instruction listing is retained at
+`/var/tmp/companion-installed-IAN-follow-disassembly.txt`.
+Ambient companion updates already selected the shared host leader, but
+`script_q_process` previously inherited the current action's actor. The final
+rest approver and the talker in time-advancing dialogue therefore determined
+which human a timed follow procedure saw. The correction binds both acting
+and local context to the host for NPC party script owners. The ambient and
+timed predicates exclude null owners and human roster actors.
+
+The before/after checks used separate private source, object and binary copies
+under `/var/tmp/fallout-companion-timed-context-20261002`. The engine objects
+and archives came from the pinned build-78 bundle. Only the private fixture
+runtime and copied script dispatcher were compiled or replaced. Shared build
+outputs and the visible game were untouched. The ordinary companion driver
+recruited, dismissed and recruited the actual Ian through guest voted dialogue
+before a labeled placement fixture separated the humans by 30 hex. No quest
+variables or VM variables were supplied by the fixture.
+
+The direct dispatcher check invoked actual `script_q_process` with Ian's SID
+and follow parameter 1 under host and guest scopes. It read the installed
+script's resulting destination, rather than supplying a movement target:
+
+| Dispatcher | Caller scope | Destination distance from host | Destination distance from guest |
+| --- | --- | ---: | ---: |
+| Before correction | Host | 2 | 32 |
+| Before correction | Guest | 28 | 2 |
+| Corrected private copy | Host | 2 | 28 |
+| Corrected private copy | Guest | 2 | 28 |
+
+Each invocation executed one native procedure, scheduled the real one-second
+follow timer and restored its acting and local caller scopes. The old
+dispatcher's driver exited 1 at the guest-follow assertion, recorded in
+`baseline-driver.log`. The corrected direct run exited normally on both peers,
+then passed native travel, disk load and authenticated reconnect with matching
+digest `3975317086569868646`. Its driver log is `fixed-driver.log`, artifact
+root `/var/tmp/fallout-native-companion-a_be9ijs`, and private engine SHA-256
+`73aaff8ae59d74211b7d1140418ff127e857a6cd3151f836a1baf4a337dbba13`.
+
+The queued acceptance restored the captured queue after the direct diagnostic,
+leaving exactly one follow timer created by Ian's installed script. The host
+proposed the ordinary minimum ten-minute rest and the guest approved last
+through TLS. A private observation callback forwarded every script queue event
+to the original `script_q_process`, counting Ian's actual SID and parameter 1
+without substituting script behavior:
+
+- The pending timer was due at `264633`; rest advanced the native clock from
+  `264628` to `270628`, exactly 6,000 ticks.
+- Ian's native follow timer fired 600 times. Every destination stayed near the
+  host, every handler entered with the guest acting actor, and every handler
+  restored its acting and local entry scopes. The final destination was one
+  hex from the host and 30 from the guest.
+- The guest executed zero native script procedures, combat attacks and random
+  draws during the rest check. Fixture positions were restored before travel.
+- Both peers then passed Junktown map 10 and Shady Sands map 26 travel, native
+  disk load and authenticated reconnect, and exited normally. Recovery digest
+  `2716186453274564462` matched. Ian retained HP 50, team 0, 12 loaded pistol
+  rounds, 163 caps and native party membership.
+
+The queued driver log is `queued-rest-observed-driver.log` in the private root;
+native logs and snapshots are `/var/tmp/fallout-native-companion-3sxhdblq`.
+The final private engine SHA-256 is
+`3291c08a8a2cb7da4f67779889feb8020cfe1b23a9f520a6f376813cabeda878`.
+
+A separate private callback executable compiled the corrected native timed
+dispatcher and observed its selected contexts. With a guest caller, NPC party
+ownership selected the host. Host-human and guest-human ownership retained the
+guest even when the test membership predicate classified those humans as party
+members. Nonparty, null-owner and inactive-world cases also retained the guest.
+All six cases preserved the timer parameter and restored nested and outer
+scopes. The source, executable and log are `native-timed-owner-context.cc`,
+`native-timed-owner-context` and `native-timed-owner-context.log` in the private
+root. This is a dispatcher branch check with controlled owner predicates, not
+an additional installed companion lifecycle test.
+The later `native_timed_companion_context_test.cc` probe includes current
+repository `game/scripts.cc` directly and replaces only the VM procedure call
+with its observer. Actual `script_q_process` and `exec_script_proc` execute.
+All six cases also passed with that current dispatcher compiled under
+AddressSanitizer; `native-timed-current-source.log` records the result. Only the
+dispatcher/test compilation was instrumented, and leak detection was disabled.
+
+An initial queued fixture incorrectly requested one minute, which the native
+rest command rejects. That failed log remains as
+`queued-rest-invalid-one-minute-driver.log`; the accepted fixture uses the
+existing ten-minute command without changing valid rest durations. The shared
+dispatcher also handles timers pumped by native `game_time_advance`, but an
+installed time-advancing dialogue and other companions remain separate content
+acceptance checks.

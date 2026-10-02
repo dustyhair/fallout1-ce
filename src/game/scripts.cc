@@ -27,6 +27,7 @@
 #include "int/window.h"
 #include "multiplayer/network_runtime.h"
 #include "multiplayer/network_world.h"
+#include "multiplayer/local_player_context.h"
 #include "platform_compat.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/gnw.h"
@@ -624,7 +625,18 @@ static void script_chk_critters()
 
             if (scriptListExtent != NULL) {
                 Script* script = &(scriptListExtent->scripts[scriptIndex]);
-                exec_script_proc(script->scr_id, proc);
+                if (multiplayer::networkWorldActive() && script->owner != nullptr
+                    && isPartyMember(script->owner)
+                    && !multiplayer::networkWorldCombatOwner(script->owner).has_value()) {
+                    // Ambient companion behavior belongs to the shared leader,
+                    // even while a guest's native action is pumping the engine.
+                    Object* leader = multiplayer::networkWorldPlayerActor(multiplayer::kHostPlayerId);
+                    multiplayer::ScopedActorPlayerContext acting(leader);
+                    multiplayer::ScopedLocalPlayerBinding binding(leader);
+                    exec_script_proc(script->scr_id, proc);
+                } else {
+                    exec_script_proc(script->scr_id, proc);
+                }
             }
         }
     }
@@ -744,7 +756,18 @@ int script_q_process(Object* obj, void* data)
 
     script->fixedParam = scriptEvent->fixedParam;
 
-    exec_script_proc(scriptEvent->sid, SCRIPT_PROC_TIMED);
+    if (multiplayer::networkWorldActive() && script->owner != nullptr
+        && isPartyMember(script->owner)
+        && !multiplayer::networkWorldCombatOwner(script->owner).has_value()) {
+        // Timed companion follow/loyalty behavior uses the shared leader, just
+        // like ambient updates, even when a guest advances native game time.
+        Object* leader = multiplayer::networkWorldPlayerActor(multiplayer::kHostPlayerId);
+        multiplayer::ScopedActorPlayerContext acting(leader);
+        multiplayer::ScopedLocalPlayerBinding binding(leader);
+        exec_script_proc(scriptEvent->sid, SCRIPT_PROC_TIMED);
+    } else {
+        exec_script_proc(scriptEvent->sid, SCRIPT_PROC_TIMED);
+    }
 
     return 0;
 }

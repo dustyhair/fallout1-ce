@@ -44,6 +44,17 @@ private:
     LocalPlayerError _error = LocalPlayerError::None;
 };
 
+// Select the build of an explicit actor for rules that read another player
+// inside an existing action, such as damage resistance or a healing target.
+class ScopedActorPlayerContext {
+public:
+    explicit ScopedActorPlayerContext(Object* actor);
+    ScopedActorPlayerContext(const ScopedActorPlayerContext&) = delete;
+    ScopedActorPlayerContext& operator=(const ScopedActorPlayerContext&) = delete;
+private:
+    std::optional<ScopedActingPlayerContext> _actingPlayer;
+};
+
 class ScopedLocalPlayerContext {
 public:
     ScopedLocalPlayerContext();

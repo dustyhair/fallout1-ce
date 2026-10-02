@@ -132,6 +132,15 @@ LocalPlayerError ScopedLocalPlayerBinding::error() const
     return _error;
 }
 
+ScopedActorPlayerContext::ScopedActorPlayerContext(Object* actor)
+{
+    if (actor != actingPlayerActor()) {
+        if (auto* player = playerStateForActor(actor)) {
+            _actingPlayer.emplace(*player, actor);
+        }
+    }
+}
+
 ScopedLocalPlayerContext::ScopedLocalPlayerContext()
 {
     PlayerCharacterState* player = localPlayerState();
