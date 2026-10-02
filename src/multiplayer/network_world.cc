@@ -1024,6 +1024,142 @@ bool hasDirectItemWithDescriptor(const Object* holder, const ItemDescriptor& des
     return false;
 }
 
+bool snapshotSceneryLayoutMismatch(const WorldSnapshot& snapshot)
+{
+    if (snapshot.scenery.size() != worldScenery.size()) return true;
+    for (std::size_t index = 0; index < snapshot.scenery.size(); ++index) {
+        if (worldScenery[index].second == nullptr
+            || worldScenery[index].second->pid != snapshot.scenery[index].pid) return true;
+    }
+    return false;
+}
+
+Object* matchSnapshotScenery(const ScenerySnapshot& state,
+    const std::vector<std::pair<EntityId, Object*>>& candidates, const std::unordered_set<Object*>& used)
+{
+    for (const auto& entry : candidates) {
+        Object* candidate = entry.second;
+        if (candidate != nullptr && used.count(candidate) == 0
+            && candidate->pid == state.pid && candidate->tile == state.tile
+            && candidate->elevation == state.elevation) return candidate;
+    }
+    return nullptr;
+}
+
+std::vector<const ItemSnapshot*> orderSnapshotItems(const WorldSnapshot& snapshot)
+{
+    // The codec already rejects dangling holders and cycles. Process parents
+    // first so both preflight and reconciliation resolve the same containers.
+    std::unordered_map<EntityId, const ItemSnapshot*, EntityIdHash> itemStates;
+    for (const ItemSnapshot& state : snapshot.items) itemStates.emplace(state.entityId, &state);
+    std::unordered_set<EntityId, EntityIdHash> orderedIds;
+    std::vector<const ItemSnapshot*> ordered;
+    ordered.reserve(snapshot.items.size());
+    for (const ItemSnapshot& state : snapshot.items) {
+        std::vector<const ItemSnapshot*> chain;
+        const ItemSnapshot* current = &state;
+        while (current != nullptr && orderedIds.insert(current->entityId).second) {
+            chain.push_back(current);
+            auto parent = itemStates.find(current->holderId);
+            current = parent != itemStates.end() ? parent->second : nullptr;
+        }
+        for (auto it = chain.rbegin(); it != chain.rend(); ++it) ordered.push_back(*it);
+    }
+    return ordered;
+}
+
+Object* matchSnapshotItem(const ItemSnapshot& state, Object* holder, bool hasHolder,
+    const std::vector<Object*>& candidates, const std::unordered_set<Object*>& used)
+{
+    // A holder planned for creation cannot own any existing native item.
+    if (hasHolder && holder == nullptr) return nullptr;
+    Object* pidFallback = nullptr;
+    for (Object* candidate : candidates) {
+        if (candidate == nullptr || used.count(candidate) != 0
+            || candidate->pid != state.itemDescriptor.pid) continue;
+        bool locationMatches = hasHolder ? candidate->owner == holder
+            : candidate->owner == nullptr && candidate->tile == state.tile
+                && candidate->elevation == state.elevation;
+        if (!locationMatches) continue;
+        ItemDescriptor descriptor;
+        if (describeItem(candidate, descriptor)
+            && itemDescriptorsEqual(descriptor, state.itemDescriptor)) return candidate;
+        if (pidFallback == nullptr) pidFallback = candidate;
+    }
+    return pidFallback;
+}
+
+bool validateRequiredObjectFrame(std::int32_t fid, std::int32_t frame,
+    EntityId id, const char* section)
+{
+    CacheEntry* handle = nullptr;
+    Art* frames = art_ptr_lock(fid, &handle);
+    bool available = frames != nullptr && frame < art_frame_max_frame(frames);
+    if (frames != nullptr) art_ptr_unlock(handle);
+    if (!available) {
+        std::fprintf(stderr,
+            "Multiplayer snapshot object frame preflight failed: section=%s entity=%u fid=%d frame=%d.\n",
+            section, id.value, fid, frame);
+    }
+    return available;
+}
+
+bool validateSnapshotObjectFrames(const WorldSnapshot& snapshot)
+{
+    // Predict the native bodies selected by reconciliation without changing
+    // IDs, holders or resources. A null body means a new frame-zero object.
+    std::unordered_map<EntityId, Object*, EntityIdHash> nativeObjects;
+    for (const ActorSnapshot& state : snapshot.actors) {
+        nativeObjects.emplace(state.entityId, session.entities().findObject(state.entityId));
+    }
+    for (std::size_t index = 0; index < snapshot.doors.size(); ++index) {
+        Object* door = worldDoors[index].second;
+        const DoorSnapshot& state = snapshot.doors[index];
+        // The native door setter always loads its existing art, even when
+        // the requested frame is unchanged. IDs are rebased by this index.
+        if (door == nullptr || !obj_is_a_portal(door) || state.open != (state.frame != 0)
+            || !validateRequiredObjectFrame(door->fid, state.frame, state.entityId, "doors")) return false;
+        nativeObjects.emplace(state.entityId, door);
+    }
+    bool reconstructScenery = networkWorldReplicaSessionActive() && snapshotSceneryLayoutMismatch(snapshot);
+    std::unordered_set<Object*> usedScenery;
+    for (std::size_t index = 0; index < snapshot.scenery.size(); ++index) {
+        const ScenerySnapshot& state = snapshot.scenery[index];
+        Object* matched = reconstructScenery ? matchSnapshotScenery(state, worldScenery, usedScenery)
+            : worldScenery[index].second;
+        if (matched != nullptr) usedScenery.insert(matched);
+        int nativeFrame = matched != nullptr ? matched->frame : 0;
+        if (nativeFrame != state.frame
+            && !validateRequiredObjectFrame(state.fid, state.frame, state.entityId, "scenery")) return false;
+        nativeObjects.emplace(state.entityId, matched);
+    }
+    bool stableCritters = snapshot.critters.size() == worldCritters.size() && validateCritterState(snapshot);
+    std::vector<Object*> critterCandidates;
+    for (const auto& entry : worldCritters) critterCandidates.push_back(entry.second);
+    std::unordered_set<Object*> usedCritters;
+    for (const CritterSnapshot& state : snapshot.critters) {
+        Object* matched = stableCritters ? session.entities().findObject(state.entityId)
+            : matchSnapshotCritter(state, critterCandidates, usedCritters);
+        if (matched != nullptr) usedCritters.insert(matched);
+        nativeObjects.emplace(state.entityId, matched);
+    }
+    std::vector<Object*> itemCandidates;
+    for (const auto& entry : worldItems) if (entry.second != nullptr) itemCandidates.push_back(entry.second);
+    std::unordered_set<Object*> usedItems;
+    for (const ItemSnapshot* state : orderSnapshotItems(snapshot)) {
+        bool hasHolder = isValid(state->holderId);
+        auto holder = nativeObjects.find(state->holderId);
+        Object* holderBody = holder != nativeObjects.end() ? holder->second : nullptr;
+        Object* matched = matchSnapshotItem(*state, holderBody, hasHolder, itemCandidates, usedItems);
+        if (matched != nullptr) usedItems.insert(matched);
+        int nativeFrame = matched != nullptr ? matched->frame : 0;
+        if (nativeFrame != state->frame
+            && !validateRequiredObjectFrame(state->fid, state->frame, state->entityId, "items")) return false;
+        nativeObjects.emplace(state->entityId, matched);
+    }
+    return true;
+}
+
 void trackWorldItem(EntityId entityId, Object* item)
 {
     auto existing = std::find_if(worldItems.begin(), worldItems.end(), [&](const auto& entry) {
@@ -4602,6 +4738,119 @@ bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts)
     newCritter.objectFlags |= OBJECT_HIDDEN;
     frameZero.critters.push_back(newCritter);
     if (!critterControl(frameZero, "new_hidden_frame_zero")) return false;
+    for (int frameSection = 0; frameSection < 3; ++frameSection) {
+        WorldSnapshot invalidFrame = rejectionBaseline;
+        ++invalidFrame.actors.front().hitPoints;
+        invalidFrame.mapLocalVariables.push_back(123456);
+        const char* reason = nullptr;
+        if (frameSection == 0) {
+            invalidFrame.doors.back().frame = 0x7FFFFFFF;
+            invalidFrame.doors.back().open = true;
+            reason = "door_frame_before_local_resize";
+        } else if (frameSection == 1) {
+            invalidFrame.scenery.back().frame = 0x7FFFFFFF;
+            reason = "scenery_frame_before_local_resize";
+        } else {
+            invalidFrame.items.back().frame = 0x7FFFFFFF;
+            reason = "item_frame_before_local_resize";
+        }
+        if (!rejectsWithoutMutation(invalidFrame, reason)) return false;
+    }
+    std::uint32_t unusedObjectId = 1;
+    while (session.entities().contains(EntityId { unusedObjectId })) ++unusedObjectId;
+    WorldSnapshot reconstructedSceneryFrame = rejectionBaseline;
+    ++reconstructedSceneryFrame.actors.front().hitPoints;
+    ScenerySnapshot addedScenery = reconstructedSceneryFrame.scenery.front();
+    addedScenery.entityId = EntityId { unusedObjectId };
+    addedScenery.tile = tile_num_in_direction(addedScenery.tile, 0, 1);
+    if (!hexGridTileIsValid(addedScenery.tile)) return false;
+    addedScenery.frame = 0x7FFFFFFF;
+    reconstructedSceneryFrame.scenery.push_back(addedScenery);
+    if (!rejectsWithoutMutation(reconstructedSceneryFrame, "new_scenery_frame_out_of_bounds")) return false;
+    WorldSnapshot rebasedItemFrame = rejectionBaseline;
+    ++rebasedItemFrame.actors.front().hitPoints;
+    EntityId oldItemId = rebasedItemFrame.items.back().entityId;
+    rebasedItemFrame.items.back().entityId = EntityId { unusedObjectId };
+    rebasedItemFrame.items.back().frame = 0x7FFFFFFF;
+    for (ItemSnapshot& state : rebasedItemFrame.items) {
+        if (state.holderId == oldItemId) state.holderId = EntityId { unusedObjectId };
+    }
+    for (TimedEventSnapshot& state : rebasedItemFrame.timedEvents) {
+        if (state.ownerId == oldItemId) state.ownerId = EntityId { unusedObjectId };
+    }
+    if (!rejectsWithoutMutation(rebasedItemFrame, "rebased_item_frame_out_of_bounds")) return false;
+    auto objectPresentationControl = [&](const WorldSnapshot& control, const char* reason) {
+        std::vector<std::uint8_t> packet;
+        if (encodeSnapshot(control, packet) != SnapshotError::None) return false;
+        auto decoded = decodeSnapshot(packet);
+        if (!decoded) return false;
+        engineExecutionProbeBegin();
+        bool applied = networkWorldApplySnapshot(decoded.snapshot);
+        WorldSnapshot captured;
+        bool capturePassed = networkWorldCaptureSnapshot({}, captured);
+        auto expected = computeSnapshotDigest(control);
+        auto actual = computeSnapshotDigest(captured);
+        bool matched = applied && capturePassed && expected && actual
+            && expected.digest.overall == actual.digest.overall;
+        bool restored = networkWorldApplySnapshot(rejectionBaseline);
+        WorldSnapshot restoredCapture;
+        bool restoreCaptured = networkWorldCaptureSnapshot({}, restoredCapture);
+        auto restoredDigest = computeSnapshotDigest(restoredCapture);
+        EngineExecutionProbeCounts controlCounts = engineExecutionProbeEnd();
+        bool preserved = restored && restoreCaptured && restoredDigest
+            && rejectionDigest.digest.overall == restoredDigest.digest.overall
+            && controlCounts.scriptProcedures == 0 && controlCounts.combatAttacks == 0
+            && controlCounts.randomDraws == 0;
+        std::fprintf(stderr, "NATIVE_SNAPSHOT_OBJECT_FRAME_CONTROL reason=%s applied=%d restored=%d.\n",
+            reason, matched ? 1 : 0, preserved ? 1 : 0);
+        return matched && preserved;
+    };
+    WorldSnapshot validDoorFrame = rejectionBaseline;
+    Object* nativeDoor = worldDoors.back().second;
+    CacheEntry* doorHandle = nullptr;
+    Art* doorFrames = art_ptr_lock(nativeDoor->fid, &doorHandle);
+    if (doorFrames == nullptr) return false;
+    validDoorFrame.doors.back().frame = art_frame_max_frame(doorFrames) - 1;
+    art_ptr_unlock(doorHandle);
+    validDoorFrame.doors.back().open = validDoorFrame.doors.back().frame != 0;
+    if (!objectPresentationControl(validDoorFrame, "native_door_final_frame")) return false;
+    Object* hiddenScenery = session.entities().findObject(rejectionBaseline.scenery.back().entityId);
+    if (hiddenScenery == nullptr) return false;
+    obj_change_fid(hiddenScenery, (OBJ_TYPE_SCENERY << 24) | 0xFFF, nullptr);
+    hiddenScenery->flags |= OBJECT_HIDDEN;
+    WorldSnapshot unchangedScenery;
+    if (!networkWorldCaptureSnapshot({}, unchangedScenery)
+        || !objectPresentationControl(unchangedScenery, "unchanged_hidden_scenery_missing_art")) return false;
+    Object* hiddenItem = session.entities().findObject(rejectionBaseline.items.back().entityId);
+    if (hiddenItem == nullptr) return false;
+    obj_change_fid(hiddenItem, 0xFFF, nullptr);
+    hiddenItem->flags |= OBJECT_HIDDEN;
+    WorldSnapshot unchangedItem;
+    if (!networkWorldCaptureSnapshot({}, unchangedItem)
+        || !objectPresentationControl(unchangedItem, "unchanged_hidden_item_missing_art")) return false;
+    WorldSnapshot newSceneryZero = rejectionBaseline;
+    addedScenery.frame = 0;
+    addedScenery.fid = (OBJ_TYPE_SCENERY << 24) | 0xFFF;
+    addedScenery.objectFlags |= OBJECT_HIDDEN;
+    newSceneryZero.scenery.push_back(addedScenery);
+    if (!objectPresentationControl(newSceneryZero, "new_hidden_scenery_frame_zero")) return false;
+    WorldSnapshot newItemZero = rejectionBaseline;
+    ItemSnapshot addedItem = newItemZero.items.front();
+    addedItem.entityId = EntityId { unusedObjectId };
+    addedItem.holderId = {};
+    addedItem.quantity = 1;
+    addedItem.tile = tile_num_in_direction(rejectionBaseline.actors.front().tile, 0, 1);
+    addedItem.elevation = rejectionBaseline.actors.front().elevation;
+    if (!hexGridTileIsValid(addedItem.tile)) return false;
+    addedItem.frame = 0;
+    addedItem.fid = 0xFFF;
+    addedItem.objectFlags |= OBJECT_HIDDEN;
+    newItemZero.items.push_back(addedItem);
+    WorldSnapshot invalidNewItemFrame = newItemZero;
+    invalidNewItemFrame.items.back().frame = 0x7FFFFFFF;
+    ++invalidNewItemFrame.actors.front().hitPoints;
+    if (!rejectsWithoutMutation(invalidNewItemFrame, "new_item_frame_out_of_bounds")) return false;
+    if (!objectPresentationControl(newItemZero, "new_hidden_item_frame_zero")) return false;
     std::fprintf(stderr, "NATIVE_SNAPSHOT_REJECTION_PREFLIGHT_PASS\n");
 
     engineExecutionProbeBegin();
@@ -7797,6 +8046,10 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
         && !validateSnapshotCritterFrames(snapshot)) {
         return false;
     }
+    if (session.isActive() && snapshotError == SnapshotError::None
+        && !validateSnapshotObjectFrames(snapshot)) {
+        return false;
+    }
     if (session.isActive()
         && snapshotError == SnapshotError::None
         && networkWorldReplicaSessionActive()
@@ -7807,7 +8060,7 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
     if (!session.isActive()
         || snapshotError != SnapshotError::None
         || snapshot.doors.size() != worldDoors.size()
-        || snapshot.scenery.size() != worldScenery.size()
+        || (!networkWorldReplicaSessionActive() && snapshot.scenery.size() != worldScenery.size())
         || !variablesValid) {
         std::fprintf(stderr,
             "Multiplayer snapshot preflight failed: active=%d error=%d doors=%zu/%zu scenery=%zu/%zu variables=%d globals=%zu/%d map_globals=%zu/%d map_locals=%zu/%d.\n",
@@ -7822,6 +8075,49 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
             snapshot.mapGlobalVariables.size(), num_map_global_vars,
             snapshot.mapLocalVariables.size(), num_map_local_vars);
         return false;
+    }
+
+    bool sceneryLayoutMismatch = snapshotSceneryLayoutMismatch(snapshot);
+    if (networkWorldReplicaSessionActive() && sceneryLayoutMismatch) {
+        // Saved terrain and map-enter scripts can have a different scenery
+        // population from the installed MAP. Replicas reconstruct descriptors
+        // instead of running the authority's spawning/removal scripts.
+        auto localScenery = worldScenery;
+        std::vector<std::pair<EntityId, Object*>> reconstructed;
+        std::unordered_set<Object*> retained;
+        std::vector<Object*> created;
+        auto discardCreated = [&created]() {
+            for (Object* object : created) {
+                auto id = session.entities().findEntity(object);
+                if (id.has_value()) session.entities().unregisterEntity(*id);
+                obj_erase_object(object, nullptr);
+            }
+            return false;
+        };
+        reconstructed.reserve(snapshot.scenery.size());
+        for (const ScenerySnapshot& state : snapshot.scenery) {
+            Object* matched = matchSnapshotScenery(state, localScenery, retained);
+            if (matched == nullptr) {
+                if (obj_pid_new(&matched, state.pid) == -1 || matched == nullptr) return discardCreated();
+                created.push_back(matched);
+                matched->flags |= OBJECT_NO_SAVE;
+                if (obj_move_to_tile(matched, state.tile, state.elevation, nullptr) == -1
+                    || !session.registerWorldObject(matched)) {
+                    return discardCreated();
+                }
+            }
+            auto entityId = session.entities().findEntity(matched);
+            if (!entityId.has_value()) return discardCreated();
+            retained.insert(matched);
+            reconstructed.emplace_back(*entityId, matched);
+        }
+        for (const auto& entry : localScenery) {
+            if (retained.count(entry.second) == 0) {
+                session.entities().unregisterEntity(entry.first);
+                obj_erase_object(entry.second, nullptr);
+            }
+        }
+        worldScenery = std::move(reconstructed);
     }
 
     bool staticRegistryMismatch = false;
@@ -7993,8 +8289,10 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
             return false;
         }
     }
+    std::vector<const ItemSnapshot*> orderedItems = orderSnapshotItems(snapshot);
     std::unordered_set<Object*> reboundItems;
-    for (const ItemSnapshot& itemState : snapshot.items) {
+    for (const ItemSnapshot* orderedItem : orderedItems) {
+        const ItemSnapshot& itemState = *orderedItem;
         Object* desiredHolder = isValid(itemState.holderId)
             ? session.entities().findObject(itemState.holderId)
             : nullptr;
@@ -8004,35 +8302,7 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
             return false;
         }
 
-        Object* matched = nullptr;
-        Object* pidFallback = nullptr;
-        for (Object* candidate : localItems) {
-            if (candidate == nullptr
-                || reboundItems.find(candidate) != reboundItems.end()
-                || candidate->pid != itemState.itemDescriptor.pid) {
-                continue;
-            }
-            bool locationMatches = desiredHolder != nullptr
-                ? candidate->owner == desiredHolder
-                : candidate->owner == nullptr
-                    && candidate->tile == itemState.tile
-                    && candidate->elevation == itemState.elevation;
-            if (!locationMatches) {
-                continue;
-            }
-            ItemDescriptor descriptor;
-            if (describeItem(candidate, descriptor)
-                && itemDescriptorsEqual(descriptor, itemState.itemDescriptor)) {
-                matched = candidate;
-                break;
-            }
-            if (pidFallback == nullptr) {
-                pidFallback = candidate;
-            }
-        }
-        if (matched == nullptr) {
-            matched = pidFallback;
-        }
+        Object* matched = matchSnapshotItem(itemState, desiredHolder, isValid(itemState.holderId), localItems, reboundItems);
         bool created = false;
         if (matched == nullptr) {
             matched = createItem(itemState.itemDescriptor);
@@ -8179,7 +8449,8 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
             return false;
         }
     }
-    for (const ItemSnapshot& itemState : snapshot.items) {
+    for (const ItemSnapshot* orderedItem : orderedItems) {
+        const ItemSnapshot& itemState = *orderedItem;
         Object* item = session.entities().findObject(itemState.entityId);
         if (!applyItemDescriptor(item, itemState.itemDescriptor)) {
             std::fprintf(stderr,
