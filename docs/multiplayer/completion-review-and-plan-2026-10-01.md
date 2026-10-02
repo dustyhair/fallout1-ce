@@ -66,7 +66,21 @@ The next five goals (current work):
 - [x] 2. Shared story movies and actual ending presentation. Both clients render the destruction movies, identical host-selected settlement slides, departure and credits. Independent skipping, reconnect after playback, missing movie assets and unfocused guest playback pass. This validates presentation, not completion of the underlying quests.
 - [x] 3. Real recruited Ian lifecycle: recruitment, dismissal, gear, native retaliation, battle, death, travel and fresh-session recovery pass. Other companions and quest-specific loyalty remain content acceptance in goal 5.
 - [x] 4. Independent active hand. Save format 8 retains each actor's hand, versions 1–7 default to left, snapshot/wire formats reject invalid values, rejected requests leave the HUD unchanged. The 50-scenario interim run includes native disk/reconnect recovery with host left and guest right.
-- [ ] 5. Complete content acceptance and final release gates on the final code. Builds 45, 51, 62, 64, 66 and 72 each passed all 50 scenarios. The subsequent capacity-stop and backup changes need final-code release checks; ordinary full-story acceptance remains open.
+- [ ] 5. Complete content acceptance and final release gates on the final code. Builds 45, 51, 62, 64, 66 and 72 each passed all 50 scenarios. Build 79's complete run is underway; ordinary full-story acceptance remains open.
+
+Goal 5 acceptance slices:
+
+- [x] Ordinary Shady Sands cave completion: all nine scorpions killed, bodies looted, native 500 XP and Seth completion dialogue, real Ian recruited and saved.
+- [x] Ordinary shared-rest HUD refresh: both actual HAL/testbox HP labels match native state after healing.
+- [x] Definitive checkpoint capacity: commands/native rules freeze, saving refuses before mutation, prior save hashes remain unchanged, ordinary Busy retries continue.
+- [x] Native shutdown and recovery: exact-slot script deletion, unique human script IDs, checkpoint-ACK transport disconnect remains reconnectable; focused build 78 exits cleanly.
+- [x] Companion duplicate cleanup: distinct/shared SID cases, nested timers, native first-tile iterator, travel/save/authenticated recovery, active guest execution counters and ASAN negative/positive proof on build 79.
+- [x] Failed native rollback retry: blocked map destination retains all backups; removing the obstruction allows complete restoration with unchanged multiplayer metadata.
+- [ ] Already-open guest Pip-Boy alarm HP/time refresh: code built in candidate 80; visible acceptance pending.
+- [ ] Latest complete 50-scenario compatibility campaign and emitted digest comparisons.
+- [ ] Ordinary Junktown and subsequent story, other companions, quest loyalty and alternative routes.
+- [ ] Checkpoint application rejection leaves native state unchanged across every fallible construction step.
+- [ ] Full interrupted-save/sidecar publication acceptance and platform/long-session release checks.
 
 Evidence for this batch: `/var/tmp/fallout-five-goals-interim22-campaign/summary.tsv`, `/var/tmp/fallout-five-goals-dialogue-script-host22-20261001.log`, `/var/tmp/fallout-five-goals-barter-guest22-20261001.log`, `/var/tmp/fallout-five-goals-quantity-death23-20261001.log`, `/var/tmp/fallout-five-goals-simultaneous-death-20261001.log`, and `/var/tmp/fallout-five-goals-reconnect-death-20261001.log`. The script-death fixture invokes `action_dmg`, the native action called by `op_critter_damage`; it is not a claim that every installed lethal script has been played.
 
@@ -923,3 +937,61 @@ independent digest witnesses. Evidence is in
 `/var/tmp/fallout-five-goals-regression72-campaign/summary.tsv` and `digests.tsv`.
 This verifies build 72. Later capacity-stop and backup changes still need their
 own focused acceptance and final-source release checks.
+
+Commit `644c4a0` refreshes the host HUD after accepted shared rest. Ordinary
+role-93 testing confirms native HP 37 to 49, poison 10 to zero, and actual HUD
+49 after the cave fight. Natalia remains at 36 and Ian heals from 46 to 50.
+The party killed all nine cave scorpions, received the native 500 XP reward and
+Seth's completed-quest dialogue, then saved SLOT09, `Nine scorpions cleared healed`.
+Ian's native AI finished the three remaining scorpions after player attacks.
+Exact journal chronology corrected an earlier attacker attribution; this does
+not claim the guest fired when her turn had not begun.
+
+Commit `b96cf03` makes native queue traversal safe when a callback removes other
+events, including a retained earlier node. AddressSanitizer reproduces the old
+use-after-free on the committed baseline. All four native regression cases pass:
+next-node removal, prior-node removal, rescheduling and retained equal-time order.
+New node identities stay in memory and do not change native save or wire formats.
+Both enabled and disabled native queue probes pass; isolated build and CTest
+pass 3/3.
+
+Commit `abe01f0` stops commands, native simulation and saving after a definitive
+checkpoint-capacity failure, while busy animations still retry. Native build-75
+acceptance proves poison timers work before the failure, pending animation and
+script/combat/random execution freeze afterward, shared rest stops, and the last
+four saved files remain byte-identical. Leaving the stopped session permits
+native load and timer progression again. The guest disconnects normally after an
+explicit native-ready witness. The isolated production commit builds, passes
+CTest 3/3 and native disk/authenticated recovery with both processes exiting zero.
+
+Native shutdown fixes are accepted and committed. Commit `a06ad57` removes the
+exact selected script slot rather than resolving its potentially duplicated SID;
+`d8886bc` retains newly allocated human script identities during party recovery.
+Read-only build-78 native recovery observes 37 unique script slots after disk load,
+including owned player SID `0x0400000F`, and both peers exit zero. Commit `9e2d498`
+preserves a transport-disconnected guest after an Applied ACK failure, with six
+negative core assertions reproduced before the fix. Commit `1a33d20` blocks pending
+combat-script requests while simulation is stopped; native ASAN proof still lets
+an ordinary elevator request reach its selector.
+
+Commit `b101957` preserves the genuine companion script while removing duplicate
+objects, visits each native object pointer once and removes all owner timers before
+freeing objects, including nested inventory. Canonical build 79 passes actual Ian
+recruit/dismiss/recruit, two orphan SID cases, Junktown/Shady travel, disk load and
+authenticated reconnect with matching digest `11010798490602263099` and clean exits.
+Active guest rules remain zero in both sessions. Private negatives reproduce
+orphan-script retention, dangling nested timers and iterator use-after-free;
+the fixed equally instrumented ASAN build passes. Native setup mistakes and the
+inactive native baseline load are excluded from multiplayer authority claims.
+
+Commit `09f2d0c` makes failed native rollback retryable. A nonempty map destination
+makes the old native restore consume backups and prevents a second restore. The
+fixed path retains every backup; removing the obstruction restores SAVE.DAT,
+map, automap and unchanged multiplayer metadata. Isolated build/CTest pass 3/3.
+This closes this rollback slice, not the complete interrupted-save release gate.
+
+Candidate 80 builds with multiplayer enabled and disabled and passes CTest 3/3
+and 2/2. Exact-slot cleanup and stopped-combat native ASAN probes pass. A visible
+Pip-Boy alarm refresh correction awaits matched deployment and real healing
+acceptance. The build-78 campaign used only the default 18 scenarios, all passed;
+it is not counted as a full run. The complete 50-scenario build-79 run is underway.
