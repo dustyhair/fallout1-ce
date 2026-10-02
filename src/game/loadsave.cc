@@ -169,7 +169,8 @@ static int SaveObjDudeCid(DB_FILE* stream);
 static int EraseSave();
 static bool SaveMultiplayerSidecar();
 static bool RecoverMultiplayerSidecarBackup();
-static void LoadMultiplayerSidecar();
+static bool LoadMultiplayerSidecar();
+static bool ValidateNetworkSaveSidecar();
 static void SaveDirectoryPath(char* path, bool relative, bool trailingSeparator);
 
 // 0x46D930
@@ -366,6 +367,11 @@ int SaveGame(int mode)
 {
     if (!multiplayer::networkRuntimeSaveAllowed()) {
         char message[] = "Multiplayer stopped. Return to the main menu and load the last successful save.";
+        display_print(message);
+        return 0;
+    }
+    if (multiplayer::networkWorldActive() && multiplayer::networkWorldStory().active) {
+        char message[] = "Finish the shared movie or ending before saving.";
         display_print(message);
         return 0;
     }
@@ -877,6 +883,15 @@ static int QuickSnapShot()
 // 0x46E754
 int LoadGame(int mode)
 {
+    if (multiplayer::networkWorldActive()
+        || multiplayer::networkRuntimeMode() == multiplayer::NetworkLaunchMode::Join) {
+        const char* message = multiplayer::networkWorldActive()
+            ? "End the multiplayer session before loading a saved game."
+            : "The host loads multiplayer saves. Join through Multiplayer.";
+        dialog_out(message, nullptr, 0, 100, 120, colorTable[32328], nullptr,
+            colorTable[32328], DIALOG_BOX_LARGE);
+        return 0;
+    }
     MessageListItem messageListItem;
 
     const char* body[] = {
@@ -1697,6 +1712,11 @@ int isLoadingGame()
 static int LoadSlot(int slot)
 {
     if (!RecoverPendingSaveRollback()) return -1;
+    if (multiplayer::networkRuntimeMode() == multiplayer::NetworkLaunchMode::Host
+        && !ValidateNetworkSaveSidecar()) {
+        debug_printf("LOADSAVE: Multiplayer save metadata is missing, corrupt or does not match SAVE.DAT.\n");
+        return -1;
+    }
     gmouse_set_cursor(MOUSE_CURSOR_WAIT_PLANET);
 
     if (isInCombat()) {
@@ -1750,7 +1770,11 @@ static int LoadSlot(int slot)
     debug_printf("LOADSAVE: Total load data read: %ld bytes.\n", db_ftell(flptr));
     db_fclose(flptr);
 
-    LoadMultiplayerSidecar();
+    if (!LoadMultiplayerSidecar()) {
+        game_reset();
+        loadingGame = 0;
+        return -1;
+    }
 
     snprintf(str, sizeof(str), "%s\\", "MAPS");
     MapDirErase(str, "BAK");
@@ -3268,15 +3292,28 @@ static bool SaveMultiplayerSidecar()
     return PublishMultiplayerSidecar(bytes);
 }
 
-static void LoadMultiplayerSidecar()
+static bool ValidateNetworkSaveSidecar()
+{
+    char relativePath[COMPAT_MAX_PATH];
+    MultiplayerSidecarPath(relativePath, "MULTI.DAT", true);
+    std::vector<std::uint8_t> bytes;
+    if (!ReadSaveFile(relativePath, multiplayer::kMultiplayerSaveMaximumSize, bytes)) return false;
+    auto decoded = multiplayer::decodeMultiplayerSave(bytes);
+    std::uint64_t digest = 0;
+    if (!decoded || !DigestSaveDat(digest) || decoded.sidecar.saveDatDigest != digest) return false;
+    for (const auto& player : decoded.sidecar.players) {
+        if (player.playerId == multiplayer::kGuestPlayerId) return !player.objectData.empty();
+    }
+    return false;
+}
+
+static bool LoadMultiplayerSidecar()
 {
     bool developerSession = multiplayer::developerLocalSessionIsEnabled();
-    bool networkSession = recovery_slot_active
-        && multiplayer::networkRuntimeMode()
-            == multiplayer::NetworkLaunchMode::Host
-        && multiplayer::networkRuntimeConnected();
+    bool networkSession = multiplayer::networkRuntimeMode()
+        == multiplayer::NetworkLaunchMode::Host;
     if (!developerSession && !networkSession) {
-        return;
+        return true;
     }
 
     char relativePath[COMPAT_MAX_PATH];
@@ -3287,7 +3324,7 @@ static void LoadMultiplayerSidecar()
         if (developerSession) {
             multiplayer::developerLocalSessionRejectLoadedSave();
         }
-        return;
+        return !networkSession;
     }
 
     multiplayer::MultiplayerSaveDecodeResult decoded = multiplayer::decodeMultiplayerSave(bytes);
@@ -3328,15 +3365,16 @@ static void LoadMultiplayerSidecar()
             loadedGuest->flags &= ~OBJECT_NO_REMOVE;
             obj_erase_object(loadedGuest, nullptr);
         }
-        debug_printf("LOADSAVE: Multiplayer sidecar is corrupt or does not match SAVE.DAT; loading without multiplayer.\n");
+        debug_printf("LOADSAVE: Multiplayer sidecar is corrupt or does not match SAVE.DAT.\n");
         if (developerSession) {
             multiplayer::developerLocalSessionRejectLoadedSave();
         }
-        return;
+        return !networkSession;
     }
 
     debug_printf("LOADSAVE: Multiplayer sidecar generation %llu staged.\n",
         static_cast<unsigned long long>(decoded.sidecar.generation));
+    return true;
 }
 
 bool MultiplayerRecoverySaveExists()
@@ -3364,10 +3402,11 @@ bool MultiplayerRecoverySaveExists()
     return present;
 }
 
-bool SaveMultiplayerRecoveryGame()
+static bool SaveMultiplayerGameToDirectory(bool recovery, int slot)
 {
     if (!multiplayer::networkRuntimeSaveAllowed()
-        || !multiplayer::networkRuntimeHostWorldActive()) {
+        || !multiplayer::networkRuntimeHostWorldActive() || slot < 0 || slot >= 10
+        || multiplayer::networkWorldStory().active) {
         return false;
     }
     if (!config_get_string(&game_config, GAME_CONFIG_SYSTEM_KEY,
@@ -3380,14 +3419,14 @@ bool SaveMultiplayerRecoveryGame()
     }
 
     int priorSlot = slot_cursor;
-    LoadSaveSlotData priorData = LSData[9];
+    LoadSaveSlotData priorData = LSData[slot];
     bool priorRecovery = recovery_slot_active;
     bool priorSuppress = suppress_save_confirmation;
-    recovery_slot_active = true;
+    recovery_slot_active = recovery;
     suppress_save_confirmation = true;
-    slot_cursor = 9;
+    slot_cursor = slot;
     memset(&LSData[slot_cursor], 0, sizeof(LSData[slot_cursor]));
-    strncpy(LSData[slot_cursor].description, "MULTIPLAYER RECOVERY", 29);
+    strncpy(LSData[slot_cursor].description, recovery ? "MULTIPLAYER RECOVERY" : "MULTIPLAYER SAVE", 29);
 
     thumbnail_image[1] = nullptr;
     int snapshotResult = QuickSnapShot();
@@ -3398,7 +3437,7 @@ bool SaveMultiplayerRecoveryGame()
         thumbnail_image[1] = nullptr;
     }
 
-    LSData[9] = priorData;
+    LSData[slot] = priorData;
     slot_cursor = priorSlot;
     suppress_save_confirmation = priorSuppress;
     recovery_slot_active = priorRecovery;
@@ -3409,19 +3448,32 @@ bool SaveMultiplayerRecoveryGame()
     return saved;
 }
 
-bool LoadMultiplayerRecoveryGame()
+bool SaveMultiplayerRecoveryGame()
 {
-    if (!MultiplayerRecoverySaveExists()) {
+    return SaveMultiplayerGameToDirectory(true, 9);
+}
+
+bool SaveMultiplayerGameSlot(int slot)
+{
+    return SaveMultiplayerGameToDirectory(false, slot);
+}
+
+static bool LoadMultiplayerGameFromDirectory(bool recovery, int slot)
+{
+    if (slot < 0 || slot >= 10 || multiplayer::networkWorldActive()
+        || multiplayer::networkRuntimeMode() != multiplayer::NetworkLaunchMode::Host) {
         return false;
     }
+    if (!config_get_string(&game_config, GAME_CONFIG_SYSTEM_KEY,
+            GAME_CONFIG_MASTER_PATCHES_KEY, &patches)) patches = emgpath;
 
     int priorSlot = slot_cursor;
-    LoadSaveSlotData priorData = LSData[9];
+    LoadSaveSlotData priorData = LSData[slot];
     bool priorRecovery = recovery_slot_active;
     bool priorSuppress = suppress_load_confirmation;
-    recovery_slot_active = true;
+    recovery_slot_active = recovery;
     suppress_load_confirmation = true;
-    slot_cursor = 9;
+    slot_cursor = slot;
 
     SaveDirectoryPath(gmpath, true, true);
     strcat(gmpath, "SAVE.DAT");
@@ -3435,11 +3487,21 @@ bool LoadMultiplayerRecoveryGame()
         loaded = LoadSlot(slot_cursor) == 0;
     }
 
-    LSData[9] = priorData;
+    LSData[slot] = priorData;
     slot_cursor = priorSlot;
     suppress_load_confirmation = priorSuppress;
     recovery_slot_active = priorRecovery;
     return loaded;
+}
+
+bool LoadMultiplayerRecoveryGame()
+{
+    return MultiplayerRecoverySaveExists() && LoadMultiplayerGameFromDirectory(true, 9);
+}
+
+bool LoadMultiplayerGameSlot(int slot)
+{
+    return LoadMultiplayerGameFromDirectory(false, slot);
 }
 
 } // namespace fallout

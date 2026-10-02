@@ -374,22 +374,26 @@ static void op_has_skill(Program* program)
     programStackPushInteger(program, result);
 }
 
+bool intExtraUsingSkill(Object* object, int skill)
+{
+    if (skill != SKILL_SNEAK || object == nullptr) return false;
+    if (multiplayer::playerStateForActor(object) != nullptr) {
+        multiplayer::ScopedActorPlayerContext context(object);
+        return is_pc_flag(PC_FLAG_SNEAKING);
+    }
+    // An unregistered NPC must not inherit the acting player's flags.
+    if (object != obj_dude) return false;
+    Proto* proto = nullptr;
+    return proto_ptr(object->pid, &proto) == 0
+        && (proto->critter.data.flags & (1 << PC_FLAG_SNEAKING)) != 0;
+}
+
 // 0x44BB50
 static void op_using_skill(Program* program)
 {
     int skill = programStackPopInteger(program);
     Object* object = static_cast<Object*>(programStackPopPointer(program));
-
-    // NOTE: In the original source code this value is left uninitialized, that
-    // explains why garbage is returned when using something else than dude and
-    // SKILL_SNEAK as arguments.
-    int result = 0;
-
-    if (skill == SKILL_SNEAK && object == obj_dude) {
-        result = is_pc_flag(PC_FLAG_SNEAKING);
-    }
-
-    programStackPushInteger(program, result);
+    programStackPushInteger(program, intExtraUsingSkill(object, skill));
 }
 
 // 0x44BBE4
@@ -3056,6 +3060,11 @@ static void op_play_gmovie(Program* program)
     program->flags |= PROGRAM_FLAG_0x20;
 
     int movie = programStackPopInteger(program);
+
+    if (movie < 0 || movie >= MOVIE_COUNT) {
+        program->flags &= ~PROGRAM_FLAG_0x20;
+        return;
+    }
 
     // CE: Disable map updates. Needed to stop animation of objects (dude in
     // particular) when playing movies (the problem can be seen as visual

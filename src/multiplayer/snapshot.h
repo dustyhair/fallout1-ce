@@ -17,7 +17,7 @@ namespace fallout {
 namespace multiplayer {
 
 constexpr std::uint32_t kSnapshotMagic = 0x46434D53;
-constexpr std::uint16_t kSnapshotVersion = 19;
+constexpr std::uint16_t kSnapshotVersion = 26;
 constexpr std::size_t kSnapshotHeaderSize = 28;
 constexpr std::size_t kMaxSnapshotPayloadSize = 512 * 1024;
 constexpr std::size_t kMaxSnapshotActors = 16;
@@ -49,6 +49,8 @@ struct ActorSnapshot {
     std::int32_t team = 0;
     EntityId whoHitMeId;
     CharacterBuild build;
+    std::int32_t poison = 0;
+    std::int32_t radiation = 0;
 };
 
 struct DoorSnapshot {
@@ -93,6 +95,7 @@ struct CritterSnapshot {
     std::int32_t combatManeuver = 0;
     std::int32_t damageLastTurn = 0;
     EntityId whoHitMeId;
+    bool partyMember = false;
 };
 
 struct ItemSnapshot {
@@ -132,6 +135,19 @@ struct WorldMapTravelSnapshot {
     WorldMapTravelProgress progress;
 };
 
+enum class StoryPresentationKind : std::uint32_t { Movie, Slides, Finale };
+
+struct StoryPresentationState {
+    std::uint64_t revision = 0;
+    bool active = false;
+    StoryPresentationKind kind = StoryPresentationKind::Movie;
+    std::int32_t movie = 0;
+    std::uint32_t flags = 0;
+    // Narration IDs selected by authority; replicas never select outcomes.
+    std::vector<std::int32_t> slides;
+    std::vector<PlayerId> completed;
+};
+
 struct WorldSnapshot {
     std::uint16_t version = kSnapshotVersion;
     EventSequence lastIncludedEvent;
@@ -157,6 +173,7 @@ struct WorldSnapshot {
     std::vector<DialogueBallot> dialogueBallots;
     std::vector<SharedActivityEntry> sharedActivity;
     std::optional<DirectTradeState> directTrade;
+    StoryPresentationState story;
 };
 
 enum class SnapshotError {

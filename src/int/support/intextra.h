@@ -17,6 +17,7 @@ typedef enum ScriptError {
 void dbg_error(Program* program, const char* name, int error);
 int correctDeath(Object* critter, int anim, bool a3);
 void intExtraClose();
+bool intExtraUsingSkill(Object* object, int skill);
 void initIntExtra();
 void updateIntExtra();
 void intExtraRemoveProgramReferences(Program* program);

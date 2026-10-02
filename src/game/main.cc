@@ -214,7 +214,10 @@ int gnw_main(int argc, char** argv)
                     int loadGameRc = LoadGame(LOAD_SAVE_MODE_FROM_MAIN_MENU);
                     if (loadGameRc == -1) {
                         debug_printf("\n ** Error running LoadGame()! **\n");
-                    } else if (loadGameRc != 0) {
+                    } else if (loadGameRc != 0
+                        && multiplayer::networkRuntimePrepareLoadedSaveLobby()
+                        && multiplayer::networkRuntimeWaitForLobby()
+                        && multiplayer::networkRuntimeEnterWorld()) {
                         win_delete(win);
                         win = -1;
                         main_game_loop();
@@ -417,7 +420,13 @@ static void main_unload_new()
         && multiplayer::networkWorldPhase()
             == multiplayer::SessionPhase::Ending;
     if (hostSessionEnding) {
-        SaveMultiplayerRecoveryGame();
+        // A terminal injury or completed finale must not replace the last
+        // recoverable point with a run that has already ended.
+        const auto& story = multiplayer::networkWorldStory();
+        bool completedFinale = story.revision != 0 && story.kind == multiplayer::StoryPresentationKind::Finale;
+        if (!multiplayer::networkWorldPartyDefeated() && !completedFinale) {
+            SaveMultiplayerRecoveryGame();
+        }
         multiplayer::networkRuntimeEndHostSession();
     }
     multiplayer::networkRuntimeLeaveWorld();
@@ -447,7 +456,20 @@ static void main_game_loop()
         multiplayer::developerLocalSessionEnsureStarted();
 
         int keyCode = get_input();
+        // Background networking can end a nested screen. Do not process a
+        // queued action, dialogue, or map entry after that terminal outcome.
+        if (game_user_wants_to_quit != 0) {
+            bool sharedDefeat = multiplayer::networkWorldActive()
+                && multiplayer::networkWorldPartyDefeated()
+                && (multiplayer::networkRuntimeHostWorldActive()
+                    || multiplayer::networkWorldPhase() == multiplayer::SessionPhase::Ending);
+            bool soloDefeat = !multiplayer::networkWorldActive()
+                && (obj_dude->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) != 0;
+            if (sharedDefeat || soloDefeat) main_show_death_scene = 1;
+            break;
+        }
         multiplayer::networkRuntimeProcessPendingTalk();
+        multiplayer::networkWorldProcessDialogueMapTransition();
         gdialog_multiplayer_guest_process();
         if (multiplayer::networkWorldWorldMapTravelApproved()) {
             worldmap_multiplayer_open();
@@ -469,11 +491,18 @@ static void main_game_loop()
             main_game_paused = 0;
         }
 
-        if ((obj_dude->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) != 0) {
+        bool multiplayerActive = multiplayer::networkWorldActive();
+        bool playerDefeated = multiplayerActive
+            ? multiplayer::networkRuntimeHostWorldActive() && multiplayer::networkWorldPartyDefeated()
+            : (obj_dude->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) != 0;
+        if (playerDefeated) {
             main_show_death_scene = 1;
             game_user_wants_to_quit = 2;
         }
         if (multiplayer::networkWorldPhase() == multiplayer::SessionPhase::Ending) {
+            if (multiplayerActive && multiplayer::networkWorldPartyDefeated()) {
+                main_show_death_scene = 1;
+            }
             game_user_wants_to_quit = 2;
         }
 

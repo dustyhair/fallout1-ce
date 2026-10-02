@@ -1,4 +1,7 @@
 #include "game/editor.h"
+#include "multiplayer/character_advancement.h"
+#include "multiplayer/network_runtime.h"
+#include "multiplayer/network_world.h"
 
 #include <assert.h>
 #include <ctype.h>
@@ -8,6 +11,7 @@
 #include "game/art.h"
 #include "game/bmpdlog.h"
 #include "game/critter.h"
+#include "game/display.h"
 #include "game/cycle.h"
 #include "game/game.h"
 #include "game/gmouse.h"
@@ -630,11 +634,12 @@ static unsigned char first_skill_list;
 
 static multiplayer::CharacterBuild localPlayerBuildBack;
 static bool hasLocalPlayerBuildBack;
+static bool networkEditorDraft = false;
+static bool networkEditorReadOnly = false;
 
 // 0x42C40C
-int editor_design(bool isCreationMode)
+static int editor_design_inner(bool isCreationMode)
 {
-    multiplayer::ScopedLocalPlayerContext localPlayerContext;
 
     char* messageListItemText;
     char line1[128];
@@ -644,14 +649,21 @@ int editor_design(bool isCreationMode)
     glblmode = isCreationMode;
 
     SavePlayer();
+    bool localMouseWasEnabled = multiplayer::networkWorldActive() && gmouse_is_enabled();
+    bool localScrollingWasEnabled = gmouse_scrolling_is_enabled();
+    if (localMouseWasEnabled) gmouse_disable(0);
 
     if (CharEditStart() == -1) {
+        if (localMouseWasEnabled) {
+            gmouse_enable();
+            if (!localScrollingWasEnabled) gmouse_disable_scrolling();
+        }
         debug_printf("\n ** Error loading character editor data! **\n");
         return -1;
     }
 
     if (!glblmode) {
-        if (UpdateLevel()) {
+        if (!networkEditorReadOnly && UpdateLevel()) {
             stat_recalc_derived(editor_player());
             ListTraits();
             ListSkills(0);
@@ -781,6 +793,10 @@ int editor_design(bool isCreationMode)
     }
 
     CharEditEnd();
+    if (localMouseWasEnabled) {
+        gmouse_enable();
+        if (!localScrollingWasEnabled) gmouse_disable_scrolling();
+    }
 
     if (rc == 1) {
         RestorePlayer();
@@ -793,6 +809,57 @@ int editor_design(bool isCreationMode)
     intface_update_hit_points(false);
 
     return rc;
+}
+
+int editor_design(bool isCreationMode)
+{
+    multiplayer::ScopedLocalPlayerContext localPlayerContext;
+    auto* player = multiplayer::actingPlayerState();
+    if (isCreationMode || player == nullptr || !multiplayer::networkWorldActive()) {
+        return editor_design_inner(isCreationMode);
+    }
+    bool canAdvance = multiplayer::networkWorldPhase() == multiplayer::SessionPhase::Exploration;
+    if (canAdvance && !multiplayer::networkRuntimeIsGuestReplica()) {
+        multiplayer::grantCharacterLevels(player->build, stat_get_base(editor_player(), STAT_INTELLIGENCE));
+    }
+    multiplayer::CharacterBuild original = player->build;
+    multiplayer::PlayerCharacterState draft = *player;
+    int rc;
+    {
+        multiplayer::ScopedActingPlayerContext context(draft, editor_player());
+        networkEditorDraft = true;
+        networkEditorReadOnly = !canAdvance;
+        rc = editor_design_inner(false);
+        networkEditorDraft = false;
+        networkEditorReadOnly = false;
+    }
+    if (rc != 0 || !canAdvance) return rc;
+    multiplayer::CharacterAdvanceCommand command;
+    command.expectedBuild = multiplayer::characterAdvancementFingerprint(original);
+    for (int skill = 0; skill < SKILL_COUNT; ++skill) {
+        command.skillIncrements[skill] = draft.build.skillPoints[skill] - original.skillPoints[skill];
+    }
+    for (int perk = 0; perk < PERK_COUNT; ++perk) {
+        if (draft.build.perkRanks[perk] > original.perkRanks[perk]) command.perk = perk;
+    }
+    if (command.perk == PERK_TAG) command.taggedSkill = draft.build.taggedSkills[3];
+    if (command.perk == PERK_MUTATE) {
+        for (int trait : original.traits) {
+            if (trait >= 0 && std::find(draft.build.traits.begin(), draft.build.traits.end(), trait) == draft.build.traits.end()) {
+                command.removedTrait = trait;
+            }
+        }
+        for (int trait : draft.build.traits) {
+            if (trait >= 0 && std::find(original.traits.begin(), original.traits.end(), trait) == original.traits.end()) {
+                command.addedTrait = trait;
+            }
+        }
+    }
+    if (command.perk == PERK_MUTATE && command.addedTrait == -1 && original.traits[0] != -1) {
+        // Native Mutate permits choosing the trait that was just removed.
+        command.removedTrait = command.addedTrait = original.traits[0];
+    }
+    return multiplayer::networkRuntimeSubmitCharacterAdvance(command) ? 0 : 1;
 }
 
 // 0x42C9F8
@@ -839,7 +906,7 @@ static int CharEditStart()
     trait_count = get_trait_count();
 
     if (!glblmode) {
-        bk_enable = map_disable_bk_processes();
+        bk_enable = map_disable_bk_processes_for_local_ui();
     }
 
     cycle_disable();
@@ -4399,7 +4466,7 @@ static int CheckValidPlayer()
 static void SavePlayer()
 {
     Proto* proto;
-    multiplayer::PlayerCharacterState* localPlayer = multiplayer::localPlayerState();
+    multiplayer::PlayerCharacterState* localPlayer = multiplayer::actingPlayerState();
     hasLocalPlayerBuildBack = localPlayer != nullptr;
     if (localPlayer != nullptr) {
         localPlayerBuildBack = localPlayer->build;
@@ -4440,7 +4507,7 @@ static void RestorePlayer()
 
     pop_perks();
 
-    multiplayer::PlayerCharacterState* localPlayer = multiplayer::localPlayerState();
+    multiplayer::PlayerCharacterState* localPlayer = multiplayer::actingPlayerState();
     if (hasLocalPlayerBuildBack && localPlayer != nullptr) {
         localPlayer->build = localPlayerBuildBack;
     } else {
@@ -4472,7 +4539,7 @@ static void RestorePlayer()
     stat_recalc_derived(editor_player());
 
     cur_hp = critter_get_hits(editor_player());
-    critter_adjust_hits(editor_player(), hp_back - cur_hp);
+    if (!networkEditorDraft) critter_adjust_hits(editor_player(), hp_back - cur_hp);
 }
 
 // 0x4349A8
@@ -4778,7 +4845,7 @@ static void InfoButton(int eventCode)
 // 0x435220
 static void SliderBtn(int keyCode)
 {
-    if (glblmode) {
+    if (glblmode || networkEditorReadOnly) {
         return;
     }
 
@@ -5218,7 +5285,11 @@ void editor_reset()
 static int UpdateLevel()
 {
     int level = stat_pc_get(PC_STAT_LEVEL);
-    if (level != last_level && level <= PC_LEVEL_MAX) {
+    auto* playerBuild = multiplayer::actingCharacterBuild();
+    if (playerBuild != nullptr) {
+        free_perk = playerBuild->pendingPerks > 0 ? 1 : 0;
+    }
+    if (playerBuild == nullptr && level != last_level && level <= PC_LEVEL_MAX) {
         for (int nextLevel = last_level + 1; nextLevel <= level; nextLevel++) {
             int sp = stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS);
             sp += 5;
@@ -5266,12 +5337,21 @@ static int UpdateLevel()
         } else if (rc == 1) {
             DrawFolder();
             free_perk = 0;
+            if (playerBuild != nullptr && playerBuild->pendingPerks > 0) {
+                --playerBuild->pendingPerks;
+            }
         }
     }
 
     last_level = level;
 
     return 1;
+}
+
+void editor_get_advancement(int& processedLevel, int& pendingPerks)
+{
+    processedLevel = std::max(last_level, 1);
+    pendingPerks = free_perk != 0 ? 1 : 0;
 }
 
 // 0x436030
@@ -5479,15 +5559,17 @@ static int perks_dialog()
         if (perk_level(PERK_TAG) != 0 && perk_back[PERK_TAG] == 0) {
             if (!Add4thTagSkill()) {
                 perk_sub(PERK_TAG);
+                rc = 0;
             }
         } else if (perk_level(PERK_MUTATE) != 0 && perk_back[PERK_MUTATE] == 0) {
             if (!GetMutateTrait()) {
                 perk_sub(PERK_MUTATE);
+                rc = 0;
             }
         } else if (perk_level(PERK_LIFEGIVER) != perk_back[PERK_LIFEGIVER]) {
             int maxHp = stat_get_bonus(editor_player(), STAT_MAXIMUM_HIT_POINTS);
             stat_set_bonus(editor_player(), STAT_MAXIMUM_HIT_POINTS, maxHp + 4);
-            critter_adjust_hits(editor_player(), 4);
+            if (!networkEditorDraft) critter_adjust_hits(editor_player(), 4);
         } else if (perk_level(PERK_EDUCATED) != perk_back[PERK_EDUCATED]) {
             int sp = stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS);
             stat_pc_set(PC_STAT_UNSPENT_SKILL_POINTS, sp + 2);

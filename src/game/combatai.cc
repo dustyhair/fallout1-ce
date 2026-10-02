@@ -1,5 +1,5 @@
 #include "game/combatai.h"
-#include "multiplayer/network_runtime.h"
+#include "multiplayer/local_player_context.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,6 +8,8 @@
 #include "game/actions.h"
 #include "game/anim.h"
 #include "game/combat.h"
+#include "multiplayer/network_world.h"
+#include "multiplayer/network_runtime.h"
 #include "game/config.h"
 #include "game/critter.h"
 #include "game/display.h"
@@ -1241,8 +1243,10 @@ Object* combat_ai(Object* critter, Object* target)
 
     if (target == NULL) {
         if (isPartyMember(critter)) {
-            if (obj_dist(critter, obj_dude) > 5) {
-                ai_move_closer(critter, obj_dude, 0);
+            Object* leader = multiplayer::networkWorldActive()
+                ? multiplayer::networkWorldPlayerActor(multiplayer::kHostPlayerId) : obj_dude;
+            if (leader != nullptr && leader->elevation == critter->elevation && obj_dist(critter, leader) > 5) {
+                ai_move_closer(critter, leader, 0);
             }
         }
     }
@@ -1259,7 +1263,7 @@ bool combatai_want_to_join(Object* a1)
         return false;
     }
 
-    if (a1->elevation != obj_dude->elevation) {
+    if (a1->elevation != (multiplayer::networkWorldActive() ? combat_get_elevation() : obj_dude->elevation)) {
         return false;
     }
 
@@ -1582,6 +1586,7 @@ bool is_within_perception(Object* critter1, Object* critter2)
     int perception;
     int max_distance;
 
+    multiplayer::ScopedActorPlayerContext targetContext(critter2);
     distance = obj_dist(critter2, critter1);
     perception = stat_level(critter1, STAT_PERCEPTION);
     if (can_see(critter1, critter2)) {
@@ -1590,7 +1595,7 @@ bool is_within_perception(Object* critter1, Object* critter2)
             max_distance /= 2;
         }
 
-        if (critter2 == obj_dude) {
+        if (critter2 == obj_dude || multiplayer::isActingPlayerActor(critter2)) {
             if (is_pc_sneak_working()) {
                 max_distance /= 4;
             }
@@ -1606,7 +1611,7 @@ bool is_within_perception(Object* critter1, Object* critter2)
             max_distance = perception;
         }
 
-        if (critter2 == obj_dude) {
+        if (critter2 == obj_dude || multiplayer::isActingPlayerActor(critter2)) {
             if (is_pc_sneak_working()) {
                 max_distance /= 4;
             }

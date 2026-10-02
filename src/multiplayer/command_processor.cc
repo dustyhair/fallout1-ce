@@ -39,9 +39,29 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     };
 
     const SharedModalCommand* modal = std::get_if<SharedModalCommand>(&command.payload);
+    const auto* npcBarter = std::get_if<NpcBarterCommand>(&command.payload);
     const DirectTradeCommand* directTrade = std::get_if<DirectTradeCommand>(&command.payload);
     const EquipmentCommand* equipment = std::get_if<EquipmentCommand>(&command.payload);
-    SessionPhase requiredPhase = equipment != nullptr
+    const auto* inventoryTransfer = std::get_if<InventoryTransferCommand>(&command.payload);
+    const auto* inventoryAction = std::get_if<InventoryActionCommand>(&command.payload);
+    const auto* advance = std::get_if<CharacterAdvanceCommand>(&command.payload);
+    const auto* start = std::get_if<StartCombatCommand>(&command.payload);
+    const auto* combatItem = std::get_if<CombatItemCommand>(&command.payload);
+    const auto* skill = std::get_if<UseSkillCommand>(&command.payload);
+    const InteractCommand* interact = std::get_if<InteractCommand>(&command.payload);
+    const PickupCommand* pickup = std::get_if<PickupCommand>(&command.payload);
+    const LootCommand* loot = std::get_if<LootCommand>(&command.payload);
+    SessionPhase requiredPhase = (interact != nullptr && interact->turnRevision != 0)
+            || (pickup != nullptr && pickup->turnRevision != 0)
+            || (loot != nullptr && loot->turnRevision != 0)
+        ? SessionPhase::Combat
+        : skill != nullptr && skill->turnRevision != 0
+        ? SessionPhase::Combat
+        : inventoryTransfer != nullptr
+        ? (inventoryTransfer->turnRevision == 0 ? SessionPhase::Exploration : SessionPhase::Combat)
+        : inventoryAction != nullptr
+        ? (inventoryAction->turnRevision == 0 ? SessionPhase::Exploration : SessionPhase::Combat)
+        : equipment != nullptr
         ? (equipment->turnRevision == 0 ? SessionPhase::Exploration : SessionPhase::Combat)
         : (std::holds_alternative<AttackCommand>(command.payload)
             || std::holds_alternative<CombatMoveCommand>(command.payload)
@@ -54,6 +74,7 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
         ? SessionPhase::Transition
         : std::holds_alternative<DialogueVoteCommand>(command.payload)
         ? SessionPhase::Dialogue
+        : npcBarter != nullptr ? SessionPhase::Dialogue
         : directTrade != nullptr
                 && directTrade->action != DirectTradeAction::Begin
         ? SessionPhase::Dialogue
@@ -72,6 +93,15 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
         return rejectAndRemember(CommandRejection::Stale);
     }
 
+    if ((start != nullptr && !isValid(*start))
+        || (advance != nullptr && !isValid(*advance))
+        || (inventoryAction != nullptr && !isValid(*inventoryAction))
+        || (combatItem != nullptr
+            && (!isValidExplosiveTimerChoice(combatItem->timerSeconds)
+                || (combatItem->timerSeconds != 0 && isValid(combatItem->targetId))))) {
+        return rejectAndRemember(CommandRejection::Malformed);
+    }
+
     Object* actor = session.entities().findObject(command.actorId);
     if (actor == nullptr) {
         return rejectAndRemember(CommandRejection::MissingEntity);
@@ -86,16 +116,16 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
         return rejectAndRemember(CommandRejection::NotOwner);
     }
 
+    if (!executor.actorCanExecute(actor, command)) {
+        return rejectAndRemember(CommandRejection::InvalidAction);
+    }
+
     GameEvent event;
     event.sequence.value = _nextEventSequence;
     event.causedBy = command.sequence;
 
     const MoveCommand* move = std::get_if<MoveCommand>(&command.payload);
     const FaceCommand* face = std::get_if<FaceCommand>(&command.payload);
-    const InteractCommand* interact = std::get_if<InteractCommand>(&command.payload);
-    const PickupCommand* pickup = std::get_if<PickupCommand>(&command.payload);
-    const LootCommand* loot = std::get_if<LootCommand>(&command.payload);
-    const UseSkillCommand* skill = std::get_if<UseSkillCommand>(&command.payload);
     const UseItemOnCommand* itemUse = std::get_if<UseItemOnCommand>(&command.payload);
     const ElevatorCommand* elevator = std::get_if<ElevatorCommand>(&command.payload);
     const ExitGridCommand* exitGrid = std::get_if<ExitGridCommand>(&command.payload);
@@ -105,7 +135,6 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     const ItemDropCommand* drop = std::get_if<ItemDropCommand>(&command.payload);
     const AttackCommand* attack = std::get_if<AttackCommand>(&command.payload);
     const CombatMoveCommand* combatMove = std::get_if<CombatMoveCommand>(&command.payload);
-    const CombatItemCommand* combatItem = std::get_if<CombatItemCommand>(&command.payload);
     const CombatReloadCommand* combatReload = std::get_if<CombatReloadCommand>(&command.payload);
     const CombatFaceCommand* combatFace = std::get_if<CombatFaceCommand>(&command.payload);
     const EndTurnCommand* endTurn = std::get_if<EndTurnCommand>(&command.payload);
@@ -115,7 +144,10 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
     Object* target = nullptr;
     EntityId targetId;
     bool hasTarget = false;
-    if (interact != nullptr) {
+    if (start != nullptr && isValid(start->targetId)) {
+        targetId = start->targetId;
+        hasTarget = true;
+    } else if (interact != nullptr) {
         targetId = interact->targetId;
         hasTarget = true;
     } else if (pickup != nullptr) {
@@ -132,7 +164,9 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
             return rejectAndRemember(CommandRejection::Malformed);
         }
     } else if (skill != nullptr) {
-        if (!isValid(skill->skill)) {
+        if (!isValid(skill->skill)
+            || (skill->skill == ExplorationSkill::Sneak && skill->targetId != command.actorId)
+            || (skill->turnRevision != 0 && skill->skill != ExplorationSkill::Sneak)) {
             return rejectAndRemember(CommandRejection::Malformed);
         }
         targetId = skill->targetId;
@@ -168,6 +202,10 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
         hasTarget = true;
     } else if (worldMapRoute != nullptr && !isValid(*worldMapRoute)) {
         return rejectAndRemember(CommandRejection::Malformed);
+    } else if (npcBarter != nullptr) {
+        if (!isValid(*npcBarter)) return rejectAndRemember(CommandRejection::Malformed);
+        targetId = npcBarter->sellerId;
+        hasTarget = true;
     } else if (directTrade != nullptr) {
         bool begin = directTrade->action == DirectTradeAction::Begin;
         bool setOffer = directTrade->action == DirectTradeAction::SetOffer;
@@ -214,13 +252,10 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
             return rejectAndRemember(CommandRejection::MissingEntity);
         }
     } else if (transfer != nullptr) {
-        bool descriptorValid = hasItemDescriptor(transfer->itemDescriptor)
-            && transfer->itemDescriptor.pid >= 0
-            && (static_cast<std::uint32_t>(transfer->itemDescriptor.pid) >> 24) == 0;
         if (transfer->quantity == 0
             || transfer->quantity > transfer->sourceQuantity
             || transfer->sourceQuantity > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())
-            || (!isValid(transfer->itemId) && !descriptorValid)) {
+            || !isValid(transfer->itemId)) {
             return rejectAndRemember(CommandRejection::Malformed);
         }
         source = session.entities().findObject(transfer->sourceId);
@@ -232,13 +267,10 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
             return rejectAndRemember(CommandRejection::MissingEntity);
         }
     } else if (drop != nullptr) {
-        bool descriptorValid = hasItemDescriptor(drop->itemDescriptor)
-            && drop->itemDescriptor.pid >= 0
-            && (static_cast<std::uint32_t>(drop->itemDescriptor.pid) >> 24) == 0;
         if (drop->quantity == 0
             || drop->quantity > drop->sourceQuantity
             || drop->sourceQuantity > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())
-            || (!isValid(drop->itemId) && !descriptorValid)) {
+            || !isValid(drop->itemId)) {
             return rejectAndRemember(CommandRejection::Malformed);
         }
         source = session.entities().findObject(drop->sourceId);
@@ -248,17 +280,23 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
         }
     }
 
+    if (skill != nullptr && skill->skill == ExplorationSkill::Steal
+        && session.players().findByActor(targetId) != nullptr) {
+        return rejectAndRemember(CommandRejection::InvalidAction);
+    }
     CommandExecutionStatus executionStatus = CommandExecutionStatus::InvalidAction;
     {
         ScopedActingPlayerContext actingPlayer(*actingState, actor);
         if (move != nullptr) {
-            executionStatus = executor.move(actor, *move);
-            event.payload = ActorMovementStartedEvent { command.actorId, move->destinationTile, move->elevation, move->running };
+            MoveCommand movement = *move;
+            movement.running = executor.movementRunning(actor, move->running);
+            executionStatus = executor.move(actor, movement);
+            event.payload = ActorMovementStartedEvent { command.actorId, movement.destinationTile, movement.elevation, movement.running };
         } else if (face != nullptr) {
             executionStatus = executor.face(actor, *face);
             event.payload = ActorFacingChangedEvent { command.actorId, face->rotation };
         } else if (interact != nullptr) {
-            DoorUseExecution doorExecution = executor.useDoor(actor, target);
+            DoorUseExecution doorExecution = executor.useDoor(actor, target, interact->turnRevision);
             executionStatus = doorExecution.status;
             event.payload = DoorUseStartedEvent {
                 command.actorId,
@@ -268,11 +306,11 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
                 doorExecution.frame,
             };
         } else if (pickup != nullptr) {
-            executionStatus = executor.pickup(actor, target);
+            executionStatus = executor.pickup(actor, target, pickup->turnRevision);
             event.payload = ItemPickupStartedEvent { command.actorId, pickup->targetId };
         } else if (loot != nullptr) {
-            executionStatus = executor.loot(actor, target);
-            event.payload = LootStartedEvent { command.actorId, loot->targetId };
+            executionStatus = executor.loot(actor, target, loot->turnRevision, loot->targetChange);
+            event.payload = LootStartedEvent { command.actorId, loot->targetId, loot->turnRevision };
         } else if (talk != nullptr) {
             executionStatus = executor.requestTalk(actor, target, *talk);
             event.payload = DialogueRequestedEvent {
@@ -283,7 +321,8 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
                 command.actorId, dialogueVote->revision, dialogueVote->option };
         } else if (skill != nullptr) {
             executionStatus = executor.useSkill(actor, target, *skill);
-            event.payload = SkillUseStartedEvent { command.actorId, skill->targetId, skill->skill };
+            event.payload = SkillUseStartedEvent { command.actorId, skill->targetId, skill->skill,
+                skill->skill == ExplorationSkill::Steal && executor.skillInventoryOpened(actor, target) };
         } else if (itemUse != nullptr) {
             executionStatus = executor.useItemOn(actor, item, target, *itemUse);
             event.payload = ItemUseStartedEvent { command.actorId, itemUse->itemId, itemUse->targetId };
@@ -371,6 +410,15 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
             event.payload = CombatActionResolvedEvent { command.actorId,
                 CombatActionKind::Reload, combatReload->weaponId,
                 combatReload->turnRevision, session.phaseRevision() };
+        } else if (start != nullptr) {
+            executionStatus = executor.startCombat(actor, target, *start);
+            event.payload = CombatRequestedEvent { command.actorId };
+        } else if (advance != nullptr) {
+            executionStatus = executor.advanceCharacter(actor, *advance);
+            event.payload = EquipmentChangedEvent { command.actorId };
+        } else if (inventoryAction != nullptr) {
+            executionStatus = executor.inventoryAction(actor, *inventoryAction);
+            event.payload = EquipmentChangedEvent { command.actorId };
         } else if (equipment != nullptr) {
             executionStatus = executor.setEquipment(actor, *equipment);
             event.payload = EquipmentChangedEvent { command.actorId };
@@ -410,6 +458,10 @@ AuthoritativeCommandResult CommandProcessor::process(const GameCommand& command,
                 worldMapRoute->targetY,
                 worldMapRoute->clear,
             };
+        } else if (npcBarter != nullptr) {
+            auto barter = executor.npcBarter(actor, *npcBarter);
+            executionStatus = barter.status;
+            event.payload = NpcBarterStateChangedEvent { std::move(barter.state), session.phaseRevision() };
         } else if (directTrade != nullptr) {
             DirectTradeExecution trade = executor.directTrade(actor,
                 command.playerId, *directTrade);

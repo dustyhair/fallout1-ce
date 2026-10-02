@@ -233,7 +233,14 @@ bool isValidBuild(const CharacterBuild& build)
             }
         }
     }
-    return build.unspentSkillPoints >= 0
+    for (const auto& uses : build.healingSkillUses) {
+        if (std::any_of(uses.begin(), uses.end(), [](auto time) { return time < 0; })) return false;
+    }
+    return build.activeHand >= 0 && build.activeHand <= 1
+        && build.processedLevel >= 1 && build.processedLevel <= build.level
+        && build.pendingPerks >= 0 && build.pendingPerks <= PC_LEVEL_MAX / 3
+        && (build.addictions & ~0x3FU) == 0
+        && build.unspentSkillPoints >= 0
         && build.level >= 1
         && build.level <= kMaximumStoredValue
         && build.experience >= 0;
@@ -628,6 +635,16 @@ MultiplayerSaveError encodeMultiplayerSave(const MultiplayerSaveSidecar& sidecar
     } else {
         for (const SavedPlayerCharacter& player : sidecar.players) {
             appendPlayerV3(payload, player);
+            if (sidecar.version >= 5) {
+                for (const auto& uses : player.build.healingSkillUses) appendInt32Array(payload, uses);
+                appendUInt32(payload, player.build.sneakWorking ? 1 : 0);
+                appendUInt32(payload, player.build.addictions);
+            }
+            if (sidecar.version >= 6) {
+                appendInt32(payload, player.build.processedLevel);
+                appendInt32(payload, player.build.pendingPerks);
+            }
+            if (sidecar.version >= 8) appendInt32(payload, player.build.activeHand);
         }
         appendUInt32(payload, sidecar.sessionRules);
         appendUInt16(payload,
@@ -732,6 +749,25 @@ MultiplayerSaveDecodeResult decodeMultiplayerSave(const std::vector<std::uint8_t
         bool read = result.sidecar.version >= 3
             ? readPlayerV3(reader, player)
             : readPlayerBase(reader, player);
+        if (read && result.sidecar.version >= 5) {
+            for (auto& uses : player.build.healingSkillUses) read = readInt32Array(reader, uses) && read;
+            std::uint32_t sneakWorking = 0;
+            read = reader.readUInt32(sneakWorking) && read && sneakWorking <= 1;
+            player.build.sneakWorking = sneakWorking != 0;
+            read = reader.readUInt32(player.build.addictions) && read;
+        }
+        if (read && result.sidecar.version >= 6) {
+            read = reader.readInt32(player.build.processedLevel) && read;
+            read = reader.readInt32(player.build.pendingPerks) && read;
+        } else if (result.sidecar.version < 6) {
+            // Older sidecars did not record grants or unused perks. Do not
+            // regrant levels that may already have been spent.
+            player.build.processedLevel = player.build.level;
+            player.build.pendingPerks = 0;
+        }
+        if (read && result.sidecar.version >= 8) read = reader.readInt32(player.build.activeHand);
+        // Version 1-7 saves did not retain per-player hand selection. Left
+        // hand is the explicit native default, never inferred from another HUD.
         if (!read) {
             result.error = MultiplayerSaveError::TruncatedPayload;
             return result;

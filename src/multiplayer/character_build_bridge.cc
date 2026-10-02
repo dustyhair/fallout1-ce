@@ -1,5 +1,10 @@
 #include "multiplayer/character_build_bridge.h"
 
+#include <algorithm>
+#include "game/editor.h"
+#include "game/intface.h"
+#include "game/object.h"
+
 #include "game/perk.h"
 #include "game/proto.h"
 #include "game/skill.h"
@@ -47,6 +52,9 @@ bool captureLegacyCharacterBuild(Object* actor, CharacterBuild& build)
     build.unspentSkillPoints = stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS);
     build.level = stat_pc_get(PC_STAT_LEVEL);
     build.experience = stat_pc_get(PC_STAT_EXPERIENCE);
+    editor_get_advancement(build.processedLevel, build.pendingPerks);
+    build.processedLevel = std::min(build.processedLevel, build.level);
+    if (actor == obj_dude) build.activeHand = intface_is_item_right_hand() ? 1 : 0;
     return true;
 }
 

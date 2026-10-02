@@ -14,6 +14,8 @@ namespace fallout {
 bool audioEngineInit();
 void audioEngineExit();
 void audioEnginePause();
+void audioEngineSetFocused(bool focused);
+void audioEngineSetBackgroundPlayback(bool enabled);
 void audioEngineResume();
 int audioEngineCreateSoundBuffer(unsigned int size, int bitsPerSample, int channels, int rate);
 bool audioEngineSoundBufferRelease(int soundBufferIndex);

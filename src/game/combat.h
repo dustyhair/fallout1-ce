@@ -28,6 +28,7 @@ int find_cid(int start, int cid, Object** critterList, int critterListLength);
 int combat_load(DB_FILE* stream);
 int combat_save(DB_FILE* stream);
 Object* combat_whose_turn();
+int combat_get_elevation();
 void combat_data_init(Object* obj);
 void combat_over_from_load();
 void combat_give_exps(int exp_points);

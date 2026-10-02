@@ -12,6 +12,8 @@
 #include "game/map.h"
 #include "game/message.h"
 #include "game/object.h"
+#include "multiplayer/network_world.h"
+#include "multiplayer/presentation_bridge.h"
 #include "game/skill.h"
 #include "platform_compat.h"
 #include "plib/color/color.h"
@@ -59,6 +61,8 @@ static void skilldex_end();
 
 // 0x507DC8
 static bool bk_enable = false;
+static bool skilldexMouseWasEnabled = false;
+static bool skilldexScrollingWasEnabled = false;
 
 // 0x507DCC
 static int grphfid[SKILLDEX_FRM_COUNT] = {
@@ -248,7 +252,10 @@ static int skilldex_start()
         return -1;
     }
 
-    bk_enable = map_disable_bk_processes();
+    skilldexMouseWasEnabled = multiplayer::networkWorldActive() && gmouse_is_enabled();
+    skilldexScrollingWasEnabled = gmouse_scrolling_is_enabled();
+    if (skilldexMouseWasEnabled) gmouse_disable(0);
+    bk_enable = map_disable_bk_processes_for_local_ui();
 
     cycle_disable();
     gmouse_set_cursor(MOUSE_CURSOR_ARROW);
@@ -271,7 +278,7 @@ static int skilldex_start()
     // Render skill values.
     int valueY = 48;
     for (int index = 0; index < SKILLDEX_SKILL_COUNT; index++) {
-        int value = skill_level(obj_dude, sklxref[index]);
+        int value = skill_level(multiplayer::localPlayerActorOrStoryActor(), sklxref[index]);
         if (value == -1) {
             value = 0;
         }
@@ -398,6 +405,11 @@ static void skilldex_end()
 
     if (bk_enable) {
         map_enable_bk_processes();
+    }
+    if (skilldexMouseWasEnabled) {
+        gmouse_enable();
+        if (!skilldexScrollingWasEnabled) gmouse_disable_scrolling();
+        skilldexMouseWasEnabled = false;
     }
 
     cycle_enable();

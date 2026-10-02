@@ -1,4 +1,5 @@
 #include "game/gmovie.h"
+#include "multiplayer/network_runtime.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -101,12 +102,24 @@ int gmovie_save(DB_FILE* stream)
 // 0x44E690
 int gmovie_play(int game_movie, int game_movie_flags)
 {
+    if (game_movie < 0 || game_movie >= MOVIE_COUNT) return -1;
+    auto shared = multiplayer::networkRuntimePresentStory(multiplayer::StoryPresentationKind::Movie,
+        game_movie, game_movie_flags);
+    if (shared.has_value()) return *shared;
+    return gmovie_play_local(game_movie, game_movie_flags);
+}
+
+int gmovie_play_local(int game_movie, int game_movie_flags)
+{
+    if (game_movie < 0 || game_movie >= MOVIE_COUNT) return -1;
     dir_entry de;
     char movieFilePath[COMPAT_MAX_PATH];
 
     debug_printf("\nPlaying movie: %s\n", movie_list[game_movie]);
 
-    snprintf(movieFilePath, sizeof(movieFilePath), "art\\cuts\\%s", movie_list[game_movie]);
+    snprintf(movieFilePath, sizeof(movieFilePath), "art\\cuts\\%s",
+        multiplayer::networkRuntimeSmokeTestMissingMovie() && game_movie == MOVIE_VEXPLD
+            ? "missing-smoke-asset.mve" : movie_list[game_movie]);
 
     if (db_dir_entry(movieFilePath, &de) != 0) {
         debug_printf("\ngmovie_play() - Error: Unable to open %s\n", movie_list[game_movie]);
@@ -256,7 +269,7 @@ int gmovie_play(int game_movie, int game_movie_flags)
 // 0x44EB04
 bool gmovie_has_been_played(int movie)
 {
-    return gmovie_played_list[movie] == 1;
+    return movie >= 0 && movie < MOVIE_COUNT && gmovie_played_list[movie] == 1;
 }
 
 // 0x44EB1C

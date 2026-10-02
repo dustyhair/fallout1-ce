@@ -23,6 +23,8 @@
 #include "game/stat.h"
 #include "game/trait.h"
 #include "multiplayer/acting_player_context.h"
+#include "multiplayer/local_player_context.h"
+#include "multiplayer/network_world.h"
 #include "platform_compat.h"
 #include "plib/color/color.h"
 #include "plib/gnw/debug.h"
@@ -37,8 +39,8 @@ namespace fallout {
 
 static void show_skill_use_messages(Object* obj, int skill, Object* a3, int a4, int a5);
 static int skill_game_difficulty(int skill);
-static int skill_use_slot_available(int skill);
-static int skill_use_slot_add(int skill);
+int skill_use_slot_available(int skill);
+int skill_use_slot_add(int skill);
 static int skill_use_slot_clear();
 
 typedef struct SkillDescription {
@@ -216,6 +218,7 @@ void skill_get_tags(int* skills, int count)
 // 0x498388
 int skill_level(Object* critter, int skill)
 {
+    multiplayer::ScopedActorPlayerContext playerContext(critter);
     SkillDescription* skill_description;
     int points;
     int bonus;
@@ -268,6 +271,7 @@ int skill_base(int skill)
 // 0x4984A8
 int skill_points(Object* obj, int skill)
 {
+    multiplayer::ScopedActorPlayerContext playerContext(obj);
     if (skill < 0 || skill >= SKILL_COUNT) {
         return 0;
     }
@@ -286,6 +290,7 @@ int skill_points(Object* obj, int skill)
 // 0x4984E4
 int skill_inc_point(Object* obj, int skill)
 {
+    multiplayer::ScopedActorPlayerContext context(obj);
     Proto* proto;
     int unspent_skill_points;
     int level;
@@ -329,6 +334,7 @@ int skill_inc_point(Object* obj, int skill)
 // 0x498588
 int skill_dec_point(Object* critter, int skill)
 {
+    multiplayer::ScopedActorPlayerContext context(critter);
     Proto* proto;
     int unspent_skill_points;
     int rc;
@@ -457,7 +463,7 @@ static void show_skill_use_messages(Object* obj, int skill, Object* a3, int a4, 
     if (stat_pc_add_experience(xpToAdd) == 0 && a4 > 0) {
         MessageListItem messageListItem;
         messageListItem.num = 505; // You earn %d XP for honing your skills
-        if (obj == obj_dude && message_search(&skill_message_file, &messageListItem)) {
+        if (message_search(&skill_message_file, &messageListItem)) {
             int after = stat_pc_get(PC_STAT_EXPERIENCE);
 
             char text[60];
@@ -470,9 +476,12 @@ static void show_skill_use_messages(Object* obj, int skill, Object* a3, int a4, 
 // 0x498814
 int skill_use(Object* obj, Object* a2, int skill, int criticalChanceModifier)
 {
+    multiplayer::ScopedActorPlayerContext context(obj);
+    multiplayer::ScopedPlayerFeedback feedback(obj);
     MessageListItem messageListItem;
     char text[60];
 
+    bool isPlayerActor = obj == obj_dude || multiplayer::isActingPlayerActor(obj);
     bool giveExp = true;
     int currentHp = stat_level(a2, STAT_CURRENT_HIT_POINTS);
     int maximumHp = stat_level(a2, STAT_MAXIMUM_HIT_POINTS);
@@ -535,7 +544,7 @@ int skill_use(Object* obj, Object* a2, int skill, int criticalChanceModifier)
                 hpToHeal = roll_random(minimumHpToHeal + 1, maximumHpToHeal + 5);
                 critter_adjust_hits(a2, hpToHeal);
 
-                if (obj == obj_dude) {
+                if (isPlayerActor) {
                     // You heal %d hit points.
                     messageListItem.num = 500;
                     if (!message_search(&skill_message_file, &messageListItem)) {
@@ -571,15 +580,15 @@ int skill_use(Object* obj, Object* a2, int skill, int criticalChanceModifier)
             scr_exec_map_update_scripts();
             palette_fade_to(cmap);
         } else {
-            if (obj == obj_dude) {
+            if (isPlayerActor) {
                 // 501: You look healty already
                 // 502: %s looks healthy already
-                messageListItem.num = (a2 == obj_dude ? 501 : 502);
+                messageListItem.num = (a2 == obj ? 501 : 502);
                 if (!message_search(&skill_message_file, &messageListItem)) {
                     return -1;
                 }
 
-                if (a2 == obj_dude) {
+                if (a2 == obj) {
                     strcpy(text, messageListItem.text);
                 } else {
                     snprintf(text, sizeof(text), messageListItem.text, object_name(a2));
@@ -590,7 +599,7 @@ int skill_use(Object* obj, Object* a2, int skill, int criticalChanceModifier)
             }
         }
 
-        if (obj == obj_dude) {
+        if (isPlayerActor) {
             inc_game_time_in_seconds(1800);
         }
 
@@ -657,7 +666,7 @@ int skill_use(Object* obj, Object* a2, int skill, int criticalChanceModifier)
 
                             // 520: You heal your %s.
                             // 521: You heal the %s.
-                            prefix.num = (a2 == obj_dude ? 520 : 521);
+                            prefix.num = (a2 == obj ? 520 : 521);
 
                             skill_use_slot_add(SKILL_DOCTOR);
 
@@ -666,7 +675,7 @@ int skill_use(Object* obj, Object* a2, int skill, int criticalChanceModifier)
                         } else {
                             // 525: You fail to heal your %s.
                             // 526: You fail to heal the %s.
-                            prefix.num = (a2 == obj_dude ? 525 : 526);
+                            prefix.num = (a2 == obj ? 525 : 526);
                         }
 
                         if (!message_search(&skill_message_file, &prefix)) {
@@ -694,7 +703,7 @@ int skill_use(Object* obj, Object* a2, int skill, int criticalChanceModifier)
                 hpToHeal = roll_random(minimumHpToHeal + 4, maximumHpToHeal + 10);
                 critter_adjust_hits(a2, hpToHeal);
 
-                if (obj == obj_dude) {
+                if (isPlayerActor) {
                     // You heal %d hit points.
                     messageListItem.num = 500;
                     if (!message_search(&skill_message_file, &messageListItem)) {
@@ -736,15 +745,15 @@ int skill_use(Object* obj, Object* a2, int skill, int criticalChanceModifier)
                 palette_fade_to(cmap);
             }
         } else {
-            if (obj == obj_dude) {
+            if (isPlayerActor) {
                 // 501: You look healty already
                 // 502: %s looks healthy already
-                messageListItem.num = (a2 == obj_dude ? 501 : 502);
+                messageListItem.num = (a2 == obj ? 501 : 502);
                 if (!message_search(&skill_message_file, &messageListItem)) {
                     return -1;
                 }
 
-                if (a2 == obj_dude) {
+                if (a2 == obj) {
                     strcpy(text, messageListItem.text);
                 } else {
                     snprintf(text, sizeof(text), messageListItem.text, object_name(a2));
@@ -756,7 +765,7 @@ int skill_use(Object* obj, Object* a2, int skill, int criticalChanceModifier)
             }
         }
 
-        if (obj == obj_dude) {
+        if (isPlayerActor) {
             inc_game_time_in_seconds(3600 * damageHealingAttempts);
         }
 
@@ -926,16 +935,27 @@ static int skill_game_difficulty(int skill)
 }
 
 // 0x499428
-static int skill_use_slot_available(int skill)
+static int* skill_use_times(int skill)
 {
+    auto* build = multiplayer::actingCharacterBuild();
+    if (build != nullptr && (skill == SKILL_FIRST_AID || skill == SKILL_DOCTOR)) {
+        return build->healingSkillUses[skill == SKILL_FIRST_AID ? 0 : 1].data();
+    }
+    return timesSkillUsed[skill];
+}
+
+int skill_use_slot_available(int skill)
+{
+    if (skill < 0 || skill >= SKILL_COUNT) return -1;
+    int* uses = skill_use_times(skill);
     for (int slot = 0; slot < SKILLS_MAX_USES_PER_DAY; slot++) {
-        if (timesSkillUsed[skill][slot] == 0) {
+        if (uses[slot] == 0) {
             return slot;
         }
     }
 
     int time = game_time();
-    int hoursSinceLastUsage = (time - timesSkillUsed[skill][0]) / GAME_TIME_TICKS_PER_HOUR;
+    int hoursSinceLastUsage = (time - uses[0]) / GAME_TIME_TICKS_PER_HOUR;
     if (hoursSinceLastUsage <= 24) {
         return -1;
     }
@@ -944,20 +964,22 @@ static int skill_use_slot_available(int skill)
 }
 
 // 0x49949C
-static int skill_use_slot_add(int skill)
+int skill_use_slot_add(int skill)
 {
+    if (skill < 0 || skill >= SKILL_COUNT) return -1;
+    int* uses = skill_use_times(skill);
     int slot = skill_use_slot_available(skill);
     if (slot == -1) {
         return -1;
     }
 
-    if (timesSkillUsed[skill][slot] != 0) {
+    if (uses[slot] != 0) {
         for (int i = 0; i < slot; i++) {
-            timesSkillUsed[skill][i] = timesSkillUsed[skill][i + 1];
+            uses[i] = uses[i + 1];
         }
     }
 
-    timesSkillUsed[skill][slot] = game_time();
+    uses[slot] = game_time();
 
     return 0;
 }
@@ -965,7 +987,8 @@ static int skill_use_slot_add(int skill)
 // 0x499508
 static int skill_use_slot_clear()
 {
-    memset(timesSkillUsed, 0, sizeof(timesSkillUsed));
+    if (auto* build = multiplayer::actingCharacterBuild()) build->healingSkillUses = {};
+    else memset(timesSkillUsed, 0, sizeof(timesSkillUsed));
     return 0;
 }
 

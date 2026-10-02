@@ -74,9 +74,23 @@ static int partyStatePrepped = 0;
 // 0x485250
 int partyMemberAdd(Object* object)
 {
+    if (object == nullptr || PID_TYPE(object->pid) != OBJ_TYPE_CRITTER) return -1;
+    // Human actors have roster identities and their own save lifecycle. A
+    // native party conversion would overwrite that identity with an NPC PID.
+    if (multiplayer::networkWorldActive()
+        && multiplayer::networkWorldCombatOwner(object).has_value()) return -1;
     int index;
     PartyMember* partyMember;
     Script* script;
+
+    if (partyMemberCount == 0 && multiplayer::networkWorldActive()) {
+        // Preserve the native player slot without converting a human actor's
+        // object/script identity to the NPC party-ID scheme.
+        partyMemberList[0] = {};
+        partyMemberList[0].object = multiplayer::networkWorldPlayerActor(
+            multiplayer::networkWorldReplicaSessionActive() ? multiplayer::kGuestPlayerId : multiplayer::kHostPlayerId);
+        partyMemberCount = 1;
+    }
 
     if (partyMemberCount >= 20) {
         return -1;
@@ -343,6 +357,8 @@ int partyMemberRecoverLoad()
             if (partyMember->vars != NULL) {
                 script->scr_local_var_offset = map_malloc_local_var(script->scr_num_local_vars);
                 memcpy(map_local_vars + script->scr_local_var_offset, partyMember->vars, sizeof(int) * script->scr_num_local_vars);
+                mem_free(partyMember->vars);
+                partyMember->vars = NULL;
             }
 
             debug_printf("[Party Member %d]: %s\n", index, critter_name(partyMember->object));
@@ -371,8 +387,13 @@ int partyMemberLoad(DB_FILE* stream)
     int index;
     Object* object;
 
-    if (db_freadInt(stream, &partyMemberCount) == -1) return -1;
-    if (db_freadInt(stream, &partyMemberItemCount) == -1) return -1;
+    int loadedCount;
+    int loadedItemCount;
+    if (db_freadInt(stream, &loadedCount) == -1
+        || db_freadInt(stream, &loadedItemCount) == -1
+        || loadedCount < 0 || loadedCount > 20 || loadedItemCount < 0) return -1;
+    partyMemberCount = loadedCount;
+    partyMemberItemCount = loadedItemCount;
 
     partyMemberList[0].object = obj_dude;
 
@@ -429,10 +450,13 @@ int partyMemberSyncPosition()
     int index;
     PartyMember* partyMember;
 
+    Object* leader = multiplayer::networkWorldActive()
+        ? multiplayer::networkWorldPlayerActor(multiplayer::kHostPlayerId) : obj_dude;
+    if (leader == nullptr) return -1;
     for (index = 1; index < partyMemberCount; index++) {
         partyMember = &(partyMemberList[index]);
         if ((partyMember->object->flags & OBJECT_HIDDEN) == 0) {
-            obj_attempt_placement(partyMember->object, obj_dude->tile, obj_dude->elevation, 2);
+            obj_attempt_placement(partyMember->object, leader->tile, leader->elevation, 2);
         }
     }
 
@@ -486,6 +510,7 @@ Object* partyMemberFindObjFromPid(int pid)
 // 0x485AAC
 bool isPartyMember(Object* object)
 {
+    if (object == nullptr) return false;
     int index;
 
     if (object->id < 18000) {
@@ -748,6 +773,7 @@ static int partyMemberItemRecoverAll()
         partyMember = itemSaveListHead;
         itemSaveListHead = itemSaveListHead->next;
         partyMemberItemRecover(partyMember);
+        if (partyMember->vars != NULL) mem_free(partyMember->vars);
         mem_free(partyMember);
     }
 

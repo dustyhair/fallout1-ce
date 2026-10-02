@@ -1,3 +1,4 @@
+#include <type_traits>
 #include "multiplayer/network_lobby.h"
 
 #include <algorithm>
@@ -16,7 +17,7 @@ constexpr std::size_t kLobbyHeaderSize = 4;
 constexpr std::size_t kChatHeaderSize = 6;
 constexpr std::size_t kMaxQueuedChatMessages = 32;
 constexpr std::size_t kMaxPendingGameplayCommands = 64;
-constexpr std::uint16_t kRecoveryWireVersion = 3;
+constexpr std::uint16_t kRecoveryWireVersion = 4;
 constexpr std::size_t kRecoveryHeaderSize = 4;
 
 enum class RecoveryMessageType : std::uint8_t {
@@ -25,6 +26,7 @@ enum class RecoveryMessageType : std::uint8_t {
     Complete = 3,
     Applied = 4,
     EndingApplied = 5,
+    StoryCompleted = 6,
 };
 
 void appendUInt16(std::vector<std::uint8_t>& bytes, std::uint16_t value)
@@ -93,13 +95,15 @@ bool isValidChatText(const std::string& text)
 EntityId eventActorId(const GameEventPayload& payload)
 {
     return std::visit([](const auto& event) {
-        return event.actorId;
+        if constexpr (std::is_same_v<std::decay_t<decltype(event)>, NpcBarterStateChangedEvent>) return event.state.buyerId;
+        else return event.actorId;
     }, payload);
 }
 
 bool isSupportedLiveEvent(const GameEventPayload& payload)
 {
     return std::holds_alternative<EquipmentChangedEvent>(payload)
+        || std::holds_alternative<CombatRequestedEvent>(payload)
         || std::holds_alternative<ActorMovementStartedEvent>(payload)
         || std::holds_alternative<ActorFacingChangedEvent>(payload)
         || std::holds_alternative<DoorUseStartedEvent>(payload)
@@ -114,6 +118,7 @@ bool isSupportedLiveEvent(const GameEventPayload& payload)
         || std::holds_alternative<RestStateChangedEvent>(payload)
         || std::holds_alternative<InventoryTransferredEvent>(payload)
         || std::holds_alternative<CapsDistributedEvent>(payload)
+        || std::holds_alternative<NpcBarterStateChangedEvent>(payload)
         || std::holds_alternative<DirectTradeStateChangedEvent>(payload)
         || std::holds_alternative<ItemDroppedEvent>(payload)
         || std::holds_alternative<AttackStartedEvent>(payload)
@@ -126,7 +131,8 @@ bool isSupportedLiveEvent(const GameEventPayload& payload)
         || std::holds_alternative<DialogueRequestedEvent>(payload)
         || std::holds_alternative<DialogueVoteRecordedEvent>(payload)
         || std::holds_alternative<DialoguePresentationEvent>(payload)
-        || std::holds_alternative<SharedActivityPublishedEvent>(payload);
+        || std::holds_alternative<SharedActivityPublishedEvent>(payload)
+        || std::holds_alternative<PlayerFeedbackEvent>(payload);
 }
 
 } // namespace
@@ -147,7 +153,10 @@ bool NetworkLobby::start(NetworkLaunchMode mode, SessionId sessionId, std::uniqu
     _nextEventSequence = 1;
     _nextExpectedEventSequence = 1;
     _lastAppliedEventSequence = {};
+    _lastDeliveredEventSequence = {};
+    _latestReceivedCheckpoint = {};
     _acknowledgedEndingPhaseRevision = 0;
+    _storyCompletions.clear();
     _acknowledgedEvents.clear();
     _pendingCommands.clear();
     _recoveryRequests.clear();
@@ -191,44 +200,45 @@ bool NetworkLobby::sendLocalMove(
         phaseRevision);
 }
 
-bool NetworkLobby::sendLocalDoorUse(EntityId targetId, std::uint32_t phaseRevision)
+bool NetworkLobby::sendLocalDoorUse(EntityId targetId, std::uint32_t phaseRevision, std::uint64_t turnRevision)
 {
     PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
     EntityId actorId { playerId.value };
     return sendLocalAction(
         DoorUseStartedEvent { actorId, targetId },
-        InteractCommand { targetId },
-        phaseRevision);
+        InteractCommand { targetId, turnRevision },
+        phaseRevision, turnRevision == 0 ? SessionPhase::Exploration : SessionPhase::Combat);
 }
 
-bool NetworkLobby::sendLocalPickup(EntityId targetId, std::uint32_t phaseRevision)
+bool NetworkLobby::sendLocalPickup(EntityId targetId, std::uint32_t phaseRevision, std::uint64_t turnRevision)
 {
     PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
     EntityId actorId { playerId.value };
     return sendLocalAction(
         ItemPickupStartedEvent { actorId, targetId },
-        PickupCommand { targetId },
-        phaseRevision);
+        PickupCommand { targetId, turnRevision },
+        phaseRevision, turnRevision == 0 ? SessionPhase::Exploration : SessionPhase::Combat);
 }
 
-bool NetworkLobby::sendLocalLoot(EntityId targetId, std::uint32_t phaseRevision)
+bool NetworkLobby::sendLocalLoot(EntityId targetId, std::uint32_t phaseRevision, std::uint64_t turnRevision, bool targetChange)
 {
     PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
     EntityId actorId { playerId.value };
     return sendLocalAction(
-        LootStartedEvent { actorId, targetId },
-        LootCommand { targetId },
-        phaseRevision);
+        LootStartedEvent { actorId, targetId, turnRevision },
+        LootCommand { targetId, turnRevision, targetChange },
+        phaseRevision, turnRevision == 0 ? SessionPhase::Exploration : SessionPhase::Combat);
 }
 
-bool NetworkLobby::sendLocalSkillUse(EntityId targetId, ExplorationSkill skill, std::uint32_t phaseRevision)
+bool NetworkLobby::sendLocalSkillUse(EntityId targetId, ExplorationSkill skill, std::uint32_t phaseRevision,
+    std::uint64_t turnRevision)
 {
     PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
     EntityId actorId { playerId.value };
     return sendLocalAction(
         SkillUseStartedEvent { actorId, targetId, skill },
-        UseSkillCommand { targetId, skill },
-        phaseRevision);
+        UseSkillCommand { targetId, skill, turnRevision },
+        phaseRevision, turnRevision == 0 ? SessionPhase::Exploration : SessionPhase::Combat);
 }
 
 bool NetworkLobby::sendLocalItemUse(EntityId itemId, EntityId targetId, std::uint32_t phaseRevision)
@@ -329,13 +339,13 @@ bool NetworkLobby::sendLocalCombatMove(std::int32_t tile,
 }
 
 bool NetworkLobby::sendLocalCombatItem(EntityId itemId, EntityId targetId,
-    std::uint64_t turnRevision, std::uint32_t phaseRevision)
+    std::uint64_t turnRevision, std::uint32_t phaseRevision, std::int32_t timerSeconds)
 {
     EntityId actorId { kGuestPlayerId.value };
     return _mode == NetworkLaunchMode::Join && sendLocalAction(
         CombatActionResolvedEvent { actorId, CombatActionKind::UseItem,
             itemId, turnRevision, phaseRevision },
-        CombatItemCommand { turnRevision, itemId, targetId },
+        CombatItemCommand { turnRevision, itemId, targetId, timerSeconds },
         phaseRevision, SessionPhase::Combat);
 }
 
@@ -349,6 +359,25 @@ bool NetworkLobby::sendLocalCombatReload(EntityId weaponId,
             weaponId, turnRevision, phaseRevision },
         CombatReloadCommand { turnRevision, weaponId, hitMode },
         phaseRevision, SessionPhase::Combat);
+}
+
+bool NetworkLobby::sendLocalInventoryAction(const InventoryActionCommand& command, std::uint32_t phaseRevision)
+{
+    return sendLocalAction(EquipmentChangedEvent { EntityId { kGuestPlayerId.value } },
+        command, phaseRevision, command.turnRevision == 0
+            ? SessionPhase::Exploration : SessionPhase::Combat);
+}
+
+bool NetworkLobby::sendLocalStartCombat(const StartCombatCommand& command, std::uint32_t phaseRevision)
+{
+    return sendLocalAction(CombatRequestedEvent { EntityId { kGuestPlayerId.value } },
+        command, phaseRevision, SessionPhase::Exploration);
+}
+
+bool NetworkLobby::sendLocalCharacterAdvance(const CharacterAdvanceCommand& command, std::uint32_t phaseRevision)
+{
+    return sendLocalAction(EquipmentChangedEvent { EntityId { kGuestPlayerId.value } },
+        command, phaseRevision, SessionPhase::Exploration);
 }
 
 bool NetworkLobby::sendLocalEquipment(const EquipmentCommand& equipment, std::uint32_t phaseRevision)
@@ -383,6 +412,12 @@ bool NetworkLobby::sendLocalDialogueVote(std::uint64_t revision,
         DialogueVoteRecordedEvent { EntityId { kGuestPlayerId.value }, revision, option },
         DialogueVoteCommand { revision, option }, phaseRevision,
         SessionPhase::Dialogue);
+}
+
+bool NetworkLobby::sendLocalNpcBarter(const NpcBarterCommand& command, std::uint32_t phaseRevision)
+{
+    return _mode == NetworkLaunchMode::Join && sendLocalAction(
+        NpcBarterStateChangedEvent {}, command, phaseRevision, SessionPhase::Dialogue);
 }
 
 bool NetworkLobby::sendLocalDirectTrade(const DirectTradeCommand& trade,
@@ -425,14 +460,15 @@ bool NetworkLobby::sendLocalInventoryTransfer(EntityId sourceId,
     std::uint32_t sourceQuantity,
     std::uint32_t phaseRevision,
     EntityId remainderItemId,
-    ItemDescriptor itemDescriptor)
+    ItemDescriptor itemDescriptor,
+    std::uint64_t turnRevision)
 {
     PlayerId playerId = _mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId;
     EntityId actorId { playerId.value };
     return sendLocalAction(
         InventoryTransferredEvent { actorId, sourceId, destinationId, itemId, quantity, sourceQuantity, remainderItemId, itemDescriptor },
-        InventoryTransferCommand { sourceId, destinationId, itemId, quantity, sourceQuantity, itemDescriptor },
-        phaseRevision);
+        InventoryTransferCommand { sourceId, destinationId, itemId, quantity, sourceQuantity, itemDescriptor, turnRevision },
+        phaseRevision, turnRevision == 0 ? SessionPhase::Exploration : SessionPhase::Combat);
 }
 
 bool NetworkLobby::sendLocalItemDrop(EntityId sourceId,
@@ -666,8 +702,26 @@ std::optional<GameEvent> NetworkLobby::takePeerEvent()
         return std::nullopt;
     }
 
+    // The engine drains events before checkpoints. Let it apply a queued
+    // complete state first when that state covers a missing application
+    // boundary before this event. Receiving the event alone is not proof
+    // that the earlier native state has been applied.
+    std::uint64_t deliveredBoundary = std::max(_lastAppliedEventSequence.value,
+        _lastDeliveredEventSequence.value);
+    auto establishesBoundary = [&](const WorldSnapshot& snapshot) {
+        return _peerEvents.front().sequence.value > deliveredBoundary + 1
+            && snapshot.lastIncludedEvent.value > _lastAppliedEventSequence.value
+            && snapshot.lastIncludedEvent.value >= _peerEvents.front().sequence.value - 1;
+    };
+    if (std::any_of(_authoritativeStates.begin(), _authoritativeStates.end(), establishesBoundary)
+        || std::any_of(_peerSnapshots.begin(), _peerSnapshots.end(), establishesBoundary)) {
+        return std::nullopt;
+    }
+
     GameEvent event = std::move(_peerEvents.front());
     _peerEvents.pop_front();
+    _lastDeliveredEventSequence.value = std::max(_lastDeliveredEventSequence.value,
+        event.sequence.value);
     return event;
 }
 
@@ -690,11 +744,17 @@ bool NetworkLobby::confirmPeerEventApplied(EventSequence sequence)
 bool NetworkLobby::confirmSnapshotApplied(EventSequence sequence)
 {
     if (_mode != NetworkLaunchMode::Join
+        || sequence.value == std::numeric_limits<std::uint64_t>::max()
         || sequence.value < _lastAppliedEventSequence.value
-        || sequence.value >= _nextExpectedEventSequence) {
+        || sequence.value > _latestReceivedCheckpoint.value) {
         return false;
     }
     _lastAppliedEventSequence = sequence;
+    _nextExpectedEventSequence = std::max(_nextExpectedEventSequence, sequence.value + 1);
+    _lastDeliveredEventSequence.value = std::max(_lastDeliveredEventSequence.value, sequence.value);
+    _peerEvents.erase(std::remove_if(_peerEvents.begin(), _peerEvents.end(),
+        [sequence](const GameEvent& event) { return event.sequence.value <= sequence.value; }),
+        _peerEvents.end());
     if (_state != NetworkLobbyState::Ready) return true;
     std::vector<std::uint8_t> body;
     appendUInt32(body, kGuestPlayerId.value);
@@ -713,6 +773,7 @@ bool NetworkLobby::requestRecovery(EventSequence lastApplied)
         || _state != NetworkLobbyState::Ready
         || !_startRequested
         || _transport == nullptr
+        || lastApplied.value > _lastAppliedEventSequence.value
         || lastApplied.value == std::numeric_limits<std::uint64_t>::max()) {
         return false;
     }
@@ -724,6 +785,10 @@ bool NetworkLobby::requestRecovery(EventSequence lastApplied)
     }
     _recovering = true;
     _nextExpectedEventSequence = lastApplied.value + 1;
+    _latestReceivedCheckpoint = lastApplied;
+    _lastDeliveredEventSequence = lastApplied;
+    _peerEvents.clear();
+    _authoritativeStates.clear();
     _peerSnapshots.clear();
     return true;
 }
@@ -733,11 +798,16 @@ bool NetworkLobby::beginReconnectRecovery(EventSequence lastApplied)
     if (_mode != NetworkLaunchMode::Join
         || _state != NetworkLobbyState::Ready
         || !_startRequested
+        || lastApplied.value > _lastAppliedEventSequence.value
         || lastApplied.value == std::numeric_limits<std::uint64_t>::max()) {
         return false;
     }
     _recovering = true;
     _nextExpectedEventSequence = lastApplied.value + 1;
+    _latestReceivedCheckpoint = lastApplied;
+    _lastDeliveredEventSequence = lastApplied;
+    _peerEvents.clear();
+    _authoritativeStates.clear();
     _peerSnapshots.clear();
     return true;
 }
@@ -851,6 +921,24 @@ std::optional<WorldSnapshot> NetworkLobby::takeAuthoritativeState()
     return snapshot;
 }
 
+bool NetworkLobby::confirmStoryPresentationCompleted(std::uint64_t revision)
+{
+    if (_mode != NetworkLaunchMode::Join || _state != NetworkLobbyState::Ready
+        || !_startRequested || !_localSheet.has_value() || revision == 0) return false;
+    std::vector<std::uint8_t> body;
+    appendUInt32(body, _localSheet->playerId.value);
+    appendUInt64(body, revision);
+    return sendRecoveryMessage(static_cast<std::uint8_t>(RecoveryMessageType::StoryCompleted), body);
+}
+
+std::optional<StoryPresentationCompletion> NetworkLobby::takeStoryPresentationCompleted()
+{
+    if (_storyCompletions.empty()) return std::nullopt;
+    auto revision = _storyCompletions.front();
+    _storyCompletions.pop_front();
+    return revision;
+}
+
 bool NetworkLobby::confirmSessionEndingApplied(std::uint32_t phaseRevision)
 {
     if (_mode != NetworkLaunchMode::Join
@@ -915,6 +1003,11 @@ bool NetworkLobby::reattachTransport(std::unique_ptr<Transport> transport)
     _nextSendSequence = 2;
     _nextReceiveSequence = 2;
     _error = NetworkLobbyError::None;
+    if (_mode == NetworkLaunchMode::Join) {
+        _nextExpectedEventSequence = _lastAppliedEventSequence.value + 1;
+        _latestReceivedCheckpoint = _lastAppliedEventSequence;
+        _lastDeliveredEventSequence = _lastAppliedEventSequence;
+    }
     _commandResults.clear();
     _recovering = false;
     _state = NetworkLobbyState::Ready;
@@ -1090,6 +1183,8 @@ void NetworkLobby::stop()
     _chatMessages.clear();
     _peerSnapshots.clear();
     _authoritativeStates.clear();
+    _latestReceivedCheckpoint = {};
+    _lastDeliveredEventSequence = {};
     _recovering = false;
     _eventJournal.clear();
     _state = NetworkLobbyState::Stopped;
@@ -1125,6 +1220,11 @@ bool NetworkLobby::startRequested() const
     return _startRequested;
 }
 
+CommandSequence NetworkLobby::nextLocalCommandSequence() const
+{
+    return CommandSequence { _nextLocalCommandSequence };
+}
+
 std::uint64_t NetworkLobby::nextSendSequence() const
 {
     return _nextSendSequence;
@@ -1133,11 +1233,6 @@ std::uint64_t NetworkLobby::nextSendSequence() const
 std::uint64_t NetworkLobby::nextReceiveSequence() const
 {
     return _nextReceiveSequence;
-}
-
-CommandSequence NetworkLobby::nextLocalCommandSequence() const
-{
-    return CommandSequence { _nextLocalCommandSequence };
 }
 
 const ProtocolDiagnostics& NetworkLobby::diagnostics() const
@@ -1245,6 +1340,16 @@ void NetworkLobby::handlePacket(const Packet& packet)
             _acknowledgedEvents[kGuestPlayerId] = applied;
             return;
         }
+        if (type == RecoveryMessageType::StoryCompleted) {
+            if (_mode != NetworkLaunchMode::Host || body.size() != 12 || !_peerSheet.has_value()
+                || readUInt32(body, 0) != _peerSheet->playerId.value || readUInt64(body, 4) == 0
+                || _storyCompletions.size() >= kMaxSnapshotActors) {
+                fail(NetworkLobbyError::UnexpectedMessage);
+                return;
+            }
+            _storyCompletions.push_back({ PlayerId { readUInt32(body, 0) }, readUInt64(body, 4) });
+            return;
+        }
         if (type == RecoveryMessageType::EndingApplied) {
             if (_mode != NetworkLaunchMode::Host || body.size() != sizeof(std::uint32_t)) {
                 fail(NetworkLobbyError::UnexpectedMessage);
@@ -1274,6 +1379,7 @@ void NetworkLobby::handlePacket(const Packet& packet)
                 return;
             }
             _nextExpectedEventSequence = snapshot.snapshot.lastIncludedEvent.value + 1;
+            _latestReceivedCheckpoint = snapshot.snapshot.lastIncludedEvent;
             SnapshotDigestResult digest = computeSnapshotDigest(snapshot.snapshot);
             if (digest) {
                 _diagnostics.recordStateChecksum(ProtocolDiagnosticDirection::ChecksumReceived,
@@ -1310,6 +1416,16 @@ void NetworkLobby::handlePacket(const Packet& packet)
             fail(NetworkLobbyError::UnexpectedMessage);
             return;
         }
+        if (state.snapshot.lastIncludedEvent.value == std::numeric_limits<std::uint64_t>::max()) {
+            fail(NetworkLobbyError::ProtocolError);
+            return;
+        }
+        // Receiving a complete state establishes the covered receive boundary,
+        // but application and its acknowledgement still belong to the engine.
+        _latestReceivedCheckpoint.value = std::max(_latestReceivedCheckpoint.value,
+            state.snapshot.lastIncludedEvent.value);
+        _nextExpectedEventSequence = std::max(_nextExpectedEventSequence,
+            state.snapshot.lastIncludedEvent.value + 1);
         if (_authoritativeStates.size() >= 2) {
             _authoritativeStates.pop_front();
         }
@@ -1366,11 +1482,14 @@ void NetworkLobby::handlePacket(const Packet& packet)
             fail(NetworkLobbyError::UnexpectedMessage);
             return;
         }
+        if (event.event.sequence.value <= _latestReceivedCheckpoint.value) {
+            return;
+        }
         if (event.event.sequence.value != _nextExpectedEventSequence) {
             if (!_recovering
                 && event.event.sequence.value > _nextExpectedEventSequence
                 && _nextExpectedEventSequence > 0
-                && requestRecovery(EventSequence { _nextExpectedEventSequence - 1 })) {
+                && requestRecovery(_lastAppliedEventSequence)) {
                 return;
             }
             if (!_recovering) {
@@ -1515,6 +1634,8 @@ void NetworkLobby::markDisconnected()
     _peerEvents.clear();
     _peerSnapshots.clear();
     _authoritativeStates.clear();
+    _latestReceivedCheckpoint = _lastAppliedEventSequence;
+    _lastDeliveredEventSequence = _lastAppliedEventSequence;
     _recovering = false;
     _error = NetworkLobbyError::Disconnected;
     _state = NetworkLobbyState::Disconnected;

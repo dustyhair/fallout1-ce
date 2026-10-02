@@ -26,6 +26,8 @@ int LoadGame(int mode);
 bool MultiplayerRecoverySaveExists();
 bool SaveMultiplayerRecoveryGame();
 bool LoadMultiplayerRecoveryGame();
+bool SaveMultiplayerGameSlot(int slot);
+bool LoadMultiplayerGameSlot(int slot);
 int isLoadingGame();
 void KillOldMaps();
 int MapDirErase(const char* path, const char* a2);

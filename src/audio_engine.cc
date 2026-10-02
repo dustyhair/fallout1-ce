@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include <mutex>
+#include <atomic>
 
 #include <SDL.h>
 
@@ -25,11 +26,11 @@ struct AudioEngineSoundBuffer {
     std::recursive_mutex mutex;
 };
 
-extern bool GNW95_isActive;
-
 static bool soundBufferIsValid(int soundBufferIndex);
 static void audioEngineMixin(void* userData, Uint8* stream, int length);
 
+static std::atomic<bool> audioFocused { true };
+static std::atomic<bool> backgroundPlayback { false };
 static SDL_AudioSpec gAudioEngineSpec;
 static SDL_AudioDeviceID gAudioEngineDeviceId = -1;
 static AudioEngineSoundBuffer gAudioEngineSoundBuffers[AUDIO_ENGINE_SOUND_BUFFERS];
@@ -48,9 +49,8 @@ static void audioEngineMixin(void* userData, Uint8* stream, int length)
 {
     memset(stream, gAudioEngineSpec.silence, length);
 
-    if (!GNW95_isActive) {
-        return;
-    }
+    bool focused = audioFocused.load();
+    if (!focused && !backgroundPlayback.load()) return;
 
     for (int index = 0; index < AUDIO_ENGINE_SOUND_BUFFERS; index++) {
         AudioEngineSoundBuffer* soundBuffer = &(gAudioEngineSoundBuffers[index]);
@@ -76,7 +76,9 @@ static void audioEngineMixin(void* userData, Uint8* stream, int length)
                     break;
                 }
 
-                SDL_MixAudioFormat(stream + pos, buffer, gAudioEngineSpec.format, bytesRead, soundBuffer->volume);
+                // Continue consuming soundtrack buffers for movie clocks while
+                // inactive, keeping the workstation output silent.
+                if (focused) SDL_MixAudioFormat(stream + pos, buffer, gAudioEngineSpec.format, bytesRead, soundBuffer->volume);
 
                 if (soundBuffer->pos >= soundBuffer->size) {
                     if (soundBuffer->looping) {
@@ -126,6 +128,16 @@ void audioEngineExit()
     if (SDL_WasInit(SDL_INIT_AUDIO)) {
         SDL_QuitSubSystem(SDL_INIT_AUDIO);
     }
+}
+
+void audioEngineSetFocused(bool focused)
+{
+    audioFocused.store(focused);
+}
+
+void audioEngineSetBackgroundPlayback(bool enabled)
+{
+    backgroundPlayback.store(enabled);
 }
 
 void audioEnginePause()

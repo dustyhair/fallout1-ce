@@ -22,6 +22,7 @@ bool networkRuntimeJoin(const char* endpoint);
 void networkRuntimeDisconnect();
 NetworkLaunchMode networkRuntimeMode();
 bool networkRuntimeIsGuestReplica();
+PlayerId networkRuntimePresentedPlayerId();
 bool networkRuntimeConnected();
 bool networkRuntimeHostWorldActive();
 bool networkRuntimeSaveAllowed();
@@ -32,6 +33,10 @@ MultiplayerSaveError networkRuntimeCaptureSave(std::uint64_t generation,
 bool networkRuntimeStageLoadedSave(const MultiplayerSaveSidecar& sidecar,
     Object* savedGuestActor);
 void networkRuntimeEndHostSession();
+std::optional<int> networkRuntimePresentStory(StoryPresentationKind kind, int movie,
+    std::uint32_t flags, const std::vector<int>& slides = {});
+void networkRuntimeProcessPendingStory();
+void networkRuntimeStoryTick();
 bool networkRuntimeFailed();
 const char* networkRuntimeStatus();
 const CharacterCreationSheet* networkRuntimeLocalSheet();
@@ -42,9 +47,12 @@ bool networkRuntimeHandleGameChatInput(int keyCode);
 bool networkRuntimeHandleCombatInput(int keyCode);
 void networkRuntimeRequestCombatTurnCheckpoint();
 bool networkRuntimeSmokeTestEnabled();
+bool networkRuntimeSmokeTestMissingMovie();
+bool networkRuntimeSmokeTestPipboyScreensaver();
 const char* networkRuntimeSmokeTestMap();
 bool networkRuntimeRunSmokeTest();
 bool networkRuntimeSubmitLocalCharacter(Object* actor);
+bool networkRuntimePrepareLoadedSaveLobby();
 bool networkRuntimeWaitForLobby();
 bool networkRuntimeLobbyReady();
 bool networkRuntimeRequestStart();
@@ -54,6 +62,11 @@ bool networkRuntimeSubmitLocalMove(int destinationTile, int elevation, bool runn
 bool networkRuntimeSubmitLocalFacing(int rotation);
 bool networkRuntimeSubmitCombatAttack(EntityId targetId, std::int32_t hitMode, std::int32_t hitLocation);
 bool networkRuntimeSubmitCombatItem(EntityId itemId, EntityId targetId = {});
+bool networkRuntimeActivateAutomapScanner(Object* scanner);
+bool networkRuntimeHandleInventoryAction(Object* item, InventoryAction action,
+    Object* ammo = nullptr, std::uint32_t quantity = 1);
+bool networkRuntimeHandleLocalCombatStart(Object* target = nullptr, int hitMode = 4, int hitLocation = 8);
+bool networkRuntimeSubmitCharacterAdvance(const CharacterAdvanceCommand& command);
 bool networkRuntimeSubmitEquipment(const EquipmentCommand& equipment);
 bool networkRuntimeSubmitCombatReload(EntityId weaponId, std::int32_t hitMode);
 bool networkRuntimeHandleCombatItemUse(Object* item);
@@ -83,11 +96,15 @@ bool networkRuntimeSubmitLocalTalk(EntityId targetId);
 bool networkRuntimeBeginDialogue();
 void networkRuntimeEndDialogue();
 bool networkRuntimeSubmitDialogueVote(std::uint64_t revision, std::uint8_t option);
+bool networkRuntimeSubmitNpcBarter(const NpcBarterCommand& command);
+bool networkRuntimeBeginNpcBarter(EntityId sellerId);
 bool networkRuntimeSubmitDirectTrade(const DirectTradeCommand& trade);
 bool networkRuntimeBeginDirectTrade(EntityId otherActorId);
 void networkRuntimeObserveDialogueDecision(std::uint64_t revision, std::uint8_t option);
-void networkRuntimeProcessPendingTalk();
+bool networkRuntimeProcessPendingTalk();
 bool networkRuntimeWorldPaused();
+// Unwind nested native screens after an authoritative terminal party outcome.
+bool networkRuntimeProcessPartyDefeat();
 bool networkRuntimeHandleLocalLootTargetChange(Object* target);
 bool networkRuntimeHandleLocalInventoryTransfer(Object* source,
     Object* destination,

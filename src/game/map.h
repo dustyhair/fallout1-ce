@@ -89,6 +89,8 @@ void map_reset();
 void map_exit();
 void map_enable_bk_processes();
 bool map_disable_bk_processes();
+// Local multiplayer menus leave shared native processing active.
+bool map_disable_bk_processes_for_local_ui();
 bool map_bk_processes_enabled();
 int map_set_elevation(int elevation);
 bool map_is_elevation_empty(int elevation);

@@ -18,6 +18,7 @@ char* itostndn(int value, char* dest);
 int editor_save(DB_FILE* stream);
 int editor_load(DB_FILE* stream);
 void editor_reset();
+void editor_get_advancement(int& processedLevel, int& pendingPerks);
 void RedrwDMPrk();
 
 } // namespace fallout

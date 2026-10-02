@@ -10,6 +10,7 @@
 #include "game/skill.h"
 #include "game/stat.h"
 #include "multiplayer/acting_player_context.h"
+#include "multiplayer/local_player_context.h"
 #include "platform_compat.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/memory.h"
@@ -385,6 +386,7 @@ void perk_remove_effect(Object* critter, int perk)
 // 0x4869AC
 int perk_adjust_skill(Object* critter, int skill)
 {
+    multiplayer::ScopedActorPlayerContext playerContext(critter);
     int modifier = 0;
 
     switch (skill) {

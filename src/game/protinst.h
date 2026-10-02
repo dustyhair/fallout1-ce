@@ -17,6 +17,8 @@ int obj_remove_from_inven(Object* critter, Object* item);
 int obj_drop(Object* a1, Object* a2);
 int obj_drop_quantity(Object* owner, Object* item, int quantity);
 int obj_destroy(Object* obj);
+bool obj_is_explosive(const Object* item);
+int obj_arm_explosive(Object* critter, Object* explosive, int seconds);
 int obj_use_radio(Object* critter, Object* item_obj);
 int protinst_use_item(Object* a1, Object* a2);
 int obj_use_item(Object* a1, Object* a2);
@@ -26,6 +28,8 @@ int check_scenery_ap_cost(Object* obj, Object* a2);
 int obj_use(Object* a1, Object* a2);
 int obj_use_door(Object* a1, Object* a2, int a3);
 int obj_use_container(Object* critter, Object* item);
+// Returns -1 on failure, 0 for native handling, 1 for a script override.
+int obj_use_skill_script(Object* source, Object* target, int skill);
 int obj_use_skill_on(Object* a1, Object* a2, int skill);
 bool obj_is_a_portal(Object* obj);
 bool obj_is_lockable(Object* obj);

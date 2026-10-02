@@ -88,6 +88,7 @@ int item_m_set_charges(Object* miscItem, int charges);
 int item_m_cell(Object* miscItem);
 int item_m_cell_pid(Object* miscItem);
 bool item_m_uses_charges(Object* obj);
+int item_m_use_motion_sensor(Object* item);
 int item_m_use_charged_item(Object* critter, Object* item);
 int item_m_dec_charges(Object* miscItem);
 int item_m_trickle(Object* item_obj, void* data);

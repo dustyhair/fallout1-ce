@@ -43,6 +43,7 @@ int gDialogReplyStr(Program* program, int messageListId, const char* text);
 int gDialogGo();
 void talk_to_critter_reacts(int a1);
 void gdialogSetBarterMod(int modifier);
+int gdialogGetBarterModifier();
 int gdActivateBarter(int modifier);
 void barter_end_to_talk_to();
 

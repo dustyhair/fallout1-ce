@@ -1,4 +1,6 @@
 #include "game/endgame.h"
+#include "multiplayer/network_runtime.h"
+#include "multiplayer/network_world.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -182,116 +184,139 @@ static int endgame_old_font;
 static int gEndgameEndingOverlay;
 
 // 0x438670
-void endgame_slideshow()
+std::vector<int> endgame_select_slides()
 {
-    int fid;
+    std::vector<int> slides;
     int v1;
-
-    if (endgame_init() != -1) {
-        if (game_get_global_var(GVAR_VATS_STATUS)) {
-            endgame_pan_desert(1, "nar_11");
-        } else {
-            endgame_pan_desert(1, "nar_10");
-        }
-
-        if (game_get_global_var(GVAR_NECROPOLIS_INVADED)) {
-            fid = art_id(OBJ_TYPE_INTERFACE, 311, 0, 0, 0);
-            endgame_display_image(fid, "nar_15");
-        } else if (game_get_global_var(GVAR_NECROP_WATER_CHIP_TAKEN)) {
-            if (game_get_global_var(GVAR_NECROP_WATER_PUMP_FIXED) == 2) {
-                fid = art_id(OBJ_TYPE_INTERFACE, 312, 0, 0, 0);
-                endgame_display_image(fid, "nar_13");
-            } else {
-                fid = art_id(OBJ_TYPE_INTERFACE, 311, 0, 0, 0);
-                endgame_display_image(fid, "nar_12");
-            }
-        }
-
-        if (game_get_global_var(GVAR_FOLLOWERS_INVADED)) {
-            fid = art_id(OBJ_TYPE_INTERFACE, 314, 0, 0, 0);
-            endgame_display_image(fid, "nar_18");
-        } else if (game_get_global_var(GVAR_TRAIN_FOLLOWERS)) {
-            fid = art_id(OBJ_TYPE_INTERFACE, 313, 0, 0, 0);
-            endgame_display_image(fid, "nar_16");
-        }
-
-        if (game_get_global_var(GVAR_SHADY_SANDS_INVADED)) {
-            fid = art_id(OBJ_TYPE_INTERFACE, 324, 0, 0, 0);
-            endgame_display_image(fid, "nar_23");
-        } else {
-            v1 = game_get_global_var(GVAR_TANDI_STATUS);
-            if (game_get_global_var(GVAR_ARADESH_STATUS)) {
-                if (v1 != 2 && v1 != 0) {
-                    fid = art_id(OBJ_TYPE_INTERFACE, 324, 0, 0, 0);
-                    endgame_display_image(fid, "nar_22");
-                } else {
-                    fid = art_id(OBJ_TYPE_INTERFACE, 323, 0, 0, 0);
-                    endgame_display_image(fid, "nar_21");
-                }
-            } else {
-                if (v1 != 2 && v1 != 0) {
-                    fid = art_id(OBJ_TYPE_INTERFACE, 323, 0, 0, 0);
-                    endgame_display_image(fid, "nar_20");
-                } else {
-                    fid = art_id(OBJ_TYPE_INTERFACE, 323, 0, 0, 0);
-                    endgame_display_image(fid, "nar_19");
-                }
-            }
-        }
-
-        if (game_get_global_var(GVAR_JUNKTOWN_INVADED)) {
-            fid = art_id(OBJ_TYPE_INTERFACE, 317, 0, 0, 0);
-            endgame_display_image(fid, "nar_27");
-        } else if (game_get_global_var(GVAR_CAPTURE_GIZMO) != 2 || game_get_global_var(GVAR_KILLIAN_DEAD)) {
-            if (!game_get_global_var(GVAR_GIZMO_DEAD)) {
-                fid = art_id(OBJ_TYPE_INTERFACE, 316, 0, 0, 0);
-                endgame_display_image(fid, "nar_25");
-            }
-        } else {
-            fid = art_id(OBJ_TYPE_INTERFACE, 315, 0, 0, 0);
-            endgame_display_image(fid, "nar_24");
-        }
-
-        if (game_get_global_var(GVAR_BECOME_AN_INITIATE) == 2 && game_get_global_var(GVAR_ENEMY_BROTHERHOOD)) {
-            fid = art_id(OBJ_TYPE_INTERFACE, 319, 0, 0, 0);
-            endgame_display_image(fid, "nar_29");
-        } else {
-            fid = art_id(OBJ_TYPE_INTERFACE, 318, 0, 0, 0);
-            endgame_display_image(fid, "nar_28");
-        }
-
-        if (game_get_global_var(GVAR_HUB_INVADED)) {
-            fid = art_id(OBJ_TYPE_INTERFACE, 326, 0, 0, 0);
-            endgame_display_image(fid, "nar_34");
-        } else if (game_get_global_var(GVAR_KIND_TO_HAROLD) == 1) {
-            fid = art_id(OBJ_TYPE_INTERFACE, 325, 0, 0, 0);
-            endgame_display_image(fid, "nar_32");
-        }
-
-        if (game_get_global_var(GVAR_RAIDERS) < 2) {
-            fid = art_id(OBJ_TYPE_INTERFACE, 320, 0, 0, 0);
-            endgame_display_image(fid, "nar_37");
-        } else {
-            v1 = game_get_global_var(GVAR_TOTAL_RAIDERS);
-            if (game_get_global_var(GVAR_GARL_DEAD) && v1 < 8 || v1 < 4) {
-                fid = art_id(OBJ_TYPE_INTERFACE, 320, 0, 0, 0);
-                endgame_display_image(fid, "nar_35");
-            } else {
-                fid = art_id(OBJ_TYPE_INTERFACE, 320, 0, 0, 0);
-                endgame_display_image(fid, "nar_36");
-            }
-        }
-
-        endgame_pan_desert(-1, "nar_40");
-
-        endgame_exit();
+    if (game_get_global_var(GVAR_VATS_STATUS)) {
+        slides.push_back(11);
+    } else {
+        slides.push_back(10);
     }
 
-    game_set_global_var(GVAR_CALM_REBELS_2, 0);
+    if (game_get_global_var(GVAR_NECROPOLIS_INVADED)) {
+        slides.push_back(15);
+    } else if (game_get_global_var(GVAR_NECROP_WATER_CHIP_TAKEN)) {
+        if (game_get_global_var(GVAR_NECROP_WATER_PUMP_FIXED) == 2) {
+            slides.push_back(13);
+        } else {
+            slides.push_back(12);
+        }
+    }
+
+    if (game_get_global_var(GVAR_FOLLOWERS_INVADED)) {
+        slides.push_back(18);
+    } else if (game_get_global_var(GVAR_TRAIN_FOLLOWERS)) {
+        slides.push_back(16);
+    }
+
+    if (game_get_global_var(GVAR_SHADY_SANDS_INVADED)) {
+        slides.push_back(23);
+    } else {
+        v1 = game_get_global_var(GVAR_TANDI_STATUS);
+        if (game_get_global_var(GVAR_ARADESH_STATUS)) {
+            if (v1 != 2 && v1 != 0) {
+
+                slides.push_back(22);
+            } else {
+
+                slides.push_back(21);
+            }
+        } else {
+            if (v1 != 2 && v1 != 0) {
+
+                slides.push_back(20);
+            } else {
+
+                slides.push_back(19);
+            }
+        }
+    }
+
+    if (game_get_global_var(GVAR_JUNKTOWN_INVADED)) {
+        slides.push_back(27);
+    } else if (game_get_global_var(GVAR_CAPTURE_GIZMO) != 2 || game_get_global_var(GVAR_KILLIAN_DEAD)) {
+        if (!game_get_global_var(GVAR_GIZMO_DEAD)) {
+            slides.push_back(25);
+        }
+    } else {
+        slides.push_back(24);
+    }
+
+    if (game_get_global_var(GVAR_BECOME_AN_INITIATE) == 2 && game_get_global_var(GVAR_ENEMY_BROTHERHOOD)) {
+        slides.push_back(29);
+    } else {
+        slides.push_back(28);
+    }
+
+    if (game_get_global_var(GVAR_HUB_INVADED)) {
+        slides.push_back(34);
+    } else if (game_get_global_var(GVAR_KIND_TO_HAROLD) == 1) {
+        slides.push_back(32);
+    }
+
+    if (game_get_global_var(GVAR_RAIDERS) < 2) {
+        slides.push_back(37);
+    } else {
+        v1 = game_get_global_var(GVAR_TOTAL_RAIDERS);
+        if (game_get_global_var(GVAR_GARL_DEAD) && v1 < 8 || v1 < 4) {
+            slides.push_back(35);
+        } else {
+            slides.push_back(36);
+        }
+    }
+
+    slides.push_back(40);
+
+    return slides;
+}
+
+void endgame_play_slides(const std::vector<int>& slides)
+{
+    if (endgame_init() == -1) return;
+    for (int slide : slides) {
+        if (multiplayer::networkRuntimeSmokeTestEnabled())
+            std::fprintf(stderr, "NATIVE_STORY_SLIDE role=%s narration=%d\n",
+                multiplayer::networkRuntimeIsGuestReplica() ? "guest" : "host", slide);
+        char narrator[12];
+        snprintf(narrator, sizeof(narrator), "nar_%d", slide);
+        if (slide == 10 || slide == 11 || slide == 40) {
+            endgame_pan_desert(slide == 40 ? -1 : 1, narrator);
+        } else {
+            int art = -1;
+            switch (slide) {
+            case 12: case 15: art = 311; break;
+            case 13: art = 312; break;
+            case 16: art = 313; break;
+            case 18: art = 314; break;
+            case 19: case 20: case 21: art = 323; break;
+            case 22: case 23: art = 324; break;
+            case 24: art = 315; break;
+            case 25: art = 316; break;
+            case 27: art = 317; break;
+            case 28: art = 318; break;
+            case 29: art = 319; break;
+            case 32: art = 325; break;
+            case 34: art = 326; break;
+            case 35: case 36: case 37: art = 320; break;
+            }
+            if (art >= 0) endgame_display_image(art_id(OBJ_TYPE_INTERFACE, art, 0, 0, 0), narrator);
+        }
+        if (game_user_wants_to_quit != 0) break;
+    }
+    endgame_exit();
+}
+
+void endgame_slideshow()
+{
+    auto slides = endgame_select_slides();
+    auto shared = multiplayer::networkRuntimePresentStory(multiplayer::StoryPresentationKind::Slides, 0, 0, slides);
+    if (!shared.has_value()) endgame_play_slides(slides);
+    if (!multiplayer::networkRuntimeIsGuestReplica()) game_set_global_var(GVAR_CALM_REBELS_2, 0);
 }
 
 // 0x438A4C
-void endgame_movie()
+void endgame_play_finale(int movie)
 {
     gsound_background_stop();
     map_disable_bk_processes();
@@ -302,20 +327,23 @@ void endgame_movie()
     gsound_background_play("maybe", 12, 14, 15);
     pause_for_tocks(3000);
 
-    // NOTE: Result is ignored. I guess there was some kind of switch for male
-    // vs. female ending, but it was not implemented.
-    if (stat_level(obj_dude, STAT_GENDER) == GENDER_MALE) {
-        gmovie_play(MOVIE_WALKM, 0);
-    } else {
-        gmovie_play(MOVIE_WALKW, 0);
-    }
+    gmovie_play(movie, 0);
 
     credits("credits.txt", -1, false);
     gsound_background_stop();
     gsound_background_callback_set(NULL);
     remove_bk_process(endgame_movie_bk_process);
     gsound_background_stop();
-    game_user_wants_to_quit = 2;
+}
+
+void endgame_movie()
+{
+    Object* storyActor = multiplayer::networkWorldActive()
+        ? multiplayer::networkWorldPlayerActor(multiplayer::kHostPlayerId) : obj_dude;
+    int movie = stat_level(storyActor, STAT_GENDER) == GENDER_MALE ? MOVIE_WALKM : MOVIE_WALKW;
+    auto shared = multiplayer::networkRuntimePresentStory(multiplayer::StoryPresentationKind::Finale, movie, 0);
+    if (!shared.has_value()) endgame_play_finale(movie);
+    if (!multiplayer::networkRuntimeIsGuestReplica()) game_user_wants_to_quit = 2;
 }
 
 // 0x438B04
@@ -543,7 +571,8 @@ static void endgame_pan_desert(int direction, const char* narratorFileName)
 
             soundUpdate();
 
-            if (get_input() != -1) {
+            multiplayer::networkRuntimeStoryTick();
+            if (game_user_wants_to_quit != 0 || get_input() != -1) {
                 // NOTE: Uninline.
                 endgame_stop_voiceover();
                 break;
@@ -613,7 +642,9 @@ static void endgame_display_image(int fid, const char* narratorFileName)
         while (true) {
             sharedFpsLimiter.mark();
 
+            multiplayer::networkRuntimeStoryTick();
             keyCode = get_input();
+            if (game_user_wants_to_quit != 0) break;
             if (keyCode != -1) {
                 break;
             }

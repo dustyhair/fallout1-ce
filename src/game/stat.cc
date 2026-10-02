@@ -1,3 +1,4 @@
+#include "multiplayer/character_advancement.h"
 #include "game/stat.h"
 
 #include <limits.h>
@@ -22,6 +23,7 @@
 #include "game/tile.h"
 #include "game/trait.h"
 #include "multiplayer/acting_player_context.h"
+#include "multiplayer/local_player_context.h"
 #include "multiplayer/developer_local_session.h"
 #include "multiplayer/network_world.h"
 #include "multiplayer/presentation_bridge.h"
@@ -189,6 +191,7 @@ int stat_save(DB_FILE* stream)
 // 0x49C4C8
 int stat_level(Object* critter, int stat)
 {
+    multiplayer::ScopedActorPlayerContext playerContext(critter);
     int value;
     if (stat >= 0 && stat < SAVEABLE_STAT_COUNT) {
         value = stat_get_base(critter, stat);
@@ -238,6 +241,7 @@ int stat_level(Object* critter, int stat)
 // 0x49C5B8
 int stat_get_base(Object* critter, int stat)
 {
+    multiplayer::ScopedActorPlayerContext playerContext(critter);
     int value = stat_get_base_direct(critter, stat);
 
     if (critter == obj_dude || multiplayer::isActingPlayerActor(critter)) {
@@ -250,6 +254,7 @@ int stat_get_base(Object* critter, int stat)
 // 0x49C5E0
 int stat_get_base_direct(Object* critter, int stat)
 {
+    multiplayer::ScopedActorPlayerContext playerContext(critter);
     Proto* proto;
 
     if (stat >= 0 && stat < SAVEABLE_STAT_COUNT) {
@@ -277,6 +282,7 @@ int stat_get_base_direct(Object* critter, int stat)
 // 0x49C64C
 int stat_get_bonus(Object* critter, int stat)
 {
+    multiplayer::ScopedActorPlayerContext playerContext(critter);
     if (stat >= 0 && stat < SAVEABLE_STAT_COUNT) {
         multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuildFor(critter);
         if (build != nullptr) {
@@ -294,6 +300,7 @@ int stat_get_bonus(Object* critter, int stat)
 // 0x49C694
 int stat_set_base(Object* critter, int stat, int value)
 {
+    multiplayer::ScopedActorPlayerContext playerContext(critter);
     Proto* proto;
 
     if (stat < 0 || stat >= STAT_COUNT) {
@@ -349,6 +356,7 @@ int stat_set_base(Object* critter, int stat, int value)
 // 0x49C7AC
 int inc_stat(Object* critter, int stat)
 {
+    multiplayer::ScopedActorPlayerContext playerContext(critter);
     int value = stat_get_base_direct(critter, stat);
 
     if (critter == obj_dude || multiplayer::isActingPlayerActor(critter)) {
@@ -361,6 +369,7 @@ int inc_stat(Object* critter, int stat)
 // 0x49C7E0
 int dec_stat(Object* critter, int stat)
 {
+    multiplayer::ScopedActorPlayerContext playerContext(critter);
     int value = stat_get_base_direct(critter, stat);
 
     if (critter == obj_dude || multiplayer::isActingPlayerActor(critter)) {
@@ -373,6 +382,7 @@ int dec_stat(Object* critter, int stat)
 // 0x49C814
 int stat_set_bonus(Object* critter, int stat, int value)
 {
+    multiplayer::ScopedActorPlayerContext playerContext(critter);
     if (stat < 0 || stat >= STAT_COUNT) {
         return -5;
     }
@@ -421,6 +431,7 @@ void stat_set_defaults(CritterProtoData* data)
 // 0x49C8D4
 void stat_recalc_derived(Object* critter)
 {
+    multiplayer::ScopedActorPlayerContext playerContext(critter);
     int strength = stat_level(critter, STAT_STRENGTH);
     int perception = stat_level(critter, STAT_PERCEPTION);
     int endurance = stat_level(critter, STAT_ENDURANCE);
@@ -685,6 +696,10 @@ int stat_pc_add_experience(int xp)
                 intface_update_hit_points(false);
             }
         }
+    }
+
+    if (build != nullptr) {
+        multiplayer::grantCharacterLevels(*build, stat_get_base(playerActor, STAT_INTELLIGENCE));
     }
 
     return 0;

@@ -16,6 +16,7 @@
 #include "game/proto.h"
 #include "game/scripts.h"
 #include "multiplayer/network_runtime.h"
+#include "multiplayer/network_world.h"
 #include "plib/gnw/memory.h"
 
 namespace fallout {
@@ -25,7 +26,10 @@ typedef struct QueueListNode {
     int time;
     int type;
     Object* owner;
-    // In-memory traversal identity; not serialized in saves or snapshots.
+    // Native IDs survive serialization even when the guest is restored later.
+    int savedOwnerId;
+    // In-memory identity only; native saves and multiplayer snapshots serialize
+    // explicit event fields, not this traversal handle.
     std::uint64_t generation;
     void* data;
     struct QueueListNode* next;
@@ -36,12 +40,20 @@ static std::uint64_t nextQueueNodeGeneration = 1;
 static int queue_destroy(Object* obj, void* data);
 static int queue_explode(Object* obj, void* data);
 static int queue_explode_exit(Object* obj, void* data);
-static int queue_do_explosion(Object* obj, bool a2);
+static int queue_do_explosion(Object* obj, bool a2, int playerId = 0);
+static int queue_player_explode(Object* obj, void* data);
+static int queue_player_premature(Object* obj, void* data);
+static int queue_player_explode_exit(Object* obj, void* data);
+static int queue_player_explosion_load(DB_FILE* stream, void** data);
+static int queue_player_explosion_save(DB_FILE* stream, void* data);
 static int queue_premature(Object* obj, void* data);
 
 static std::size_t queue_event_payload_count(int eventType)
 {
     switch (eventType) {
+    case EVENT_TYPE_PLAYER_EXPLOSION:
+    case EVENT_TYPE_PLAYER_EXPLOSION_FAILURE:
+        return 1;
     case EVENT_TYPE_DRUG:
         return 6;
     case EVENT_TYPE_WITHDRAWAL:
@@ -72,6 +84,12 @@ static void queue_free_list(QueueListNode* list)
 static void* queue_create_event_data(const QueueEventState& state)
 {
     switch (state.eventType) {
+    case EVENT_TYPE_PLAYER_EXPLOSION:
+    case EVENT_TYPE_PLAYER_EXPLOSION_FAILURE: {
+        auto* event = static_cast<PlayerExplosionEvent*>(mem_malloc(sizeof(PlayerExplosionEvent)));
+        if (event != nullptr) event->playerId = state.payload[0];
+        return event;
+    }
     case EVENT_TYPE_DRUG: {
         DrugEffectEvent* event = (DrugEffectEvent*)mem_malloc(sizeof(*event));
         if (event != NULL) {
@@ -128,10 +146,88 @@ EventTypeDescription q_func[EVENT_TYPE_COUNT] = {
     { critter_sneak_check, NULL, NULL, NULL, true, critter_sneak_clear },
     { queue_premature, NULL, NULL, NULL, true, queue_explode_exit },
     { scr_map_q_process, NULL, NULL, NULL, true, NULL },
+    { queue_player_explode, mem_free, queue_player_explosion_load, queue_player_explosion_save, true, queue_player_explode_exit },
+    { queue_player_premature, mem_free, queue_player_explosion_load, queue_player_explosion_save, true, queue_player_explode_exit },
 };
 
 // 0x662F4C
 static QueueListNode* queue;
+static Object* mapExitPeerActor;
+static int mapExitEventType;
+
+static bool persistent_actor_event(int eventType)
+{
+    return eventType == EVENT_TYPE_DRUG || eventType == EVENT_TYPE_WITHDRAWAL
+        || eventType == EVENT_TYPE_POISON || eventType == EVENT_TYPE_RADIATION;
+}
+
+static int clear_peer_map_exit_event(Object* owner, void* data)
+{
+    if (owner == nullptr || (owner != mapExitPeerActor && obj_top_environment(owner) != mapExitPeerActor)) return 0;
+    if (owner == mapExitPeerActor && persistent_actor_event(mapExitEventType)) return 0;
+    auto* handler = q_func[mapExitEventType].field_14;
+    return handler != nullptr ? handler(owner, data) : 1;
+}
+
+DetachedActorQueueEvents::DetachedActorQueueEvents(Object* actor)
+    : _actor(actor)
+{
+    if (actor == nullptr) return;
+    Object* previousActor = mapExitPeerActor;
+    int previousType = mapExitEventType;
+    mapExitPeerActor = actor;
+    // Run native exit effects while carried items still have a real inventory
+    // owner. In particular destruction must remove an item before inventory is
+    // detached, and wake-up must affect the copied peer state.
+    for (int type = 0; type < EVENT_TYPE_COUNT; ++type) {
+        if (!q_func[type].field_10) continue;
+        mapExitEventType = type;
+        queue_clear_type(type, clear_peer_map_exit_event);
+    }
+    mapExitPeerActor = previousActor;
+    mapExitEventType = previousType;
+    QueueListNode* detached = nullptr;
+    QueueListNode** tail = &detached;
+    QueueListNode** link = &queue;
+    while (*link != nullptr) {
+        QueueListNode* node = *link;
+        bool persistent = persistent_actor_event(node->type) || node->type == EVENT_TYPE_KNOCKOUT;
+        bool carried = node->owner != nullptr && node->owner != actor
+            && obj_top_environment(node->owner) == actor;
+        if ((node->owner == actor && persistent) || carried) {
+            *link = node->next;
+            node->next = nullptr;
+            *tail = node;
+            tail = &node->next;
+        } else {
+            link = &node->next;
+        }
+    }
+    _events = detached;
+}
+
+DetachedActorQueueEvents::~DetachedActorQueueEvents()
+{
+    queue_free_list(static_cast<QueueListNode*>(_events));
+}
+
+void DetachedActorQueueEvents::restore(Object* replacement)
+{
+    if (replacement == nullptr) return;
+    auto* detached = static_cast<QueueListNode*>(_events);
+    _events = nullptr;
+    while (detached != nullptr) {
+        QueueListNode* node = detached;
+        detached = node->next;
+        if (node->owner == _actor) node->owner = replacement;
+        node->savedOwnerId = -2;
+        if (node->owner != nullptr) node->owner->flags |= OBJECT_USED;
+        QueueListNode** link = &queue;
+        while (*link != nullptr && (*link)->time <= node->time) link = &(*link)->next;
+        node->next = *link;
+        *link = node;
+    }
+}
 
 // 0x490670
 void queue_init()
@@ -157,90 +253,61 @@ int queue_exit()
 int queue_load(DB_FILE* stream)
 {
     int count;
-    if (db_freadInt(stream, &count) == -1) {
-        return -1;
-    }
+    if (db_freadInt(stream, &count) == -1 || count < 0
+        || count > (db_filelength(stream) - db_ftell(stream)) / 12) return -1;
 
-    queue = NULL;
-
-    QueueListNode** nextPtr = &queue;
-
-    int rc = 0;
-    for (int index = 0; index < count; index += 1) {
-        QueueListNode* queueListNode = (QueueListNode*)mem_malloc(sizeof(*queueListNode));
-        if (queueListNode == NULL) {
-            rc = -1;
-            break;
+    QueueListNode* loaded = nullptr;
+    QueueListNode** next = &loaded;
+    int previousTime = 0;
+    for (int index = 0; index < count; ++index) {
+        auto* node = static_cast<QueueListNode*>(mem_malloc(sizeof(QueueListNode)));
+        if (node == nullptr) { queue_free_list(loaded); return -1; }
+        node->generation = nextQueueNodeGeneration++;
+        node->owner = nullptr;
+        node->data = nullptr;
+        node->next = nullptr;
+        if (db_freadInt(stream, &node->time) == -1
+            || db_freadInt(stream, &node->type) == -1
+            || db_freadInt(stream, &node->savedOwnerId) == -1
+            || node->type < 0 || node->type >= EVENT_TYPE_COUNT
+            || node->time < 0 || node->time < previousTime) {
+            mem_free(node); queue_free_list(loaded); return -1;
         }
-
-        if (db_freadInt(stream, &(queueListNode->time)) == -1) {
-            mem_free(queueListNode);
-            rc = -1;
-            break;
-        }
-
-        if (db_freadInt(stream, &(queueListNode->type)) == -1) {
-            mem_free(queueListNode);
-            rc = -1;
-            break;
-        }
-
-        int objectId;
-        if (db_freadInt(stream, &objectId) == -1) {
-            mem_free(queueListNode);
-            rc = -1;
-            break;
-        }
-
-        Object* obj;
-        if (objectId == -2) {
-            obj = NULL;
-        } else {
-            obj = obj_find_first();
-            while (obj != NULL) {
-                obj = inven_find_id(obj, objectId);
-                if (obj != NULL) {
-                    break;
-                }
-                obj = obj_find_next();
+        if (node->savedOwnerId != -2) {
+            for (Object* root = obj_find_first(); root != nullptr; root = obj_find_next()) {
+                node->owner = inven_find_id(root, node->savedOwnerId);
+                if (node->owner != nullptr) break;
             }
         }
-
-        queueListNode->owner = obj;
-
-        EventTypeDescription* eventTypeDescription = &(q_func[queueListNode->type]);
-        if (eventTypeDescription->readProc != NULL) {
-            if (eventTypeDescription->readProc(stream, &(queueListNode->data)) == -1) {
-                mem_free(queueListNode);
-                rc = -1;
-                break;
-            }
-        } else {
-            queueListNode->data = NULL;
+        auto* description = &q_func[node->type];
+        if (description->readProc != nullptr
+            && description->readProc(stream, &node->data) == -1) {
+            queue_free_list(node); queue_free_list(loaded); return -1;
         }
-
-        queueListNode->next = NULL;
-
-        *nextPtr = queueListNode;
-        nextPtr = &(queueListNode->next);
+        *next = node;
+        next = &node->next;
+        previousTime = node->time;
     }
+    queue_free_list(queue);
+    queue = loaded;
+    return 0;
+}
 
-    if (rc == -1) {
-        while (queue != NULL) {
-            QueueListNode* next = queue->next;
-
-            EventTypeDescription* eventTypeDescription = &(q_func[queue->type]);
-            if (eventTypeDescription->freeProc != NULL) {
-                eventTypeDescription->freeProc(queue->data);
-            }
-
-            mem_free(queue);
-
-            queue = next;
+// Called after the independently saved guest and its inventory are attached.
+// Map loading may have resolved a guest native ID to nothing or a new object.
+void queue_bind_loaded_owner(int savedActorId, Object* actor)
+{
+    if (actor == nullptr) return;
+    for (auto* node = queue; node != nullptr; node = node->next) {
+        if (node->savedOwnerId == -2) continue;
+        Object* owner = node->savedOwnerId == savedActorId
+            ? actor : inven_find_id(actor, node->savedOwnerId);
+        if (owner != nullptr) {
+            node->owner = owner;
+            node->savedOwnerId = -2;
+            owner->flags |= OBJECT_USED;
         }
     }
-
-    return rc;
 }
 
 // 0x4907F4
@@ -263,7 +330,7 @@ int queue_save(DB_FILE* stream)
     queueListNode = queue;
     while (queueListNode != NULL) {
         Object* object = queueListNode->owner;
-        int objectId = object != NULL ? object->id : -2;
+        int objectId = object != NULL ? object->id : queueListNode->savedOwnerId;
 
         if (db_fwriteInt(stream, queueListNode->time) == -1) {
             return -1;
@@ -304,6 +371,7 @@ int queue_add(int delay, Object* obj, void* data, int eventType)
     newQueueListNode->time = v2;
     newQueueListNode->type = eventType;
     newQueueListNode->owner = obj;
+    newQueueListNode->savedOwnerId = -2;
     newQueueListNode->data = data;
 
     if (obj != NULL) {
@@ -523,6 +591,11 @@ bool queue_capture_state(std::vector<QueueEventState>& state)
             return false;
         }
         switch (node->type) {
+        case EVENT_TYPE_PLAYER_EXPLOSION:
+        case EVENT_TYPE_PLAYER_EXPLOSION_FAILURE:
+            event.payload[0] = static_cast<PlayerExplosionEvent*>(node->data)->playerId;
+            if (event.payload[0] <= 0) { state.clear(); return false; }
+            break;
         case EVENT_TYPE_DRUG: {
             DrugEffectEvent* data = (DrugEffectEvent*)node->data;
             for (int index = 0; index < 3; index++) {
@@ -584,6 +657,8 @@ bool PreparedQueueEvents::prepare(const std::vector<QueueEventState>& state)
             && event.eventType != EVENT_TYPE_MAP_UPDATE_EVENT;
         if (event.time <= 0
             || event.time < previousTime
+            || ((event.eventType == EVENT_TYPE_PLAYER_EXPLOSION || event.eventType == EVENT_TYPE_PLAYER_EXPLOSION_FAILURE)
+                && event.payload[0] <= 0)
             || expectedPayloadCount != event.payloadCount
             || (ownerRequired && event.owner == NULL)
             || ((event.eventType == EVENT_TYPE_GAME_TIME || event.eventType == EVENT_TYPE_MAP_UPDATE_EVENT)
@@ -615,6 +690,7 @@ bool PreparedQueueEvents::prepare(const std::vector<QueueEventState>& state)
         node->time = event.time;
         node->type = event.eventType;
         node->owner = event.owner;
+        node->savedOwnerId = -2;
         node->data = data;
         node->next = NULL;
         *next = node;
@@ -690,7 +766,7 @@ static int queue_explode_exit(Object* obj, void* data)
 }
 
 // 0x490B48
-static int queue_do_explosion(Object* explosive, bool premature)
+static int queue_do_explosion(Object* explosive, bool premature, int playerId)
 {
     Object* owner;
     int tile;
@@ -717,13 +793,67 @@ static int queue_do_explosion(Object* explosive, bool premature)
         max_damage = 80;
     }
 
-    if (action_explode(tile, elevation, min_damage, max_damage, obj_dude, premature) == -2) {
-        queue_add(50, explosive, NULL, EVENT_TYPE_EXPLOSION);
+    Object* source = playerId != 0
+        ? multiplayer::networkWorldPlayerActor(multiplayer::PlayerId { static_cast<std::uint32_t>(playerId) }) : obj_dude;
+    if (action_explode(tile, elevation, min_damage, max_damage, source, premature) == -2) {
+        if (playerId != 0) queue_add_player_explosion(50, explosive, playerId, false);
+        else queue_add(50, explosive, NULL, EVENT_TYPE_EXPLOSION);
     } else {
         obj_destroy(explosive);
     }
 
     return 1;
+}
+
+int queue_add_player_explosion(int delay, Object* owner, int playerId, bool premature)
+{
+    if (playerId <= 0 || owner == nullptr || delay < 0) return -1;
+    auto* event = static_cast<PlayerExplosionEvent*>(mem_malloc(sizeof(PlayerExplosionEvent)));
+    if (event == nullptr) return -1;
+    event->playerId = playerId;
+    if (queue_add(delay, owner, event, premature ? EVENT_TYPE_PLAYER_EXPLOSION_FAILURE : EVENT_TYPE_PLAYER_EXPLOSION) != 0) {
+        mem_free(event);
+        return -1;
+    }
+    return 0;
+}
+
+static int queue_player_explosion_load(DB_FILE* stream, void** data)
+{
+    int id;
+    if (db_freadInt32(stream, &id) != 0 || id <= 0) return -1;
+    auto* event = static_cast<PlayerExplosionEvent*>(mem_malloc(sizeof(PlayerExplosionEvent)));
+    if (event == nullptr) return -1;
+    event->playerId = id;
+    *data = event;
+    return 0;
+}
+
+static int queue_player_explosion_save(DB_FILE* stream, void* data)
+{
+    auto* event = static_cast<PlayerExplosionEvent*>(data);
+    return event != nullptr && event->playerId > 0 ? db_fwriteInt32(stream, event->playerId) : -1;
+}
+
+static int queue_player_explode(Object* obj, void* data)
+{
+    return queue_do_explosion(obj, true, static_cast<PlayerExplosionEvent*>(data)->playerId);
+}
+
+static int queue_player_explode_exit(Object* obj, void* data)
+{
+    return queue_do_explosion(obj, false, static_cast<PlayerExplosionEvent*>(data)->playerId);
+}
+
+static int queue_player_premature(Object* obj, void* data)
+{
+    int playerId = static_cast<PlayerExplosionEvent*>(data)->playerId;
+    multiplayer::ScopedPlayerFeedback feedback(multiplayer::networkWorldPlayerActor(
+        multiplayer::PlayerId { static_cast<std::uint32_t>(playerId) }));
+    MessageListItem message;
+    message.num = 4000;
+    if (message_search(&misc_message_file, &message)) display_print(message.text);
+    return queue_do_explosion(obj, true, playerId);
 }
 
 // 0x490BCC

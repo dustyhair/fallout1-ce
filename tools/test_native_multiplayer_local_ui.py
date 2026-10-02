@@ -15,6 +15,7 @@ def main():
     parser.add_argument('data_root', type=pathlib.Path)
     parser.add_argument('--source-root', type=pathlib.Path)
     parser.add_argument('--expect-negative', action='store_true')
+    parser.add_argument('--expect-extra-negative', action='store_true', help='Pip-Boy/inventory corrected but other menus still pause')
     parser.add_argument('--port', type=int, default=0)
     args = parser.parse_args()
     if args.port != 0 and not 1024 <= args.port <= 65535:
@@ -28,6 +29,9 @@ def main():
         'src/game/map.cc': 'native_local_ui_map.cc',
         'src/game/pipboy.cc': 'native_local_ui_pipboy.cc',
         'src/game/inventry.cc': 'native_local_ui_inventory.cc',
+        'src/game/skilldex.cc': 'native_local_ui_skilldex.cc',
+        'src/game/options.cc': 'native_local_ui_options.cc',
+        'src/game/editor.cc': 'native_local_ui_editor.cc',
     }
     binary = native.compile_fixture(args.build_directory.resolve(), source, checkout / 'tests', root)
     port = args.port
@@ -38,7 +42,10 @@ def main():
     during = 0 if args.expect_negative else 1
     markers = (f'screen=pipboy before=1 opened=1 during={during} after=1',
                f'screen=inventory before=1 during={during} after=1')
-    run_fixture(binary, args.data_root.resolve(), port, root, 'local-ui', args.expect_negative,
+    extra_during = 0 if args.expect_negative or args.expect_extra_negative else 1
+    markers += tuple(f'screen={screen} before=1 opened=1 during={extra_during} after=1'
+                     for screen in ('skilldex', 'options', 'editor'))
+    run_fixture(binary, args.data_root.resolve(), port, root, 'local-ui', args.expect_negative or args.expect_extra_negative,
                 markers=markers, result_label='NATIVE_LOCAL_UI_BACKGROUND_PASS')
 
 

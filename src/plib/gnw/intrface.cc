@@ -29,6 +29,9 @@ static int tm_index_active(int queueIndex);
 
 // 0x53A268
 static int wd = -1;
+static int stringInputDepth = 0;
+
+bool win_string_input_is_active() { return stringInputDepth > 0; }
 
 // 0x53A270
 static bool tm_watch_active = false;
@@ -528,7 +531,7 @@ int win_list_select_at(const char* title, char** items, int itemsLength, SelectF
 }
 
 // 0x4C7858
-int win_get_str(char* dest, int length, const char* title, int x, int y)
+int win_get_str(char* dest, int length, const char* title, int x, int y, bool (*cancelRequested)())
 {
     if (!GNW_win_init_flag) {
         return -1;
@@ -599,7 +602,7 @@ int win_get_str(char* dest, int length, const char* title, int x, int y)
         16,
         text_height() + 16,
         colorTable[GNW_wcolor[3]],
-        colorTable[GNW_wcolor[0]]);
+        colorTable[GNW_wcolor[0]], cancelRequested);
 
     win_delete(win);
 
@@ -1053,8 +1056,9 @@ int win_width_needed(char** fileNameList, int fileNameListLength)
 }
 
 // 0x4C8E3C
-int win_input_str(int win, char* dest, int maxLength, int x, int y, int textColor, int backgroundColor)
+int win_input_str(int win, char* dest, int maxLength, int x, int y, int textColor, int backgroundColor, bool (*cancelRequested)())
 {
+    struct InputScope { InputScope() { ++stringInputDepth; } ~InputScope() { --stringInputDepth; } } inputScope;
     Window* window = GNW_find(win);
     unsigned char* buffer = window->buffer + window->width * y + x;
 
@@ -1082,6 +1086,10 @@ int win_input_str(int win, char* dest, int maxLength, int x, int y, int textColo
         sharedFpsLimiter.mark();
 
         int keyCode = get_input();
+        if (cancelRequested != nullptr && cancelRequested()) {
+            dest[cursorPos] = '\0';
+            return -1;
+        }
         if (keyCode != -1) {
             if (keyCode == KEY_ESCAPE) {
                 dest[cursorPos] = '\0';

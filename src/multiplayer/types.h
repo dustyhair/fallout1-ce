@@ -1,7 +1,11 @@
 #ifndef FALLOUT_MULTIPLAYER_TYPES_H_
 #define FALLOUT_MULTIPLAYER_TYPES_H_
 
+#include <algorithm>
 #include <array>
+#include "game/perk_defs.h"
+#include "game/skill_defs.h"
+#include "game/trait.h"
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -125,15 +129,17 @@ enum class SharedModalKind : std::uint8_t {
     Rest = 3,
     Elevator = 4,
     WorldMap = 5,
+    Theft = 6,
 };
 
 constexpr bool isValid(SharedModalKind kind)
 {
-    return kind >= SharedModalKind::Dialogue && kind <= SharedModalKind::WorldMap;
+    return kind >= SharedModalKind::Dialogue && kind <= SharedModalKind::Theft;
 }
 
 constexpr SessionPhase sharedModalPhase(SharedModalKind kind)
 {
+    if (kind == SharedModalKind::Theft) return SessionPhase::Exploration;
     return kind == SharedModalKind::Dialogue || kind == SharedModalKind::Barter
         ? SessionPhase::Dialogue
         : SessionPhase::Transition;
@@ -151,14 +157,18 @@ struct FaceCommand {
 
 struct InteractCommand {
     EntityId targetId;
+    std::uint64_t turnRevision = 0;
 };
 
 struct PickupCommand {
     EntityId targetId;
+    std::uint64_t turnRevision = 0;
 };
 
 struct LootCommand {
     EntityId targetId;
+    std::uint64_t turnRevision = 0;
+    bool targetChange = false;
 };
 
 // These values intentionally match Fallout's Skill enum. Only targeted,
@@ -166,6 +176,7 @@ struct LootCommand {
 enum class ExplorationSkill : std::int32_t {
     FirstAid = 6,
     Doctor = 7,
+    Sneak = 8,
     Lockpick = 9,
     Steal = 10,
     Traps = 11,
@@ -178,6 +189,7 @@ constexpr bool isValid(ExplorationSkill skill)
     switch (skill) {
     case ExplorationSkill::FirstAid:
     case ExplorationSkill::Doctor:
+    case ExplorationSkill::Sneak:
     case ExplorationSkill::Lockpick:
     case ExplorationSkill::Steal:
     case ExplorationSkill::Traps:
@@ -191,6 +203,7 @@ constexpr bool isValid(ExplorationSkill skill)
 struct UseSkillCommand {
     EntityId targetId;
     ExplorationSkill skill = ExplorationSkill::FirstAid;
+    std::uint64_t turnRevision = 0; // Combat supports only self-targeted Sneak.
 };
 
 struct UseItemOnCommand {
@@ -333,6 +346,55 @@ struct DirectTradeCommand {
     DirectTradeOffer offer;
 };
 
+enum class NpcBarterAction : std::uint8_t { Begin = 1, Offer = 2, Accept = 3, Cancel = 4 };
+enum class NpcBarterStatus : std::uint8_t { Negotiating = 1, Rejected = 2, Committed = 3, Cancelled = 4 };
+
+struct NpcBarterCommand {
+    NpcBarterAction action = NpcBarterAction::Begin;
+    EntityId sellerId;
+    std::uint64_t revision = 0;
+    DirectTradeOffer buyerOffer;
+    DirectTradeOffer sellerOffer;
+};
+
+struct NpcBarterState {
+    EntityId buyerId;
+    EntityId sellerId;
+    std::uint64_t revision = 0;
+    NpcBarterStatus status = NpcBarterStatus::Negotiating;
+    DirectTradeOffer buyerOffer;
+    DirectTradeOffer sellerOffer;
+    std::uint32_t offeredValue = 0;
+    std::uint32_t askingValue = 0;
+};
+
+inline bool isValidBarterOffer(const DirectTradeOffer& offer)
+{
+    if (offer.caps > INT32_MAX || offer.items.size() > kMaximumDirectTradeItemsPerPlayer) return false;
+    std::uint32_t previous = 0;
+    for (const auto& item : offer.items) {
+        if (item.itemId.value <= previous || item.quantity == 0 || item.quantity > INT32_MAX) return false;
+        previous = item.itemId.value;
+    }
+    return true;
+}
+
+inline bool isValid(const NpcBarterCommand& command)
+{
+    if (command.action < NpcBarterAction::Begin || command.action > NpcBarterAction::Cancel
+        || !isValid(command.sellerId) || !isValidBarterOffer(command.buyerOffer)
+        || !isValidBarterOffer(command.sellerOffer)) return false;
+    if ((command.action == NpcBarterAction::Begin) != (command.revision == 0)) return false;
+    return command.action == NpcBarterAction::Offer
+        || (command.buyerOffer.items.empty() && command.buyerOffer.caps == 0
+            && command.sellerOffer.items.empty() && command.sellerOffer.caps == 0);
+}
+
+struct NpcBarterStateChangedEvent {
+    NpcBarterState state;
+    std::uint32_t phaseRevision = 0;
+};
+
 constexpr bool hasItemDescriptor(const ItemDescriptor& descriptor)
 {
     return descriptor.pid != -1;
@@ -345,6 +407,7 @@ struct InventoryTransferCommand {
     std::uint32_t quantity = 0;
     std::uint32_t sourceQuantity = 0;
     ItemDescriptor itemDescriptor;
+    std::uint64_t turnRevision = 0;
 };
 
 struct ItemDropCommand {
@@ -374,6 +437,23 @@ constexpr bool isValid(CombatActionKind kind)
     return kind >= CombatActionKind::Move && kind <= CombatActionKind::Face;
 }
 
+struct StartCombatCommand {
+    EntityId targetId; // Empty means enter combat without an initial attack.
+    std::int32_t hitMode = 4;
+    std::int32_t hitLocation = 8;
+};
+
+inline bool isValid(const StartCombatCommand& command)
+{
+    return command.hitMode >= 0 && command.hitMode < 20
+        && command.hitMode != 6 && command.hitMode != 7
+        && command.hitLocation >= 0 && command.hitLocation < 9;
+}
+
+struct CombatRequestedEvent {
+    EntityId actorId;
+};
+
 struct CombatMoveCommand {
     std::uint64_t turnRevision = 0;
     std::int32_t destinationTile = -1;
@@ -381,10 +461,16 @@ struct CombatMoveCommand {
     bool running = false;
 };
 
+constexpr bool isValidExplosiveTimerChoice(std::int32_t seconds)
+{
+    return seconds == 0 || (seconds >= 10 && seconds <= 180 && seconds % 10 == 0);
+}
+
 struct CombatItemCommand {
     std::uint64_t turnRevision = 0;
     EntityId itemId;
     EntityId targetId; // Empty for self-use.
+    std::int32_t timerSeconds = 0; // Explicit explosive timer; zero for other items.
 };
 
 struct CombatReloadCommand {
@@ -407,6 +493,58 @@ struct EquipmentCommand {
     std::int32_t activeHand = 1;
     EquipmentAction action = EquipmentAction::Set;
 };
+
+// Intent only: the host derives costs, eligibility, and resulting stats.
+struct CharacterAdvanceCommand {
+    std::uint64_t expectedBuild = 0;
+    std::array<std::int32_t, SKILL_COUNT> skillIncrements {};
+    std::int32_t perk = -1;
+    std::int32_t taggedSkill = -1;
+    std::int32_t removedTrait = -1;
+    std::int32_t addedTrait = -1;
+};
+
+inline bool isValid(const CharacterAdvanceCommand& command)
+{
+    return command.expectedBuild != 0
+        && std::all_of(command.skillIncrements.begin(), command.skillIncrements.end(),
+            [](int count) { return count >= 0 && count <= 99; })
+        && command.perk >= -1 && command.perk < PERK_COUNT
+        && command.taggedSkill >= -1 && command.taggedSkill < SKILL_COUNT
+        && command.removedTrait >= -1 && command.removedTrait < TRAIT_COUNT
+        && command.addedTrait >= -1 && command.addedTrait < TRAIT_COUNT;
+}
+
+enum class InventoryAction : std::int32_t {
+    Use = 0,
+    Reload = 1,
+    Unload = 2,
+    Drop = 3,
+    Scan = 4, // Equipped sensor activation from the local automap, no inventory-open charge.
+};
+
+// Inventory edits are free after the native inventory-open AP charge.
+// HUD use/reload in combat continue through CombatItem/CombatReload.
+struct InventoryActionCommand {
+    std::uint64_t turnRevision = 0;
+    EntityId itemId;
+    InventoryAction action = InventoryAction::Use;
+    EntityId ammoId; // Empty selects native automatic reload.
+    std::uint32_t quantity = 1; // Selected ammo stacks, dropped items, or caps.
+    std::int32_t timerSeconds = 0;
+};
+
+constexpr bool isValid(const InventoryActionCommand& command)
+{
+    return isValid(command.itemId)
+        && isValidExplosiveTimerChoice(command.timerSeconds)
+        && (command.action == InventoryAction::Use || command.timerSeconds == 0)
+        && command.action >= InventoryAction::Use && command.action <= InventoryAction::Scan
+        && command.quantity > 0 && command.quantity <= 2147483647U
+        && command.itemId != command.ammoId
+        && (command.action == InventoryAction::Reload
+            || (!isValid(command.ammoId) && (command.action == InventoryAction::Drop || command.quantity == 1)));
+}
 
 struct EquipmentChangedEvent {
     EntityId actorId; // Equipment and AP arrive in the following checkpoint.
@@ -456,7 +594,7 @@ constexpr bool isValid(const WorldMapRouteCommand& route)
             && route.targetY >= 0 && route.targetY < kWorldMapHeight;
 }
 
-using GameCommandPayload = std::variant<MoveCommand, FaceCommand, InteractCommand, PickupCommand, LootCommand, UseSkillCommand, UseItemOnCommand, ElevatorCommand, ExitGridCommand, SceneryTransitionCommand, RestCommand, InventoryTransferCommand, ItemDropCommand, AttackCommand, CombatMoveCommand, CombatItemCommand, CombatReloadCommand, CombatFaceCommand, EndTurnCommand, SharedModalCommand, WorldMapRouteCommand, TalkCommand, DialogueVoteCommand, DirectTradeCommand, EquipmentCommand>;
+using GameCommandPayload = std::variant<MoveCommand, FaceCommand, InteractCommand, PickupCommand, LootCommand, UseSkillCommand, UseItemOnCommand, ElevatorCommand, ExitGridCommand, SceneryTransitionCommand, RestCommand, InventoryTransferCommand, ItemDropCommand, AttackCommand, CombatMoveCommand, CombatItemCommand, CombatReloadCommand, CombatFaceCommand, EndTurnCommand, SharedModalCommand, WorldMapRouteCommand, TalkCommand, DialogueVoteCommand, DirectTradeCommand, NpcBarterCommand, EquipmentCommand, InventoryActionCommand, CharacterAdvanceCommand, StartCombatCommand>;
 
 struct GameCommand {
     CommandSequence sequence;
@@ -532,12 +670,14 @@ struct ItemPickupCompletedEvent {
 struct LootStartedEvent {
     EntityId actorId;
     EntityId targetId;
+    std::uint64_t turnRevision = 0;
 };
 
 struct SkillUseStartedEvent {
     EntityId actorId;
     EntityId targetId;
     ExplorationSkill skill = ExplorationSkill::FirstAid;
+    bool inventoryOpened = false;
 };
 
 struct ItemUseStartedEvent {
@@ -760,6 +900,11 @@ struct SharedActivityEntry {
     std::string text;
 };
 
+struct PlayerFeedbackEvent {
+    EntityId actorId;
+    std::string text;
+};
+
 struct SharedActivityPublishedEvent {
     EntityId actorId; // Host actor for system-originated entries.
     SharedActivityEntry entry;
@@ -772,7 +917,7 @@ struct WorldMapRouteSelectedEvent {
     bool clear = false;
 };
 
-using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, ItemPickupCompletedEvent, LootStartedEvent, SkillUseStartedEvent, ItemUseStartedEvent, ElevatorTransitionedEvent, ExitGridTransitionedEvent, SceneryTransitionedEvent, RestStateChangedEvent, InventoryTransferredEvent, CapsDistributedEvent, DirectTradeStateChangedEvent, ItemDroppedEvent, AttackStartedEvent, CombatTurnStateChangedEvent, CombatActionResolvedEvent, PartyExperienceAwardedEvent, SharedModalStateChangedEvent, WorldMapRouteSelectedEvent, WorldMapArrivedEvent, DialogueRequestedEvent, DialogueVoteRecordedEvent, DialoguePresentationEvent, SharedActivityPublishedEvent, EquipmentChangedEvent>;
+using GameEventPayload = std::variant<ActorMovementStartedEvent, ActorFacingChangedEvent, DoorUseStartedEvent, ItemPickupStartedEvent, ItemPickupCompletedEvent, LootStartedEvent, SkillUseStartedEvent, ItemUseStartedEvent, ElevatorTransitionedEvent, ExitGridTransitionedEvent, SceneryTransitionedEvent, RestStateChangedEvent, InventoryTransferredEvent, CapsDistributedEvent, DirectTradeStateChangedEvent, NpcBarterStateChangedEvent, ItemDroppedEvent, AttackStartedEvent, CombatTurnStateChangedEvent, CombatActionResolvedEvent, PartyExperienceAwardedEvent, SharedModalStateChangedEvent, WorldMapRouteSelectedEvent, WorldMapArrivedEvent, DialogueRequestedEvent, DialogueVoteRecordedEvent, DialoguePresentationEvent, SharedActivityPublishedEvent, EquipmentChangedEvent, PlayerFeedbackEvent, CombatRequestedEvent>;
 
 struct GameEvent {
     EventSequence sequence;

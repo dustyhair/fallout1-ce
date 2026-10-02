@@ -60,13 +60,14 @@ printf '\\n'
     def test_matching_digests_pass(self):
         result, summary = self.run_campaign("matching")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("scenarios=13", result.stdout)
+        self.assertIn("scenarios=18", result.stdout)
         self.assertNotIn("FAIL", summary)
+        self.assertIn("inventory_actions\t0\t0\tPASS", summary)
 
     def test_full_matrix_has_unique_scenarios(self):
         result, summary = self.run_campaign("matching", full=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("scenarios=42", result.stdout)
+        self.assertIn("scenarios=50", result.stdout)
         names = [line.split("\t")[0] for line in summary.splitlines()[1:]]
         self.assertEqual(len(names), len(set(names)))
 

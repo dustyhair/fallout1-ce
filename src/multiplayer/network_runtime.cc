@@ -9,19 +9,26 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <filesystem>
 #include <limits>
 #include <optional>
 #include <string>
 #include <thread>
 #include <utility>
+#include <unordered_set>
 #include <vector>
 
 #include "agent_journal.h"
 #include "game/actions.h"
+#include "game/automap.h"
 #include "game/anim.h"
 #include "game/combat.h"
+#include "game/combatai.h"
 #include "game/critter.h"
 #include "game/display.h"
+#include "game/editor.h"
+#include "game/endgame.h"
+#include "game/gmovie.h"
 #include "game/game.h"
 #include "game/game_vars.h"
 #include "game/gconfig.h"
@@ -36,6 +43,7 @@
 #include "game/object.h"
 #include "game/pipboy.h"
 #include "game/perk_defs.h"
+#include "game/party.h"
 #include "game/protinst.h"
 #include "game/proto.h"
 #include "game/proto_types.h"
@@ -152,9 +160,82 @@ bool smokeCombatObservedExit = false;
 bool smokeCombatReceivedExplorationState = false;
 bool smokeCombatExitAfterAttack = false;
 bool smokeKnifeGift = false;
+bool smokeNativeWorldDiscovery = false;
+bool smokeNativeSnapshotCapacity = false;
+std::optional<PlayerId> smokeNativeCompanion;
+bool smokeNativeCompanionDeath = false;
+bool smokeNativeCompanionCleanup = false;
+bool smokeNativeCompanionBattle = false;
+bool smokeNativeCompanionHostility = false;
+bool smokeNativeCompanionIntroName = false;
+bool smokeNativeCompanionReplyName = false;
+bool smokeNativeCompanionNameFailed = false;
+bool companionCombatRunning = false;
+bool companionCombatObserved = false;
+int companionCombatPid = -1;
+EntityId companionCombatTarget;
+int companionCombatInitialAmmo = 0;
+int companionCombatInitialHp = 0;
+int companionCombatInitialGuestHp = 0;
+int companionCombatTurns = 0;
+std::uint64_t companionCombatRevision = 0;
+bool smokeNativeStory = false;
+bool smokeNativeStoryReconnect = false;
+bool smokeNativeStoryReconnectRequested = false;
+bool smokeNativeStoryMissing = false;
+bool storyPlaying = false;
+bool storyFailed = false;
+std::uint64_t playedStoryRevision = 0;
+std::uint64_t storyCompletionSent = 0;
 bool smokeNativeInventory = false;
+bool smokeNativeInventoryDefeat = false;
+bool smokeNativeInventoryDefeatTriggered = false;
+std::chrono::steady_clock::time_point smokeNativeInventoryHeldAt {};
+bool smokeNativeCharacterEditor = false;
+bool smokeNativeAutomap = false;
+std::optional<PlayerId> smokeNativeAutomapDefeat;
+bool smokeNativeAutomapDefeatArmed = false;
+bool smokeNativeAutomapDefeatTriggered = false;
+std::optional<PlayerId> smokeNativeDialogueDefeat;
+bool smokeNativeBarterDefeat = false;
+bool smokeNativeBarterQuantityDefeat = false;
+bool smokeNativeDialogueDefeatTriggered = false;
+std::chrono::steady_clock::time_point smokeNativeDialogueReadyAt {};
+std::string smokeNativeDefeatMethod;
+bool smokeNativeDefeatReconnect = false;
+bool smokeNativeDefeatReconnectRequested = false;
+std::chrono::steady_clock::time_point smokeNativeGuestDialogueAt {};
+bool smokeNativePipboyDefeat = false;
+bool smokeNativePipboyScreensaver = false;
+std::chrono::steady_clock::time_point smokeNativePipboyReadyAt {};
+std::string smokeNativeDefeatHazard;
+bool smokeNativeDefeatHazardPassed = false;
+bool smokeNativeExplosiveTimer = false;
+std::optional<PlayerId> smokeNativeTimerDefeat;
+bool smokeNativeTimerDefeatTriggered = false;
+bool smokeGuestCombatStart = false;
+bool smokeGuestCombatAttack = false;
+bool smokeGuestCombatFloor = false;
+bool smokeGuestCombatStartSent = false;
+bool smokeNativeCombatInventory = false;
+bool smokeNativeCombatLoot = false;
+bool smokeNativeContainerLoot = false;
+bool smokeNativeContainerLootHost = false;
+bool smokeInventoryActions = false;
+bool smokeSavedSlot = false;
+int smokePeerInventoryActions = 0;
+int smokeCombatSneakPeerEvents = 0;
 bool replicaWorldReady = false;
 int smokeWeaponPid = 0;
+std::string smokeNativeWeaponFamily;
+int smokeNativeDenseMap = -1;
+std::string smokeNativeDenseMapName;
+bool smokeNativeWeaponChecksPassed = true;
+int smokeNativeWeaponAttacksChecked = 0;
+int smokeNativeWeaponInventoryChecked = 0;
+int smokeNativeWeaponPeerInventoryChecked = 0;
+int smokeNativeWeaponTargetDamage = 0;
+int smokeNativeWeaponFriendlyDamage = 0;
 int smokeAttackHitMode = HIT_MODE_PUNCH;
 int smokeAttackLocation = HIT_LOCATION_UNCALLED;
 bool smokeHostWeaponAttackAccepted = false;
@@ -270,9 +351,17 @@ std::chrono::steady_clock::time_point reconnectDeadline;
 std::chrono::steady_clock::time_point nextReconnectAttempt;
 EventSequence reconnectLastApplied;
 std::uint64_t nextHostCommandSequence = 1;
+struct PendingScannerActivation {
+    CommandSequence sequence;
+    std::optional<CommandResult> result;
+};
+std::optional<PendingScannerActivation> pendingScannerActivation;
+
 std::uint64_t nextDirectTradeId = 1;
 std::uint64_t lastSentCombatEndRevision = 0;
 std::deque<EventSequence> pendingCombatEffectAcks;
+std::deque<std::pair<EventSequence, SkillUseStartedEvent>> pendingTheftPresentations;
+std::deque<std::pair<EventSequence, LootStartedEvent>> pendingLootPresentations;
 std::chrono::steady_clock::time_point nextAuthoritativeState;
 std::chrono::steady_clock::time_point nextAgentWorldReport;
 std::optional<std::int32_t> pendingLocalRestRequest;
@@ -342,7 +431,78 @@ bool smokeTestTimedQueueRoundTrip()
         && queue_replace_state(expected)
         && queue_capture_state(actual)
         && queueEventStatesEqual(expected, actual);
+    // Native saves load the queue before the separate multiplayer guest.
+    // Simulate that missing actor ID, then bind it to the live actor.
+    int savedId = obj_dude->id;
+    int savedFlags = obj_dude->flags;
+    constexpr int absentActorId = 2000000000;
+    Object* delayedActor = nullptr;
+    Object* delayedItem = nullptr;
+    Object* collidingItem = nullptr;
+    bool fixtureReady = obj_pid_new(&delayedActor, obj_dude->pid) == 0
+        && obj_pid_new(&delayedItem, PROTO_ID_FLARE) == 0
+        && obj_pid_new(&collidingItem, PROTO_ID_STIMPACK) == 0
+        && obj_disconnect(delayedItem, nullptr) == 0
+        && obj_disconnect(collidingItem, nullptr) == 0
+        && item_add_force(delayedActor, delayedItem, 1) == 0
+        && item_add_force(delayedActor, collidingItem, 1) == 0;
+    auto eraseFixture = [&]() {
+        if (delayedItem != nullptr && delayedItem->owner == nullptr) obj_erase_object(delayedItem, nullptr);
+        if (collidingItem != nullptr && collidingItem->owner == nullptr) obj_erase_object(collidingItem, nullptr);
+        if (delayedActor != nullptr) {
+            delayedActor->flags &= ~OBJECT_NO_REMOVE;
+            obj_erase_object(delayedActor, nullptr);
+        }
+    };
+    if (!fixtureReady) {
+        queue_replace_state(original);
+        eraseFixture();
+        obj_dude->flags = savedFlags;
+        return false;
+    }
+    delayedActor->id = absentActorId - 1;
+    delayedItem->id = absentActorId + 1;
+    // A freshly loaded map can reuse an absent guest item's native ID.
+    // Resolve this one to the host first, then attach the correct inventory.
+    collidingItem->id = savedId;
+    obj_dude->id = absentActorId;
+    passed = queue_add(1000000, obj_dude, nullptr, EVENT_TYPE_SNEAK) == 0 && passed;
+    passed = queue_add(1000000, delayedItem, nullptr, EVENT_TYPE_FLARE) == 0 && passed;
+    passed = queue_add(1000000, collidingItem, nullptr, EVENT_TYPE_ITEM_TRICKLE) == 0 && passed;
+    DB_FILE* stream = db_fopen("QUEUE-REVIEW.TMP", "wb");
+    passed = stream != nullptr && queue_save(stream) == 0 && passed;
+    if (stream != nullptr) passed = db_fclose(stream) == 0 && passed;
+    obj_dude->id = savedId;
+    stream = db_fopen("QUEUE-REVIEW.TMP", "rb");
+    passed = stream != nullptr && queue_load(stream) == 0 && passed;
+    if (stream != nullptr) db_fclose(stream);
+    passed = !queue_find(delayedItem, EVENT_TYPE_FLARE)
+        && queue_find(obj_dude, EVENT_TYPE_ITEM_TRICKLE) && passed;
+    queue_bind_loaded_owner(delayedActor->id, delayedActor);
+    passed = queue_find(delayedItem, EVENT_TYPE_FLARE)
+        && queue_find(collidingItem, EVENT_TYPE_ITEM_TRICKLE)
+        && !queue_find(obj_dude, EVENT_TYPE_ITEM_TRICKLE)
+        && (delayedItem->flags & OBJECT_USED) != 0
+        && (collidingItem->flags & OBJECT_USED) != 0 && passed;
+    queue_bind_loaded_owner(absentActorId, obj_dude);
+    passed = queue_find(obj_dude, EVENT_TYPE_SNEAK) && passed;
+    std::vector<QueueEventState> beforeBadLoad;
+    passed = queue_capture_state(beforeBadLoad) && passed;
+    stream = db_fopen("QUEUE-REVIEW.TMP", "wb");
+    if (stream != nullptr) {
+        passed = db_fwriteInt(stream, 1) == 0 && db_fwriteInt(stream, game_time() + 1000) == 0
+            && db_fwriteInt(stream, EVENT_TYPE_COUNT) == 0 && db_fwriteInt(stream, -2) == 0 && passed;
+        db_fclose(stream);
+    } else passed = false;
+    stream = db_fopen("QUEUE-REVIEW.TMP", "rb");
+    passed = stream != nullptr && queue_load(stream) == -1 && passed;
+    if (stream != nullptr) db_fclose(stream);
+    std::vector<QueueEventState> afterBadLoad;
+    passed = queue_capture_state(afterBadLoad) && queueEventStatesEqual(beforeBadLoad, afterBadLoad) && passed;
     bool restored = queue_replace_state(original);
+    eraseFixture();
+    obj_dude->flags = savedFlags;
+    std::fprintf(stderr, "NATIVE_QUEUE_RECOVERY_%s owner_binding=1 inventory_binding=1 collision_rebound=1 malformed_type=1 atomic_load=1\n", passed ? "PASS" : "FAIL");
     return passed && restored;
 }
 
@@ -661,6 +821,8 @@ AgentJournalActorState actorJournalState(PlayerId playerId, bool local)
         }
         state.hitPoints = critter_get_hits(actor);
         state.actionPoints = actor->data.critter.combat.ap;
+        state.poison = critter_get_poison(actor);
+        state.radiation = critter_get_rads(actor);
     }
     return state;
 }
@@ -772,6 +934,8 @@ std::vector<AgentJournalInventoryItemState> localInventoryJournalStates(Object* 
         }
         AgentJournalInventoryItemState state;
         state.entityId = entityId->value;
+        state.inventoryIndex = index;
+        state.holderId = networkWorldFindEntity(localActor).value_or(EntityId {}).value;
         state.pid = item->pid;
         const char* name = object_name(item);
         state.name = name != nullptr ? name : "";
@@ -780,7 +944,8 @@ std::vector<AgentJournalInventoryItemState> localInventoryJournalStates(Object* 
         state.leftHand = (item->flags & OBJECT_IN_LEFT_HAND) != 0;
         state.rightHand = (item->flags & OBJECT_IN_RIGHT_HAND) != 0;
         state.armor = (item->flags & OBJECT_WORN) != 0;
-        state.ammo = item_get_type(item) == ITEM_TYPE_WEAPON ? item_w_curr_ammo(item) : -1;
+        state.ammo = item_get_type(item) == ITEM_TYPE_WEAPON || item_get_type(item) == ITEM_TYPE_AMMO
+            ? item_w_curr_ammo(item) : -1;
         states.push_back(std::move(state));
     }
     std::sort(states.begin(), states.end(), [](const auto& left, const auto& right) {
@@ -931,6 +1096,23 @@ void reportAgentWorldState()
         }
         state.trade = std::move(trade);
     }
+    if (const auto* barter = networkWorldNpcBarterState()) {
+        AgentJournalWorldState::Trade trade;
+        trade.id = barter->sellerId.value; trade.revision = barter->revision; trade.npc = true;
+        trade.offeredValue = barter->offeredValue; trade.askingValue = barter->askingValue;
+        trade.status = static_cast<unsigned>(barter->status);
+        for (int side = 0; side < 2; ++side) {
+            auto actorId = side == 0 ? barter->buyerId : barter->sellerId;
+            const auto& offer = side == 0 ? barter->buyerOffer : barter->sellerOffer;
+            AgentJournalWorldState::Trade::Participant participant;
+            participant.actorId = actorId.value;
+            participant.playerId = networkWorldCombatOwner(networkWorldFindObject(actorId)).value_or(PlayerId {}).value;
+            participant.caps = offer.caps;
+            for (const auto& item : offer.items) participant.items.push_back({ item.itemId.value, item.quantity });
+            trade.participants.push_back(std::move(participant));
+        }
+        state.trade = std::move(trade);
+    }
     for (const SharedActivityEntry& entry : networkWorldSharedActivity()) {
         state.sharedActivity.push_back({ entry.id, entry.sourceId.value,
             entry.sourceName,
@@ -946,6 +1128,20 @@ void reportAgentWorldState()
     Object* localActor = hostIsLocal ? hostActor : guestActor;
     if (localActor != nullptr) {
         state.localInventory = localInventoryJournalStates(localActor);
+        std::vector<Object*> holders { localActor };
+        std::unordered_set<Object*> visited { localActor };
+        for (std::size_t index = 0; index < holders.size(); ++index) {
+            Object* holder = holders[index];
+            if (holder != localActor) {
+                auto contents = localInventoryJournalStates(holder);
+                state.containedInventory.insert(state.containedInventory.end(), contents.begin(), contents.end());
+            }
+            for (int slot = 0; slot < holder->data.inventory.length; ++slot) {
+                Object* item = holder->data.inventory.items[slot].item;
+                if (item != nullptr && item->data.inventory.length > 0 && visited.insert(item).second)
+                    holders.push_back(item);
+            }
+        }
         state.visibleCritters = visibleCritterJournalStates(localActor, hostActor, guestActor);
         state.visibleInteractables = visibleInteractableJournalStates(localActor);
     }
@@ -1165,6 +1361,9 @@ void reportState()
 
 bool isCheckpointedCombatAction(const GameCommandPayload& payload)
 {
+    if (const auto* door = std::get_if<InteractCommand>(&payload)) return door->turnRevision != 0;
+    if (const auto* pickup = std::get_if<PickupCommand>(&payload)) return pickup->turnRevision != 0;
+    if (const auto* loot = std::get_if<LootCommand>(&payload)) return loot->turnRevision != 0;
     return std::holds_alternative<AttackCommand>(payload)
         || std::holds_alternative<CombatMoveCommand>(payload)
         || std::holds_alternative<CombatItemCommand>(payload)
@@ -1177,7 +1376,12 @@ bool needsInventoryCheckpoint(const AuthoritativeCommandResult& outcome)
     if (!outcome.event.has_value()) return false;
     const auto* trade = std::get_if<DirectTradeStateChangedEvent>(
         &outcome.event->payload);
-    return std::holds_alternative<EquipmentChangedEvent>(outcome.event->payload)
+    const auto* skill = std::get_if<SkillUseStartedEvent>(&outcome.event->payload);
+    return std::holds_alternative<LootStartedEvent>(outcome.event->payload)
+        || std::holds_alternative<NpcBarterStateChangedEvent>(outcome.event->payload)
+        || (skill != nullptr && (skill->skill == ExplorationSkill::Sneak || skill->skill == ExplorationSkill::Steal))
+        || std::holds_alternative<InventoryTransferredEvent>(outcome.event->payload)
+        || std::holds_alternative<EquipmentChangedEvent>(outcome.event->payload)
         || (trade != nullptr && trade->inventoryChanged)
         || std::holds_alternative<CapsDistributedEvent>(
             outcome.event->payload);
@@ -1185,6 +1389,18 @@ bool needsInventoryCheckpoint(const AuthoritativeCommandResult& outcome)
 
 SessionPhase commandExpectedPhase(const GameCommandPayload& payload)
 {
+    if (const auto* door = std::get_if<InteractCommand>(&payload)) return door->turnRevision == 0 ? SessionPhase::Exploration : SessionPhase::Combat;
+    if (const auto* pickup = std::get_if<PickupCommand>(&payload)) return pickup->turnRevision == 0 ? SessionPhase::Exploration : SessionPhase::Combat;
+    if (const auto* loot = std::get_if<LootCommand>(&payload)) return loot->turnRevision == 0 ? SessionPhase::Exploration : SessionPhase::Combat;
+    if (const auto* skill = std::get_if<UseSkillCommand>(&payload)) {
+        return skill->turnRevision == 0 ? SessionPhase::Exploration : SessionPhase::Combat;
+    }
+    if (const auto* transfer = std::get_if<InventoryTransferCommand>(&payload)) {
+        return transfer->turnRevision == 0 ? SessionPhase::Exploration : SessionPhase::Combat;
+    }
+    if (const auto* inventory = std::get_if<InventoryActionCommand>(&payload)) {
+        return inventory->turnRevision == 0 ? SessionPhase::Exploration : SessionPhase::Combat;
+    }
     if (const auto* equipment = std::get_if<EquipmentCommand>(&payload)) {
         return equipment->turnRevision == 0 ? SessionPhase::Exploration : SessionPhase::Combat;
     }
@@ -1192,6 +1408,7 @@ SessionPhase commandExpectedPhase(const GameCommandPayload& payload)
         || std::holds_alternative<EndTurnCommand>(payload)) {
         return SessionPhase::Combat;
     }
+    if (std::holds_alternative<NpcBarterCommand>(payload)) return SessionPhase::Dialogue;
     if (std::holds_alternative<DialogueVoteCommand>(payload)) {
         return SessionPhase::Dialogue;
     }
@@ -1209,6 +1426,96 @@ SessionPhase commandExpectedPhase(const GameCommandPayload& payload)
     return SessionPhase::Exploration;
 }
 
+// Dedicated installed weapon acceptance fixture. All mutations below are test
+// setup; commands still use the native host executor and guest checkpoints.
+static int nativeWeaponResources(Object* actor)
+{
+    Proto* proto = nullptr;
+    if (actor == nullptr || proto_ptr(smokeWeaponPid, &proto) != 0) return -1;
+    int total = 0;
+    for (int index = 0; index < actor->data.inventory.length; ++index) {
+        const auto& entry = actor->data.inventory.items[index];
+        int type = item_get_type(entry.item);
+        if (proto->item.data.weapon.ammoCapacity == 0) {
+            if (entry.item->pid == smokeWeaponPid) total += entry.quantity;
+        } else if (type == ITEM_TYPE_WEAPON && item_w_caliber(entry.item) == proto->item.data.weapon.caliber) {
+            total += item_w_curr_ammo(entry.item) * entry.quantity;
+        } else if (type == ITEM_TYPE_AMMO && item_w_caliber(entry.item) == proto->item.data.weapon.caliber) {
+            total += item_w_curr_ammo(entry.item) + item_w_max_ammo(entry.item) * (entry.quantity - 1);
+        }
+    }
+    return total;
+}
+
+struct NativeWeaponCommandBefore {
+    bool tracked = false;
+    int ap = 0, resources = 0, otherAp = 0, otherResources = 0;
+    int targetHp = 0, otherHp = 0, cost = 0, spent = 0;
+};
+
+static NativeWeaponCommandBefore nativeWeaponBefore(const GameCommand& command)
+{
+    NativeWeaponCommandBefore before;
+    if (!smokeTestEnabled || smokeNativeWeaponFamily.empty()
+        || (!std::holds_alternative<AttackCommand>(command.payload)
+            && !std::holds_alternative<InventoryActionCommand>(command.payload))) return before;
+    Object* actor = networkWorldPlayerActor(command.playerId);
+    Object* other = networkWorldPlayerActor(command.playerId == kHostPlayerId ? kGuestPlayerId : kHostPlayerId);
+    Object* target = networkWorldFindObject(networkWorldCombatSmokeTarget());
+    if (actor == nullptr || other == nullptr || target == nullptr) return before;
+    before.tracked = true;
+    before.ap = actor->data.critter.combat.ap;
+    before.resources = nativeWeaponResources(actor);
+    before.otherAp = other->data.critter.combat.ap;
+    before.otherResources = nativeWeaponResources(other);
+    before.targetHp = critter_get_hits(target);
+    before.otherHp = critter_get_hits(other);
+    if (const auto* attack = std::get_if<AttackCommand>(&command.payload)) {
+        auto* player = playerStateForActor(actor);
+        if (player == nullptr) { before.tracked = false; return before; }
+        ScopedActingPlayerContext context(*player, actor);
+        Object* weapon = inven_right_hand(actor);
+        int anim = item_w_anim(actor, attack->hitMode);
+        before.cost = item_w_mp_cost(actor, attack->hitMode, attack->hitLocation != HIT_LOCATION_UNCALLED);
+        before.spent = anim == ANIM_FIRE_BURST || anim == ANIM_FIRE_CONTINUOUS
+            ? std::min(item_w_rounds(weapon), item_w_curr_ammo(weapon)) : 1;
+    }
+    return before;
+}
+
+static void nativeWeaponAfter(const GameCommand& command, const AuthoritativeCommandResult& outcome,
+    const NativeWeaponCommandBefore& before)
+{
+    if (!before.tracked) return;
+    Object* actor = networkWorldPlayerActor(command.playerId);
+    Object* other = networkWorldPlayerActor(command.playerId == kHostPlayerId ? kGuestPlayerId : kHostPlayerId);
+    Object* target = networkWorldFindObject(networkWorldCombatSmokeTarget());
+    bool attack = std::holds_alternative<AttackCommand>(command.payload);
+    bool passed = outcome.result.status == CommandStatus::Accepted && !outcome.replayed
+        && actor != nullptr && other != nullptr && target != nullptr
+        && actor->data.critter.combat.ap == before.ap - (attack ? before.cost : 0)
+        && nativeWeaponResources(actor) == before.resources - (attack ? before.spent : 0)
+        && other->data.critter.combat.ap == before.otherAp
+        && nativeWeaponResources(other) == before.otherResources;
+    if (passed && attack) {
+        ++smokeNativeWeaponAttacksChecked;
+        smokeNativeWeaponTargetDamage += before.targetHp - critter_get_hits(target);
+        smokeNativeWeaponFriendlyDamage += before.otherHp - critter_get_hits(other);
+    } else if (passed) {
+        ++smokeNativeWeaponInventoryChecked;
+        if (command.playerId == kGuestPlayerId) ++smokeNativeWeaponPeerInventoryChecked;
+    }
+    smokeNativeWeaponChecksPassed = smokeNativeWeaponChecksPassed && passed;
+    std::fprintf(stderr,
+        "NATIVE_WEAPON_COMMAND_%s family=%s owner=%s attack=%d phase=%d status=%d reject=%d ap=%d->%d cost=%d resources=%d->%d spent=%d other_ap=%d->%d other_resources=%d->%d target_hp=%d->%d friend_hp=%d->%d\n",
+        passed ? "PASS" : "FAIL", smokeNativeWeaponFamily.c_str(), command.playerId == kHostPlayerId ? "host" : "guest",
+        attack, static_cast<int>(networkWorldPhase()), static_cast<int>(outcome.result.status), static_cast<int>(outcome.result.rejection),
+        before.ap, actor != nullptr ? actor->data.critter.combat.ap : -1, before.cost,
+        before.resources, nativeWeaponResources(actor), before.spent, before.otherAp,
+        other != nullptr ? other->data.critter.combat.ap : -1, before.otherResources, nativeWeaponResources(other),
+        before.targetHp, target != nullptr ? critter_get_hits(target) : -1, before.otherHp, other != nullptr ? critter_get_hits(other) : -1);
+}
+
 bool submitHostCommand(GameCommandPayload payload)
 {
     if (launchOptions.mode != NetworkLaunchMode::Host || !networkWorldActive() || snapshotCapacityFailed()) {
@@ -1223,9 +1530,12 @@ bool submitHostCommand(GameCommandPayload payload)
     command.payload = std::move(payload);
 
     bool needsCombatCheckpoint = isCheckpointedCombatAction(command.payload);
+    auto weaponBefore = nativeWeaponBefore(command);
     AuthoritativeCommandResult outcome = networkWorldProcessCommand(command);
+    nativeWeaponAfter(command, outcome, weaponBefore);
     bool accepted = outcome.result.status == CommandStatus::Accepted;
     if (accepted && (std::holds_alternative<EquipmentCommand>(command.payload)
+            || std::holds_alternative<InventoryActionCommand>(command.payload)
             || std::holds_alternative<RestCommand>(command.payload))) intface_redraw();
     bool needsStateCheckpoint = needsCombatCheckpoint
         || (accepted && needsInventoryCheckpoint(outcome));
@@ -1238,7 +1548,7 @@ bool submitHostCommand(GameCommandPayload payload)
         debug_printf("Multiplayer host command outcome could not be published.\n");
         return false;
     }
-    if (accepted && needsStateCheckpoint && lobby.state() == NetworkLobbyState::Ready) {
+    if (needsStateCheckpoint && lobby.state() == NetworkLobbyState::Ready) {
         WorldSnapshot state;
         if (!captureRuntimeCheckpoint(lobby.latestAuthoritativeEvent(), state)
             || !lobby.sendAuthoritativeState(state)) {
@@ -1251,13 +1561,83 @@ bool submitHostCommand(GameCommandPayload payload)
     return accepted;
 }
 
+static bool runNativeLethalHazard(Object* victim)
+{
+    if (victim == nullptr) return false;
+    struct OtherPlayerState {
+        Object* actor;
+        int hp, poison, radiation;
+        std::array<int, PRIMARY_STAT_COUNT> bonuses;
+    };
+    std::vector<OtherPlayerState> others;
+    // The transport currently exposes two players. The check itself uses the
+    // full captured roster so future peers must retain independent effects.
+    WorldSnapshot before;
+    if (!networkWorldCaptureAuthoritativeState(lobby.latestAuthoritativeEvent(), before)) return false;
+    for (const auto& player : before.actors) {
+        Object* actor = networkWorldPlayerActor(player.ownerId);
+        if (actor == nullptr || actor == victim) continue;
+        OtherPlayerState state { actor, critter_get_hits(actor), critter_get_poison(actor), critter_get_rads(actor), {} };
+        for (int stat = 0; stat < PRIMARY_STAT_COUNT; ++stat) state.bonuses[stat] = stat_get_bonus(actor, stat);
+        others.push_back(state);
+    }
+    int eventType;
+    if (smokeNativeDefeatHazard == "poison") {
+        victim->data.critter.hp = 1;
+        if (critter_adjust_poison(victim, 20) != 0) return false;
+        eventType = EVENT_TYPE_POISON;
+    } else {
+        if (critter_adjust_rads(victim, 5000) != 0) return false;
+        critter_check_rads(victim);
+        eventType = EVENT_TYPE_RADIATION;
+    }
+    std::vector<QueueEventState> timers;
+    if (!queue_capture_state(timers)) return false;
+    bool found = false;
+    int originalDeadline = 0;
+    for (auto& timer : timers) {
+        if (timer.owner == victim && timer.eventType == eventType) {
+            found = true;
+            originalDeadline = timer.time;
+            // Shorten only the native hazard's wait in this isolated fixture.
+            // Keep its real payload, handler and all other timers unchanged.
+            timer.time = game_time() + 1;
+        }
+    }
+    std::stable_sort(timers.begin(), timers.end(), [](const auto& left, const auto& right) { return left.time < right.time; });
+    if (!found || !queue_replace_state(timers)) return false;
+    set_game_time(game_time() + 1);
+    queue_process();
+    bool passed = critter_is_dead(victim) && networkWorldPartyDefeated();
+    for (const auto& state : others) {
+        passed = passed && critter_get_hits(state.actor) == state.hp
+            && critter_get_poison(state.actor) == state.poison
+            && critter_get_rads(state.actor) == state.radiation;
+        for (int stat = 0; stat < PRIMARY_STAT_COUNT; ++stat)
+            passed = passed && stat_get_bonus(state.actor, stat) == state.bonuses[stat];
+    }
+    std::fprintf(stdout, "NATIVE_LETHAL_HAZARD_%s hazard=%s native_deadline=%d other_players_unchanged=%zu\n",
+        passed ? "PASS" : "FAIL", smokeNativeDefeatHazard.c_str(), originalDeadline, others.size());
+    std::fflush(stdout);
+    return passed;
+}
+
 void networkRuntimeBackgroundProcess()
 {
     if (snapshotCapacityFailed()) {
+        // Keep the capacity failure visible and stop authoritative gameplay.
         reportAgentWorldState();
         return;
     }
     if (networkWorldCombatActionResolving()) {
+        // A native attack script can play a movie before its command returns.
+        // Pump presentation acknowledgements without re-entering gameplay or
+        // publishing an intermediate combat checkpoint.
+        if (storyPlaying && lobbyStarted) {
+            lobby.poll();
+            while (auto completed = lobby.takeStoryPresentationCompleted())
+                networkWorldCompleteStory(completed->playerId, completed->revision);
+        }
         return;
     }
     if (!lobbyStarted) {
@@ -1273,6 +1653,7 @@ void networkRuntimeBackgroundProcess()
     lobby.poll();
     pollReconnect();
     if (lobby.state() == NetworkLobbyState::Disconnected) {
+        storyCompletionSent = 0;
         pendingLocalItemDrop.reset();
         pendingLocalExitGrid.reset();
         pendingLocalRestRequest.reset();
@@ -1284,6 +1665,96 @@ void networkRuntimeBackgroundProcess()
         }
     }
     if (networkWorldActive()) {
+        if (smokeTestEnabled && smokeNativeDefeatReconnect && !smokeNativeDefeatReconnectRequested
+            && launchOptions.mode == NetworkLaunchMode::Join && dialog_active()) {
+            if (smokeNativeGuestDialogueAt == std::chrono::steady_clock::time_point {})
+                smokeNativeGuestDialogueAt = std::chrono::steady_clock::now();
+            if (std::chrono::steady_clock::now() - smokeNativeGuestDialogueAt >= std::chrono::seconds(1)) {
+                smokeNativeDefeatReconnectRequested = lobby.disconnectForReconnect();
+                if (smokeNativeDefeatReconnectRequested) {
+                    nextReconnectAttempt = std::chrono::steady_clock::now() + std::chrono::milliseconds(3500);
+                    std::fprintf(stderr, "NATIVE_TERMINAL_RECONNECT_REQUEST before_death=1\n");
+                }
+            }
+        }
+        if (smokeTestEnabled && smokeNativeDialogueDefeat.has_value()
+            && !smokeNativeDialogueDefeatTriggered && launchOptions.mode == NetworkLaunchMode::Host
+            && dialog_active() && networkWorldDialoguePresentation() != nullptr) {
+            bool ready = (!smokeNativeBarterDefeat || inven_network_barter_window_is_active())
+                && (!smokeNativeBarterQuantityDefeat || win_string_input_is_active());
+            if (smokeNativeBarterDefeat && networkWorldNpcBarterState() == nullptr) {
+                Object* seller = networkWorldFindObject(networkWorldDialoguePresentation()->targetId);
+                Proto* proto = nullptr;
+                if (seller != nullptr && proto_ptr(seller->pid, &proto) == 0) {
+                    // Enable a seller only inside this isolated terminal-UI fixture.
+                    proto->critter.data.flags |= CRITTER_BARTER;
+                    networkRuntimeBeginNpcBarter(networkWorldDialoguePresentation()->targetId);
+                }
+            }
+            if (ready && smokeNativeDialogueReadyAt == std::chrono::steady_clock::time_point {})
+                smokeNativeDialogueReadyAt = std::chrono::steady_clock::now();
+            if (ready && std::chrono::steady_clock::now() - smokeNativeDialogueReadyAt >= std::chrono::seconds(3)) {
+                smokeNativeDialogueDefeatTriggered = true;
+                Object* victim = networkWorldPlayerActor(*smokeNativeDialogueDefeat);
+                if (smokeNativeDefeatMethod == "script")
+                    action_dmg(victim->tile, victim->elevation, 999, 999, DAMAGE_TYPE_NORMAL, false, true);
+                else critter_adjust_hits(victim, -victim->data.critter.hp);
+                if (smokeNativeDefeatMethod == "simultaneous") {
+                    Object* other = networkWorldPlayerActor(*smokeNativeDialogueDefeat == kHostPlayerId ? kGuestPlayerId : kHostPlayerId);
+                    critter_adjust_hits(other, -other->data.critter.hp);
+                }
+                std::fprintf(stderr, "NATIVE_DIALOGUE_LETHAL_DAMAGE victim=%s method=%s barter=%d\n",
+                    *smokeNativeDialogueDefeat == kHostPlayerId ? "host" : "guest", smokeNativeDefeatMethod.c_str(), smokeNativeBarterDefeat);
+            }
+        }
+        bool inventoryDefeat = smokeNativeInventoryDefeat && !smokeNativeInventoryDefeatTriggered
+            && inven_network_inventory_window_is_active();
+        bool timerDefeat = smokeNativeTimerDefeat.has_value() && !smokeNativeTimerDefeatTriggered
+            && inven_quantity_window_is_active();
+        if (smokeTestEnabled && (inventoryDefeat || timerDefeat)
+            && launchOptions.mode == NetworkLaunchMode::Host) {
+            if ((mouse_get_buttons() & MOUSE_EVENT_LEFT_BUTTON_REPEAT) == 0) {
+                smokeNativeInventoryHeldAt = {};
+            } else if (smokeNativeInventoryHeldAt == std::chrono::steady_clock::time_point {}) {
+                smokeNativeInventoryHeldAt = std::chrono::steady_clock::now();
+            } else if (std::chrono::steady_clock::now() - smokeNativeInventoryHeldAt >= std::chrono::milliseconds(500)) {
+                if (timerDefeat) smokeNativeTimerDefeatTriggered = true;
+                else smokeNativeInventoryDefeatTriggered = true;
+                PlayerId victimId = timerDefeat ? *smokeNativeTimerDefeat : kGuestPlayerId;
+                Object* victim = networkWorldPlayerActor(victimId);
+                critter_adjust_hits(victim, -victim->data.critter.hp);
+                std::fprintf(stderr, "NATIVE_%s_LETHAL_DAMAGE mouse_held=1 victim=%s\n",
+                    timerDefeat ? "TIMER" : "INVENTORY", victimId == kHostPlayerId ? "host" : "guest");
+            }
+        }
+        // This fixture waits for input in both real automap windows before
+        // invoking the native lethal-damage path. It never runs in normal play.
+        if (smokeTestEnabled && smokeNativeAutomapDefeatArmed
+            && !smokeNativeAutomapDefeatTriggered && launchOptions.mode == NetworkLaunchMode::Host) {
+            bool bothScanned = true;
+            for (PlayerId id : { kHostPlayerId, kGuestPlayerId }) {
+                Object* actor = networkWorldPlayerActor(id);
+                Object* sensor = actor != nullptr ? inven_pid_is_carried_ptr(actor, PROTO_ID_MOTION_SENSOR) : nullptr;
+                bothScanned &= sensor != nullptr && item_m_curr_charges(sensor) == 1;
+            }
+            if (smokeNativePipboyDefeat) {
+                bool screenOpen = pipboy_is_open()
+                    && (!smokeNativePipboyScreensaver || pipboy_screensaver_is_active());
+                if (screenOpen && smokeNativePipboyReadyAt == std::chrono::steady_clock::time_point {})
+                    smokeNativePipboyReadyAt = std::chrono::steady_clock::now();
+                bothScanned = screenOpen && std::chrono::steady_clock::now() - smokeNativePipboyReadyAt >= std::chrono::seconds(3);
+            }
+            if (bothScanned && lobby.acknowledgedEvent(kGuestPlayerId).value >= lobby.latestAuthoritativeEvent().value) {
+                smokeNativeAutomapDefeatTriggered = true;
+                Object* victim = networkWorldPlayerActor(*smokeNativeAutomapDefeat);
+                if (smokeNativeDefeatHazard.empty()) critter_adjust_hits(victim, -victim->data.critter.hp);
+                else smokeNativeDefeatHazardPassed = runNativeLethalHazard(victim);
+                std::fprintf(stdout, "NATIVE_%s_LETHAL_DAMAGE victim=%s\n",
+                    smokeNativePipboyDefeat ? "PIPBOY" : "AUTOMAP",
+                    *smokeNativeAutomapDefeat == kHostPlayerId ? "host" : "guest");
+                std::fflush(stdout);
+            }
+        }
         if (launchOptions.mode == NetworkLaunchMode::Host
             && smokeScenario == SmokeScenario::CombatScriptStatus
             && networkWorldPhase() == SessionPhase::Combat
@@ -1306,11 +1777,50 @@ void networkRuntimeBackgroundProcess()
             networkWorldObserveWorldMapDiscoveries();
             networkWorldCombatSetPlayerConnected(kGuestPlayerId,
                 lobby.state() == NetworkLobbyState::Ready);
+            networkWorldDialogueSetConnected(kHostPlayerId, true);
             networkWorldDialogueSetConnected(kGuestPlayerId,
                 lobby.state() == NetworkLobbyState::Ready);
             networkWorldDirectTradeSetConnected(kGuestPlayerId,
                 lobby.state() == NetworkLobbyState::Ready);
             networkWorldCombatTick();
+            if (companionCombatRunning && isInCombat()
+                && combat_whose_turn() == networkWorldPlayerActor(kHostPlayerId)
+                && networkWorldActiveCombatOwner() == kHostPlayerId
+                && networkWorldCombatTurnRevision() != companionCombatRevision) {
+                Object* companion = partyMemberFindObjFromPid(companionCombatPid);
+                if (companion == nullptr) {
+                    for (Object* object = obj_find_first(); object != nullptr; object = obj_find_next())
+                        if (object->pid == companionCombatPid) { companion = object; break; }
+                }
+                Object* target = networkWorldFindObject(companionCombatTarget);
+                Object* weapon = companion != nullptr ? inven_right_hand(companion) : nullptr;
+                bool observed = companion != nullptr && (smokeNativeCompanionHostility
+                    ? isPartyMember(companion) && companion->data.critter.combat.team
+                        == networkWorldPlayerActor(kGuestPlayerId)->data.critter.combat.team
+                        && critter_get_hits(companion) < companionCombatInitialHp
+                        && companion->data.critter.combat.whoHitMe == networkWorldPlayerActor(kGuestPlayerId)
+                        && weapon != nullptr && item_w_curr_ammo(weapon) < companionCombatInitialAmmo
+                        && critter_get_hits(networkWorldPlayerActor(kGuestPlayerId)) < companionCombatInitialGuestHp
+                    : weapon != nullptr && item_w_curr_ammo(weapon) < companionCombatInitialAmmo
+                        && target != nullptr && critter_get_hits(target) < companionCombatInitialHp);
+                std::fprintf(stderr, "NATIVE_COMPANION_COMBAT_TURN turn=%d ammo=%d hp=%d party=%d team=%d observed=%d guest_hp=%d guest_target=%d\n",
+                    companionCombatTurns, weapon != nullptr ? item_w_curr_ammo(weapon) : -1,
+                    target != nullptr ? critter_get_hits(target) : -1,
+                    companion != nullptr && isPartyMember(companion),
+                    companion != nullptr ? companion->data.critter.combat.team : -1, observed,
+                    critter_get_hits(networkWorldPlayerActor(kGuestPlayerId)),
+                    companion != nullptr && companion->data.critter.combat.whoHitMe == networkWorldPlayerActor(kGuestPlayerId));
+                if ((observed || companionCombatTurns >= 8)
+                    && lobby.acknowledgedEvent(kGuestPlayerId).value >= lobby.latestAuthoritativeEvent().value) {
+                    companionCombatObserved = observed;
+                    companionCombatRunning = false;
+                    combat_over_from_load();
+                } else if (!observed) {
+                    companionCombatRevision = networkWorldCombatTurnRevision();
+                    ++companionCombatTurns;
+                    combat_end_turn();
+                }
+            }
             if (smokeCombatAutoEnd
                 && isInCombat()
                 && smokeScenario == SmokeScenario::CombatScriptStatus
@@ -1338,6 +1848,18 @@ void networkRuntimeBackgroundProcess()
                     EquipmentCommand equipment { networkWorldCombatTurnRevision(), {},
                         networkWorldFindEntity(inven_right_hand(actor)).value_or(EntityId {}), {}, 1 };
                     int before = actor->data.critter.combat.ap;
+                    if (smokeInventoryActions) {
+                        auto* player = playerStateForActor(actor);
+                        bool sneakApplied = player != nullptr
+                            && submitHostCommand(UseSkillCommand { EntityId { kHostPlayerId.value }, ExplorationSkill::Sneak, equipment.turnRevision })
+                            && (player->build.prototypeFlags & (1 << PC_FLAG_SNEAKING)) != 0
+                            && submitHostCommand(UseSkillCommand { EntityId { kHostPlayerId.value }, ExplorationSkill::Sneak, equipment.turnRevision })
+                            && (player->build.prototypeFlags & (1 << PC_FLAG_SNEAKING)) == 0
+                            && actor->data.critter.combat.ap == before;
+                        std::fprintf(stderr, "COMBAT_SNEAK_%s role=host ap=%d expected=%d\n",
+                            sneakApplied ? "PASS" : "FAIL", actor->data.critter.combat.ap, before);
+                        if (!sneakApplied) return;
+                    }
                     EquipmentCommand access = equipment;
                     access.action = EquipmentAction::OpenInventory;
                     bool equipmentApplied = submitHostCommand(access)
@@ -1345,6 +1867,18 @@ void networkRuntimeBackgroundProcess()
                         && submitHostCommand(equipment)
                         && submitHostCommand(equipment)
                         && actor->data.critter.combat.ap == before - 4;
+                    if ((smokeInventoryActions || (!smokeNativeWeaponFamily.empty() && smokeWeaponPid != 25)) && equipmentApplied) {
+                        if (smokeInventoryActions) equipmentApplied = networkWorldRunCombatInventoryDropSmokeTest() && equipmentApplied;
+                        equipmentApplied = equipmentApplied && submitHostCommand(InventoryActionCommand {
+                                equipment.turnRevision, equipment.rightHand, InventoryAction::Unload })
+                            && submitHostCommand(InventoryActionCommand {
+                                equipment.turnRevision, equipment.rightHand, InventoryAction::Reload })
+                            && actor->data.critter.combat.ap == before - 4
+                            && inven_right_hand(actor) != nullptr
+                            && item_w_curr_ammo(inven_right_hand(actor)) == item_w_max_ammo(inven_right_hand(actor));
+                        std::fprintf(stderr, "COMBAT_INVENTORY_ACTION_%s role=host ap=%d expected=%d\n",
+                            equipmentApplied ? "PASS" : "FAIL", actor->data.critter.combat.ap, before - 4);
+                    }
                     access.action = EquipmentAction::CloseInventory;
                     equipmentApplied = submitHostCommand(access) && equipmentApplied;
                     if (!equipmentApplied) {
@@ -1391,8 +1925,16 @@ void networkRuntimeBackgroundProcess()
                 submitHostCommand(RestCommand { minutes });
             }
             while (std::optional<GameEvent> event = networkWorldTakeDeferredEvent()) {
+                const auto* closedModal = std::get_if<SharedModalStateChangedEvent>(&event->payload);
+                bool initialAttack = smokeGuestCombatStart && std::holds_alternative<AttackStartedEvent>(event->payload);
                 bool needsProgressionCheckpoint =
-                    std::holds_alternative<PartyExperienceAwardedEvent>(event->payload);
+                    std::holds_alternative<AttackStartedEvent>(event->payload)
+                    || std::holds_alternative<PartyExperienceAwardedEvent>(event->payload)
+                    || std::holds_alternative<LootStartedEvent>(event->payload)
+                    || std::holds_alternative<ItemPickupCompletedEvent>(event->payload)
+                    || std::holds_alternative<NpcBarterStateChangedEvent>(event->payload)
+                    || (closedModal != nullptr && closedModal->kind == SharedModalKind::Dialogue
+                        && !closedModal->open);
                 if (!lobby.publishDeferredEvent(std::move(*event))) {
                     debug_printf("Multiplayer deferred authoritative event could not be published.\n");
                     break;
@@ -1409,6 +1951,11 @@ void networkRuntimeBackgroundProcess()
                         debug_printf("Multiplayer progression checkpoint could not be sent.\n");
                         break;
                     }
+                }
+                if (initialAttack && smokeCombatExitAfterAttack) {
+                    smokeCombatAttackAccepted = true;
+                    smokeCombatExitAfterAttack = false;
+                    combat_over_from_load();
                 }
             }
             if (!pendingRecoveryRequest.has_value()) {
@@ -1433,9 +1980,16 @@ void networkRuntimeBackgroundProcess()
                     deferredPeerRestCommand = std::move(*command);
                     break;
                 }
+                auto weaponBefore = nativeWeaponBefore(*command);
                 AuthoritativeCommandResult outcome = networkWorldProcessCommand(*command);
+                nativeWeaponAfter(*command, outcome, weaponBefore);
+                if (smokeInventoryActions && outcome.result.status == CommandStatus::Accepted
+                    && !outcome.replayed && std::holds_alternative<InventoryActionCommand>(command->payload)) {
+                    ++smokePeerInventoryActions;
+                }
                 if (outcome.result.status == CommandStatus::Accepted
                     && (std::holds_alternative<EquipmentCommand>(command->payload)
+                        || std::holds_alternative<InventoryActionCommand>(command->payload)
                         || std::holds_alternative<RestCommand>(command->payload))) intface_redraw();
                 if (isDialogueSmokeScenario()
                     && std::holds_alternative<DialogueVoteCommand>(command->payload)) {
@@ -1469,11 +2023,15 @@ void networkRuntimeBackgroundProcess()
                 }
                 bool needsCombatCheckpoint = outcome.result.status == CommandStatus::Accepted
                     && isCheckpointedCombatAction(command->payload);
-                bool needsStateCheckpoint = needsCombatCheckpoint
+                bool needsStateCheckpoint = isCheckpointedCombatAction(command->payload)
                     || (outcome.result.status == CommandStatus::Accepted
                         && needsInventoryCheckpoint(outcome));
+                bool smokeActionCheckpoint = needsCombatCheckpoint
+                    && !std::holds_alternative<InteractCommand>(command->payload)
+                    && !std::holds_alternative<PickupCommand>(command->payload)
+                    && !std::holds_alternative<LootCommand>(command->payload);
                 bool outcomeSent = lobby.sendCommandOutcome(std::move(outcome));
-                if (needsCombatCheckpoint
+                if (smokeActionCheckpoint
                     && smokeScenario == SmokeScenario::CombatReconnect) {
                     smokeCombatAttackAccepted = true;
                     smokeCombatAttackEventSequence = lobby.latestAuthoritativeEvent();
@@ -1496,7 +2054,7 @@ void networkRuntimeBackgroundProcess()
                     nextAuthoritativeState = std::chrono::steady_clock::now()
                         + std::chrono::milliseconds(250);
                 }
-                if (needsCombatCheckpoint && smokeCombatExitAfterAttack) {
+                if (smokeActionCheckpoint && smokeCombatExitAfterAttack) {
                     smokeCombatAttackAccepted = true;
                     smokeCombatExitAfterAttack = false;
                     combat_over_from_load();
@@ -1522,6 +2080,8 @@ void networkRuntimeBackgroundProcess()
             }
             pendingLocalItemDrop.reset();
             pendingCombatEffectAcks.clear();
+            pendingTheftPresentations.clear();
+            pendingLootPresentations.clear();
             if (!lobby.confirmSnapshotApplied(snapshot->lastIncludedEvent)) {
                 debug_printf("Multiplayer recovery snapshot boundary could not be confirmed.\n");
                 lobby.abortRecovery();
@@ -1539,7 +2099,8 @@ void networkRuntimeBackgroundProcess()
             }
         }
         Object* localActor = localPlayerActor();
-        if (localActor != nullptr
+        if (localActor != nullptr && !smokeNativeWorldDiscovery
+            && (launchOptions.mode != NetworkLaunchMode::Join || replicaWorldReady)
             && networkWorldPhase() == SessionPhase::Exploration
             && FID_ANIM_TYPE(localActor->fid) == ANIM_STAND
             && localActor->rotation != lastSentLocalRotation
@@ -1549,7 +2110,13 @@ void networkRuntimeBackgroundProcess()
             lastSentLocalRotation = localActor->rotation;
         }
         while (std::optional<CommandResult> result = lobby.takeCommandResult()) {
+            if (pendingScannerActivation.has_value()
+                && result->commandSequence.value == pendingScannerActivation->sequence.value)
+                pendingScannerActivation->result = *result;
             if (result->status == CommandStatus::Rejected) {
+                std::string rejection = "sequence=" + std::to_string(result->commandSequence.value)
+                    + " reason=" + std::to_string(static_cast<int>(result->rejection));
+                agentJournalWriteText("multiplayer_command_rejected", rejection.c_str());
                 debug_printf("Multiplayer command %llu rejected with reason %d.\n",
                     static_cast<unsigned long long>(result->commandSequence.value),
                     static_cast<int>(result->rejection));
@@ -1558,7 +2125,11 @@ void networkRuntimeBackgroundProcess()
                 lastSentCombatEndRevision = 0;
             }
         }
-        while (std::optional<GameEvent> event = lobby.takePeerEvent()) {
+        // A fresh guest must establish the complete saved world before replaying
+        // queued events against its temporary lobby actors.
+        while (launchOptions.mode != NetworkLaunchMode::Join || replicaWorldReady) {
+            std::optional<GameEvent> event = lobby.takePeerEvent();
+            if (!event.has_value()) break;
             bool applied = false;
             if (const auto* movement = std::get_if<ActorMovementStartedEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerMove(*movement);
@@ -1570,13 +2141,28 @@ void networkRuntimeBackgroundProcess()
             } else if (const auto* doorUse = std::get_if<DoorUseStartedEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerDoorUse(*doorUse);
             } else if (const auto* pickup = std::get_if<ItemPickupStartedEvent>(&event->payload)) {
-                applied = networkWorldApplyPeerPickup(*pickup);
+                // Ownership comes from the covering checkpoint, including stack merges.
+                applied = true;
             } else if (const auto* pickup = std::get_if<ItemPickupCompletedEvent>(&event->payload)) {
-                applied = networkWorldApplyPeerPickupCompletion(*pickup);
+                applied = true;
             } else if (const auto* loot = std::get_if<LootStartedEvent>(&event->payload)) {
-                applied = networkWorldApplyPeerLoot(*loot);
+                // Host approach and container scripts complete before this event.
+                // Wait for their checkpoint before validating range or opening UI.
+                pendingLootPresentations.emplace_back(event->sequence, *loot);
+                applied = true;
             } else if (const auto* skill = std::get_if<SkillUseStartedEvent>(&event->payload)) {
-                applied = networkWorldApplyPeerSkillUse(*skill);
+                if (skill->skill == ExplorationSkill::Steal) {
+                    // The actor may still be at the pre-approach position.
+                    // Open inventory only after the covering host checkpoint.
+                    pendingTheftPresentations.emplace_back(event->sequence, *skill);
+                    applied = true;
+                } else {
+                    applied = networkWorldApplyPeerSkillUse(*skill);
+                }
+                if (smokeInventoryActions && applied && skill->skill == ExplorationSkill::Sneak
+                    && networkWorldPhase() == SessionPhase::Combat && skill->actorId == EntityId { kGuestPlayerId.value }) {
+                    ++smokeCombatSneakPeerEvents;
+                }
             } else if (const auto* itemUse = std::get_if<ItemUseStartedEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerItemUse(*itemUse);
             } else if (const auto* elevator = std::get_if<ElevatorTransitionedEvent>(&event->payload)) {
@@ -1605,6 +2191,8 @@ void networkRuntimeBackgroundProcess()
                 }
             } else if (const auto* presentation = std::get_if<DialoguePresentationEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerDialoguePresentation(*presentation);
+            } else if (const auto* feedback = std::get_if<PlayerFeedbackEvent>(&event->payload)) {
+                applied = networkWorldApplyPeerPlayerFeedback(*feedback);
             } else if (const auto* activity = std::get_if<SharedActivityPublishedEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerSharedActivity(*activity);
             } else if (const auto* route = std::get_if<WorldMapRouteSelectedEvent>(&event->payload)) {
@@ -1613,6 +2201,8 @@ void networkRuntimeBackgroundProcess()
                 applied = networkWorldApplyInventoryTransfer(*transfer);
             } else if (const auto* distribution = std::get_if<CapsDistributedEvent>(&event->payload)) {
                 applied = networkWorldApplyCapsDistribution(*distribution);
+            } else if (const auto* barter = std::get_if<NpcBarterStateChangedEvent>(&event->payload)) {
+                applied = networkWorldApplyPeerNpcBarter(*barter);
             } else if (const auto* trade = std::get_if<DirectTradeStateChangedEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerDirectTrade(*trade);
             } else if (const auto* drop = std::get_if<ItemDroppedEvent>(&event->payload)) {
@@ -1658,6 +2248,8 @@ void networkRuntimeBackgroundProcess()
                 }
             } else if (const auto* award = std::get_if<PartyExperienceAwardedEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerPartyExperience(*award);
+            } else if (const auto* start = std::get_if<CombatRequestedEvent>(&event->payload)) {
+                applied = networkWorldFindObject(start->actorId) != nullptr;
             } else if (const auto* combat = std::get_if<CombatTurnStateChangedEvent>(&event->payload)) {
                 applied = networkWorldApplyPeerCombatTurn(*combat);
                 if (applied) {
@@ -1704,11 +2296,23 @@ void networkRuntimeBackgroundProcess()
                 if (const auto* drop = std::get_if<ItemDroppedEvent>(&event->payload)) {
                     continuePendingLocalItemDrop(*drop);
                 }
-                if (std::holds_alternative<EquipmentChangedEvent>(event->payload)
+                const auto* closedModal = std::get_if<SharedModalStateChangedEvent>(&event->payload);
+                if ((closedModal != nullptr && closedModal->kind == SharedModalKind::Dialogue
+                        && !closedModal->open)
+                    || std::holds_alternative<InventoryTransferredEvent>(event->payload)
+                    || std::holds_alternative<EquipmentChangedEvent>(event->payload)
                     || std::holds_alternative<AttackStartedEvent>(event->payload)
                     || std::holds_alternative<CombatActionResolvedEvent>(event->payload)
                     || std::holds_alternative<PartyExperienceAwardedEvent>(event->payload)
                     || std::holds_alternative<CombatTurnStateChangedEvent>(event->payload)
+                    || std::holds_alternative<LootStartedEvent>(event->payload)
+                    || std::holds_alternative<ItemPickupStartedEvent>(event->payload)
+                    || std::holds_alternative<ItemPickupCompletedEvent>(event->payload)
+                    || (std::get_if<DirectTradeStateChangedEvent>(&event->payload) != nullptr
+                        && std::get<DirectTradeStateChangedEvent>(event->payload).inventoryChanged)
+                    || std::holds_alternative<NpcBarterStateChangedEvent>(event->payload)
+                    || (std::get_if<SkillUseStartedEvent>(&event->payload) != nullptr
+                        && std::get<SkillUseStartedEvent>(event->payload).skill == ExplorationSkill::Steal)
                     || !pendingCombatEffectAcks.empty()) {
                     pendingCombatEffectAcks.push_back(event->sequence);
                 } else if (!lobby.confirmPeerEventApplied(event->sequence)) {
@@ -1732,10 +2336,28 @@ void networkRuntimeBackgroundProcess()
                 debug_printf("Multiplayer authoritative state could not be applied.\n");
             } else {
                 replicaWorldReady = true;
+                while (!pendingTheftPresentations.empty()
+                    && pendingTheftPresentations.front().first.value <= state->lastIncludedEvent.value) {
+                    const auto& skill = pendingTheftPresentations.front().second;
+                    if (state->phase == SessionPhase::Exploration && !networkWorldApplyPeerSkillUse(skill))
+                        debug_printf("Multiplayer checkpointed theft presentation could not be applied.\n");
+                    pendingTheftPresentations.pop_front();
+                }
+                while (!pendingLootPresentations.empty()
+                    && pendingLootPresentations.front().first.value <= state->lastIncludedEvent.value) {
+                    auto loot = pendingLootPresentations.front().second;
+                    pendingLootPresentations.pop_front();
+                    if ((state->phase == SessionPhase::Exploration || state->phase == SessionPhase::Combat)
+                        && !networkWorldApplyPeerLoot(loot))
+                        debug_printf("Multiplayer checkpointed loot presentation could not be applied.\n");
+                }
                 if (state->phase == SessionPhase::Ending
                     && !lobby.confirmSessionEndingApplied(state->phaseRevision)) {
                     debug_printf("Multiplayer ending checkpoint could not be confirmed.\n");
                 }
+                if (state->phase == SessionPhase::Ending && state->story.revision != 0
+                    && state->story.kind == StoryPresentationKind::Finale && !state->story.active)
+                    game_user_wants_to_quit = 2;
                 while (!pendingCombatEffectAcks.empty()
                     && pendingCombatEffectAcks.front().value <= state->lastIncludedEvent.value) {
                     pendingCombatEffectAcks.pop_front();
@@ -1829,7 +2451,35 @@ void networkRuntimeBackgroundProcess()
                 networkRuntimeSubmitLocalExitGrid(*readyExit);
             }
         }
-        if (isDialogueSmokeScenario()
+        if (smokeNativeCompanion.has_value() && networkWorldPhase() == SessionPhase::Dialogue) {
+            const auto* presentation = networkWorldDialoguePresentation();
+            auto* talker = playerStateForActor(networkWorldPlayerActor(*smokeNativeCompanion));
+            auto* other = playerStateForActor(networkWorldPlayerActor(*smokeNativeCompanion == kHostPlayerId ? kGuestPlayerId : kHostPlayerId));
+            if (presentation != nullptr && talker != nullptr && other != nullptr) {
+                if (!smokeNativeCompanionIntroName) {
+                    for (const auto& option : presentation->options) {
+                        if (option.find("I'm ") == std::string::npos) continue;
+                        bool correct = option.find("I'm " + talker->name + ".") != std::string::npos
+                            && option.find(other->name) == std::string::npos;
+                        smokeNativeCompanionIntroName = correct;
+                        smokeNativeCompanionNameFailed |= !correct;
+                        std::fprintf(stderr, "NATIVE_COMPANION_TALKER_NAME_%s role=%s stage=option expected=%s actual=%s\n",
+                            correct ? "PASS" : "FAIL", launchOptions.mode == NetworkLaunchMode::Host ? "host" : "guest", talker->name.c_str(), option.c_str());
+                        break;
+                    }
+                }
+                if (!smokeNativeCompanionReplyName && (presentation->reply.rfind("So, ", 0) == 0
+                        || presentation->reply.rfind("What can I do for you, ", 0) == 0)) {
+                    bool correct = presentation->reply.find(talker->name) != std::string::npos
+                        && presentation->reply.find(other->name) == std::string::npos;
+                    smokeNativeCompanionReplyName = correct;
+                    smokeNativeCompanionNameFailed |= !correct;
+                    std::fprintf(stderr, "NATIVE_COMPANION_TALKER_NAME_%s role=%s stage=reply expected=%s actual=%s\n",
+                        correct ? "PASS" : "FAIL", launchOptions.mode == NetworkLaunchMode::Host ? "host" : "guest", talker->name.c_str(), presentation->reply.c_str());
+                }
+            }
+        }
+        if (isDialogueSmokeScenario() && !smokeNativeDialogueDefeat.has_value() && !smokeNativeCompanion.has_value()
             && networkWorldPhase() == SessionPhase::Dialogue) {
             if (const auto* presentation = networkWorldDialoguePresentation();
                 presentation != nullptr
@@ -1869,6 +2519,7 @@ void networkRuntimeBackgroundProcess()
             }
         }
     }
+    networkRuntimeProcessPartyDefeat();
     reportAgentWorldState();
     reportLobbyStatus();
 }
@@ -1908,6 +2559,7 @@ bool startConfiguredRuntime()
 
     if (!backgroundProcessRegistered) {
         add_bk_process(networkRuntimeBackgroundProcess);
+        set_input_observer(networkRuntimeProcessPendingStory);
         backgroundProcessRegistered = true;
     }
     set_background_processing_when_inactive(true);
@@ -1948,7 +2600,35 @@ bool networkRuntimeConfigure(int argc, char** argv)
     launchOptions = result.options;
     smokeTestEnabled = false;
     smokeScenario = SmokeScenario::Movement;
+    smokeNativeInventoryDefeat = smokeNativeInventoryDefeatTriggered = false;
+    smokeNativeInventoryHeldAt = {};
+    smokeNativeTimerDefeat.reset();
+    smokeNativeTimerDefeatTriggered = false;
+    smokeNativeDialogueDefeat.reset();
+    smokeNativeBarterDefeat = smokeNativeDialogueDefeatTriggered = false;
+    smokeNativeDialogueReadyAt = {};
+    smokeNativeDefeatMethod = "damage";
+    smokeNativeDefeatReconnect = smokeNativeDefeatReconnectRequested = false;
+    smokeNativeGuestDialogueAt = {};
+    smokeNativePipboyDefeat = smokeNativePipboyScreensaver = false;
+    smokeNativePipboyReadyAt = {};
+    smokeNativeDefeatHazard.clear();
+    smokeNativeDefeatHazardPassed = false;
+    smokeNativeAutomapDefeat.reset();
+    smokeNativeAutomapDefeatArmed = smokeNativeAutomapDefeatTriggered = false;
     replicaWorldReady = false;
+    storyPlaying = storyFailed = false;
+    playedStoryRevision = storyCompletionSent = 0;
+    smokeNativeBarterQuantityDefeat = false;
+    smokeNativeStory = false;
+    smokeNativeStoryReconnect = smokeNativeStoryReconnectRequested = smokeNativeStoryMissing = false;
+    smokeNativeWorldDiscovery = false;
+    smokeNativeSnapshotCapacity = false;
+    smokeNativeCompanion.reset();
+    smokeNativeCompanionDeath = false;
+    smokeNativeCompanionCleanup = false;
+    smokeNativeCompanionBattle = smokeNativeCompanionHostility = false;
+    smokeNativeCompanionIntroName = smokeNativeCompanionReplyName = smokeNativeCompanionNameFailed = false;
     smokeWeaponPid = 0;
     smokeAttackHitMode = HIT_MODE_PUNCH;
     smokeAttackLocation = HIT_LOCATION_UNCALLED;
@@ -1966,8 +2646,124 @@ bool networkRuntimeConfigure(int argc, char** argv)
             smokeTestEnabled = true;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-knife-gift") == 0) {
             smokeKnifeGift = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-inventory-actions") == 0) {
+            smokeInventoryActions = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-saved-slot") == 0) {
+            smokeSavedSlot = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-snapshot-capacity") == 0) {
+            smokeNativeSnapshotCapacity = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-world-discovery") == 0) {
+            smokeNativeWorldDiscovery = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-container-loot") == 0) {
+            smokeNativeContainerLoot = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-container-loot-host") == 0) {
+            smokeNativeContainerLoot = true;
+            smokeNativeContainerLootHost = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-combat-loot") == 0) {
+            smokeNativeCombatLoot = true;
+            smokeNativeCombatInventory = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-combat-inventory") == 0) {
+            smokeNativeCombatInventory = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-guest-combat-start") == 0) {
+            smokeGuestCombatStart = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-guest-combat-attack") == 0) {
+            smokeGuestCombatStart = smokeGuestCombatAttack = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-guest-combat-floor") == 0) {
+            smokeGuestCombatStart = smokeGuestCombatFloor = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-companion=host") == 0) {
+            smokeNativeCompanion = kHostPlayerId;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-companion=guest") == 0) {
+            smokeNativeCompanion = kGuestPlayerId;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-companion-death") == 0) {
+            smokeNativeCompanionDeath = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-companion-cleanup") == 0) {
+            smokeNativeCompanionCleanup = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-companion-battle") == 0) {
+            smokeNativeCompanionBattle = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-companion-hostility") == 0) {
+            smokeNativeCompanionHostility = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-story-reconnect") == 0) {
+            smokeNativeStoryReconnect = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-story-missing") == 0) {
+            smokeNativeStoryMissing = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-story") == 0) {
+            smokeNativeStory = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-automap") == 0) {
+            smokeNativeAutomap = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-automap-defeat=host") == 0) {
+            smokeNativeAutomap = true;
+            smokeNativeAutomapDefeat = kHostPlayerId;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-automap-defeat=guest") == 0) {
+            smokeNativeAutomap = true;
+            smokeNativeAutomapDefeat = kGuestPlayerId;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-dialogue-defeat=host") == 0) {
+            smokeNativeDialogueDefeat = kHostPlayerId;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-dialogue-defeat=guest") == 0) {
+            smokeNativeDialogueDefeat = kGuestPlayerId;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-defeat-reconnect") == 0) {
+            smokeNativeDefeatReconnect = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-barter-quantity-defeat") == 0) {
+            smokeNativeBarterQuantityDefeat = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-barter-defeat") == 0) {
+            smokeNativeBarterDefeat = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-defeat-method=script") == 0) {
+            smokeNativeDefeatMethod = "script";
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-defeat-method=simultaneous") == 0) {
+            smokeNativeDefeatMethod = "simultaneous";
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-pipboy-defeat") == 0) {
+            smokeNativePipboyDefeat = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-pipboy-screensaver") == 0) {
+            smokeNativePipboyDefeat = smokeNativePipboyScreensaver = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-hazard=poison") == 0) {
+            smokeNativeDefeatHazard = "poison";
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-hazard=radiation") == 0) {
+            smokeNativeDefeatHazard = "radiation";
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-explosive-timer") == 0) {
+            smokeNativeExplosiveTimer = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-timer-defeat=host") == 0) {
+            smokeNativeExplosiveTimer = true;
+            smokeNativeTimerDefeat = kHostPlayerId;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-timer-defeat=guest") == 0) {
+            smokeNativeExplosiveTimer = true;
+            smokeNativeTimerDefeat = kGuestPlayerId;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-character-editor") == 0) {
+            smokeNativeCharacterEditor = true;
+        } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-inventory-defeat") == 0) {
+            smokeNativeInventory = smokeNativeInventoryDefeat = true;
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-native-inventory") == 0) {
             smokeNativeInventory = true;
+        } else if (argv[index] != nullptr && std::strncmp(argv[index], "--multiplayer-smoke-native-dense-map=", 37) == 0) {
+            smokeNativeDenseMapName = argv[index] + 37;
+            struct DenseMap { const char* name; int map; };
+            static constexpr DenseMap maps[] = {
+                { "gunrunners", MAP_LAGUNRUN }, { "hub", MAP_HUBDWNTN },
+                { "necropolis", MAP_HALLDED }, { "mariposa", MAP_MBSTRG12 },
+                { "cathedral", MAP_CHILDRN1 },
+            };
+            for (const auto& map : maps) {
+                if (smokeNativeDenseMapName == map.name) { smokeNativeDenseMap = map.map; break; }
+            }
+            if (smokeNativeDenseMap < 0) { std::fprintf(stderr, "Unknown native dense map.\n"); return false; }
+        } else if (argv[index] != nullptr && std::strncmp(argv[index], "--multiplayer-smoke-native-weapon-family=", 41) == 0) {
+            smokeNativeWeaponFamily = argv[index] + 41;
+            struct Family { const char* name; int pid; bool secondary; };
+            static constexpr Family families[] = {
+                { "smg", 9, true }, { "assault", 23, true }, { "minigun", 12, false },
+                { "grenade", 25, false }, { "rocket", 13, false }, { "laser", 16, false },
+                { "plasma", 24, false }, { "flamer", 11, false },
+                { "laser-rifle", 118, false }, { "plasma-rifle", 15, false },
+            };
+            bool known = false;
+            for (const auto& family : families) {
+                if (smokeNativeWeaponFamily == family.name) {
+                    smokeWeaponPid = family.pid;
+                    smokeAttackHitMode = family.secondary ? HIT_MODE_RIGHT_WEAPON_SECONDARY : HIT_MODE_RIGHT_WEAPON_PRIMARY;
+                    smokeAttackLocation = HIT_LOCATION_UNCALLED;
+                    known = true;
+                    break;
+                }
+            }
+            if (!known) { std::fprintf(stderr, "Unknown native weapon family.\n"); return false; }
         } else if (argv[index] != nullptr && std::strcmp(argv[index], "--multiplayer-smoke-weapon=knife") == 0) {
             smokeWeaponPid = 4;
             smokeAttackHitMode = HIT_MODE_RIGHT_WEAPON_PRIMARY;
@@ -2088,6 +2884,18 @@ bool networkRuntimeConfigure(int argc, char** argv)
             }
         }
     }
+    if (smokeNativeCompanionCleanup && (!smokeTestEnabled || !smokeNativeCompanion.has_value())) {
+        std::fprintf(stderr, "Native companion cleanup requires the companion smoke fixture.\n");
+        return false;
+    }
+    if (smokeNativeDenseMap >= 0 && (!smokeTestEnabled || smokeScenario != SmokeScenario::Recovery)) {
+        std::fprintf(stderr, "Native dense map requires the recovery smoke fixture.\n");
+        return false;
+    }
+    if (!smokeNativeWeaponFamily.empty() && (!smokeTestEnabled || smokeScenario != SmokeScenario::CombatAttack)) {
+        std::fprintf(stderr, "Native weapon family requires the combat-attack smoke fixture.\n");
+        return false;
+    }
     if (smokeTestEnabled && launchOptions.mode == NetworkLaunchMode::Disabled) {
         std::fprintf(stderr, "--multiplayer-smoke-test requires --multiplayer-host or --multiplayer-join.\n");
         return false;
@@ -2147,6 +2955,11 @@ bool networkRuntimeConfigure(int argc, char** argv)
 bool networkRuntimeSmokeTestEnabled()
 {
     return smokeTestEnabled;
+}
+
+bool networkRuntimeSmokeTestPipboyScreensaver()
+{
+    return smokeTestEnabled && smokeNativePipboyScreensaver;
 }
 
 const char* networkRuntimeSmokeTestMap()
@@ -2447,11 +3260,732 @@ static bool runLiveWorldMapTravelSmoke(const SessionId sessionId)
     return true;
 }
 
+static bool runLiveInventoryActionsSmoke()
+{
+    const bool host = launchOptions.mode == NetworkLaunchMode::Host;
+    Object* actor = localPlayerActor();
+    auto weaponId = networkWorldFindEntity(inven_right_hand(actor));
+    if (!weaponId.has_value()) return false;
+    auto waitFor = [&](auto predicate) {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        while (std::chrono::steady_clock::now() < deadline) {
+            networkRuntimeBackgroundProcess();
+            if (predicate()) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return false;
+    };
+    auto weapon = [&]() { return networkWorldFindObject(*weaponId); };
+    auto equipped = [&]() { return weapon() != nullptr && inven_right_hand(actor) == weapon(); };
+    auto rounds = [&]() {
+        int total = 0;
+        for (int index = 0; index < actor->data.inventory.length; ++index) {
+            const auto& entry = actor->data.inventory.items[index];
+            if (item_get_type(entry.item) == ITEM_TYPE_WEAPON) total += item_w_curr_ammo(entry.item) * entry.quantity;
+            if (item_get_type(entry.item) == ITEM_TYPE_AMMO) total += item_w_curr_ammo(entry.item)
+                + item_w_max_ammo(entry.item) * (entry.quantity - 1);
+        }
+        return total;
+    };
+    if (host && !networkWorldRunPlayerRulesSmokeTest()) return false;
+    auto* localState = localPlayerState();
+    if (localState == nullptr) return false;
+    for (bool enabled : { true, false }) {
+        networkRuntimeHandleLocalSkillUse(actor, SKILL_SNEAK);
+        if (!waitFor([&]() { return ((localState->build.prototypeFlags & (1 << PC_FLAG_SNEAKING)) != 0) == enabled; })) return false;
+    }
+    std::fprintf(stderr, "SNEAK_ACTION_SMOKE_PASS role=%s authority=host\n", host ? "host" : "guest");
+    int initialRounds = rounds();
+    for (int stage = 0; stage < 4; ++stage) {
+        Object* ammo = nullptr;
+        if (stage == 3) {
+            for (int index = 0; index < actor->data.inventory.length; ++index) {
+                Object* candidate = actor->data.inventory.items[index].item;
+                if (item_get_type(candidate) == ITEM_TYPE_AMMO && item_w_can_reload(weapon(), candidate)) {
+                    ammo = candidate;
+                    break;
+                }
+            }
+            if (ammo == nullptr) return false;
+        }
+        networkRuntimeHandleInventoryAction(weapon(), stage % 2 == 0
+            ? InventoryAction::Unload : InventoryAction::Reload, ammo);
+        if (!waitFor([&]() { return equipped() && (stage % 2 == 0
+                ? item_w_curr_ammo(weapon()) == 0 : item_w_curr_ammo(weapon()) == item_w_max_ammo(weapon())); })
+            || rounds() != initialRounds) {
+            std::fprintf(stderr, "INVENTORY_ACTION_SMOKE_FAIL stage=%d role=%s rounds=%d expected=%d\n",
+                stage, host ? "host" : "guest", rounds(), initialRounds);
+            return false;
+        }
+    }
+    Object* drug = inven_pid_is_carried_ptr(actor, PROTO_ID_STIMPACK);
+    if (drug == nullptr) return false;
+    int initialDrugs = item_count(actor, drug);
+    networkRuntimeHandleInventoryAction(drug, InventoryAction::Use);
+    if (!waitFor([&]() {
+            Object* remaining = inven_pid_is_carried_ptr(actor, PROTO_ID_STIMPACK);
+            return remaining != nullptr && item_count(actor, remaining) == initialDrugs - 1;
+        })) return false;
+    // The host must observe all guest commands before starting combat. Guest
+    // presentation never reloads/unloads objects itself.
+    if (host && !waitFor([&]() { return smokePeerInventoryActions == 5; })) return false;
+    std::fprintf(stderr, "INVENTORY_ACTION_SMOKE_PASS role=%s rounds=%d equipped=1\n", host ? "host" : "guest", initialRounds);
+    return true;
+}
+
+static bool runNativeSnapshotCapacitySmoke()
+{
+    bool host = launchOptions.mode == NetworkLaunchMode::Host;
+    if (!host) {
+        bool ready = false;
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(45);
+        while (std::chrono::steady_clock::now() < deadline) {
+            get_input();
+            networkRuntimeBackgroundProcess();
+            WorldSnapshot native;
+            if (!ready && lobby.state() == NetworkLobbyState::Ready
+                && networkWorldCaptureSnapshot(lobby.lastAppliedEvent(), native)) {
+                ready = true;
+                std::fprintf(stdout, "NATIVE_SNAPSHOT_CAPACITY_PEER_READY native_capture=1\n");
+                std::fflush(stdout);
+            }
+            if (ready && (lobby.state() == NetworkLobbyState::Disconnected
+                    || (lobby.state() == NetworkLobbyState::Failed
+                        && lobby.error() == NetworkLobbyError::ProtocolError))) {
+                std::fprintf(stdout, "NATIVE_SNAPSHOT_CAPACITY_PEER_STOPPED_PASS disconnected=%d failed=%d\n",
+                    lobby.state() == NetworkLobbyState::Disconnected, lobby.state() == NetworkLobbyState::Failed);
+                std::fflush(stdout);
+                return true;
+            }
+            if (networkRuntimeFailed()) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return false;
+    }
+    WorldSnapshot before;
+    if (!captureRuntimeCheckpoint(lobby.latestAuthoritativeEvent(), before)
+        || !SaveMultiplayerGameSlot(1)) return false;
+    std::fprintf(stdout, "NATIVE_SNAPSHOT_CAPACITY_BASELINE_SAVE_READY slot=2\n");
+    std::fflush(stdout);
+    // The driver hashes the completed save before allowing the failure test.
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (!std::filesystem::exists("native-capacity-save-checked")
+        && std::chrono::steady_clock::now() < deadline) {
+        get_input();
+        networkRuntimeBackgroundProcess();
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    if (!std::filesystem::exists("native-capacity-save-checked")) return false;
+    Object* actor = networkWorldPlayerActor(kHostPlayerId);
+    if (actor == nullptr) return false;
+    int fid = actor->fid, frame = actor->frame, x = actor->x, y = actor->y;
+    bool animation = register_begin(ANIMATION_REQUEST_RESERVED) == 0
+        && register_object_animate(actor, ANIM_WALK, 0) == 0 && register_end() == 0
+        && anim_busy(actor) == -1;
+    WorldSnapshot busy;
+    bool busyRetry = animation && !captureRuntimeCheckpoint(lobby.latestAuthoritativeEvent(), busy)
+        && !networkRuntimeFailed() && lobby.state() == NetworkLobbyState::Ready
+        && networkWorldLastSnapshotCaptureDiagnostic().failure == SnapshotCaptureFailure::BusyObject;
+    register_clear(actor);
+    obj_change_fid(actor, fid, nullptr);
+    obj_set_frame(actor, frame, nullptr);
+    obj_offset(actor, x - actor->x, y - actor->y, nullptr);
+    WorldSnapshot idle;
+    busyRetry = busyRetry && captureRuntimeCheckpoint(lobby.latestAuthoritativeEvent(), idle);
+    if (!busyRetry) return false;
+    int originalHp = critter_get_hits(actor), originalPoison = actor->data.critter.poison;
+    actor->data.critter.poison = 10;
+    if (queue_add(0, actor, nullptr, EVENT_TYPE_POISON) != 0) return false;
+    queue_process();
+    bool timerControl = critter_get_hits(actor) == originalHp - 1 && actor->data.critter.poison == 8;
+    queue_remove_this(actor, EVENT_TYPE_POISON);
+    critter_adjust_hits(actor, originalHp - critter_get_hits(actor));
+    actor->data.critter.poison = 10;
+    if (!timerControl || queue_add(0, actor, nullptr, EVENT_TYPE_POISON) != 0) return false;
+    Object* npc = nullptr;
+    int scriptedSid = -1;
+    for (Object* object = obj_find_first(); object != nullptr; object = obj_find_next()) {
+        if (scriptedSid == -1 && object->sid >= 0) scriptedSid = object->sid;
+        if (npc == nullptr && FID_TYPE(object->fid) == OBJ_TYPE_CRITTER
+            && !networkWorldCombatOwner(object).has_value()) npc = object;
+    }
+    bool npcAnimation = npc != nullptr && register_begin(ANIMATION_REQUEST_RESERVED) == 0
+        && register_object_animate(npc, ANIM_WALK, 0) == 0 && register_end() == 0
+        && anim_busy(npc) == -1;
+    if (!npcAnimation || scriptedSid == -1
+        || !captureRuntimeCheckpoint(lobby.latestAuthoritativeEvent(), idle)) return false;
+    auto beforeDigest = computeSnapshotDigest(idle);
+    int frozenTime = game_time(), frozenHp = critter_get_hits(actor), frozenPoison = actor->data.critter.poison;
+    auto boundary = lobby.latestAuthoritativeEvent();
+    auto hostSequence = nextHostCommandSequence;
+    bool rejected = networkWorldRunVariableCapacitySmoke(captureRuntimeCheckpoint);
+    bool failed = rejected && snapshotCapacityFailed() && networkRuntimeFailed()
+        && !networkRuntimeConnected();
+    std::string status = runtimeStatus;
+    bool blocked = !submitHostCommand(FaceCommand { (actor->rotation + 1) % ROTATION_COUNT })
+        && nextHostCommandSequence == hostSequence && lobby.latestAuthoritativeEvent() == boundary;
+    engineExecutionProbeBegin();
+    exec_script_proc(scriptedSid, SCRIPT_PROC_USE);
+    bool aiStopped = combat_ai(npc, actor) == nullptr;
+    bool attackStopped = combat_attack(actor, networkWorldPlayerActor(kGuestPlayerId),
+        HIT_MODE_PUNCH, HIT_LOCATION_TORSO) == -1;
+    auto frozenUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(750);
+    while (std::chrono::steady_clock::now() < frozenUntil) {
+        queue_process();
+        process_bk();
+        networkRuntimeBackgroundProcess();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    auto counts = engineExecutionProbeEnd();
+    bool restStopped = networkWorldRunStoppedRestSmoke();
+    bool simulationFrozen = restStopped && aiStopped && attackStopped && game_time() == frozenTime
+        && critter_get_hits(actor) == frozenHp && actor->data.critter.poison == frozenPoison
+        && queue_find(actor, EVENT_TYPE_POISON) && counts.scriptProcedures == 0
+        && counts.combatAttacks == 0 && counts.randomDraws == 0;
+    bool stableStatus = runtimeStatus == status && status.find("EXCEEDS CAPACITY") != std::string::npos;
+    WorldSnapshot stopped;
+    auto stoppedDigest = networkWorldCaptureSnapshot(boundary, stopped)
+        ? computeSnapshotDigest(stopped) : SnapshotDigestResult { SnapshotError::InvalidMap, {} };
+    bool unchangedBeforeSave = stoppedDigest && beforeDigest && stoppedDigest.digest == beforeDigest.digest;
+    bool saveRefused = !SaveMultiplayerGameSlot(1);
+    WorldSnapshot after;
+    auto afterDigest = networkWorldCaptureSnapshot(boundary, after)
+        ? computeSnapshotDigest(after) : SnapshotDigestResult { SnapshotError::InvalidMap, {} };
+    bool unchanged = unchangedBeforeSave && afterDigest && afterDigest.digest == beforeDigest.digest;
+    if (!unchanged) {
+        std::fprintf(stderr, "NATIVE_SNAPSHOT_CAPACITY_WORLD_CHANGED before_save=%d post_save_section=%d before=%llu stopped=%llu after=%llu.\n",
+            unchangedBeforeSave, static_cast<int>(firstDivergentSection(beforeDigest.digest, afterDigest.digest)),
+            static_cast<unsigned long long>(beforeDigest.digest.overall),
+            static_cast<unsigned long long>(stoppedDigest.digest.overall),
+            static_cast<unsigned long long>(afterDigest.digest.overall));
+    }
+    int capacityError = static_cast<int>(lobby.error());
+    register_clear(npc);
+    queue_remove_this(actor, EVENT_TYPE_POISON);
+    actor->data.critter.poison = originalPoison;
+    bool passed = failed && blocked && stableStatus && saveRefused && unchanged && simulationFrozen;
+    networkRuntimeStop();
+    bool loadAllowed = passed && networkRuntimeSaveAllowed() && !networkRuntimeSimulationStopped()
+        && LoadMultiplayerGameSlot(1) && obj_dude != nullptr;
+    bool timerThawed = false;
+    if (loadAllowed) {
+        int hp = critter_get_hits(obj_dude), poison = obj_dude->data.critter.poison;
+        obj_dude->data.critter.poison = 10;
+        if (queue_add(0, obj_dude, nullptr, EVENT_TYPE_POISON) == 0) {
+            queue_process();
+            timerThawed = critter_get_hits(obj_dude) == hp - 1 && obj_dude->data.critter.poison == 8;
+        }
+        queue_remove_this(obj_dude, EVENT_TYPE_POISON);
+        critter_adjust_hits(obj_dude, hp - critter_get_hits(obj_dude));
+        obj_dude->data.critter.poison = poison;
+    }
+    passed = passed && loadAllowed && timerThawed;
+    std::fprintf(stdout, "NATIVE_SNAPSHOT_CAPACITY_%s capacity_error=%d busy_retry=%d gameplay_blocked=%d status_stable=%d save_refused=%d world_unchanged=%d timer_control=%d simulation_frozen=%d pending_animation=%d load_allowed=%d timer_thawed=%d rest_stopped=%d\n",
+        passed ? "PASS" : "FAIL", capacityError, busyRetry, blocked, stableStatus, saveRefused, unchanged,
+        timerControl, simulationFrozen, npcAnimation, loadAllowed, timerThawed, restStopped);
+    std::fflush(stdout);
+    return passed;
+}
+
+static bool runNativeWorldDiscoverySmoke()
+{
+    bool host = launchOptions.mode == NetworkLaunchMode::Host;
+    std::optional<WorldDiscoverySmokeFixture> original;
+    if (host) {
+        original = networkWorldPrepareWorldDiscoverySmokeTest();
+        WorldSnapshot state;
+        if (!original.has_value()
+            || !networkWorldCaptureAuthoritativeState(lobby.latestAuthoritativeEvent(), state)
+            || !lobby.sendAuthoritativeState(state)) return false;
+    }
+    bool firstApplied = false;
+    bool reconnectRequested = false;
+    bool sawDisconnect = false;
+    bool recovered = false;
+    bool secondFacing = false;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(45);
+    engineExecutionProbeBegin();
+    while (std::chrono::steady_clock::now() < deadline && !networkRuntimeFailed()) {
+        networkRuntimeBackgroundProcess();
+        sawDisconnect |= lobby.state() == NetworkLobbyState::Disconnected;
+        auto fixture = networkWorldVerifyWorldDiscoverySmokeTest();
+        if (!host && !firstApplied && fixture.has_value()) {
+            original = fixture;
+            firstApplied = networkRuntimeSubmitLocalFacing(1);
+            if (!firstApplied) break;
+            std::fprintf(stderr,
+                "NATIVE_WORLD_DISCOVERY_APPLIED role=guest items=2 resources=3 npc=1 scenery=1 timer_owner=%u timer_time=%d.\n",
+                fixture->npcId.value, fixture->timerTime);
+        }
+        if (!host && firstApplied && !reconnectRequested && lobby.lastAppliedEvent().value >= 1) {
+            if (!networkWorldEraseWorldDiscoverySmokeTest() || !lobby.disconnectForReconnect()) break;
+            reconnectRequested = true;
+            std::fprintf(stderr, "NATIVE_WORLD_DISCOVERY_ERASED_BEFORE_RECONNECT role=guest nested_ids_removed=1 timer_removed=1.\n");
+        }
+        if (!host && reconnectRequested && fixture.has_value()
+            && lobby.state() == NetworkLobbyState::Ready && !lobby.recoveryInProgress()
+            && !secondFacing) {
+            recovered = original.has_value() && fixture->groundId == original->groundId
+                && fixture->childId == original->childId && fixture->npcId == original->npcId
+                && fixture->sceneryId == original->sceneryId && fixture->timerTime == original->timerTime;
+            if (!recovered || !networkRuntimeSubmitLocalFacing(2)) break;
+            secondFacing = true;
+            std::fprintf(stderr, "NATIVE_WORLD_DISCOVERY_RECONSTRUCTED role=guest stable_ids=1 resources=3 timer_exact=1.\n");
+        }
+        if (host && sawDisconnect && lobby.state() == NetworkLobbyState::Ready
+            && networkWorldPlayerActor(kGuestPlayerId)->rotation == 2
+            && lobby.acknowledgedEvent(kGuestPlayerId).value >= lobby.latestAuthoritativeEvent().value
+            && networkWorldPhase() != SessionPhase::Ending) {
+            recovered = fixture.has_value() && original.has_value()
+                && fixture->timerTime == original->timerTime;
+            if (!recovered) break;
+            networkRuntimeEndHostSession();
+        }
+        if (networkWorldPhase() == SessionPhase::Ending && recovered
+            && (host ? lobby.acknowledgedEndingPhaseRevision() == networkWorldPhaseRevision()
+                     : secondFacing)) {
+            WorldSnapshot state;
+            if (!networkWorldCaptureAuthoritativeState(host ? lobby.latestAuthoritativeEvent()
+                    : lobby.lastAppliedEvent(), state)) break;
+            auto digest = computeSnapshotDigest(state);
+            auto finalFixture = networkWorldVerifyWorldDiscoverySmokeTest();
+            if (!digest || !finalFixture.has_value() || !original.has_value()
+                || finalFixture->timerTime != original->timerTime) break;
+            EngineExecutionProbeCounts counts = engineExecutionProbeEnd();
+            if (!host && (counts.scriptProcedures != 0 || counts.combatAttacks != 0 || counts.randomDraws != 0)) return false;
+            std::fprintf(stdout,
+                "NATIVE_WORLD_DISCOVERY_TLS_PASS role=%s reconnect=1 native_apply=1 resources=3 timer_exact=1 digest=%llu scripts=%u attacks=%u rng=%u\n",
+                host ? "host" : "guest", static_cast<unsigned long long>(digest.digest.overall),
+                counts.scriptProcedures, counts.combatAttacks, counts.randomDraws);
+            std::fflush(stdout);
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    engineExecutionProbeEnd();
+    std::fprintf(stderr, "NATIVE_WORLD_DISCOVERY_TLS_FAIL role=%s first=%d reconnect=%d disconnected=%d recovered=%d phase=%d event=%llu\n",
+        host ? "host" : "guest", firstApplied, reconnectRequested, sawDisconnect, recovered,
+        static_cast<int>(networkWorldPhase()), static_cast<unsigned long long>(lobby.lastAppliedEvent().value));
+    return false;
+}
+
+static bool runNativeContainerLootSmoke()
+{
+    bool host = launchOptions.mode == NetworkLaunchMode::Host;
+    PlayerId looterId = smokeNativeContainerLootHost ? kHostPlayerId : kGuestPlayerId;
+    std::optional<EntityId> target;
+    if (host) {
+        target = networkWorldPrepareGroundContainerLootSmokeTest(looterId);
+        WorldSnapshot fixture;
+        bool captured = target.has_value() && networkWorldCaptureAuthoritativeState(lobby.latestAuthoritativeEvent(), fixture);
+        bool sent = captured && lobby.sendAuthoritativeState(fixture);
+        if (!sent) {
+            std::vector<std::uint8_t> diagnosticPayload;
+            std::fprintf(stderr, "NATIVE_CONTAINER_FIXTURE_FAILED target=%u captured=%d error=%d\n", target.has_value() ? target->value : 0, captured,
+                captured ? static_cast<int>(encodeSnapshot(fixture, diagnosticPayload)) : -1);
+            return false;
+        }
+    } else {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        while (std::chrono::steady_clock::now() < deadline && !target.has_value()) {
+            networkRuntimeBackgroundProcess();
+            target = networkWorldPrepareGroundContainerLootSmokeTest(looterId);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (!target.has_value()) return false;
+    }
+    Object* looter = networkWorldPlayerActor(looterId);
+    Object* container = networkWorldFindObject(*target);
+    Object* ammo = inven_pid_is_carried_ptr(container, 30);
+    if (ammo == nullptr) {
+        std::fprintf(stderr, "NATIVE_CONTAINER_AMMO_MISSING target=%u entries=%d\n", target->value, container->data.inventory.length);
+        for (int i = 0; i < container->data.inventory.length; ++i)
+            std::fprintf(stderr, "NATIVE_CONTAINER_CONTENT pid=%d quantity=%d\n", container->data.inventory.items[i].item->pid, container->data.inventory.items[i].quantity);
+        return false;
+    }
+    int expected = item_count(container, ammo);
+    auto countPid = [](Object* owner, int pid) {
+        int total = 0;
+        for (int index = 0; index < owner->data.inventory.length; ++index) {
+            const auto& entry = owner->data.inventory.items[index];
+            if (entry.item->pid == pid) total += entry.quantity;
+        }
+        return total;
+    };
+    int before = countPid(looter, 30);
+    int beforeKnives = countPid(looter, 4);
+    int expectedKnives = countPid(container, 4);
+    if (host == smokeNativeContainerLootHost && !networkRuntimeHandleLocalPickup(container)) return false;
+    std::fprintf(stderr, "NATIVE_CONTAINER_LOOT_READY role=%s target=%u ammo_before=%d expected=%d\n",
+        host ? "host" : "guest", target->value, before, expected);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    bool transferred = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        networkRuntimeBackgroundProcess();
+        get_input();
+        scripts_check_state();
+        renderPresent();
+        Object* remainingAmmo = inven_pid_is_carried_ptr(container, 30);
+        transferred = remainingAmmo == nullptr && countPid(looter, 30) == before + expected
+            && countPid(looter, 4) == beforeKnives + expectedKnives
+            && container->data.inventory.length == 0 && container->owner == nullptr;
+        if (transferred && !inven_loot_window_is_active()) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    std::fprintf(stderr, "NATIVE_CONTAINER_LOOT_%s role=%s looter=%s ammo=%d added=%d knives=%d knife_added=%d container_empty=%d container_ground=%d\n",
+        transferred ? "PASS" : "FAIL", host ? "host" : "guest", smokeNativeContainerLootHost ? "host" : "guest",
+        countPid(looter, 30), expected, countPid(looter, 4), expectedKnives,
+        container->data.inventory.length == 0, container->owner == nullptr);
+    if (host && transferred) {
+        // Let the native guest window close before moving its actor into the
+        // following combat fixture.
+        auto settle = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (std::chrono::steady_clock::now() < settle) {
+            networkRuntimeBackgroundProcess();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    return transferred;
+}
+
+static bool runNativeMapScreenSmoke()
+{
+    bool host = launchOptions.mode == NetworkLaunchMode::Host;
+    if (host) {
+        WorldSnapshot state;
+        if (!networkWorldPrepareAutomapSmoke()
+            || !networkWorldCaptureAuthoritativeState(lobby.latestAuthoritativeEvent(), state)
+            || !lobby.sendAuthoritativeState(state)) return false;
+    }
+    auto wait = [&](auto ready) {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(40);
+        while (std::chrono::steady_clock::now() < deadline) {
+            networkRuntimeBackgroundProcess();
+            if (ready()) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return false;
+    };
+    auto sensor = [&]() { return inven_pid_is_carried_ptr(localPlayerActor(), PROTO_ID_MOTION_SENSOR); };
+    if (!wait([&] { return localPlayerActor() != nullptr && sensor() != nullptr && item_m_curr_charges(sensor()) == 2; })) return false;
+    smokeNativeAutomapDefeatArmed = smokeNativeAutomapDefeat.has_value();
+    for (int stage = 1; stage <= 3; ++stage) {
+        std::fprintf(stdout, "NATIVE_AUTOMAP_READY role=%s stage=%d elevation=%d\n", host ? "host" : "guest", stage, localPlayerActor()->elevation);
+        std::fflush(stdout);
+        if (smokeNativePipboyDefeat) pipboy(PIPBOY_OPEN_INTENT_UNSPECIFIED);
+        else automap(true, false);
+        if (smokeNativeAutomapDefeat.has_value()) {
+            if (game_user_wants_to_quit != 2 || !networkWorldPartyDefeated()
+                || (host && (!smokeNativeAutomapDefeatTriggered
+                    || (!smokeNativeDefeatHazard.empty() && !smokeNativeDefeatHazardPassed)))) return false;
+            if (host) networkRuntimeEndHostSession();
+            if (!wait([&] { return networkWorldPhase() == SessionPhase::Ending; })) return false;
+            if (smokeNativePipboyDefeat && (pipboy_is_open() || pipboy_screensaver_is_active())) return false;
+            const char* command = smokeNativePipboyDefeat
+                ? (smokeNativePipboyScreensaver ? "pipboy_screensaver_defeat" : "pipboy_defeat") : "automap_defeat";
+            std::fprintf(stdout, "MULTIPLAYER_SMOKE_TEST_PASS role=%s command=%s victim=%s native_window_unwound=1 ending=1\n",
+                host ? "host" : "guest", command, *smokeNativeAutomapDefeat == kHostPlayerId ? "host" : "guest");
+            std::fflush(stdout);
+            return true;
+        }
+        if (!wait([&] { return sensor() != nullptr && item_m_curr_charges(sensor()) == std::max(0, 2 - stage); })) return false;
+        std::fprintf(stdout, "NATIVE_AUTOMAP_STAGE_PASS role=%s stage=%d charges=%d\n", host ? "host" : "guest", stage, item_m_curr_charges(sensor()));
+        std::fflush(stdout);
+    }
+    auto chargesIntact = [&] {
+        for (PlayerId id : { kHostPlayerId, kGuestPlayerId }) {
+            Object* actor = networkWorldPlayerActor(id);
+            Object* item = actor != nullptr ? inven_pid_is_carried_ptr(actor, PROTO_ID_MOTION_SENSOR) : nullptr;
+            if (item == nullptr || item_m_curr_charges(item) != 0 || inven_right_hand(actor) != item) return false;
+        }
+        return true;
+    };
+    if (!wait(chargesIntact) || (host && !SaveMultiplayerRecoveryGame())) return false;
+    if (!host) {
+        if (!lobby.disconnectForReconnect()) return false;
+        nextReconnectAttempt = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        if (!wait([&] { return lobby.state() == NetworkLobbyState::Ready && replicaWorldReady
+            && !lobby.recoveryInProgress() && chargesIntact(); })) return false;
+    } else {
+        bool sawDisconnect = false;
+        if (!wait([&] {
+            sawDisconnect = sawDisconnect || lobby.state() == NetworkLobbyState::Disconnected;
+            return sawDisconnect && lobby.state() == NetworkLobbyState::Ready && !lobby.recoveryInProgress()
+                && chargesIntact() && lobby.acknowledgedEvent(kGuestPlayerId).value >= lobby.latestAuthoritativeEvent().value;
+        })) return false;
+    }
+    auto settle = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < settle) { networkRuntimeBackgroundProcess();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+    std::fprintf(stdout, "MULTIPLAYER_SMOKE_TEST_PASS role=%s command=automap repeated_input=1 empty=1 checkpoint=1 reconnect=1\n", host ? "host" : "guest");
+    std::fflush(stdout);
+    return true;
+}
+
+static bool runNativeExplosiveTimerSmoke()
+{
+    bool host = launchOptions.mode == NetworkLaunchMode::Host;
+    if (host) {
+        WorldSnapshot state;
+        if (!networkWorldPrepareExplosiveTimerSmoke()
+            || !networkWorldCaptureAuthoritativeState(lobby.latestAuthoritativeEvent(), state)
+            || !lobby.sendAuthoritativeState(state)) return false;
+    }
+    auto wait = [&](auto ready) {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(40);
+        while (std::chrono::steady_clock::now() < deadline) {
+            networkRuntimeBackgroundProcess();
+            if (ready()) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return false;
+    };
+    auto unarmed = [&]() -> Object* {
+        Object* actor = localPlayerActor();
+        if (actor == nullptr) return nullptr;
+        for (int i = 0; i < actor->data.inventory.length; ++i) {
+            auto entry = actor->data.inventory.items[i];
+            if (entry.item->pid == PROTO_ID_DYNAMITE_I) return entry.item;
+        }
+        return nullptr;
+    };
+    if (!wait([&] { return unarmed() != nullptr && item_count(localPlayerActor(), unarmed()) == 2; })) return false;
+    for (const char* stage : { "cancel", "arm" }) {
+        std::fprintf(stdout, "NATIVE_EXPLOSIVE_TIMER_READY role=%s stage=%s\n", host ? "host" : "guest", stage);
+        std::fflush(stdout);
+        if (!networkRuntimeHandleInventoryAction(unarmed(), InventoryAction::Use)) return false;
+        if (smokeNativeTimerDefeat.has_value()) {
+            if (game_user_wants_to_quit != 2 || inven_quantity_window_is_active()
+                || !networkWorldPartyDefeated() || unarmed() == nullptr
+                || item_count(localPlayerActor(), unarmed()) != 2
+                || (host && !smokeNativeTimerDefeatTriggered)) return false;
+            for (PlayerId id : { kHostPlayerId, kGuestPlayerId }) {
+                Object* actor = networkWorldPlayerActor(id);
+                if (inven_pid_is_carried_ptr(actor, PROTO_ID_DYNAMITE_II) != nullptr) return false;
+            }
+            if (host) networkRuntimeEndHostSession();
+            if (networkWorldPhase() != SessionPhase::Ending) return false;
+            std::fprintf(stdout, "MULTIPLAYER_SMOKE_TEST_PASS role=%s command=timer_defeat victim=%s native_window_unwound=1 bombs_unarmed=1 ending=1\n",
+                host ? "host" : "guest", *smokeNativeTimerDefeat == kHostPlayerId ? "host" : "guest");
+            std::fflush(stdout);
+            return true;
+        }
+        if (std::strcmp(stage, "cancel") == 0) {
+            if (unarmed() == nullptr || item_count(localPlayerActor(), unarmed()) != 2) return false;
+        } else if (!wait([&] {
+            Object* actor = localPlayerActor();
+            if (unarmed() == nullptr || item_count(actor, unarmed()) != 1) return false;
+            for (int i = 0; i < actor->data.inventory.length; ++i) {
+                Object* item = actor->data.inventory.items[i].item;
+                if (item->pid == PROTO_ID_DYNAMITE_II && (item->flags & OBJECT_USED) != 0) return true;
+            }
+            return false;
+        })) return false;
+        std::fprintf(stdout, "NATIVE_EXPLOSIVE_TIMER_STAGE_PASS role=%s stage=%s\n", host ? "host" : "guest", stage);
+        std::fflush(stdout);
+    }
+    if (!wait([&] {
+        for (PlayerId id : std::vector<PlayerId> { kHostPlayerId, kGuestPlayerId }) {
+            Object* actor = networkWorldPlayerActor(id);
+            bool armed = false;
+            for (int i = 0; i < actor->data.inventory.length; ++i)
+                armed |= actor->data.inventory.items[i].item->pid == PROTO_ID_DYNAMITE_II;
+            if (!armed) return false;
+        }
+        return true;
+    })) return false;
+    auto timersIntact = [&] {
+        std::vector<QueueEventState> timers;
+        if (!queue_capture_state(timers)) return false;
+        for (PlayerId id : std::vector<PlayerId> { kHostPlayerId, kGuestPlayerId }) {
+            Object* actor = networkWorldPlayerActor(id);
+            if (actor == nullptr) return false;
+            Object* bomb = nullptr;
+            for (int i = 0; i < actor->data.inventory.length; ++i)
+                if (actor->data.inventory.items[i].item->pid == PROTO_ID_DYNAMITE_II)
+                    bomb = actor->data.inventory.items[i].item;
+            if (bomb == nullptr || std::count_if(timers.begin(), timers.end(), [&](const auto& timer) {
+                return timer.owner == bomb && (timer.eventType == EVENT_TYPE_PLAYER_EXPLOSION
+                    || timer.eventType == EVENT_TYPE_PLAYER_EXPLOSION_FAILURE)
+                    && timer.payloadCount == 1 && timer.payload[0] == static_cast<int>(id.value);
+            }) != 1) return false;
+        }
+        return true;
+    };
+    if (!timersIntact() || (host && !SaveMultiplayerRecoveryGame())) return false;
+    if (!host) {
+        if (!lobby.disconnectForReconnect()) return false;
+        nextReconnectAttempt = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        if (!wait([&] { return lobby.state() == NetworkLobbyState::Ready
+            && replicaWorldReady && !lobby.recoveryInProgress() && timersIntact(); })) return false;
+    } else {
+        bool sawDisconnect = false;
+        if (!wait([&] {
+            sawDisconnect = sawDisconnect || lobby.state() == NetworkLobbyState::Disconnected;
+            return sawDisconnect && lobby.state() == NetworkLobbyState::Ready
+                && !lobby.recoveryInProgress() && timersIntact()
+                && lobby.acknowledgedEvent(kGuestPlayerId).value >= lobby.latestAuthoritativeEvent().value;
+        })) return false;
+    }
+    std::fprintf(stdout, "NATIVE_EXPLOSIVE_TIMER_RECOVERY_PASS role=%s owner_binding=1 armer_binding=1 no_duplicate_timer=1\n", host ? "host" : "guest");
+    std::fflush(stdout);
+    auto settle = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < settle) { networkRuntimeBackgroundProcess();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+    std::fprintf(stdout, "MULTIPLAYER_SMOKE_TEST_PASS role=%s command=explosive-timer cancel=1 arm=1 split=1 checkpoint=1 reconnect=1\n", host ? "host" : "guest");
+    std::fflush(stdout);
+    return true;
+}
+
+static bool runNativeCharacterEditorSmoke()
+{
+    bool host = launchOptions.mode == NetworkLaunchMode::Host;
+    if (host && !networkWorldPrepareCharacterEditorSmoke()) return false;
+    auto wait = [&](auto ready) {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (std::chrono::steady_clock::now() < deadline) {
+            networkRuntimeBackgroundProcess();
+            if (ready()) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return false;
+    };
+    if (!wait([&] { auto* p = localPlayerState(); return p != nullptr && p->build.level == 3
+        && p->build.unspentSkillPoints == 10 && p->build.pendingPerks == 1; })) return false;
+    auto original = localPlayerState()->build;
+    for (const char* stage : { "cancel", "skills", "perk" }) {
+        std::fprintf(stdout, "NATIVE_CHARACTER_EDITOR_READY role=%s stage=%s\n", host ? "host" : "guest", stage);
+        std::fflush(stdout);
+        int rc = editor_design(false);
+        if (std::strcmp(stage, "cancel") == 0) {
+            if (rc != 1 || localPlayerState()->build != original) return false;
+        } else {
+            if (rc != 0 || !wait([&] { const auto& build = localPlayerState()->build;
+                return build.unspentSkillPoints == 7 && build.skillPoints[SKILL_SMALL_GUNS] == 3
+                    && build.pendingPerks == (std::strcmp(stage, "skills") == 0 ? 1 : 0); })) return false;
+        }
+        std::fprintf(stdout, "NATIVE_CHARACTER_EDITOR_STAGE_PASS role=%s stage=%s\n", host ? "host" : "guest", stage);
+        std::fflush(stdout);
+    }
+    if (!wait([&] {
+        for (PlayerId id : { kHostPlayerId, kGuestPlayerId }) {
+            auto* p = playerStateForActor(networkWorldPlayerActor(id));
+            if (p == nullptr || p->build.unspentSkillPoints != 7 || p->build.pendingPerks != 0
+                || p->build.skillPoints[SKILL_SMALL_GUNS] != 3 || p->build.perkRanks[PERK_AWARENESS] != 1) return false;
+        }
+        return true;
+    })) return false;
+    if (host && !SaveMultiplayerRecoveryGame()) return false;
+    // Keep polling long enough for the final commit checkpoint to reach the
+    // replica before either process exits.
+    auto settle = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < settle) {
+        networkRuntimeBackgroundProcess();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    std::fprintf(stdout, "MULTIPLAYER_SMOKE_TEST_PASS role=%s command=character-editor cancel=1 skills=1 perks=1 checkpoint=1\n",
+        host ? "host" : "guest");
+    std::fflush(stdout);
+    return true;
+}
+
+static bool prepareNativeWeaponFamily()
+{
+    Proto* proto = nullptr;
+    if (proto_ptr(smokeWeaponPid, &proto) != 0 || proto == nullptr || proto->item.type != ITEM_TYPE_WEAPON) return false;
+    const auto& native = proto->item.data.weapon;
+    for (PlayerId id : { kHostPlayerId, kGuestPlayerId }) {
+        Object* actor = networkWorldPlayerActor(id);
+        auto* player = playerStateForActor(actor);
+        if (actor == nullptr || player == nullptr) return false;
+        // Explicit test setup: keep the real attack/damage engine, but reduce
+        // misses and let both humans survive native explosion extras.
+        player->build.skillPoints[SKILL_SMALL_GUNS] = 180;
+        player->build.skillPoints[SKILL_BIG_GUNS] = 180;
+        player->build.skillPoints[SKILL_ENERGY_WEAPONS] = 180;
+        player->build.skillPoints[SKILL_THROWING] = 180;
+        {
+            ScopedActingPlayerContext context(*player, actor);
+            if (stat_set_bonus(actor, STAT_MAXIMUM_HIT_POINTS, 1000) != 0
+                || stat_set_bonus(actor, STAT_STRENGTH, 5) != 0
+                || critter_adjust_hits(actor, 1000) != 0) return false;
+        }
+        Object* extra = nullptr;
+        int extraPid = native.ammoCapacity > 0 ? native.ammoTypePid : smokeWeaponPid;
+        Proto* extraProto = nullptr;
+        if (proto_ptr(extraPid, &extraProto) != 0 || extraProto == nullptr
+            || (native.ammoCapacity > 0 && (extraProto->item.type != ITEM_TYPE_AMMO
+                || extraProto->item.data.ammo.caliber != native.caliber))) return false;
+        if (obj_pid_new(&extra, extraPid) != 0 || extra == nullptr
+            || obj_disconnect(extra, nullptr) == -1 || item_add_force(actor, extra, native.ammoCapacity > 0 ? 1 : 2) != 0) return false;
+    }
+    WorldSnapshot setup;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!networkWorldCaptureAuthoritativeState(lobby.latestAuthoritativeEvent(), setup)) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            std::fprintf(stderr, "NATIVE_WEAPON_SETUP_FAIL family=%s gate=capture\n", smokeNativeWeaponFamily.c_str());
+            return false;
+        }
+        get_input();
+        networkRuntimeBackgroundProcess();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!lobby.sendAuthoritativeState(setup)) return false;
+    std::fprintf(stderr,
+        "NATIVE_WEAPON_SETUP_READY family=%s pid=%d capacity=%d ammo_pid=%d caliber=%d primary_ap=%d secondary_ap=%d rounds=%d damage_type=%d test_skill_points=180 test_hp_bonus=1000\n",
+        smokeNativeWeaponFamily.c_str(), smokeWeaponPid, native.ammoCapacity, native.ammoTypePid, native.caliber,
+        native.actionPointCost1, native.actionPointCost2, native.rounds, native.damageType);
+    return true;
+}
+
+static bool runNativeWeaponInventory()
+{
+    const bool host = launchOptions.mode == NetworkLaunchMode::Host;
+    Object* actor = localPlayerActor();
+    auto weaponId = networkWorldFindEntity(inven_right_hand(actor));
+    if (!weaponId.has_value()) return false;
+    if (smokeWeaponPid == 25) return true; // Thrown grenades have no native magazine.
+    int resources = nativeWeaponResources(actor);
+    int ap = actor->data.critter.combat.ap;
+    engineExecutionProbeBegin();
+    bool passed = true;
+    for (auto action : { InventoryAction::Unload, InventoryAction::Reload }) {
+        if (!networkRuntimeHandleInventoryAction(networkWorldFindObject(*weaponId), action)) { passed = false; break; }
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        bool applied = false;
+        while (std::chrono::steady_clock::now() < deadline) {
+            networkRuntimeBackgroundProcess();
+            Object* weapon = networkWorldFindObject(*weaponId);
+            if (weapon != nullptr && item_w_curr_ammo(weapon) == (action == InventoryAction::Unload ? 0 : item_w_max_ammo(weapon))) {
+                applied = true; break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        passed = passed && applied && nativeWeaponResources(actor) == resources && actor->data.critter.combat.ap == ap;
+        if (!passed) break;
+    }
+    if (host && passed) {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (smokeNativeWeaponPeerInventoryChecked < 2 && std::chrono::steady_clock::now() < deadline) {
+            networkRuntimeBackgroundProcess();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        passed = smokeNativeWeaponPeerInventoryChecked == 2;
+    }
+    auto counts = engineExecutionProbeEnd();
+    passed = passed && (host || (counts.scriptProcedures == 0 && counts.combatAttacks == 0 && counts.randomDraws == 0));
+    std::fprintf(stderr, "NATIVE_WEAPON_INVENTORY_%s role=%s family=%s resources=%d->%d ap=%d->%d rules=%u/%u/%u\n",
+        passed ? "PASS" : "FAIL", host ? "host" : "guest", smokeNativeWeaponFamily.c_str(), resources,
+        nativeWeaponResources(actor), ap, actor->data.critter.combat.ap, counts.scriptProcedures, counts.combatAttacks, counts.randomDraws);
+    return passed;
+}
+
 static bool runLiveCombatTurnSmoke(SessionId sessionId, bool reportPass = true)
 {
     const bool host = launchOptions.mode == NetworkLaunchMode::Host;
     if (smokeWeaponPid != 0) {
-        if (host && !networkWorldPrepareEquipmentSmoke(smokeWeaponPid)) return false;
+        if (host && !networkWorldPrepareEquipmentSmoke(smokeWeaponPid, smokeNativeInventory)) return false;
+        if (host && !smokeNativeWeaponFamily.empty() && !prepareNativeWeaponFamily()) return false;
         if (smokeNativeInventory) {
             auto readyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
             while (!host && !replicaWorldReady && std::chrono::steady_clock::now() < readyDeadline) {
@@ -2461,6 +3995,16 @@ static bool runLiveCombatTurnSmoke(SessionId sessionId, bool reportPass = true)
             if (!host && !replicaWorldReady) return false;
             std::fprintf(stderr, "NATIVE_INVENTORY_READY role=%s\n", host ? "host" : "guest");
             handle_inventory();
+            if (smokeNativeInventoryDefeat) {
+                if (game_user_wants_to_quit != 2 || !networkWorldPartyDefeated()
+                    || (host && !smokeNativeInventoryDefeatTriggered)) return false;
+                if (host) networkRuntimeEndHostSession();
+                if (networkWorldPhase() != SessionPhase::Ending) return false;
+                std::fprintf(stdout, "MULTIPLAYER_SMOKE_TEST_PASS role=%s command=inventory_defeat native_window_unwound=1 ending=1\n",
+                    host ? "host" : "guest");
+                std::fflush(stdout);
+                return true;
+            }
             Object* equipped = inven_right_hand(localPlayerActor());
             if (equipped == nullptr || equipped->pid != smokeWeaponPid) {
                 std::fprintf(stderr, "NATIVE_INVENTORY_FAIL role=%s\n", host ? "host" : "guest");
@@ -2509,7 +4053,10 @@ static bool runLiveCombatTurnSmoke(SessionId sessionId, bool reportPass = true)
             return false;
         }
         std::fprintf(stderr, "Equipment smoke equipped both players pid=%d.\n", smokeWeaponPid);
+        if (!smokeNativeWeaponFamily.empty() && !runNativeWeaponInventory()) return false;
+        if (smokeInventoryActions && !runLiveInventoryActionsSmoke()) return false;
     }
+    if (smokeNativeContainerLoot && !runNativeContainerLootSmoke()) return false;
     const bool killScenario = smokeScenario == SmokeScenario::CombatKill;
     const bool reconnectScenario = smokeScenario == SmokeScenario::CombatReconnect;
     const bool attackScenario = smokeScenario == SmokeScenario::CombatAttack
@@ -2524,21 +4071,43 @@ static bool runLiveCombatTurnSmoke(SessionId sessionId, bool reportPass = true)
     const bool actionScenario = attackScenario || moveScenario || faceScenario
         || itemScenario || reloadScenario;
     const std::uint32_t explorationRevision = networkWorldPhaseRevision();
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(smokeNativeCombatInventory ? 90 : 20);
     std::chrono::steady_clock::time_point explorationSettledAt;
-    if (host && (actionScenario || separatedScenario || scriptStatusScenario)) {
+    if (host && (actionScenario || separatedScenario || scriptStatusScenario || smokeGuestCombatStart)) {
         WorldSnapshot placed;
-        if ((actionScenario && !networkWorldPrepareCombatAttackSmoke(killScenario))
-            || (itemScenario && !networkWorldPrepareCombatItemSmoke())
-            || (reloadScenario && !networkWorldPrepareCombatReloadSmoke())
-            || (separatedScenario
-                && !networkWorldPrepareCombatSeparatedElevationSmoke())
-            || !networkWorldCaptureAuthoritativeState(
-                lobby.latestAuthoritativeEvent(), placed)
-            || !lobby.sendAuthoritativeState(placed)) {
+        bool prepared = (!smokeGuestCombatFloor || networkWorldPrepareCombatSeparatedElevationSmoke())
+            && (!actionScenario || networkWorldPrepareCombatAttackSmoke(killScenario))
+            && (!itemScenario || networkWorldPrepareCombatItemSmoke())
+            && (!reloadScenario || networkWorldPrepareCombatReloadSmoke())
+            && (!separatedScenario || networkWorldPrepareCombatSeparatedElevationSmoke())
+            && (!smokeNativeCombatLoot || networkWorldPrepareCombatLootSmoke().has_value());
+        if (prepared && !smokeNativeWeaponFamily.empty()) {
+            prepared = networkWorldPrepareHostWeaponAttackSmoke();
+            Object* target = networkWorldFindObject(networkWorldCombatSmokeTarget());
+            Object* guest = networkWorldPlayerActor(kGuestPlayerId);
+            Object* hostActor = networkWorldPlayerActor(kHostPlayerId);
+            if (prepared && target != nullptr && guest != nullptr && hostActor != nullptr) {
+                // Native damage clamps surviving HP to the prototype maximum.
+                // Pad that maximum as explicit fixture setup too.
+                if (stat_set_bonus(target, STAT_MAXIMUM_HIT_POINTS, 1000) != 0) return false;
+                target->data.critter.hp = stat_level(target, STAT_MAXIMUM_HIT_POINTS);
+                int opposite = (tile_dir(target->tile, guest->tile) + 3) % ROTATION_COUNT;
+                int tile = tile_num_in_direction(target->tile, opposite, 1);
+                prepared = tile >= 0 && obj_blocking_at(hostActor, tile, target->elevation) == nullptr
+                    && obj_move_to_tile(hostActor, tile, target->elevation, nullptr) == 0;
+                std::fprintf(stderr, "NATIVE_WEAPON_COMBAT_READY family=%s prepared=%d host_tile=%d target_tile=%d guest_tile=%d target_hp=%d\n",
+                    smokeNativeWeaponFamily.c_str(), prepared, hostActor->tile, target->tile, guest->tile, critter_get_hits(target));
+            } else prepared = false;
+        }
+        bool captured = prepared && networkWorldCaptureAuthoritativeState(
+            lobby.latestAuthoritativeEvent(), placed);
+        bool sent = captured && lobby.sendAuthoritativeState(placed);
+        if (!sent) {
+            std::fprintf(stderr, "Combat smoke setup failed: prepared=%d captured=%d sent=%d snapshot=%d.\n",
+                prepared, captured, sent, captured ? static_cast<int>(validateSnapshot(placed)) : -1);
             return false;
         }
-        if (smokeWeaponPid != 0 && !networkWorldPrepareHostWeaponAttackSmoke()) return false;
+        if (smokeWeaponPid != 0 && smokeNativeWeaponFamily.empty() && !networkWorldPrepareHostWeaponAttackSmoke()) return false;
         smokeCombatExitAfterAttack = !reconnectScenario;
     }
     engineExecutionProbeBegin();
@@ -2550,13 +4119,27 @@ static bool runLiveCombatTurnSmoke(SessionId sessionId, bool reportPass = true)
             // Exercise the same queued entry point used by script opcodes.
             scripts_request_combat(nullptr);
             scripts_check_state();
-        } else {
+        } else if (!smokeGuestCombatStart) {
             combat(nullptr);
         }
-        smokeCombatAutoEnd = false;
+        if (!smokeGuestCombatStart) smokeCombatAutoEnd = false;
     }
     while (std::chrono::steady_clock::now() < deadline) {
         networkRuntimeBackgroundProcess();
+        if (host && smokeGuestCombatStart) scripts_check_state();
+        if (!host && smokeGuestCombatStart && !smokeGuestCombatStartSent && replicaWorldReady
+            && networkWorldPhase() == SessionPhase::Exploration) {
+            if (smokeGuestCombatFloor && localPlayerActor()->elevation != 1) continue;
+            if (smokeGuestCombatAttack) {
+                Object* target = networkWorldFindObject(networkWorldCombatSmokeTarget());
+                if (target == nullptr || obj_dist(localPlayerActor(), target) != 1) continue;
+                combat_attack_this(target);
+                smokeCombatAttackSent = true;
+            } else {
+                game_handle_input(KEY_LOWERCASE_A, false);
+            }
+            smokeGuestCombatStartSent = true;
+        }
         if (scriptStatusScenario && networkWorldPhase() == SessionPhase::Combat
             && networkWorldCombatScriptStatusObserved()) {
             smokeCombatScriptStatusObserved = true;
@@ -2581,13 +4164,61 @@ static bool runLiveCombatTurnSmoke(SessionId sessionId, bool reportPass = true)
                             ? networkWorldCombatSmokeAmmoUnits() : -1;
                     }
                     if (attackScenario) {
-                        if (smokeWeaponPid != 0) {
+                        if (smokeNativeCombatLoot) {
+                            auto lootId = networkWorldPrepareCombatLootSmoke();
+                            if (!lootId.has_value()) return false;
+                            auto revision = networkWorldCombatTurnRevision();
+                            int before = guest->data.critter.combat.ap;
+                            Object* container = networkWorldFindObject(*lootId);
+                            std::fprintf(stderr, "NATIVE_COMBAT_LOOT_READY role=guest ap=%d target=%u\n", before, lootId->value);
+                            networkRuntimeHandleLocalLoot(container);
+                            auto until = std::chrono::steady_clock::now() + std::chrono::seconds(45);
+                            bool opened = false;
+                            bool taken = false;
+                            while (std::chrono::steady_clock::now() < until) {
+                                networkRuntimeBackgroundProcess();
+                                get_input();
+                                scripts_check_state();
+                                opened = opened || guest->data.critter.combat.ap == before - 3;
+                                taken = container->data.inventory.length == 0;
+                                if (opened && taken && !inven_loot_window_is_active()) break;
+                                renderPresent();
+                                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                            }
+                            bool passed = opened && taken && !inven_loot_window_is_active()
+                                && networkWorldCombatTurnRevision() == revision
+                                && guest->data.critter.combat.ap == before - 3;
+                            std::fprintf(stderr, "NATIVE_COMBAT_LOOT_%s role=guest ap=%d expected=%d\n",
+                                passed ? "PASS" : "FAIL", guest->data.critter.combat.ap, before - 3);
+                            if (!passed) return false;
+                            smokeCombatInitialAp = guest->data.critter.combat.ap;
+                        } else if (smokeNativeCombatInventory) {
+                            auto revision = networkWorldCombatTurnRevision();
+                            int before = guest->data.critter.combat.ap;
+                            std::fprintf(stderr, "NATIVE_COMBAT_INVENTORY_READY role=guest ap=%d\n", before);
+                            handle_inventory();
+                            bool passed = networkWorldCombatTurnRevision() == revision
+                                && guest->data.critter.combat.ap == before - 4;
+                            std::fprintf(stderr, "NATIVE_COMBAT_INVENTORY_%s role=guest ap=%d expected=%d\n",
+                                passed ? "PASS" : "FAIL", guest->data.critter.combat.ap, before - 4);
+                            if (!passed) return false;
+                        } else if (smokeWeaponPid != 0) {
                             EquipmentCommand equipment { networkWorldCombatTurnRevision(), {},
                                 networkWorldFindEntity(inven_right_hand(guest)).value_or(EntityId {}), {}, 1 };
+                            if (smokeInventoryActions
+                                && (!lobby.sendLocalSkillUse(EntityId { kGuestPlayerId.value }, ExplorationSkill::Sneak,
+                                        networkWorldPhaseRevision(), equipment.turnRevision)
+                                    || !lobby.sendLocalSkillUse(EntityId { kGuestPlayerId.value }, ExplorationSkill::Sneak,
+                                        networkWorldPhaseRevision(), equipment.turnRevision))) return false;
                             EquipmentCommand access = equipment;
                             access.action = EquipmentAction::OpenInventory;
                             if (!networkRuntimeSubmitEquipment(access)
                                 || !networkRuntimeSubmitEquipment(equipment)) return false;
+                            if ((smokeInventoryActions || (!smokeNativeWeaponFamily.empty() && smokeWeaponPid != 25))
+                                && (!lobby.sendLocalInventoryAction(InventoryActionCommand {
+                                        equipment.turnRevision, equipment.rightHand, InventoryAction::Unload }, networkWorldPhaseRevision())
+                                    || !lobby.sendLocalInventoryAction(InventoryActionCommand {
+                                        equipment.turnRevision, equipment.rightHand, InventoryAction::Reload }, networkWorldPhaseRevision()))) return false;
                             access.action = EquipmentAction::CloseInventory;
                             if (!networkRuntimeSubmitEquipment(access)) return false;
                         }
@@ -2685,15 +4316,23 @@ static bool runLiveCombatTurnSmoke(SessionId sessionId, bool reportPass = true)
         }
         observedOwners += std::to_string(owner.value);
     }
+    smokeCombatAutoEnd = false;
     bool sawOrderedTurns = host
-        ? (scriptStatusScenario ? smokeCombatHostTurnCount >= 1
+        ? (smokeGuestCombatStart && smokeGuestCombatAttack ? smokeCombatAttackAccepted
+            : scriptStatusScenario ? smokeCombatHostTurnCount >= 1
             : reconnectScenario
                 ? smokeCombatAttackAccepted
                     && smokeCombatAttackEventSequence.value != 0
                     && lobby.acknowledgedEvent(kGuestPlayerId).value
                         >= smokeCombatAttackEventSequence.value
                 : smokeCombatAutoEndRevision != 0)
-        : scriptStatusScenario
+        : smokeGuestCombatStart && smokeGuestCombatAttack
+            ? !smokeCombatObservedOwners.empty() && smokeCombatObservedOwners.front() == kGuestPlayerId
+            : smokeGuestCombatFloor
+            ? !smokeCombatObservedOwners.empty()
+                && std::find(smokeCombatObservedOwners.begin(), smokeCombatObservedOwners.end(), kGuestPlayerId) != smokeCombatObservedOwners.end()
+                && std::find(smokeCombatObservedOwners.begin(), smokeCombatObservedOwners.end(), kHostPlayerId) == smokeCombatObservedOwners.end()
+            : scriptStatusScenario
             ? !smokeCombatObservedOwners.empty()
                 && smokeCombatObservedOwners.front() == kHostPlayerId
             : separatedScenario
@@ -2702,10 +4341,31 @@ static bool runLiveCombatTurnSmoke(SessionId sessionId, bool reportPass = true)
                 && std::find(smokeCombatObservedOwners.begin(),
                        smokeCombatObservedOwners.end(), kGuestPlayerId)
                     == smokeCombatObservedOwners.end()
-            : smokeCombatObservedOwners.size() >= 2
-                && smokeCombatObservedOwners[0] == kHostPlayerId
-                && smokeCombatObservedOwners[1] == kGuestPlayerId;
+            // A checkpoint can include the first turn before the guest
+            // observes its event. Later rounds also use native initiative.
+            // Require both owners, not a fixed order of observed events.
+            : std::find(smokeCombatObservedOwners.begin(),
+                  smokeCombatObservedOwners.end(), kHostPlayerId)
+                    != smokeCombatObservedOwners.end()
+                && std::find(smokeCombatObservedOwners.begin(),
+                       smokeCombatObservedOwners.end(), kGuestPlayerId)
+                    != smokeCombatObservedOwners.end();
+    if (!smokeNativeWeaponFamily.empty()) {
+        bool familyPassed = !host || (smokeNativeWeaponChecksPassed && smokeNativeWeaponAttacksChecked == 2
+            && smokeNativeWeaponInventoryChecked == (smokeWeaponPid == 25 ? 0 : 8)
+            && smokeNativeWeaponTargetDamage > 0
+            && ((smokeWeaponPid != 25 && smokeWeaponPid != 13) || smokeNativeWeaponFriendlyDamage > 0));
+        std::fprintf(stderr, "NATIVE_WEAPON_RESULT_%s role=%s family=%s checked_attacks=%d checked_inventory=%d target_damage=%d friendly_damage=%d host_resources=%d guest_resources=%d host_hp=%d guest_hp=%d\n",
+            familyPassed ? "PASS" : "FAIL", host ? "host" : "guest", smokeNativeWeaponFamily.c_str(),
+            smokeNativeWeaponAttacksChecked, smokeNativeWeaponInventoryChecked, smokeNativeWeaponTargetDamage, smokeNativeWeaponFriendlyDamage,
+            nativeWeaponResources(networkWorldPlayerActor(kHostPlayerId)), nativeWeaponResources(networkWorldPlayerActor(kGuestPlayerId)),
+            critter_get_hits(networkWorldPlayerActor(kHostPlayerId)), critter_get_hits(networkWorldPlayerActor(kGuestPlayerId)));
+        if (!familyPassed) return false;
+    }
     bool passed = sawOrderedTurns
+        && (!smokeInventoryActions || (localPlayerState() != nullptr
+            && (localPlayerState()->build.prototypeFlags & (1 << PC_FLAG_SNEAKING)) == 0
+            && (host || smokeCombatSneakPeerEvents == 2)))
         && (!actionScenario
             || (host ? smokeCombatAttackAccepted
                            && (attackScenario ? (reconnectScenario
@@ -2729,6 +4389,9 @@ static bool runLiveCombatTurnSmoke(SessionId sessionId, bool reportPass = true)
                         && smokeCombatHostTurnCount >= 2
                         && smokeCombatPostReconnectGuestTurnCompleted
                       : smokeCombatObservedOwners.size() >= 4)))
+        && (!smokeGuestCombatFloor || (networkWorldPlayerActor(kGuestPlayerId) != nullptr
+                && networkWorldPlayerActor(kGuestPlayerId)->elevation == 1
+                && networkWorldPlayerActor(kHostPlayerId)->elevation == 0))
         && (!separatedScenario
             || (networkWorldPlayerActor(kGuestPlayerId) != nullptr
                 && networkWorldPlayerActor(kGuestPlayerId)->elevation == 1))
@@ -2743,6 +4406,12 @@ static bool runLiveCombatTurnSmoke(SessionId sessionId, bool reportPass = true)
         && networkWorldCaptureAuthoritativeState(
             host ? lobby.latestAuthoritativeEvent() : lobby.lastAppliedEvent(), snapshot)
         && (digest = computeSnapshotDigest(snapshot));
+    if (smokeInventoryActions && !host) {
+        std::fprintf(stderr, "COMBAT_SNEAK_%s role=guest cues=%d\n",
+            smokeCombatSneakPeerEvents == 2 && localPlayerState() != nullptr
+                && (localPlayerState()->build.prototypeFlags & (1 << PC_FLAG_SNEAKING)) == 0 ? "PASS" : "FAIL",
+            smokeCombatSneakPeerEvents);
+    }
     if (!passed) {
         if (itemScenario || reloadScenario || faceScenario) {
             Object* actor = networkWorldPlayerActor(kGuestPlayerId);
@@ -2853,6 +4522,14 @@ static bool runLiveDialogueSmoke(const SessionId sessionId)
             if (submitted) {
                 networkRuntimeProcessPendingTalk();
             }
+            if (smokeNativeDialogueDefeat.has_value() && smokeNativeDialogueDefeatTriggered) {
+                if (game_user_wants_to_quit != 2 || !networkWorldPartyDefeated() || dialog_active()
+                    || inven_network_barter_window_is_active()) return false;
+                networkRuntimeEndHostSession();
+                std::fprintf(stdout, "MULTIPLAYER_SMOKE_TEST_PASS role=host command=dialogue_defeat barter=%d ending=1\n", smokeNativeBarterDefeat);
+                std::fflush(stdout);
+                return true;
+            }
             for (int attempt = 0; attempt < 20; attempt++) {
                 networkRuntimeBackgroundProcess();
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -2891,6 +4568,13 @@ static bool runLiveDialogueSmoke(const SessionId sessionId)
         if (!host && networkWorldPhase() == SessionPhase::Dialogue
             && networkWorldDialoguePresentation() != nullptr) {
             gdialog_multiplayer_guest_process();
+        }
+        if (!host && smokeNativeDialogueDefeat.has_value() && networkWorldPhase() == SessionPhase::Ending) {
+            if (game_user_wants_to_quit != 2 || !networkWorldPartyDefeated() || dialog_active()
+                || inven_network_barter_window_is_active()) return false;
+            std::fprintf(stdout, "MULTIPLAYER_SMOKE_TEST_PASS role=guest command=dialogue_defeat barter=%d ending=1\n", smokeNativeBarterDefeat);
+            std::fflush(stdout);
+            return true;
         }
         questEntries = 0;
         for (const SharedActivityEntry& entry : networkWorldSharedActivity()) {
@@ -3090,6 +4774,598 @@ static bool runLiveDirectTradeSmoke(SessionId sessionId)
     return false;
 }
 
+static bool runLiveRecoverySmoke(const CharacterCreationSheet& sheet, SessionId originalSessionId);
+
+static bool runNativeCompanionCombat(int pid)
+{
+    bool host = launchOptions.mode == NetworkLaunchMode::Host;
+    Object* companion = partyMemberFindObjFromPid(pid);
+    if (companion == nullptr || inven_right_hand(companion) == nullptr) {
+        std::fprintf(stderr, "NATIVE_COMPANION_COMBAT_SETUP_FAILED role=%s step=gear companion=%d inventory=%d\n",
+            host ? "host" : "guest", companion != nullptr,
+            companion != nullptr ? companion->data.inventory.length : -1);
+        return false;
+    }
+    EntityId targetId;
+    int initialAmmo = item_w_curr_ammo(inven_right_hand(companion));
+    int initialGuestHp = 0;
+    int initialCompanionHp = critter_get_hits(companion);
+    if (host) {
+        WorldSnapshot before;
+        auto idleDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while ((anim_busy(networkWorldPlayerActor(kHostPlayerId)) || anim_busy(networkWorldPlayerActor(kGuestPlayerId)))
+            && std::chrono::steady_clock::now() < idleDeadline) {
+            get_input();
+            networkRuntimeBackgroundProcess();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        if (!networkWorldCaptureAuthoritativeState(lobby.latestAuthoritativeEvent(), before)) {
+            std::fprintf(stderr, "NATIVE_COMPANION_COMBAT_SETUP_FAILED role=host step=capture host_busy=%d guest_busy=%d\n",
+                anim_busy(networkWorldPlayerActor(kHostPlayerId)), anim_busy(networkWorldPlayerActor(kGuestPlayerId)));
+            return false;
+        }
+        if (smokeNativeCompanionHostility) {
+            auto id = networkWorldFindEntity(companion);
+            if (!id.has_value()) return false;
+            targetId = *id;
+        }
+        else {
+            for (const auto& critter : before.critters) {
+                Object* candidate = networkWorldFindObject(critter.entityId);
+                if (candidate != nullptr && critter.hitPoints > 0
+                    && std::strstr(object_name(candidate), "scorpion") != nullptr) {
+                    targetId = critter.entityId;
+                    break;
+                }
+            }
+        }
+        Object* target = networkWorldFindObject(targetId);
+        if (target == nullptr || !networkWorldMovePartyNearDialogueTarget(targetId)
+            || (!smokeNativeCompanionHostility && partyMemberSyncPosition() != 0)) {
+            std::fprintf(stderr, "NATIVE_COMPANION_COMBAT_SETUP_FAILED role=host step=placement target=%d tile=%d\n",
+                target != nullptr, target != nullptr ? target->tile : -1);
+            return false;
+        }
+        if (smokeNativeCompanionHostility) {
+            Object* guest = networkWorldPlayerActor(kGuestPlayerId);
+            // Pad health only in this bounded fixture so native Ian retaliation
+            // cannot end the session before a missed punch can be retried.
+            if (stat_set_bonus(guest, STAT_MAXIMUM_HIT_POINTS, 300) != 0
+                || critter_adjust_hits(guest, 300) != 0) return false;
+        }
+        companionCombatPid = pid;
+        companionCombatTarget = targetId;
+        companionCombatInitialAmmo = initialAmmo;
+        companionCombatInitialHp = critter_get_hits(target);
+        companionCombatInitialGuestHp = critter_get_hits(networkWorldPlayerActor(kGuestPlayerId));
+        companionCombatTurns = 0;
+        companionCombatRevision = 0;
+        companionCombatObserved = false;
+        companionCombatRunning = true;
+        WorldSnapshot fixture;
+        if (!networkWorldCaptureAuthoritativeState(lobby.latestAuthoritativeEvent(), fixture)
+            || !lobby.sendAuthoritativeState(fixture)) {
+            std::fprintf(stderr, "NATIVE_COMPANION_COMBAT_SETUP_FAILED role=host step=publish host_busy=%d guest_busy=%d\n",
+                anim_busy(networkWorldPlayerActor(kHostPlayerId)), anim_busy(networkWorldPlayerActor(kGuestPlayerId)));
+            return false;
+        }
+        std::fprintf(stderr, "NATIVE_COMPANION_COMBAT_READY mode=%s target=%s target_id=%u target_hp=%d ammo=%d\n",
+            smokeNativeCompanionHostility ? "hostility" : "battle", object_name(target), targetId.value,
+            critter_get_hits(target), initialAmmo);
+    }
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(75);
+    bool started = false;
+    bool sawCombat = false;
+    std::uint64_t endedTurn = 0;
+    auto approachAt = std::chrono::steady_clock::time_point {};
+    while (std::chrono::steady_clock::now() < deadline && !networkRuntimeFailed()) {
+        get_input();
+        networkRuntimeBackgroundProcess();
+        if (!host && !started && networkWorldPhase() == SessionPhase::Exploration
+            && (!smokeNativeCompanionHostility || critter_get_hits(networkWorldPlayerActor(kGuestPlayerId)) >= 300)) {
+            Object* target = smokeNativeCompanionHostility ? companion : nullptr;
+            if (target == nullptr) {
+                WorldSnapshot state;
+                if (!networkWorldCaptureAuthoritativeState(lobby.lastAppliedEvent(), state)) return false;
+                for (const auto& critter : state.critters) {
+                    Object* candidate = networkWorldFindObject(critter.entityId);
+                    if (candidate != nullptr && critter.hitPoints > 0
+                        && std::strstr(object_name(candidate), "scorpion") != nullptr
+                        && obj_dist(networkWorldPlayerActor(kGuestPlayerId), candidate) <= 2) {
+                        target = candidate;
+                        break;
+                    }
+                }
+            }
+            Object* guest = networkWorldPlayerActor(kGuestPlayerId);
+            if (target != nullptr && obj_dist(guest, target) == 1) {
+                // Use the real guest first attack to engage the installed NPC.
+                started = true;
+                initialGuestHp = critter_get_hits(guest);
+                combat_attack_this(target);
+            } else if (target != nullptr && std::chrono::steady_clock::now() >= approachAt) {
+                // A carried companion may occupy the only adjacent open tile
+                // on arrival. Approach through the normal movement command.
+                for (int rotation = 0; rotation < ROTATION_COUNT; ++rotation) {
+                    int tile = tile_num_in_direction(target->tile, rotation, 1);
+                    if (tile >= 0 && obj_blocking_at(guest, tile, target->elevation) == nullptr
+                        && networkRuntimeSubmitLocalMove(tile, target->elevation, false)) break;
+                }
+                approachAt = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            }
+        }
+        if (host) scripts_check_state();
+        if (networkWorldPhase() == SessionPhase::Combat) {
+            sawCombat = true;
+            if (!host && networkWorldActiveCombatOwner() == kGuestPlayerId
+                && networkWorldCombatTurnRevision() != endedTurn) {
+                endedTurn = networkWorldCombatTurnRevision();
+                if (smokeNativeCompanionHostility && isPartyMember(companion)) {
+                    auto id = networkWorldFindEntity(companion);
+                    if (!id.has_value() || !networkRuntimeSubmitCombatAttack(*id, HIT_MODE_PUNCH, HIT_LOCATION_UNCALLED)) return false;
+                }
+                networkRuntimeHandleCombatInput(KEY_SPACE);
+            }
+        }
+        if ((host || sawCombat)
+            && networkWorldPhase() == SessionPhase::Exploration
+            && (host ? !companionCombatRunning : inven_right_hand(companion) != nullptr
+                && item_w_curr_ammo(inven_right_hand(companion)) < initialAmmo
+                && (!smokeNativeCompanionHostility || (critter_get_hits(companion) < initialCompanionHp
+                    && critter_get_hits(networkWorldPlayerActor(kGuestPlayerId)) < initialGuestHp)))) break;
+        renderPresent();
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    companionCombatRunning = false;
+    bool peerObserved = sawCombat && (smokeNativeCompanionHostility
+        ? isPartyMember(companion) && companion->data.critter.combat.team
+            == networkWorldPlayerActor(kGuestPlayerId)->data.critter.combat.team
+            && inven_right_hand(companion) != nullptr
+            && item_w_curr_ammo(inven_right_hand(companion)) < initialAmmo
+            && critter_get_hits(networkWorldPlayerActor(kGuestPlayerId)) < initialGuestHp
+            && critter_get_hits(companion) < initialCompanionHp
+        : inven_right_hand(companion) != nullptr
+            && item_w_curr_ammo(inven_right_hand(companion)) < initialAmmo);
+    if (networkWorldPhase() != SessionPhase::Exploration
+        || !(host ? companionCombatObserved : peerObserved)) {
+        std::fprintf(stderr, "NATIVE_COMPANION_COMBAT_FAILED role=%s mode=%s phase=%d turns=%d observed=%d\n",
+            host ? "host" : "guest", smokeNativeCompanionHostility ? "hostility" : "battle",
+            static_cast<int>(networkWorldPhase()), companionCombatTurns, companionCombatObserved);
+        return false;
+    }
+    if (host) {
+        WorldSnapshot state;
+        if (!networkWorldCaptureAuthoritativeState(lobby.latestAuthoritativeEvent(), state)
+            || !lobby.sendAuthoritativeState(state)) return false;
+        EventSequence exit = state.lastIncludedEvent;
+        auto acknowledgedAt = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (lobby.acknowledgedEvent(kGuestPlayerId).value < exit.value
+            && std::chrono::steady_clock::now() < acknowledgedAt) {
+            get_input();
+            networkRuntimeBackgroundProcess();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        if (lobby.acknowledgedEvent(kGuestPlayerId).value < exit.value) return false;
+        // Let the replica leave this combat fixture before recovery publishes
+        // Ending; its loop must observe the intervening Exploration boundary.
+        auto settledAt = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        while (std::chrono::steady_clock::now() < settledAt) {
+            get_input();
+            networkRuntimeBackgroundProcess();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    std::fprintf(stderr, "NATIVE_COMPANION_COMBAT_PASS role=%s mode=%s native_ai=1 bounded_fixture=1 ammo_before=%d ammo_after=%d hp=%d party=%d team=%d\n",
+        host ? "host" : "guest", smokeNativeCompanionHostility ? "hostility" : "battle", initialAmmo,
+        item_w_curr_ammo(inven_right_hand(companion)), critter_get_hits(companion), isPartyMember(companion),
+        companion->data.critter.combat.team);
+    return true;
+}
+
+static bool runNativeCompanionTravel(int pid)
+{
+    bool host = launchOptions.mode == NetworkLaunchMode::Host;
+    if (host) {
+        Object* guest = networkWorldPlayerActor(kGuestPlayerId);
+        int tile = guest->tile;
+        int elevation = guest->elevation;
+        if (obj_move_to_tile(guest, tile, (elevation + 1) % ELEVATION_COUNT, nullptr) != 0) return false;
+        {
+            ScopedLocalPlayerBinding binding(guest);
+            if (partyMemberSyncPosition() != 0) return false;
+        }
+        Object* companion = partyMemberFindObjFromPid(pid);
+        bool followsHost = companion != nullptr && companion->elevation == networkWorldPlayerActor(kHostPlayerId)->elevation;
+        if (obj_move_to_tile(guest, tile, elevation, nullptr) != 0 || !followsHost) return false;
+        std::fprintf(stderr, "NATIVE_COMPANION_FLOOR_PASS shared_leader=host guest_floor_independent=1\n");
+    }
+    for (int map : { smokeNativeCompanionBattle ? MAP_CAVES : MAP_JUNKENT, MAP_SHADYW }) {
+        bool approved = false;
+        bool arrived = false;
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(25);
+        while (std::chrono::steady_clock::now() < deadline && !networkRuntimeFailed()) {
+            get_input();
+            networkRuntimeBackgroundProcess();
+            if (!approved && networkWorldPhase() == SessionPhase::Exploration) {
+                if (host || networkWorldPendingWorldMapProposer().has_value())
+                    approved = networkRuntimeRequestSharedModal(SharedModalKind::WorldMap, true);
+            }
+            if (host && !arrived && networkWorldPhase() == SessionPhase::Transition) {
+                arrived = networkWorldFinishWorldMapTravel(WorldMapArrivalKind::City, 0, map);
+                if (!arrived) return false;
+            }
+            if (map_data.field_34 == map && networkWorldPhase() == SessionPhase::Exploration
+                && (host ? arrived : approved)) break;
+            renderPresent();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        Object* companion = partyMemberFindObjFromPid(pid);
+        if (map_data.field_34 != map || companion == nullptr || !isPartyMember(companion)) return false;
+        if (host) {
+            networkRuntimeBackgroundProcess();
+            EventSequence arrival = lobby.latestAuthoritativeEvent();
+            auto appliedAt = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (lobby.acknowledgedEvent(kGuestPlayerId).value < arrival.value
+                && std::chrono::steady_clock::now() < appliedAt) {
+                get_input();
+                networkRuntimeBackgroundProcess();
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            if (lobby.acknowledgedEvent(kGuestPlayerId).value < arrival.value) return false;
+        }
+        std::fprintf(stderr, "NATIVE_COMPANION_TRAVEL_PASS role=%s map=%d native_party_preserved=1\n", host ? "host" : "guest", map);
+        if (map == MAP_CAVES && !runNativeCompanionCombat(pid)) return false;
+    }
+    return true;
+}
+
+static bool reportNativeCompanionReplicaAuthority(const char* stage)
+{
+    auto counts = engineExecutionProbeEnd();
+    bool passed = counts.scriptProcedures == 0 && counts.combatAttacks == 0 && counts.randomDraws == 0;
+    std::fprintf(stderr, "NATIVE_COMPANION_CLEANUP_AUTHORITY_%s role=guest stage=%s script=%u combat=%u random=%u\n",
+        passed ? "PASS" : "FAIL", stage, counts.scriptProcedures, counts.combatAttacks, counts.randomDraws);
+    return passed;
+}
+
+static bool runNativeCompanionSmoke()
+{
+    EntityId ianId;
+    for (EntityId id : networkWorldDialogueSmokeTargets()) {
+        Object* npc = networkWorldFindObject(id);
+        if (npc != nullptr && std::strcmp(object_name(npc), "Ian") == 0) { ianId = id; break; }
+    }
+    Object* ian = networkWorldFindObject(ianId);
+    if (ian == nullptr || isPartyMember(ian)) return false;
+    if (partyMemberAdd(networkWorldPlayerActor(kHostPlayerId)) != -1
+        || partyMemberAdd(networkWorldPlayerActor(kGuestPlayerId)) != -1) return false;
+    bool host = launchOptions.mode == NetworkLaunchMode::Host;
+    PlayerId local = host ? kHostPlayerId : kGuestPlayerId;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(90);
+    if (host) {
+        if (!networkWorldMovePartyNearDialogueTarget(ianId)) return false;
+        item_caps_adjust(networkWorldPlayerActor(*smokeNativeCompanion), 200);
+        WorldSnapshot fixture;
+        if (!networkWorldCaptureAuthoritativeState(lobby.latestAuthoritativeEvent(), fixture)
+            || !lobby.sendAuthoritativeState(fixture)) return false;
+    }
+    if (smokeNativeCompanionCleanup && !host) engineExecutionProbeBegin();
+    bool submitted = false;
+    int stage = 0;
+    bool configuredWeapon = false;
+    bool completedConversation = false;
+    int equippedPid = -1;
+    int savedPid = ian->pid;
+    CharacterCreationSheet originalSheet = *lobby.localSheet();
+    SessionId originalSession = bootstrap.sessionId();
+    while (std::chrono::steady_clock::now() < deadline && !networkRuntimeFailed()) {
+        get_input();
+        networkRuntimeBackgroundProcess();
+        if (!submitted && local == *smokeNativeCompanion
+            && networkWorldPhase() == SessionPhase::Exploration
+            && obj_dist(networkWorldPlayerActor(local), ian) <= 2) {
+            submitted = networkRuntimeSubmitLocalTalk(ianId);
+        }
+        completedConversation = (host && networkRuntimeProcessPendingTalk()) || completedConversation;
+        if (!host) gdialog_multiplayer_guest_process();
+        if (host && completedConversation && networkWorldPhase() == SessionPhase::Exploration) {
+            // Leave a real exploration boundary between native conversations.
+            // Otherwise the driver can start another talk before the replica
+            // returns from its parent window and observes dismissal/recruitment.
+            auto settledAt = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+            while (std::chrono::steady_clock::now() < settledAt) {
+                get_input();
+                networkRuntimeBackgroundProcess();
+                renderPresent();
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        }
+        if (networkWorldPhase() == SessionPhase::Exploration) {
+            if ((stage == 0 || stage == 2) && isPartyMember(ian)) {
+                ++stage;
+                submitted = false;
+                completedConversation = false;
+                std::fprintf(stderr, "NATIVE_COMPANION_RECRUITED role=%s stage=%d pid=%d id=%d sid=%d humans_excluded=1\n",
+                    host ? "host" : "guest", stage, ian->pid, ian->id, ian->sid);
+            } else if (host && stage == 1 && isPartyMember(ian) && !configuredWeapon
+                && completedConversation) {
+                Object* weapon = inven_right_hand(ian);
+                if (weapon == nullptr) {
+                    // The dialogue requests drawing on the next battle, rather
+                    // than drawing immediately. Prepare native gear separately
+                    // for the travel/save fixture, using his existing inventory.
+                    auto idleDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                    while (anim_busy(ian) && std::chrono::steady_clock::now() < idleDeadline) {
+                        get_input();
+                        networkRuntimeBackgroundProcess();
+                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    }
+                    if (anim_busy(ian)) return false;
+                    weapon = ai_search_inven(ian, 0);
+                    int result = weapon != nullptr ? inven_wield(ian, weapon, HAND_RIGHT) : -1;
+                    if (result != 0) {
+                        std::fprintf(stderr, "NATIVE_COMPANION_GEAR_FAILED weapon_pid=%d fid=%d busy=%d equipped=%d result=%d\n",
+                            weapon != nullptr ? weapon->pid : -1, ian->fid, anim_busy(ian),
+                            weapon != nullptr && inven_right_hand(ian) == weapon, result);
+                        return false;
+                    }
+                }
+                configuredWeapon = true;
+                completedConversation = false;
+                equippedPid = weapon->pid;
+                submitted = false;
+                std::fprintf(stderr, "NATIVE_COMPANION_EQUIPMENT_PASS role=host native_dialogue=1 native_gear_fixture=1 weapon_pid=%d\n", equippedPid);
+            } else if (!host && stage == 1 && isPartyMember(ian) && !configuredWeapon
+                && inven_right_hand(ian) != nullptr) {
+                configuredWeapon = true;
+                equippedPid = inven_right_hand(ian)->pid;
+                submitted = false;
+            } else if (stage == 1 && !isPartyMember(ian)) {
+                ++stage;
+                submitted = false;
+                std::fprintf(stderr, "NATIVE_COMPANION_DISMISSED role=%s native_dialogue=1\n", host ? "host" : "guest");
+                completedConversation = false;
+            }
+            if (stage == 3) break;
+        }
+        if (!host && networkWorldPhase() == SessionPhase::Ending) break;
+        renderPresent();
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    if (stage != 3 || !isPartyMember(ian) || smokeNativeCompanionNameFailed
+        || !smokeNativeCompanionIntroName || !smokeNativeCompanionReplyName) {
+        std::fprintf(stderr, "NATIVE_COMPANION_TALKER_NAME_RESULT_FAIL role=%s intro=%d reply=%d failed=%d stage=%d\n",
+            host ? "host" : "guest", smokeNativeCompanionIntroName, smokeNativeCompanionReplyName, smokeNativeCompanionNameFailed, stage);
+        return false;
+    }
+    if (smokeNativeCompanionCleanup) {
+        // Recruitment can return while a player's native approach animation
+        // is settling. Require an actual idle checkpoint before the fixture.
+        auto readyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        bool ready = false;
+        do {
+            get_input();
+            networkRuntimeBackgroundProcess();
+            WorldSnapshot settled;
+            EventSequence boundary = host ? lobby.latestAuthoritativeEvent() : lobby.lastAppliedEvent();
+            ready = networkWorldCaptureAuthoritativeState(boundary, settled);
+            if (ready) break;
+            const auto& diagnostic = networkWorldLastSnapshotCaptureDiagnostic();
+            if (diagnostic.failure != SnapshotCaptureFailure::BusyObject) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        } while (std::chrono::steady_clock::now() < readyDeadline && !networkRuntimeFailed());
+        if (!ready) {
+            const auto& diagnostic = networkWorldLastSnapshotCaptureDiagnostic();
+            std::fprintf(stderr, "NATIVE_COMPANION_CLEANUP_FAIL sid_mode=preflight gate=idle_checkpoint reason=%d section=%s entity=%u\n",
+                static_cast<int>(diagnostic.failure), diagnostic.section, diagnostic.entityId.value);
+            return false;
+        }
+        std::fprintf(stderr, "NATIVE_COMPANION_CLEANUP_READY role=%s map=%d event=%llu native_capture=1\n",
+            host ? "host" : "guest", map_data.field_34,
+            static_cast<unsigned long long>((host ? lobby.latestAuthoritativeEvent() : lobby.lastAppliedEvent()).value));
+        if (host && !networkWorldRunCompanionCleanupSmoke(ian)) return false;
+    }
+    if (!runNativeCompanionTravel(savedPid)) return false;
+    ian = partyMemberFindObjFromPid(savedPid);
+    if (smokeNativeCompanionHostility && !runNativeCompanionCombat(savedPid)) return false;
+    Object* weapon = ian != nullptr ? inven_right_hand(ian) : nullptr;
+    if (weapon == nullptr || (host && weapon->pid != equippedPid)) return false;
+    equippedPid = weapon->pid;
+    int companionCaps = item_caps_total(ian);
+    int weaponQuantity = inven_pid_quantity_carried(ian, equippedPid);
+    if (smokeNativeCompanionDeath) {
+        if (host) critter_kill(ian, ANIM_FALL_BACK, true);
+        auto deathDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        bool observed = false;
+        while (std::chrono::steady_clock::now() < deathDeadline && !networkRuntimeFailed()) {
+            get_input();
+            networkRuntimeBackgroundProcess();
+            if (host) {
+                WorldSnapshot state;
+                if (networkWorldCaptureAuthoritativeState(lobby.latestAuthoritativeEvent(), state))
+                    observed = lobby.sendAuthoritativeState(state);
+            } else observed = critter_is_dead(ian) && !isPartyMember(ian);
+            if (observed) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        if (!observed || !critter_is_dead(ian) || isPartyMember(ian)
+            || networkWorldPartyDefeated() || item_caps_total(ian) != companionCaps
+            || inven_pid_quantity_carried(ian, equippedPid) != weaponQuantity) return false;
+        std::fprintf(stderr, "NATIVE_COMPANION_DEATH_PASS role=%s humans_alive=1 corpse_resources_preserved=1\n", host ? "host" : "guest");
+    }
+    int companionHp = critter_get_hits(ian);
+    int companionTeam = ian->data.critter.combat.team;
+    Object* carriedWeapon = inven_pid_is_carried_ptr(ian, equippedPid);
+    if (carriedWeapon == nullptr) return false;
+    int companionAmmo = item_w_curr_ammo(carriedWeapon);
+    if (!runLiveRecoverySmoke(originalSheet, originalSession)) return false;
+    Object* recovered = partyMemberFindObjFromPid(savedPid);
+    if (smokeNativeCompanionDeath) {
+        for (Object* object = obj_find_first(); object != nullptr; object = obj_find_next())
+            if (object->pid == savedPid && critter_is_dead(object)) { recovered = object; break; }
+    }
+    bool correctMembership = recovered != nullptr && (smokeNativeCompanionDeath
+        ? critter_is_dead(recovered) && !isPartyMember(recovered) : isPartyMember(recovered));
+    if (!correctMembership || recovered->pid != savedPid
+        || (!smokeNativeCompanionDeath && (inven_right_hand(recovered) == nullptr
+            || inven_right_hand(recovered)->pid != equippedPid))
+        || inven_pid_quantity_carried(recovered, equippedPid) != weaponQuantity
+        || item_caps_total(recovered) != companionCaps
+        || critter_get_hits(recovered) != companionHp
+        || recovered->data.critter.combat.team != companionTeam
+        || inven_pid_is_carried_ptr(recovered, equippedPid) == nullptr
+        || item_w_curr_ammo(inven_pid_is_carried_ptr(recovered, equippedPid)) != companionAmmo) {
+        setStatus("MULTIPLAYER COMPANION RECOVERY FAILED: NATIVE MEMBERSHIP");
+        return false;
+    }
+    if (smokeNativeCompanionCleanup) {
+        Script* script = nullptr;
+        bool hasOwnedScript = scr_ptr(recovered->sid, &script) == 0 && script->owner == recovered;
+        bool validScriptState = host ? hasOwnedScript : recovered->sid == -1 || hasOwnedScript;
+        if (smokeNativeCompanionDeath || !validScriptState) {
+            std::fprintf(stderr, "NATIVE_COMPANION_CLEANUP_FAIL sid_mode=recovery gate=script_state role=%s sid=%d owned=%d\n",
+                host ? "host" : "guest", recovered->sid, hasOwnedScript);
+            return false;
+        }
+        if (!host) {
+            if (!reportNativeCompanionReplicaAuthority("recovered_session")) return false;
+        }
+        std::fprintf(stderr, "NATIVE_COMPANION_CLEANUP_RECOVERY_PASS role=%s native_membership=1 script_owner=%d replica_script_absent=%d resources_exact=1 disk_load=1 reconnect=1\n",
+            host ? "host" : "guest", hasOwnedScript, !host && recovered->sid == -1);
+    }
+    std::fprintf(stderr, "NATIVE_COMPANION_RECOVERY role=%s disk_load=1 reconnect=1 pid=%d id=%d sid=%d corpse=%d hp=%d team=%d ammo=%d caps=%d party=%d\n",
+        host ? "host" : "guest", recovered->pid, recovered->id, recovered->sid, smokeNativeCompanionDeath,
+        companionHp, companionTeam, companionAmmo, companionCaps, isPartyMember(recovered));
+    std::fprintf(stdout, "MULTIPLAYER_SMOKE_TEST_PASS role=%s scenario=native-companion recruited=Ian native_membership=%d corpse=%d talker=%s\n",
+        host ? "host" : "guest", !smokeNativeCompanionDeath, smokeNativeCompanionDeath,
+        *smokeNativeCompanion == kHostPlayerId ? "host" : "guest");
+    std::fflush(stdout);
+    return true;
+}
+
+static bool runNativeStorySmoke()
+{
+    if (launchOptions.mode == NetworkLaunchMode::Host) {
+        register_begin(0);
+        register_object_animate(networkWorldPlayerActor(kHostPlayerId), ANIM_STAND, -1);
+        register_end();
+        gmovie_play(MOVIE_VEXPLD, GAME_MOVIE_FADE_IN | GAME_MOVIE_FADE_OUT | GAME_MOVIE_PAUSE_MUSIC);
+        gmovie_play(MOVIE_CATHEXP, GAME_MOVIE_FADE_IN | GAME_MOVIE_FADE_OUT | GAME_MOVIE_PAUSE_MUSIC);
+        endgame_slideshow();
+        std::fprintf(stderr, "NATIVE_STORY_PRE_FINALE active=%d revision=%llu quit=%d\n", networkWorldStory().active, static_cast<unsigned long long>(networkWorldStory().revision), game_user_wants_to_quit);
+        endgame_movie();
+        if (storyFailed || networkWorldStory().active || networkWorldStory().completed.size() != 2) return false;
+        networkRuntimeEndHostSession();
+    } else {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(35);
+        while (std::chrono::steady_clock::now() < deadline && !networkRuntimeFailed()) {
+            get_input();
+            networkRuntimeProcessPendingStory();
+            if (networkWorldPhase() == SessionPhase::Ending) break;
+            renderPresent();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        if (playedStoryRevision != 4 || networkWorldPhase() != SessionPhase::Ending) return false;
+    }
+    std::fprintf(stdout, "MULTIPLAYER_SMOKE_TEST_PASS role=%s scenario=native-story revision=%llu actual_movies=2 settlement_slides=1 departure_credits=1\n",
+        launchOptions.mode == NetworkLaunchMode::Host ? "host" : "guest",
+        static_cast<unsigned long long>(networkWorldStory().revision));
+    std::fflush(stdout);
+    return true;
+}
+
+static bool reportNativeDenseSnapshot(const WorldSnapshot& snapshot, const char* stage)
+{
+    std::vector<std::uint8_t> bytes;
+    auto error = encodeSnapshot(snapshot, bytes);
+    auto digest = computeSnapshotDigest(snapshot);
+    bool passed = error == SnapshotError::None && digest
+        && snapshot.mapId == smokeNativeDenseMap && snapshot.actors.size() == 2;
+    std::fprintf(stderr,
+        "NATIVE_DENSE_SNAPSHOT_%s role=%s name=%s stage=%s map=%d phase=%d actors=%zu critters=%zu doors=%zu scenery=%zu items=%zu globals=%zu map_globals=%zu map_locals=%zu timers=%zu bytes=%zu encode_error=%d digest=%llu\n",
+        passed ? "PASS" : "FAIL", launchOptions.mode == NetworkLaunchMode::Host ? "host" : "guest",
+        smokeNativeDenseMapName.c_str(), stage, snapshot.mapId, static_cast<int>(snapshot.phase),
+        snapshot.actors.size(), snapshot.critters.size(), snapshot.doors.size(), snapshot.scenery.size(), snapshot.items.size(),
+        snapshot.gameGlobalVariables.size(), snapshot.mapGlobalVariables.size(), snapshot.mapLocalVariables.size(), snapshot.timedEvents.size(),
+        bytes.size(), static_cast<int>(error), static_cast<unsigned long long>(digest.digest.overall));
+    return passed;
+}
+
+static bool runNativeDenseMapArrival()
+{
+    bool host = launchOptions.mode == NetworkLaunchMode::Host;
+    bool approved = false;
+    bool arrived = false;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (std::chrono::steady_clock::now() < deadline && !networkRuntimeFailed()) {
+        get_input();
+        networkRuntimeBackgroundProcess();
+        if (!approved && networkWorldPhase() == SessionPhase::Exploration
+            && (host || networkWorldPendingWorldMapProposer().has_value())) {
+            approved = networkRuntimeRequestSharedModal(SharedModalKind::WorldMap, true);
+        }
+        if (host && !arrived && networkWorldPhase() == SessionPhase::Transition) {
+            // Dedicated test setup: select the installed map after both humans
+            // approve departure. This does not complete its quests or routes.
+            arrived = networkWorldFinishWorldMapTravel(WorldMapArrivalKind::City, 0, smokeNativeDenseMap);
+            if (!arrived) break;
+        }
+        if (map_data.field_34 == smokeNativeDenseMap && networkWorldPhase() == SessionPhase::Exploration
+            && (host ? arrived : approved)) break;
+        renderPresent();
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    if (map_data.field_34 != smokeNativeDenseMap || networkWorldPhase() != SessionPhase::Exploration) {
+        std::fprintf(stderr, "NATIVE_DENSE_ARRIVAL_FAIL role=%s expected_map=%d actual_map=%d phase=%d approved=%d arrived=%d\n",
+            host ? "host" : "guest", smokeNativeDenseMap, map_data.field_34, static_cast<int>(networkWorldPhase()), approved, arrived);
+        return false;
+    }
+    WorldSnapshot native;
+    auto captureDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!networkWorldCaptureAuthoritativeState(host ? lobby.latestAuthoritativeEvent() : lobby.lastAppliedEvent(), native)) {
+        if (std::chrono::steady_clock::now() >= captureDeadline) {
+            std::fprintf(stderr, "NATIVE_DENSE_ARRIVAL_FAIL role=%s gate=capture map=%d host_busy=%d guest_busy=%d\n",
+                host ? "host" : "guest", smokeNativeDenseMap, anim_busy(networkWorldPlayerActor(kHostPlayerId)), anim_busy(networkWorldPlayerActor(kGuestPlayerId)));
+            return false;
+        }
+        get_input();
+        networkRuntimeBackgroundProcess();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!reportNativeDenseSnapshot(native, "arrival")) return false;
+    if (host) {
+        // Preserve an unmodified native arrival in this isolated profile before
+        // the standard recovery fixture adds its status/timer assertions.
+        if (!SaveMultiplayerGameSlot(1) || !lobby.sendAuthoritativeState(native)) {
+            std::fprintf(stderr, "NATIVE_DENSE_ARRIVAL_FAIL role=host gate=baseline_save_or_publish\n");
+            return false;
+        }
+        std::fprintf(stderr, "NATIVE_DENSE_BASELINE_SAVE_PASS map=%d slot=2 isolated_profile=1\n", smokeNativeDenseMap);
+        // The isolated driver writes this witness only after the guest has
+        // captured and validated the actual native arrival on this map.
+        auto readyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        bool peerNativeReady = false;
+        while (!peerNativeReady && std::chrono::steady_clock::now() < readyDeadline) {
+            FILE* ready = std::fopen("dense-peer-native-ready", "rb");
+            if (ready != nullptr) {
+                int witnessedMap = -1;
+                peerNativeReady = std::fscanf(ready, "%d", &witnessedMap) == 1
+                    && witnessedMap == smokeNativeDenseMap;
+                std::fclose(ready);
+            }
+            get_input();
+            networkRuntimeBackgroundProcess();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        if (!peerNativeReady) {
+            std::fprintf(stderr, "NATIVE_DENSE_ARRIVAL_FAIL role=host gate=peer_native_ready map=%d\n", smokeNativeDenseMap);
+            return false;
+        }
+        std::fprintf(stderr, "NATIVE_DENSE_PEER_NATIVE_READY_PASS map=%d driver_guest_capture_witness=1\n", smokeNativeDenseMap);
+    }
+    return true;
+}
+
 static bool runLiveRecoverySmoke(const CharacterCreationSheet& sheet,
     SessionId originalSessionId)
 {
@@ -3101,8 +5377,9 @@ static bool runLiveRecoverySmoke(const CharacterCreationSheet& sheet,
     auto endingDeadline = std::chrono::steady_clock::now()
         + std::chrono::seconds(15);
     if (launchOptions.mode == NetworkLaunchMode::Host) {
-        if (!SaveMultiplayerRecoveryGame()
-            || !MultiplayerRecoverySaveExists()) {
+        bool saved = smokeSavedSlot ? SaveMultiplayerGameSlot(0) : SaveMultiplayerRecoveryGame();
+        bool activeLoadBlocked = !LoadMultiplayerGameSlot(0);
+        if (!saved || !activeLoadBlocked || (!smokeSavedSlot && !MultiplayerRecoverySaveExists())) {
             setStatus("MULTIPLAYER RECOVERY SMOKE FAILED: HIDDEN SAVE");
             return false;
         }
@@ -3125,9 +5402,12 @@ static bool runLiveRecoverySmoke(const CharacterCreationSheet& sheet,
         networkRuntimeBackgroundProcess();
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    if (smokeNativeCompanionCleanup && launchOptions.mode == NetworkLaunchMode::Join
+        && !reportNativeCompanionReplicaAuthority("initial_session")) return false;
     networkRuntimeStop();
 
     if (launchOptions.mode == NetworkLaunchMode::Join) {
+        if (smokeNativeCompanion.has_value()) partyMemberClear();
         char baselineMap[] = "V13Ent.map";
         if (map_load(baselineMap) == -1) {
             setStatus("MULTIPLAYER RECOVERY SMOKE FAILED: GUEST BASELINE MAP");
@@ -3151,7 +5431,52 @@ static bool runLiveRecoverySmoke(const CharacterCreationSheet& sheet,
 
     bool submitted = false;
     bool recoveryLoaded = false;
+    if (smokeSavedSlot && launchOptions.mode == NetworkLaunchMode::Host) {
+        const char* sidecarPath = "SAVEGAME\\SLOT01\\MULTI.DAT";
+        DB_FILE* stream = db_fopen(sidecarPath, "rb");
+        long size = stream != nullptr ? db_filelength(stream) : -1;
+        std::vector<std::uint8_t> bytes;
+        bool read = size > 0 && static_cast<std::size_t>(size) <= kMultiplayerSaveMaximumSize;
+        if (read) {
+            bytes.resize(static_cast<std::size_t>(size));
+            read = db_fread(bytes.data(), 1, bytes.size(), stream) == bytes.size();
+        }
+        if (stream != nullptr) db_fclose(stream);
+        if (!read) return false;
+        auto writeSidecar = [&](const std::vector<std::uint8_t>& contents) {
+            DB_FILE* output = db_fopen(sidecarPath, "wb");
+            if (output == nullptr) return false;
+            bool written = db_fwrite(contents.data(), 1, contents.size(), output) == contents.size();
+            return db_fclose(output) == 0 && written;
+        };
+        Object* originalActor = obj_dude;
+        CritterObjectData originalState = obj_dude->data.critter;
+        int originalTile = obj_dude->tile;
+        int originalTime = game_time();
+        auto corrupt = bytes;
+        corrupt[0] ^= 0xFF;
+        bool rejected = writeSidecar(corrupt) && !LoadMultiplayerGameSlot(0);
+        bool restored = writeSidecar(bytes);
+        if (!rejected || !restored || obj_dude != originalActor
+            || obj_dude->tile != originalTile || game_time() != originalTime
+            || std::memcmp(&obj_dude->data.critter, &originalState, sizeof(originalState)) != 0) {
+            setStatus("MULTIPLAYER SAVED SLOT SMOKE FAILED: CORRUPT PREFLIGHT MUTATED WORLD");
+            return false;
+        }
+        std::fprintf(stdout, "MULTIPLAYER_SAVED_SLOT_PREFLIGHT_PASS active_reload_blocked=1 corrupt_metadata_blocked=1 native_state_preserved=1\n");
+        std::fflush(stdout);
+        recoveryLoaded = LoadMultiplayerGameSlot(0)
+            && networkRuntimePrepareLoadedSaveLobby();
+        if (!recoveryLoaded) return false;
+        // This is the same path as main-menu Load, before the guest has chosen
+        // a lobby character. startLobby submits the staged placeholder later.
+        submitted = true;
+    }
     bool entered = false;
+    bool restoredStateVerified = false;
+    bool reconnectStarted = false;
+    bool sawRecoveryDisconnect = false;
+    bool knockoutReconnectVerified = false;
     auto verifiedAt = std::chrono::steady_clock::time_point {};
     auto deadline = std::chrono::steady_clock::now()
         + std::chrono::seconds(45);
@@ -3175,22 +5500,54 @@ static bool runLiveRecoverySmoke(const CharacterCreationSheet& sheet,
             } else if (!entered) {
                 if (launchOptions.mode == NetworkLaunchMode::Host
                     && !recoveryLoaded) {
-                    recoveryLoaded = LoadMultiplayerRecoveryGame();
+                    recoveryLoaded = smokeSavedSlot ? LoadMultiplayerGameSlot(0) : LoadMultiplayerRecoveryGame();
                     if (!recoveryLoaded) break;
                 }
                 entered = networkRuntimeEnterWorld();
                 if (!entered) break;
+                // The explicit single-player baseline map load above happens
+                // between sessions. Measure the resumed active replica.
+                if (smokeNativeCompanionCleanup && launchOptions.mode == NetworkLaunchMode::Join)
+                    engineExecutionProbeBegin();
             }
         }
 
-        if (entered && networkWorldVerifyRecoverySmokeTest()
-            && map_data.field_34 == MAP_SHADYW) {
-            if (verifiedAt.time_since_epoch().count() == 0) {
-                verifiedAt = std::chrono::steady_clock::now();
+        if (entered && !restoredStateVerified && networkWorldVerifyRecoverySmokeTest()
+            && map_data.field_34 == (smokeNativeDenseMap >= 0 ? smokeNativeDenseMap : MAP_SHADYW)) {
+            restoredStateVerified = true;
+            verifiedAt = std::chrono::steady_clock::now();
+        }
+        if (entered && restoredStateVerified && !knockoutReconnectVerified) {
+            if (launchOptions.mode == NetworkLaunchMode::Join && !reconnectStarted) {
+                if (!lobby.disconnectForReconnect()) break;
+                reconnectStarted = true;
+                nextReconnectAttempt = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
             }
-            if (launchOptions.mode == NetworkLaunchMode::Join
-                || std::chrono::steady_clock::now() - verifiedAt
-                    >= std::chrono::seconds(2)) {
+            sawRecoveryDisconnect |= lobby.state() == NetworkLobbyState::Disconnected;
+            bool reconnected = launchOptions.mode == NetworkLaunchMode::Host
+                ? sawRecoveryDisconnect : reconnectStarted;
+            if (reconnected && lobby.state() == NetworkLobbyState::Ready && !lobby.recoveryInProgress()
+                && (launchOptions.mode == NetworkLaunchMode::Host || replicaWorldReady)
+                && networkWorldVerifyRecoverySmokeTest()) {
+                knockoutReconnectVerified = true;
+                verifiedAt = std::chrono::steady_clock::now();
+                std::fprintf(stdout, "KNOCKOUT_RECOVERY_PASS role=%s disk_load=1 reconnect=1 still_incapacitated=1 timer_exact=1\n",
+                    launchOptions.mode == NetworkLaunchMode::Host ? "host" : "guest");
+                std::fflush(stdout);
+            }
+        }
+        if (entered && restoredStateVerified && knockoutReconnectVerified) {
+            // Compare the same applied checkpoint, rather than letting the
+            // guest exit before the resumed host's facing event is published.
+            // Ending freezes that boundary and supplies a native apply ack.
+            if (launchOptions.mode == NetworkLaunchMode::Host
+                && networkWorldPhase() != SessionPhase::Ending
+                && std::chrono::steady_clock::now() - verifiedAt >= std::chrono::seconds(2)) {
+                networkRuntimeEndHostSession();
+            }
+            if (networkWorldPhase() == SessionPhase::Ending
+                && (launchOptions.mode == NetworkLaunchMode::Join
+                    || lobby.acknowledgedEndingPhaseRevision() == networkWorldPhaseRevision())) {
                 WorldSnapshot snapshot;
                 SnapshotDigestResult digest;
                 bool captured = networkWorldCaptureAuthoritativeState(
@@ -3200,12 +5557,36 @@ static bool runLiveRecoverySmoke(const CharacterCreationSheet& sheet,
                 if (!captured || !(digest = computeSnapshotDigest(snapshot))) {
                     break;
                 }
+                if (smokeNativeDenseMap >= 0 && !reportNativeDenseSnapshot(snapshot, "recovered")) return false;
+                std::fprintf(stderr,
+                    "RECOVERY_SECTION_DIGEST event=%llu phase=%d revision=%u time=%d session=%llu actors=%llu critters=%llu doors=%llu scenery=%llu items=%llu globals=%llu mapvars=%llu timers=%llu worldmap=%llu\n",
+                    static_cast<unsigned long long>(snapshot.lastIncludedEvent.value),
+                    static_cast<int>(snapshot.phase), snapshot.phaseRevision, snapshot.gameTime,
+                    static_cast<unsigned long long>(digest.digest.session),
+                    static_cast<unsigned long long>(digest.digest.actors),
+                    static_cast<unsigned long long>(digest.digest.critters),
+                    static_cast<unsigned long long>(digest.digest.doors),
+                    static_cast<unsigned long long>(digest.digest.scenery),
+                    static_cast<unsigned long long>(digest.digest.items),
+                    static_cast<unsigned long long>(digest.digest.globals),
+                    static_cast<unsigned long long>(digest.digest.mapVariables),
+                    static_cast<unsigned long long>(digest.digest.timedEvents),
+                    static_cast<unsigned long long>(digest.digest.worldMap));
+                std::vector<std::uint8_t> encodedSnapshot;
+                if (encodeSnapshot(snapshot, encodedSnapshot) == SnapshotError::None) {
+                    FILE* diagnostic = std::fopen("recovery-smoke-snapshot.bin", "wb");
+                    if (diagnostic != nullptr) {
+                        std::fwrite(encodedSnapshot.data(), 1, encodedSnapshot.size(), diagnostic);
+                        std::fclose(diagnostic);
+                    }
+                }
                 std::fprintf(stdout,
-                    "MULTIPLAYER_RECOVERY_SMOKE_PASS role=%s old_session=%llu new_session=%llu map=%d caps=7 activity=1 digest=%llu\n",
+                    "MULTIPLAYER_RECOVERY_SMOKE_PASS role=%s old_session=%llu new_session=%llu map=%d saved_slot=%d host_hp=17 host_poison=7 host_radiation=11 host_crippled=1 caps=7 activity=1 digest=%llu\n",
                     launchOptions.mode == NetworkLaunchMode::Host ? "host" : "guest",
                     static_cast<unsigned long long>(originalSessionId.value),
                     static_cast<unsigned long long>(bootstrap.sessionId().value),
                     map_data.field_34,
+                    smokeSavedSlot,
                     static_cast<unsigned long long>(digest.digest.overall));
                 std::fflush(stdout);
                 return true;
@@ -3258,7 +5639,7 @@ bool networkRuntimeRunSmokeTest()
         }
 
         if (lobbyStarted && lobby.state() == NetworkLobbyState::Ready) {
-            if ((smokeScenario == SmokeScenario::DirectTrade
+            if ((smokeNativeSnapshotCapacity || smokeNativeWorldDiscovery || smokeNativeCharacterEditor || smokeNativeExplosiveTimer || smokeNativeAutomap || smokeScenario == SmokeScenario::DirectTrade
                     || smokeScenario == SmokeScenario::Recovery
                     || smokeScenario == SmokeScenario::WorldMapTravel
                     || isDialogueSmokeScenario()
@@ -3296,6 +5677,10 @@ bool networkRuntimeRunSmokeTest()
                 setStatus("MULTIPLAYER SMOKE TEST FAILED: SHARED MODAL CONTROLLER");
                 break;
             }
+            if (!networkWorldRunPartyRecoverySmokeTest(networkRuntimeProcessPartyDefeat)) {
+                setStatus("MULTIPLAYER SMOKE TEST FAILED: PARTY RECOVERY");
+                break;
+            }
             // Do not interpret the actors' spawn hex as a new exit-grid step.
             pendingLocalExitGrid = networkWorldReadyLocalExitGrid();
             if (!networkWorldRunPartyExperienceSmokeTest()) {
@@ -3303,12 +5688,42 @@ bool networkRuntimeRunSmokeTest()
                 break;
             }
 
+            if (smokeNativeSnapshotCapacity) {
+                if (runNativeSnapshotCapacitySmoke()) return true;
+                break;
+            }
+            if (smokeNativeWorldDiscovery) {
+                if (runNativeWorldDiscoverySmoke()) return true;
+                break;
+            }
+
+            if (smokeNativeAutomap) {
+                if (runNativeMapScreenSmoke()) return true;
+                break;
+            }
+            if (smokeNativeExplosiveTimer) {
+                if (runNativeExplosiveTimerSmoke()) return true;
+                break;
+            }
+            if (smokeNativeCharacterEditor) {
+                if (runNativeCharacterEditorSmoke()) return true;
+                break;
+            }
             if (smokeScenario == SmokeScenario::DirectTrade) {
                 if (runLiveDirectTradeSmoke(bootstrap.sessionId())) return true;
                 break;
             }
 
+            if (smokeNativeCompanion.has_value()) {
+                if (runNativeCompanionSmoke()) return true;
+                break;
+            }
+            if (smokeNativeStory) {
+                if (runNativeStorySmoke()) return true;
+                break;
+            }
             if (smokeScenario == SmokeScenario::Recovery) {
+                if (smokeNativeDenseMap >= 0 && !runNativeDenseMapArrival()) break;
                 if (runLiveRecoverySmoke(sheet, bootstrap.sessionId())) return true;
                 break;
             }
@@ -3342,6 +5757,43 @@ bool networkRuntimeRunSmokeTest()
             std::unique_ptr<Transport> transport = lobby.takeTransport();
             if (transport == nullptr) {
                 setStatus("MULTIPLAYER SMOKE TEST FAILED: MISSING GAMEPLAY TRANSPORT");
+                break;
+            }
+
+            // These older exploration fixtures use a raw transport rather than
+            // the live lobby runtime. They still need the same initial host
+            // checkpoint as a real session, including both starting kits and
+            // their authoritative entity IDs.
+            bool initialStateReady = false;
+            if (launchOptions.mode == NetworkLaunchMode::Host) {
+                WorldSnapshot initialState;
+                ProtocolEnvelope initialEnvelope;
+                initialEnvelope.kind = MessageKind::Snapshot;
+                initialEnvelope.sessionId = sessionId;
+                initialEnvelope.sequence = nextSendSequence++;
+                std::vector<std::uint8_t> packet;
+                initialStateReady = networkWorldCaptureAuthoritativeState(EventSequence {}, initialState)
+                    && encodeSnapshot(initialState, initialEnvelope.payload) == SnapshotError::None
+                    && encodeEnvelope(initialEnvelope, packet) == ProtocolError::None
+                    && transport->send(std::move(packet)) == TransportSendResult::Sent;
+            } else {
+                while (std::chrono::steady_clock::now() < deadline && !initialStateReady) {
+                    transport->poll();
+                    if (auto packet = transport->receive()) {
+                        auto decoded = decodeEnvelope(*packet);
+                        if (!decoded || decoded.envelope.kind != MessageKind::Snapshot
+                            || decoded.envelope.sessionId != sessionId
+                            || decoded.envelope.sequence != nextReceiveSequence++) break;
+                        auto initialState = decodeSnapshot(decoded.envelope.payload);
+                        initialStateReady = initialState && networkWorldApplyAuthoritativeState(initialState.snapshot);
+                        break;
+                    }
+                    if (!transport->isConnected()) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
+            if (!initialStateReady) {
+                setStatus("MULTIPLAYER SMOKE TEST FAILED: INITIAL HOST CHECKPOINT");
                 break;
             }
 
@@ -4503,32 +6955,149 @@ bool networkRuntimeStageLoadedSave(const MultiplayerSaveSidecar& sidecar,
     Object* savedGuestActor)
 {
     if (launchOptions.mode != NetworkLaunchMode::Host
-        || !networkRuntimeConnected()
         || networkWorldActive()
         || savedGuestActor == nullptr
         || validateMultiplayerSave(sidecar) != MultiplayerSaveError::None) {
         return false;
     }
 
-    MultiplayerSaveSidecar claimed = sidecar;
-    SavedPlayerSlotResolution resolution = resolveSavedPlayerSlot(claimed,
-        kGuestPlayerId, bootstrap.reconnectToken(), true);
-    if (resolution == SavedPlayerSlotResolution::ReplacementAllowed
-        && claimSavedPlayerSlot(claimed, kGuestPlayerId,
-               bootstrap.reconnectToken()) != MultiplayerSaveError::None) {
-        return false;
-    }
-    if (resolution != SavedPlayerSlotResolution::ExactReconnect
-        && resolution != SavedPlayerSlotResolution::ReplacementAllowed) {
-        return false;
-    }
-
     discardPendingLoadedSave();
-    pendingLoadedSave = std::move(claimed);
+    pendingLoadedSave = sidecar;
     pendingLoadedGuestActor = savedGuestActor;
     pendingLoadedGuestActor->flags |= OBJECT_NO_SAVE;
     pendingLoadedGuestActor->flags &= ~OBJECT_NO_REMOVE;
     return true;
+}
+
+bool networkRuntimeSmokeTestMissingMovie()
+{
+    return smokeTestEnabled && smokeNativeStoryMissing && networkRuntimeIsGuestReplica();
+}
+
+void networkRuntimeStoryTick()
+{
+    if (storyPlaying) networkRuntimeBackgroundProcess();
+}
+
+static int playNativeStory(const StoryPresentationState& state)
+{
+    if (state.kind == StoryPresentationKind::Movie) return gmovie_play(state.movie, state.flags);
+    if (state.kind == StoryPresentationKind::Slides) endgame_play_slides(state.slides);
+    else endgame_play_finale(state.movie);
+    return 0;
+}
+
+std::optional<int> networkRuntimePresentStory(StoryPresentationKind kind, int movie,
+    std::uint32_t flags, const std::vector<int>& slides)
+{
+    if (storyPlaying || !networkWorldActive()
+        || (kind == StoryPresentationKind::Movie && movie < MOVIE_VEXPLD)) return std::nullopt;
+    // Replica scripts must never initiate a new presentation or choose outcomes.
+    if (networkRuntimeIsGuestReplica()) return -1;
+    StoryPresentationState state;
+    state.revision = networkWorldStory().revision + 1;
+    state.kind = kind;
+    state.movie = movie;
+    state.flags = flags;
+    state.slides = slides;
+    if (!networkWorldBeginStory(state)) {
+        std::fprintf(stderr, "Story begin rejected: revision=%llu previous=%llu active=%d mode=%d\n",
+            static_cast<unsigned long long>(state.revision), static_cast<unsigned long long>(networkWorldStory().revision),
+            networkWorldStory().active, static_cast<int>(launchOptions.mode));
+        return -1;
+    }
+    bool mapWasEnabled = map_disable_bk_processes();
+    struct MapScope {
+        bool restoreEnabled;
+        ~MapScope() { if (restoreEnabled) map_enable_bk_processes(); else map_disable_bk_processes(); }
+    } mapScope { mapWasEnabled };
+    WorldSnapshot checkpoint;
+    bool captured = false;
+    auto captureDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    do {
+        captured = networkWorldCaptureAuthoritativeState(lobby.latestAuthoritativeEvent(), checkpoint);
+        if (captured) break;
+        // Native movie callers may already have disabled object_animate.
+        // Let an existing action finish before taking the complete checkpoint.
+        map_enable_bk_processes();
+        process_bk();
+        map_disable_bk_processes();
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    } while (std::chrono::steady_clock::now() < captureDeadline && !networkRuntimeFailed());
+    if (!captured || validateSnapshot(checkpoint) != SnapshotError::None) {
+        setStatus("MULTIPLAYER STORY CHECKPOINT FAILED");
+        storyFailed = true;
+        game_user_wants_to_quit = 2;
+        networkWorldFinishStory();
+        return -1;
+    }
+    if (lobby.state() == NetworkLobbyState::Ready) lobby.sendAuthoritativeState(checkpoint);
+    storyPlaying = true;
+    std::fprintf(stderr, "NATIVE_STORY_STARTED role=host revision=%llu kind=%u movie=%d\n",
+        static_cast<unsigned long long>(state.revision), static_cast<unsigned>(kind), movie);
+    int result = playNativeStory(state);
+    networkWorldCompleteStory(kHostPlayerId, state.revision);
+    std::fprintf(stderr, "NATIVE_STORY_COMPLETED role=host revision=%llu kind=%u result=%d\n",
+        static_cast<unsigned long long>(state.revision), static_cast<unsigned>(kind), result);
+    // A teammate may skip while another watches every narration or the credits.
+    // Keep the bounded failure deadline longer than the full native sequence.
+    auto deadline = std::chrono::steady_clock::now()
+        + (kind == StoryPresentationKind::Movie ? std::chrono::minutes(10) : std::chrono::minutes(30));
+    while (game_user_wants_to_quit == 0 && !networkRuntimeFailed()) {
+        networkRuntimeBackgroundProcess();
+        while (auto completed = lobby.takeStoryPresentationCompleted())
+            networkWorldCompleteStory(completed->playerId, completed->revision);
+        const auto& completed = networkWorldStory().completed;
+        bool everyone = std::all_of(checkpoint.actors.begin(), checkpoint.actors.end(), [&](const auto& actor) {
+            return std::find(completed.begin(), completed.end(), actor.ownerId) != completed.end();
+        });
+        if (everyone) break;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            setStatus("MULTIPLAYER STORY PRESENTATION TIMED OUT");
+            storyFailed = true;
+            game_user_wants_to_quit = 2;
+            break;
+        }
+        get_input();
+        renderPresent();
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    storyPlaying = false;
+    networkWorldFinishStory();
+    if (networkWorldCaptureAuthoritativeState(lobby.latestAuthoritativeEvent(), checkpoint)
+        && lobby.state() == NetworkLobbyState::Ready) lobby.sendAuthoritativeState(checkpoint);
+    return result;
+}
+
+void networkRuntimeProcessPendingStory()
+{
+    if (storyPlaying || !networkRuntimeIsGuestReplica() || !replicaWorldReady) return;
+    auto state = networkWorldStory();
+    if (!state.active || state.revision == 0) return;
+    if (state.revision > playedStoryRevision) {
+        storyPlaying = true;
+        std::fprintf(stderr, "NATIVE_STORY_STARTED role=guest revision=%llu kind=%u movie=%d\n",
+            static_cast<unsigned long long>(state.revision), static_cast<unsigned>(state.kind), state.movie);
+        int result = playNativeStory(state);
+        playedStoryRevision = state.revision;
+        storyPlaying = false;
+        char waitingMessage[80];
+        std::snprintf(waitingMessage, sizeof(waitingMessage), "%s", result == -1
+            ? "This movie is unavailable. Waiting for the other players."
+            : "Waiting for the other players to finish.");
+        display_print(waitingMessage);
+        std::fprintf(stderr, "NATIVE_STORY_COMPLETED role=guest revision=%llu kind=%u result=%d\n",
+            static_cast<unsigned long long>(state.revision), static_cast<unsigned>(state.kind), result);
+    }
+    if (smokeNativeStoryReconnect && !smokeNativeStoryReconnectRequested && playedStoryRevision == 1) {
+        smokeNativeStoryReconnectRequested = lobby.disconnectForReconnect();
+        if (smokeNativeStoryReconnectRequested) {
+            std::fprintf(stderr, "NATIVE_STORY_RECONNECT_REQUEST revision=1 completed_before_ack=1\n");
+            storyCompletionSent = 0;
+        }
+    }
+    if (state.revision == playedStoryRevision && storyCompletionSent != state.revision
+        && lobby.confirmStoryPresentationCompleted(state.revision)) storyCompletionSent = state.revision;
 }
 
 void networkRuntimeEndHostSession()
@@ -4556,19 +7125,16 @@ void networkRuntimeEndHostSession()
             static_cast<int>(endingEncodeError));
         return;
     }
-    if (!lobby.sendAuthoritativeState(ending)) {
-        std::fprintf(stderr,
-            "Multiplayer ending checkpoint could not be sent: lobby=%d error=%d bytes=%zu.\n",
-            static_cast<int>(lobby.state()), static_cast<int>(lobby.error()),
-            encodedEnding.size());
-        return;
-    }
-    auto deadline = std::chrono::steady_clock::now()
-        + std::chrono::seconds(5);
-    while (lobby.state() == NetworkLobbyState::Ready
-        && lobby.acknowledgedEndingPhaseRevision() != ending.phaseRevision
-        && std::chrono::steady_clock::now() < deadline) {
-        lobby.poll();
+    // Keep the listener and native recovery pump alive through the bounded
+    // terminal handshake. A disconnect at death must not lose Ending or let
+    // the reconnecting guest resume the last live checkpoint.
+    bool sent = lobby.state() == NetworkLobbyState::Ready && lobby.sendAuthoritativeState(ending);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (lobby.acknowledgedEndingPhaseRevision() != ending.phaseRevision
+        && std::chrono::steady_clock::now() < deadline && !networkRuntimeFailed()) {
+        networkRuntimeBackgroundProcess();
+        if (lobby.state() == NetworkLobbyState::Disconnected) sent = false;
+        else if (!sent && lobby.state() == NetworkLobbyState::Ready) sent = lobby.sendAuthoritativeState(ending);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     if (lobby.acknowledgedEndingPhaseRevision() != ending.phaseRevision) {
@@ -4580,7 +7146,7 @@ void networkRuntimeEndHostSession()
 
 bool networkRuntimeFailed()
 {
-    return bootstrap.state() == NetworkBootstrapState::Rejected
+    return storyFailed || bootstrap.state() == NetworkBootstrapState::Rejected
         || bootstrap.state() == NetworkBootstrapState::Failed
         || (lobbyStarted && (lobby.state() == NetworkLobbyState::Rejected || lobby.state() == NetworkLobbyState::Failed));
 }
@@ -4656,7 +7222,9 @@ bool networkRuntimeHandleGameChatInput(int keyCode)
         if (keyCode == KEY_LOWERCASE_O || keyCode == KEY_UPPERCASE_O) {
             char input[96] = {};
             if (win_get_str(input, 94,
-                    "Offer: caps [item-id quantity] (0 clears)", 80, 80)
+                    "Offer: caps [item-id quantity] (0 clears)", 80, 80, [] {
+                        return game_user_wants_to_quit != 0 || networkWorldPhase() != SessionPhase::Dialogue;
+                    })
                 != 0) return true;
             unsigned int caps = 0;
             unsigned int itemId = 0;
@@ -4745,6 +7313,10 @@ bool networkRuntimeHandleCombatInput(int keyCode)
     std::uint64_t revision = networkWorldCombatTurnRevision();
     bool ownsTurn = networkWorldActiveCombatOwner() == kGuestPlayerId
         && revision != 0;
+    if (keyCode == KEY_HOME) {
+        game_handle_input(keyCode, true);
+        return true;
+    }
     if (keyCode == KEY_SPACE) {
         if (!ownsTurn) {
             char message[] = "It is not your combat turn.";
@@ -4777,6 +7349,12 @@ bool networkRuntimeHandleCombatInput(int keyCode)
             || keyCode == KEY_LOWERCASE_R || keyCode == KEY_UPPERCASE_R;
     }
     if (keyCode == -2) {
+        if (gmouse_3d_get_mode() == GAME_MOUSE_MODE_ARROW) {
+            int mouseX, mouseY;
+            mouse_get_position(&mouseX, &mouseY);
+            gmouse_handle_event(mouseX, mouseY, mouse_get_buttons());
+            return true;
+        }
         int buttons = mouse_get_buttons();
         if ((buttons & MOUSE_EVENT_RIGHT_BUTTON_DOWN) != 0
             && (buttons & MOUSE_EVENT_RIGHT_BUTTON_REPEAT) == 0) {
@@ -4892,6 +7470,28 @@ bool networkRuntimeSubmitLocalCharacter(Object* actor)
     return true;
 }
 
+bool networkRuntimePrepareLoadedSaveLobby()
+{
+    if (launchOptions.mode == NetworkLaunchMode::Disabled) return true;
+    if (launchOptions.mode != NetworkLaunchMode::Host || !pendingLoadedSave.has_value()) return false;
+    // Lobby sheets identify participants; the sidecar restores their complete
+    // builds. Advanced characters may exceed the creation screen's 40 points.
+    if (networkRuntimeLocalSheet() != nullptr) return true;
+    const SavedPlayerCharacter* host = nullptr;
+    for (const auto& player : pendingLoadedSave->players) {
+        if (player.playerId == kHostPlayerId) host = &player;
+    }
+    if (host == nullptr) return false;
+    CharacterCreationSheet sheet;
+    sheet.playerId = kHostPlayerId;
+    sheet.name = host->name;
+    sheet.primaryStats = { 5, 5, 5, 5, 5, 5, 10 };
+    sheet.taggedSkills = { SKILL_SMALL_GUNS, SKILL_FIRST_AID, SKILL_SPEECH };
+    pendingLocalSheet = sheet;
+    if (lobbyStarted && lobby.submitLocalSheet(sheet) != CharacterLobbyError::None) return false;
+    return true;
+}
+
 bool networkRuntimeWaitForLobby()
 {
     if (launchOptions.mode == NetworkLaunchMode::Disabled) {
@@ -4992,6 +7592,18 @@ bool networkRuntimeEnterWorld()
         return false;
     }
     replicaWorldReady = false;
+    if (pendingLoadedSave.has_value()) {
+        SavedPlayerSlotResolution resolution = resolveSavedPlayerSlot(*pendingLoadedSave,
+            kGuestPlayerId, bootstrap.reconnectToken(), true);
+        if ((resolution == SavedPlayerSlotResolution::ReplacementAllowed
+                && claimSavedPlayerSlot(*pendingLoadedSave, kGuestPlayerId,
+                    bootstrap.reconnectToken()) != MultiplayerSaveError::None)
+            || (resolution != SavedPlayerSlotResolution::ExactReconnect
+                && resolution != SavedPlayerSlotResolution::ReplacementAllowed)) {
+            setStatus("MULTIPLAYER WORLD FAILED: SAVED GUEST SLOT COULD NOT BE CLAIMED");
+            return false;
+        }
+    }
     if (!networkWorldEnter(launchOptions.mode, *local, *peer, !pendingLoadedSave.has_value())) {
         setStatus("MULTIPLAYER WORLD FAILED: COULD NOT PLACE BOTH PLAYERS");
         return false;
@@ -5022,6 +7634,9 @@ bool networkRuntimeSubmitLocalMove(int destinationTile, int elevation, bool runn
     Object* actor = localPlayerActor();
     if (!networkWorldActive() || actor == nullptr || elevation != actor->elevation) {
         return false;
+    }
+    if (networkRuntimeIsGuestReplica() && !replicaWorldReady) {
+        return true;
     }
     if (destinationTile == actor->tile) {
         return true;
@@ -5060,6 +7675,9 @@ bool networkRuntimeSubmitLocalFacing(int rotation)
     if (!networkWorldActive() || rotation < 0 || rotation >= ROTATION_COUNT) {
         return false;
     }
+    if (networkRuntimeIsGuestReplica() && !replicaWorldReady) {
+        return true;
+    }
     bool combat = networkWorldPhase() == SessionPhase::Combat;
     if (combat && networkWorldActiveCombatOwner() != localPlayerId()) {
         return true;
@@ -5079,6 +7697,72 @@ bool networkRuntimeSubmitLocalFacing(int rotation)
     return submitted;
 }
 
+static int selectNetworkExplosiveTimer(Object* item)
+{
+    if (!obj_is_explosive(item)) return 0;
+    if ((item->flags & OBJECT_USED) != 0
+        || item->pid == PROTO_ID_DYNAMITE_II || item->pid == PROTO_ID_PLASTIC_EXPLOSIVES_II) {
+        char message[] = "The explosive timer is already ticking.";
+        display_print(message);
+        return -1;
+    }
+    return inven_set_timer(item);
+}
+
+static bool submitScannerActivation(EntityId itemId, InventoryAction action, bool combatHud = false)
+{
+    Object* item = networkWorldFindObject(itemId);
+    if (!networkWorldActive() || item == nullptr || item->pid != PROTO_ID_MOTION_SENSOR
+        || item_m_curr_charges(item) <= 0 || pendingScannerActivation.has_value()
+        || lobby.state() != NetworkLobbyState::Ready
+        || (networkRuntimeIsGuestReplica() && (!replicaWorldReady || lobby.recoveryInProgress()))) return false;
+    int initialCharges = item_m_curr_charges(item);
+    auto phase = networkWorldPhase();
+    auto phaseRevision = networkWorldPhaseRevision();
+    if (phase != SessionPhase::Exploration && phase != SessionPhase::Combat) return false;
+    std::uint64_t turn = phase == SessionPhase::Combat ? networkWorldCombatTurnRevision() : 0;
+    InventoryActionCommand command { turn, itemId, action };
+    if (launchOptions.mode == NetworkLaunchMode::Host) {
+        bool accepted = combatHud ? submitHostCommand(CombatItemCommand { turn, itemId }) : submitHostCommand(command);
+        Object* applied = networkWorldFindObject(itemId);
+        // A deferred checkpoint failure cannot undo an applied host action.
+        return applied != nullptr && item_m_curr_charges(applied) == initialCharges - 1
+            && (accepted || !networkRuntimeFailed());
+    }
+    pendingScannerActivation = PendingScannerActivation { lobby.nextLocalCommandSequence(), {} };
+    bool sent = combatHud
+        ? lobby.sendLocalCombatItem(itemId, {}, turn, phaseRevision)
+        : lobby.sendLocalInventoryAction(command, phaseRevision);
+    bool accepted = false;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+    while (sent && std::chrono::steady_clock::now() < deadline
+        && lobby.state() == NetworkLobbyState::Ready && !lobby.recoveryInProgress()
+        && networkWorldPhase() == phase && networkWorldPhaseRevision() == phaseRevision) {
+        networkRuntimeBackgroundProcess();
+        if (!pendingScannerActivation.has_value()) break;
+        if (pendingScannerActivation->result.has_value()) {
+            const auto& result = *pendingScannerActivation->result;
+            if (result.status == CommandStatus::Rejected) break;
+            if (result.eventCount > 0 && lobby.lastAppliedEvent().value
+                    >= result.firstEventSequence.value + result.eventCount - 1) {
+                Object* applied = networkWorldFindObject(itemId);
+                accepted = applied != nullptr && item_m_curr_charges(applied) == initialCharges - 1;
+                break;
+            }
+        }
+        renderPresent();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    pendingScannerActivation.reset();
+    return accepted;
+}
+
+bool networkRuntimeActivateAutomapScanner(Object* scanner)
+{
+    auto id = networkWorldFindEntity(scanner);
+    return id.has_value() && submitScannerActivation(*id, InventoryAction::Scan);
+}
+
 bool networkRuntimeSubmitCombatItem(EntityId itemId, EntityId targetId)
 {
     if (!networkWorldActive() || networkWorldPhase() != SessionPhase::Combat
@@ -5087,10 +7771,75 @@ bool networkRuntimeSubmitCombatItem(EntityId itemId, EntityId targetId)
         return false;
     }
     std::uint64_t revision = networkWorldCombatTurnRevision();
+    std::uint32_t phaseRevision = networkWorldPhaseRevision();
+    Object* item = networkWorldFindObject(itemId);
+    if (item != nullptr && item->pid == PROTO_ID_MOTION_SENSOR) {
+        if (isValid(targetId)) return false;
+        bool activated = submitScannerActivation(itemId, InventoryAction::Use, true);
+        if (activated) automap(true, true);
+        return activated;
+    }
+    if (obj_is_explosive(item)) {
+        if (isValid(targetId) && networkWorldFindObject(targetId) != localPlayerActor()) return false;
+        targetId = {};
+    }
+    int seconds = selectNetworkExplosiveTimer(item);
+    if (seconds == -1 || networkWorldPhase() != SessionPhase::Combat
+        || networkWorldCombatTurnRevision() != revision || networkWorldPhaseRevision() != phaseRevision) return false;
     return launchOptions.mode == NetworkLaunchMode::Host
-        ? submitHostCommand(CombatItemCommand { revision, itemId, targetId })
-        : lobby.sendLocalCombatItem(itemId, targetId, revision,
-              networkWorldPhaseRevision());
+        ? submitHostCommand(CombatItemCommand { revision, itemId, targetId, seconds })
+        : lobby.sendLocalCombatItem(itemId, targetId, revision, phaseRevision, seconds);
+}
+
+bool networkRuntimeHandleInventoryAction(Object* item, InventoryAction action,
+    Object* ammo, std::uint32_t quantity)
+{
+    if (!networkWorldActive()) return false;
+    auto itemId = networkWorldFindEntity(item);
+    auto ammoId = ammo != nullptr ? networkWorldFindEntity(ammo) : std::optional<EntityId> {};
+    if (!itemId.has_value() || (ammo != nullptr && !ammoId.has_value())
+        || (networkRuntimeIsGuestReplica() && !replicaWorldReady)) return true;
+    if (action == InventoryAction::Use && item != nullptr && item->pid == PROTO_ID_MOTION_SENSOR) {
+        if (submitScannerActivation(*itemId, action)) automap(true, true);
+        return true;
+    }
+    InventoryActionCommand command {
+        networkWorldPhase() == SessionPhase::Combat ? networkWorldCombatTurnRevision() : 0,
+        *itemId, action, ammoId.value_or(EntityId {}), quantity,
+    };
+    auto phase = networkWorldPhase();
+    auto phaseRevision = networkWorldPhaseRevision();
+    if (action == InventoryAction::Use) command.timerSeconds = selectNetworkExplosiveTimer(item);
+    if (command.timerSeconds == -1 || networkWorldPhase() != phase
+        || networkWorldPhaseRevision() != phaseRevision
+        || (phase == SessionPhase::Combat && networkWorldCombatTurnRevision() != command.turnRevision)) return true;
+    if (launchOptions.mode == NetworkLaunchMode::Host) {
+        submitHostCommand(command);
+    } else {
+        lobby.sendLocalInventoryAction(command, phaseRevision);
+    }
+    return true;
+}
+
+bool networkRuntimeHandleLocalCombatStart(Object* target, int hitMode, int hitLocation)
+{
+    if (!networkWorldActive()) return false;
+    auto targetId = target != nullptr ? networkWorldFindEntity(target) : std::optional<EntityId> { EntityId {} };
+    if (!targetId.has_value() || networkWorldPhase() != SessionPhase::Exploration
+        || (networkRuntimeIsGuestReplica() && !replicaWorldReady)) return true;
+    StartCombatCommand command { *targetId, hitMode, hitLocation };
+    if (launchOptions.mode == NetworkLaunchMode::Host) submitHostCommand(command);
+    else lobby.sendLocalStartCombat(command, networkWorldPhaseRevision());
+    return true;
+}
+
+bool networkRuntimeSubmitCharacterAdvance(const CharacterAdvanceCommand& command)
+{
+    if (!networkWorldActive() || networkWorldPhase() != SessionPhase::Exploration
+        || (networkRuntimeIsGuestReplica() && !replicaWorldReady)) return false;
+    return launchOptions.mode == NetworkLaunchMode::Host
+        ? submitHostCommand(command)
+        : lobby.sendLocalCharacterAdvance(command, networkWorldPhaseRevision());
 }
 
 bool networkRuntimeSubmitEquipment(const EquipmentCommand& equipment)
@@ -5099,7 +7848,8 @@ bool networkRuntimeSubmitEquipment(const EquipmentCommand& equipment)
     bool submitted = launchOptions.mode == NetworkLaunchMode::Host
         ? submitHostCommand(equipment)
         : lobby.sendLocalEquipment(equipment, networkWorldPhaseRevision());
-    if (submitted) intface_select_item(equipment.activeHand);
+    if (submitted && launchOptions.mode == NetworkLaunchMode::Host && equipment.action == EquipmentAction::Set)
+        intface_select_item(equipment.activeHand);
     return submitted;
 }
 
@@ -5155,11 +7905,13 @@ bool networkRuntimeHandleLocalDoorUse(Object* target)
         return true;
     }
 
+    std::uint64_t turnRevision = networkWorldPhase() == SessionPhase::Combat ? networkWorldCombatTurnRevision() : 0;
+    if (turnRevision != 0 && networkWorldActiveCombatOwner() != localPlayerId()) return true;
     if (launchOptions.mode == NetworkLaunchMode::Host) {
-        submitHostCommand(InteractCommand { *targetId });
+        submitHostCommand(InteractCommand { *targetId, turnRevision });
         return true;
     }
-    if (!lobby.sendLocalDoorUse(*targetId, networkWorldPhaseRevision())) {
+    if (!lobby.sendLocalDoorUse(*targetId, networkWorldPhaseRevision(), turnRevision)) {
         debug_printf("Multiplayer door command could not be sent.\n");
     }
     return true;
@@ -5193,6 +7945,9 @@ bool networkRuntimeHandleLocalPickup(Object* target)
     if (!networkWorldActive() || target == nullptr || FID_TYPE(target->fid) != OBJ_TYPE_ITEM) {
         return false;
     }
+    if (item_get_type(target) == ITEM_TYPE_CONTAINER && !proto_action_can_pickup(target->pid)) {
+        return networkRuntimeHandleLocalLoot(target);
+    }
 
     std::optional<EntityId> targetId = networkWorldFindEntity(target);
     if (!targetId.has_value()) {
@@ -5200,11 +7955,13 @@ bool networkRuntimeHandleLocalPickup(Object* target)
         return true;
     }
 
+    std::uint64_t turnRevision = networkWorldPhase() == SessionPhase::Combat ? networkWorldCombatTurnRevision() : 0;
+    if (turnRevision != 0 && networkWorldActiveCombatOwner() != localPlayerId()) return true;
     if (launchOptions.mode == NetworkLaunchMode::Host) {
-        submitHostCommand(PickupCommand { *targetId });
+        submitHostCommand(PickupCommand { *targetId, turnRevision });
         return true;
     }
-    if (!lobby.sendLocalPickup(*targetId, networkWorldPhaseRevision())) {
+    if (!lobby.sendLocalPickup(*targetId, networkWorldPhaseRevision(), turnRevision)) {
         debug_printf("Multiplayer pickup command could not be sent.\n");
     }
     return true;
@@ -5212,7 +7969,10 @@ bool networkRuntimeHandleLocalPickup(Object* target)
 
 bool networkRuntimeHandleLocalLoot(Object* target)
 {
-    if (!networkWorldActive() || target == nullptr || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER) {
+    if (!networkWorldActive() || target == nullptr
+        || (FID_TYPE(target->fid) != OBJ_TYPE_CRITTER
+            && (FID_TYPE(target->fid) != OBJ_TYPE_ITEM || target->owner != nullptr
+                || item_get_type(target) != ITEM_TYPE_CONTAINER))) {
         return false;
     }
 
@@ -5221,11 +7981,15 @@ bool networkRuntimeHandleLocalLoot(Object* target)
         debug_printf("Multiplayer loot target is missing a shared entity ID.\n");
         return true;
     }
+    std::uint64_t turnRevision = networkWorldPhase() == SessionPhase::Combat ? networkWorldCombatTurnRevision() : 0;
+    if (turnRevision != 0 && networkWorldActiveCombatOwner() != localPlayerId()) return true;
     if (launchOptions.mode == NetworkLaunchMode::Host) {
-        submitHostCommand(LootCommand { *targetId });
+        if (submitHostCommand(LootCommand { *targetId, turnRevision })) {
+            scripts_request_loot_container(localPlayerActor(), target);
+        }
         return true;
     }
-    if (!lobby.sendLocalLoot(*targetId, networkWorldPhaseRevision())) {
+    if (!lobby.sendLocalLoot(*targetId, networkWorldPhaseRevision(), turnRevision)) {
         debug_printf("Multiplayer loot command could not be sent.\n");
     }
     return true;
@@ -5245,11 +8009,14 @@ bool networkRuntimeHandleLocalSkillUse(Object* target, int skill)
         debug_printf("Multiplayer skill target is missing a shared entity ID.\n");
         return true;
     }
+    std::uint64_t turnRevision = explorationSkill == ExplorationSkill::Sneak
+            && networkWorldPhase() == SessionPhase::Combat
+        ? networkWorldCombatTurnRevision() : 0;
     if (launchOptions.mode == NetworkLaunchMode::Host) {
-        submitHostCommand(UseSkillCommand { *targetId, explorationSkill });
+        submitHostCommand(UseSkillCommand { *targetId, explorationSkill, turnRevision });
         return true;
     }
-    if (!lobby.sendLocalSkillUse(*targetId, explorationSkill, networkWorldPhaseRevision())) {
+    if (!lobby.sendLocalSkillUse(*targetId, explorationSkill, networkWorldPhaseRevision(), turnRevision)) {
         debug_printf("Multiplayer skill command could not be sent.\n");
     }
     return true;
@@ -5259,6 +8026,9 @@ bool networkRuntimeHandleLocalItemUse(Object* actor, Object* item, Object* targe
 {
     if (!networkWorldActive() || actor != localPlayerActor()) {
         return false;
+    }
+    if (target == actor && networkWorldPhase() == SessionPhase::Exploration) {
+        return networkRuntimeHandleInventoryAction(item, InventoryAction::Use);
     }
     if (networkWorldPhase() == SessionPhase::Combat) {
         std::optional<EntityId> itemId = networkWorldFindEntity(item);
@@ -5527,6 +8297,20 @@ bool networkRuntimeSubmitDialogueVote(std::uint64_t revision, std::uint8_t optio
         : lobby.sendLocalDialogueVote(revision, option, networkWorldPhaseRevision());
 }
 
+bool networkRuntimeSubmitNpcBarter(const NpcBarterCommand& command)
+{
+    if (!networkWorldActive() || networkWorldPhase() != SessionPhase::Dialogue || !isValid(command)) return false;
+    return launchOptions.mode == NetworkLaunchMode::Host ? submitHostCommand(command)
+        : lobby.sendLocalNpcBarter(command, networkWorldPhaseRevision());
+}
+
+PlayerId networkRuntimePresentedPlayerId() { return launchOptions.mode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId; }
+
+bool networkRuntimeBeginNpcBarter(EntityId sellerId)
+{
+    return networkRuntimeSubmitNpcBarter(NpcBarterCommand { NpcBarterAction::Begin, sellerId });
+}
+
 bool networkRuntimeSubmitDirectTrade(const DirectTradeCommand& trade)
 {
     if (!networkWorldActive()) return false;
@@ -5583,21 +8367,22 @@ void networkRuntimeObserveDialogueDecision(std::uint64_t revision, std::uint8_t 
         static_cast<unsigned long long>(revision), option);
 }
 
-void networkRuntimeProcessPendingTalk()
+bool networkRuntimeProcessPendingTalk()
 {
-    if (launchOptions.mode != NetworkLaunchMode::Host || !networkWorldActive()) return;
+    if (launchOptions.mode != NetworkLaunchMode::Host || !networkWorldActive()) return false;
     EntityId actorId;
     EntityId targetId;
-    if (!networkWorldTakePendingTalk(actorId, targetId)) return;
+    if (!networkWorldTakePendingTalk(actorId, targetId)) return false;
     Object* actor = networkWorldFindObject(actorId);
     Object* target = networkWorldFindObject(targetId);
     PlayerCharacterState* player = playerStateForActor(actor);
     if (actor == nullptr || target == nullptr || player == nullptr) {
         networkWorldEndDialogue();
-        return;
+        return false;
     }
     ScopedActingPlayerContext acting(*player, actor);
     ScopedLocalPlayerBinding binding(actor);
+    ScopedPlayerFeedback feedback(actor);
     if (smokeScenario == SmokeScenario::DialogueGuest
         && player->id == kGuestPlayerId) {
         int guestIntelligence = stat_level(actor, STAT_INTELLIGENCE);
@@ -5621,6 +8406,7 @@ void networkRuntimeProcessPendingTalk()
     if (networkWorldPhase() == SessionPhase::Dialogue) {
         networkWorldEndDialogue();
     }
+    return true;
 }
 
 bool networkRuntimeSubmitLocalWorldMapRoute(std::int32_t targetX, std::int32_t targetY, bool clear)
@@ -5674,9 +8460,23 @@ bool networkRuntimeBlockUnsupportedSharedModal(SharedModalKind kind)
 bool networkRuntimeWorldPaused()
 {
     return networkWorldActive()
-        && (networkWorldSharedModalActive()
+        && (networkWorldPhase() == SessionPhase::Ending || networkWorldSharedModalActive()
             || (networkRuntimeIsGuestReplica()
-                && networkWorldPhase() == SessionPhase::Combat));
+                && (!replicaWorldReady || networkWorldPhase() == SessionPhase::Combat)));
+}
+
+bool networkRuntimeProcessPartyDefeat()
+{
+    if (!networkWorldActive() || networkWorldCombatActionResolving()
+        || !networkWorldPartyDefeated()) return false;
+    bool exitRequired = launchOptions.mode == NetworkLaunchMode::Host
+        ? !isInCombat()
+        : launchOptions.mode == NetworkLaunchMode::Join
+            && networkWorldPhase() == SessionPhase::Ending;
+    if (exitRequired && game_user_wants_to_quit == 0) {
+        game_user_wants_to_quit = 2;
+    }
+    return exitRequired;
 }
 
 bool networkRuntimeHandleLocalLootTargetChange(Object* target)
@@ -5690,11 +8490,12 @@ bool networkRuntimeHandleLocalLootTargetChange(Object* target)
         debug_printf("Multiplayer loot target is missing a shared entity ID.\n");
         return true;
     }
+    std::uint64_t turnRevision = networkWorldPhase() == SessionPhase::Combat ? networkWorldCombatTurnRevision() : 0;
     if (launchOptions.mode == NetworkLaunchMode::Host) {
-        submitHostCommand(LootCommand { *targetId });
+        submitHostCommand(LootCommand { *targetId, turnRevision, true });
         return true;
     }
-    if (!lobby.sendLocalLoot(*targetId, networkWorldPhaseRevision())) {
+    if (!lobby.sendLocalLoot(*targetId, networkWorldPhaseRevision(), turnRevision, true)) {
         debug_printf("Multiplayer loot target change could not be sent.\n");
     }
     return true;
@@ -5759,6 +8560,8 @@ NetworkInventoryTransferDisposition networkRuntimePrepareLocalInventoryTransfer(
             ? NetworkInventoryTransferDisposition::Reject
             : NetworkInventoryTransferDisposition::ApplyLocally;
     }
+    std::uint64_t turnRevision = networkWorldPhase() == SessionPhase::Combat
+        ? networkWorldCombatTurnRevision() : 0;
     if (quantity == 0 || quantity > availableQuantity) {
         return NetworkInventoryTransferDisposition::Reject;
     }
@@ -5793,6 +8596,7 @@ NetworkInventoryTransferDisposition networkRuntimePrepareLocalInventoryTransfer(
             quantity,
             availableQuantity,
             itemDescriptor,
+            turnRevision,
         });
         return accepted
             ? NetworkInventoryTransferDisposition::DeferToHost
@@ -5802,14 +8606,20 @@ NetworkInventoryTransferDisposition networkRuntimePrepareLocalInventoryTransfer(
         return NetworkInventoryTransferDisposition::Reject;
     }
 
+    if (!itemId.has_value()) {
+        debug_printf("Multiplayer guest item is awaiting host identity.\n");
+        return NetworkInventoryTransferDisposition::Reject;
+    }
+
     if (!lobby.sendLocalInventoryTransfer(*sourceId,
             *destinationId,
-            itemId.value_or(EntityId {}),
+            *itemId,
             quantity,
             availableQuantity,
             networkWorldPhaseRevision(),
             {},
-            itemDescriptor)) {
+            itemDescriptor,
+            turnRevision)) {
         debug_printf("Multiplayer inventory transfer command could not be sent.\n");
         return NetworkInventoryTransferDisposition::Reject;
     }
@@ -5879,6 +8689,11 @@ NetworkItemDropDisposition networkRuntimePrepareLocalItemDrop(Object* source,
             : NetworkItemDropDisposition::Reject;
     }
     if (launchOptions.mode != NetworkLaunchMode::Join) {
+        return NetworkItemDropDisposition::Reject;
+    }
+
+    if (!itemId.has_value()) {
+        debug_printf("Multiplayer guest item is awaiting host identity.\n");
         return NetworkItemDropDisposition::Reject;
     }
 
@@ -5975,7 +8790,10 @@ bool networkRuntimeHandleLocalMoneyDrop(Object* source, Object* item, std::uint3
 
 void networkRuntimeLeaveWorld()
 {
+    discardPendingLoadedSave();
     pendingCombatEffectAcks.clear();
+    pendingTheftPresentations.clear();
+    pendingLootPresentations.clear();
     lastSentLocalRotation = -1;
     nextHostCommandSequence = 1;
     nextDirectTradeId = 1;
@@ -5990,6 +8808,9 @@ void networkRuntimeLeaveWorld()
 void networkRuntimeStop()
 {
     set_background_processing_when_inactive(false);
+    set_input_observer(nullptr);
+    storyPlaying = storyFailed = false;
+    playedStoryRevision = storyCompletionSent = 0;
     networkWorldLeave();
     discardPendingLoadedSave();
     agentJournalWriteWorldExit();

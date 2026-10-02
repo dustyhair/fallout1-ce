@@ -246,6 +246,52 @@ static std::string dialogCachePath(const std::string& text, int speakerListId, b
     return relativePath.str();
 }
 
+#if defined(FALLOUT_HAVE_SPEECHD)
+static bool connectSpeechDispatcher()
+{
+    if (multiplayer::networkRuntimeSmokeTestEnabled()) return false;
+    if (tts_connection != nullptr) return true;
+    tts_connection = spd_open("fallout-ce-tts", "main", nullptr, SPD_MODE_THREADED);
+    if (tts_connection == nullptr) {
+        debug_printf("Text-to-speech: could not connect to Speech Dispatcher.\n");
+        return false;
+    }
+    char* stringValue = nullptr;
+    tts_connection->callback_end = speechDispatcherFinished;
+    tts_connection->callback_cancel = speechDispatcherFinished;
+    spd_set_notification_on(tts_connection, SPD_END);
+    spd_set_notification_on(tts_connection, SPD_CANCEL);
+
+    int value = 0;
+    if (config_get_value(&game_config, GAME_CONFIG_TTS_KEY, GAME_CONFIG_TTS_RATE_KEY, &value)) {
+        spd_set_voice_rate(tts_connection, clampSpeechSetting(value));
+    }
+    if (config_get_value(&game_config, GAME_CONFIG_TTS_KEY, GAME_CONFIG_TTS_PITCH_KEY, &value)) {
+        spd_set_voice_pitch(tts_connection, clampSpeechSetting(value));
+    }
+    if (config_get_value(&game_config, GAME_CONFIG_TTS_KEY, GAME_CONFIG_TTS_VOLUME_KEY, &value)) {
+        spd_set_volume(tts_connection, clampSpeechSetting(value));
+    }
+
+    if (config_get_string(&game_config, GAME_CONFIG_TTS_KEY, GAME_CONFIG_TTS_LANGUAGE_KEY, &stringValue)
+        && stringValue[0] != '\0') {
+        spd_set_language(tts_connection, stringValue);
+    }
+    if (config_get_string(&game_config, GAME_CONFIG_TTS_KEY, GAME_CONFIG_TTS_OUTPUT_MODULE_KEY, &stringValue)
+        && stringValue[0] != '\0') {
+        spd_set_output_module(tts_connection, stringValue);
+    }
+    if (config_get_string(&game_config, GAME_CONFIG_TTS_KEY, GAME_CONFIG_TTS_VOICE_KEY, &stringValue)
+        && stringValue[0] != '\0') {
+        spd_set_synthesis_voice(tts_connection, stringValue);
+    }
+
+    spd_set_punctuation(tts_connection, SPD_PUNCT_SOME);
+    debug_printf("Text-to-speech: connected to Speech Dispatcher.\n");
+    return true;
+}
+#endif
+
 bool ttsInit()
 {
     configGetBool(&game_config, GAME_CONFIG_TTS_KEY, GAME_CONFIG_TTS_ENABLED_KEY, &tts_enabled);
@@ -263,48 +309,10 @@ bool ttsInit()
     }
 
     bool speechDispatcherAvailable = false;
-
 #if defined(FALLOUT_HAVE_SPEECHD)
-    // Headless multiplayer smoke runs must not contact Speech Dispatcher.
-    if (!multiplayer::networkRuntimeSmokeTestEnabled()) {
-        tts_connection = spd_open("fallout-ce-tts", "main", nullptr, SPD_MODE_THREADED);
-    }
-    if (tts_connection == nullptr) {
-        debug_printf("Text-to-speech: could not connect to Speech Dispatcher.\n");
-    } else {
-        tts_connection->callback_end = speechDispatcherFinished;
-        tts_connection->callback_cancel = speechDispatcherFinished;
-        spd_set_notification_on(tts_connection, SPD_END);
-        spd_set_notification_on(tts_connection, SPD_CANCEL);
-
-        int value = 0;
-        if (config_get_value(&game_config, GAME_CONFIG_TTS_KEY, GAME_CONFIG_TTS_RATE_KEY, &value)) {
-            spd_set_voice_rate(tts_connection, clampSpeechSetting(value));
-        }
-        if (config_get_value(&game_config, GAME_CONFIG_TTS_KEY, GAME_CONFIG_TTS_PITCH_KEY, &value)) {
-            spd_set_voice_pitch(tts_connection, clampSpeechSetting(value));
-        }
-        if (config_get_value(&game_config, GAME_CONFIG_TTS_KEY, GAME_CONFIG_TTS_VOLUME_KEY, &value)) {
-            spd_set_volume(tts_connection, clampSpeechSetting(value));
-        }
-
-        if (config_get_string(&game_config, GAME_CONFIG_TTS_KEY, GAME_CONFIG_TTS_LANGUAGE_KEY, &stringValue)
-            && stringValue[0] != '\0') {
-            spd_set_language(tts_connection, stringValue);
-        }
-        if (config_get_string(&game_config, GAME_CONFIG_TTS_KEY, GAME_CONFIG_TTS_OUTPUT_MODULE_KEY, &stringValue)
-            && stringValue[0] != '\0') {
-            spd_set_output_module(tts_connection, stringValue);
-        }
-        if (config_get_string(&game_config, GAME_CONFIG_TTS_KEY, GAME_CONFIG_TTS_VOICE_KEY, &stringValue)
-            && stringValue[0] != '\0') {
-            spd_set_synthesis_voice(tts_connection, stringValue);
-        }
-
-        spd_set_punctuation(tts_connection, SPD_PUNCT_SOME);
-        speechDispatcherAvailable = true;
-        debug_printf("Text-to-speech: connected to Speech Dispatcher.\n");
-    }
+    // A disabled session can connect later when the user enables speech.
+    speechDispatcherAvailable = !multiplayer::networkRuntimeSmokeTestEnabled();
+    if (tts_enabled) connectSpeechDispatcher();
 #else
     debug_printf("Text-to-speech: this build has no Speech Dispatcher support.\n");
 #endif
@@ -437,6 +445,10 @@ void ttsRepeat()
 
 void ttsToggle()
 {
+    if (multiplayer::networkRuntimeSmokeTestEnabled()) return;
+#if defined(FALLOUT_HAVE_SPEECHD)
+    if (!tts_enabled && !connectSpeechDispatcher() && !ttsAudioIsAvailable()) return;
+#endif
     if (!tts_available) {
         return;
     }

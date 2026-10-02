@@ -16,6 +16,8 @@
 #include "game/graphlib.h"
 #include "game/gsound.h"
 #include "game/loadsave.h"
+#include "game/map.h"
+#include "multiplayer/network_world.h"
 #include "game/message.h"
 #include "game/scripts.h"
 #include "game/textobj.h"
@@ -332,6 +334,8 @@ static int music_volume;
 
 // 0x661F00
 static bool bk_enable;
+static bool optionsMouseWasEnabled = false;
+static bool optionsScrollingWasEnabled = false;
 
 // 0x661F04
 static int prf_running;
@@ -539,7 +543,10 @@ static int OptnStart()
         return -1;
     }
 
-    bk_enable = map_disable_bk_processes();
+    optionsMouseWasEnabled = multiplayer::networkWorldActive() && gmouse_is_enabled();
+    optionsScrollingWasEnabled = gmouse_scrolling_is_enabled();
+    if (optionsMouseWasEnabled) gmouse_disable(0);
+    bk_enable = map_disable_bk_processes_for_local_ui();
 
     mouse_3d_was_on = gmouse_3d_is_on();
     if (mouse_3d_was_on) {
@@ -606,6 +613,11 @@ static int OptnEnd()
 
     if (bk_enable) {
         map_enable_bk_processes();
+    }
+    if (optionsMouseWasEnabled) {
+        gmouse_enable();
+        if (!optionsScrollingWasEnabled) gmouse_disable_scrolling();
+        optionsMouseWasEnabled = false;
     }
 
     return 0;

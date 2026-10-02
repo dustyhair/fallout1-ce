@@ -66,8 +66,6 @@ private:
     bool _active = false;
     SessionPhase _phase = SessionPhase::Lobby;
     std::uint32_t _phaseRevision = 0;
-    EntityId _hostActorId;
-    EntityId _guestActorId;
     EntityRegistry _entities;
     PlayerCharacterStateStore _players;
     CharacterLobby _characterLobby;

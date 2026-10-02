@@ -47,6 +47,8 @@
 #include "game/worldmap.h"
 #include "multiplayer/developer_local_session.h"
 #include "multiplayer/network_world.h"
+#include "multiplayer/network_runtime.h"
+#include "multiplayer/local_player_context.h"
 #include "multiplayer/presentation_bridge.h"
 #include "tts.h"
 #include "int/movie.h"
@@ -573,7 +575,7 @@ int game_handle_input(int eventCode, bool isInCombatMode)
     case KEY_LOWERCASE_A:
         if (intface_is_enabled()) {
             if (!isInCombatMode) {
-                combat(NULL);
+                if (!multiplayer::networkRuntimeHandleLocalCombatStart()) combat(NULL);
             }
         }
         break;
@@ -600,7 +602,7 @@ int game_handle_input(int eventCode, bool isInCombatMode)
     case KEY_LOWERCASE_C:
         if (intface_is_enabled()) {
             gsound_play_sfx_file("ib1p1xx1");
-            bool isoWasEnabled = map_disable_bk_processes();
+            bool isoWasEnabled = map_disable_bk_processes_for_local_ui();
             editor_design(false);
             if (isoWasEnabled) {
                 map_enable_bk_processes();
@@ -802,6 +804,11 @@ int game_handle_input(int eventCode, bool isInCombatMode)
         break;
     case KEY_COMMA:
     case KEY_LESS:
+        if (multiplayer::networkWorldActive()) {
+            Object* actor = multiplayer::localPlayerActor();
+            if (actor != nullptr) multiplayer::networkRuntimeSubmitLocalFacing((actor->rotation + ROTATION_COUNT - 1) % ROTATION_COUNT);
+            break;
+        }
         if (register_begin(ANIMATION_REQUEST_RESERVED) == 0) {
             register_object_dec_rotation(obj_dude);
             register_end();
@@ -809,6 +816,11 @@ int game_handle_input(int eventCode, bool isInCombatMode)
         break;
     case KEY_DOT:
     case KEY_GREATER:
+        if (multiplayer::networkWorldActive()) {
+            Object* actor = multiplayer::localPlayerActor();
+            if (actor != nullptr) multiplayer::networkRuntimeSubmitLocalFacing((actor->rotation + 1) % ROTATION_COUNT);
+            break;
+        }
         if (register_begin(ANIMATION_REQUEST_RESERVED) == 0) {
             register_object_inc_rotation(obj_dude);
             register_end();

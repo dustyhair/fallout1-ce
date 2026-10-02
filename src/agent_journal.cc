@@ -105,6 +105,8 @@ std::string actorJson(const AgentJournalActorState& actor)
            << ",\"screen_y\":" << actor.screenY
            << ",\"hp\":" << actor.hitPoints
            << ",\"ap\":" << actor.actionPoints
+           << ",\"poison\":" << actor.poison
+           << ",\"radiation\":" << actor.radiation
            << '}';
     return output.str();
 }
@@ -113,6 +115,8 @@ std::string inventoryItemJson(const AgentJournalInventoryItemState& item)
 {
     std::ostringstream output;
     output << "{\"entity_id\":" << item.entityId
+           << ",\"inventory_index\":" << item.inventoryIndex
+           << ",\"holder_id\":" << item.holderId
            << ",\"pid\":" << item.pid
            << ",\"name\":" << jsonString(item.name.c_str())
            << ",\"quantity\":" << item.quantity
@@ -327,8 +331,10 @@ void agentJournalWriteWorldState(const AgentJournalWorldState& state)
     if (state.trade.has_value()) {
         const auto& trade = *state.trade;
         fields << "{\"id\":" << trade.id
-               << ",\"revision\":" << trade.revision
-               << ",\"participants\":[";
+               << ",\"revision\":" << trade.revision;
+        if (trade.npc) fields << ",\"npc\":true,\"offered_value\":" << trade.offeredValue
+            << ",\"asking_value\":" << trade.askingValue << ",\"status\":" << trade.status;
+        fields << ",\"participants\":[";
         for (std::size_t index = 0; index < trade.participants.size(); index++) {
             if (index != 0) fields << ',';
             const auto& participant = trade.participants[index];
@@ -373,6 +379,11 @@ void agentJournalWriteWorldState(const AgentJournalWorldState& state)
             fields << ',';
         }
         fields << inventoryItemJson(state.localInventory[index]);
+    }
+    fields << "],\"contained_inventory\":[";
+    for (std::size_t index = 0; index < state.containedInventory.size(); ++index) {
+        if (index != 0) fields << ',';
+        fields << inventoryItemJson(state.containedInventory[index]);
     }
     fields << "],\"visible_critters\":[";
     for (std::size_t index = 0; index < state.visibleCritters.size(); index++) {

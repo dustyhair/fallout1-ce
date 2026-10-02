@@ -164,6 +164,7 @@ struct WorldMapState {
 
 void worldmap_capture_state(WorldMapState& state);
 bool worldmap_apply_state(const WorldMapState& state);
+bool worldmap_multiplayer_position_is_city();
 bool worldmap_multiplayer_choose_destination(bool encounter,
     int specialEncounter,
     bool enterCity,
@@ -254,6 +255,8 @@ int save_world_map(DB_FILE* stream);
 int load_world_map(DB_FILE* stream);
 int world_map(WorldMapContext ctx);
 void worldmap_multiplayer_open();
+bool worldmap_multiplayer_render_smoke_test();
+WorldMapTravelStepResult worldmap_multiplayer_advance_travel();
 WorldMapContext town_map(WorldMapContext ctx);
 void KillWorldWin();
 int worldmap_script_jump(int city, int a2);

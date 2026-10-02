@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include <algorithm>
+#include <chrono>
 
 #include "game/bmpdlog.h"
 #include "game/config.h"
@@ -12,9 +13,14 @@
 #include "game/gmouse.h"
 #include "game/graphlib.h"
 #include "game/gsound.h"
+#include "game/display.h"
 #include "game/item.h"
 #include "game/map.h"
 #include "game/object.h"
+#include "multiplayer/local_player_context.h"
+#include "multiplayer/network_runtime.h"
+#include "multiplayer/network_world.h"
+#include "multiplayer/presentation_bridge.h"
 #include "platform_compat.h"
 #include "plib/color/color.h"
 #include "plib/gnw/button.h"
@@ -194,6 +200,14 @@ int automap_save(DB_FILE* stream)
     return db_fwriteInt(stream, autoflags);
 }
 
+int automap_player_marker(const Object* actor, int elevation)
+{
+    if (actor == nullptr || actor->tile < 0 || actor->elevation != elevation
+        || FID_TYPE(actor->fid) != OBJ_TYPE_CRITTER) return 0;
+    if (actor == multiplayer::localPlayerActorOrStoryActor()) return 1;
+    return multiplayer::networkWorldActive() && multiplayer::playerStateForActor(actor) != nullptr ? 2 : 0;
+}
+
 // 0x41A80C
 void automap(bool isInGame, bool isUsingScanner)
 {
@@ -253,7 +267,11 @@ void automap(bool isInGame, bool isUsingScanner)
         win_set_button_rest_state(switchBtn, 1, 0);
     }
 
-    int elevation = map_elevation;
+    Object* localActor = multiplayer::localPlayerActorOrStoryActor();
+    int elevation = localActor != nullptr ? localActor->elevation : map_elevation;
+    bool networkMap = multiplayer::networkWorldActive();
+    int originalMap = map_data.field_34;
+    auto nextRefresh = std::chrono::steady_clock::now();
 
     autoflags &= AUTOMAP_WTH_HIGH_DETAILS;
 
@@ -267,7 +285,10 @@ void automap(bool isInGame, bool isUsingScanner)
 
     draw_top_down_map(window, elevation, frmData[AUTOMAP_FRM_BACKGROUND], autoflags);
 
-    bool isoWasEnabled = map_disable_bk_processes();
+    // A personal map must not stop the host's animation/AI for other players.
+    bool isoWasEnabled = networkMap ? false : map_disable_bk_processes();
+    bool mouseWasEnabled = networkMap && gmouse_is_enabled();
+    if (mouseWasEnabled) gmouse_disable(0);
     gmouse_set_cursor(MOUSE_CURSOR_ARROW);
 
     bool done = false;
@@ -275,10 +296,25 @@ void automap(bool isInGame, bool isUsingScanner)
         sharedFpsLimiter.mark();
 
         bool needsRefresh = false;
+        if (networkMap) {
+            if (!multiplayer::networkWorldActive() || map_data.field_34 != originalMap) break;
+            localActor = multiplayer::localPlayerActorOrStoryActor();
+            if (localActor == nullptr) break;
+            if (elevation != localActor->elevation) {
+                elevation = localActor->elevation;
+                autoflags &= ~AUTOMAP_WITH_SCANNER;
+                needsRefresh = true;
+            }
+            if (std::chrono::steady_clock::now() >= nextRefresh) {
+                needsRefresh = true;
+                nextRefresh = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+            }
+        }
 
         // FIXME: There is minor bug in the interface - pressing H/L to toggle
         // high/low details does not update switch state.
         int keyCode = get_input();
+        if (networkMap && game_user_wants_to_quit != 0) break;
         switch (keyCode) {
         case KEY_TAB:
         case KEY_ESCAPE:
@@ -302,28 +338,36 @@ void automap(bool isInGame, bool isUsingScanner)
             break;
         case KEY_UPPERCASE_S:
         case KEY_LOWERCASE_S:
-            if (elevation != map_elevation) {
-                elevation = map_elevation;
+            localActor = multiplayer::localPlayerActorOrStoryActor();
+            if (localActor == nullptr) break;
+            if (elevation != localActor->elevation) {
+                elevation = localActor->elevation;
                 needsRefresh = true;
             }
 
             if ((autoflags & AUTOMAP_WITH_SCANNER) == 0) {
                 Object* scanner = NULL;
 
-                Object* item1 = inven_left_hand(obj_dude);
+                Object* item1 = inven_left_hand(localActor);
                 if (item1 != NULL && item1->pid == PROTO_ID_MOTION_SENSOR) {
                     scanner = item1;
                 } else {
-                    Object* item2 = inven_right_hand(obj_dude);
+                    Object* item2 = inven_right_hand(localActor);
                     if (item2 != NULL && item2->pid == PROTO_ID_MOTION_SENSOR) {
                         scanner = item2;
                     }
                 }
 
                 if (scanner != NULL && item_m_curr_charges(scanner) > 0) {
-                    needsRefresh = true;
-                    autoflags |= AUTOMAP_WITH_SCANNER;
-                    item_m_dec_charges(scanner);
+                    bool activated = networkMap
+                        ? multiplayer::networkRuntimeActivateAutomapScanner(scanner)
+                        : item_m_use_motion_sensor(scanner) == 0;
+                    if (activated) {
+                        needsRefresh = true;
+                        autoflags |= AUTOMAP_WITH_SCANNER;
+                    } else if (networkMap) {
+                        display_print("Motion sensor activation was not confirmed.");
+                    }
                 } else {
                     gsound_play_sfx_file("iisxxxx1");
 
@@ -362,6 +406,7 @@ void automap(bool isInGame, bool isUsingScanner)
     if (isoWasEnabled) {
         map_enable_bk_processes();
     }
+    if (mouseWasEnabled) gmouse_enable();
 
     win_delete(window);
     text_font(oldFont);
@@ -396,9 +441,12 @@ static void draw_top_down_map(int window, int elevation, unsigned char* backgrou
 
         int objectType = FID_TYPE(object->fid);
         unsigned char objectColor;
+        int playerMarker = automap_player_marker(object, elevation);
 
         if ((flags & AUTOMAP_IN_GAME) != 0) {
-            if (objectType == OBJ_TYPE_CRITTER
+            if (playerMarker != 0) {
+                objectColor = colorTable[playerMarker == 1 ? 31744 : 1023];
+            } else if (objectType == OBJ_TYPE_CRITTER
                 && (object->flags & OBJECT_HIDDEN) == 0
                 && (flags & AUTOMAP_WITH_SCANNER) != 0
                 && (object->data.critter.combat.results & DAM_DEAD) == 0) {
@@ -416,8 +464,6 @@ static void draw_top_down_map(int window, int elevation, unsigned char* backgrou
                     && (flags & AUTOMAP_WTH_HIGH_DETAILS) != 0
                     && object->pid != PROTO_ID_0x2000158) {
                     objectColor = colorTable[480];
-                } else if (object == obj_dude) {
-                    objectColor = colorTable[31744];
                 } else {
                     objectColor = colorTable[0];
                 }
@@ -455,7 +501,7 @@ static void draw_top_down_map(int window, int elevation, unsigned char* backgrou
                     v12[1] = objectColor;
                 }
 
-                if (object == obj_dude) {
+                if (playerMarker == 1) {
                     v12[-1] = objectColor;
                     v12[-AUTOMAP_WINDOW_WIDTH] = objectColor;
                     v12[AUTOMAP_WINDOW_WIDTH] = objectColor;

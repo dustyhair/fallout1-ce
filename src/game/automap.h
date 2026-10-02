@@ -6,6 +6,8 @@
 
 namespace fallout {
 
+struct Object;
+
 #define AUTOMAP_DB "AUTOMAP.DB"
 #define AUTOMAP_TMP "AUTOMAP.TMP"
 
@@ -37,6 +39,8 @@ int automap_reset();
 void automap_exit();
 int automap_load(DB_FILE* stream);
 int automap_save(DB_FILE* stream);
+// 0: no player marker, 1: local player, 2: another registered player.
+int automap_player_marker(const Object* actor, int elevation);
 void automap(bool isInGame, bool isUsingScanner);
 int draw_top_down_map_pipboy(int win, int map, int elevation);
 int automap_pip_save();

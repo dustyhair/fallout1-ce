@@ -36,6 +36,7 @@ void gmovie_exit();
 int gmovie_load(DB_FILE* stream);
 int gmovie_save(DB_FILE* stream);
 int gmovie_play(int game_movie, int game_movie_flags);
+int gmovie_play_local(int game_movie, int game_movie_flags);
 bool gmovie_has_been_played(int game_movie);
 
 } // namespace fallout

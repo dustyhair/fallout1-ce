@@ -27,6 +27,9 @@
 #include "game/worldmap.h"
 #include "multiplayer/acting_player_context.h"
 #include "multiplayer/local_player_context.h"
+#include "multiplayer/network_world.h"
+#include "multiplayer/network_runtime.h"
+#include "multiplayer/presentation_bridge.h"
 #include "platform_compat.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/memory.h"
@@ -103,6 +106,7 @@ static int pc_kill_counts[KILL_TYPE_COUNT];
 
 // 0x56BF20
 static int old_rad_level;
+static Object* radiationQueueOwner = nullptr;
 
 // 0x427860
 int critter_init()
@@ -273,7 +277,7 @@ int critter_get_poison(Object* critter)
 
 // Adjust critter's current poison by specified amount.
 //
-// For unknown reason this function only works on dude.
+// Player characters have independent poison resistance and timers.
 //
 // The [amount] can either be positive (adds poison) or negative (removes
 // poison).
@@ -283,9 +287,10 @@ int critter_adjust_poison(Object* critter, int amount)
 {
     MessageListItem messageListItem;
 
-    if (critter != obj_dude) {
+    if (critter != obj_dude && multiplayer::playerStateForActor(critter) == nullptr) {
         return -1;
     }
+    multiplayer::ScopedActorPlayerContext playerContext(critter);
 
     if (amount > 0) {
         // Take poison resistance into account.
@@ -294,16 +299,17 @@ int critter_adjust_poison(Object* critter, int amount)
 
     critter->data.critter.poison += amount;
     if (critter->data.critter.poison > 0) {
-        queue_clear_type(EVENT_TYPE_POISON, NULL);
-        queue_add(10 * (505 - 5 * critter->data.critter.poison), obj_dude, NULL, EVENT_TYPE_POISON);
+        queue_remove_this(critter, EVENT_TYPE_POISON);
+        queue_add(10 * (505 - 5 * critter->data.critter.poison), critter, NULL, EVENT_TYPE_POISON);
 
         // You have been poisoned!
         messageListItem.num = 3000;
-        if (message_search(&misc_message_file, &messageListItem)) {
+        if (amount > 0 && multiplayer::isPresentedPlayerActor(critter) && message_search(&misc_message_file, &messageListItem)) {
             display_print(messageListItem.text);
         }
     } else {
         critter->data.critter.poison = 0;
+        queue_remove_this(critter, EVENT_TYPE_POISON);
     }
 
     return 0;
@@ -314,18 +320,21 @@ int critter_check_poison(Object* obj, void* data)
 {
     MessageListItem messageListItem;
 
-    if (obj != obj_dude) {
+    if (obj != obj_dude && multiplayer::playerStateForActor(obj) == nullptr) {
         return 0;
     }
+    // A cured actor can still have a stale callback from an older save.
+    if (critter_get_poison(obj) <= 0) return 0;
+    multiplayer::ScopedActorPlayerContext playerContext(obj);
 
     critter_adjust_poison(obj, -2);
     critter_adjust_hits(obj, -1);
 
-    intface_update_hit_points(false);
+    if (multiplayer::isPresentedPlayerActor(obj)) intface_update_hit_points(false);
 
     // You take damage from poison.
     messageListItem.num = 3001;
-    if (message_search(&misc_message_file, &messageListItem)) {
+    if (multiplayer::isPresentedPlayerActor(obj) && message_search(&misc_message_file, &messageListItem)) {
         display_print(messageListItem.text);
     }
 
@@ -349,32 +358,35 @@ int critter_adjust_rads(Object* obj, int amount)
     MessageListItem messageListItem;
     Proto* proto;
 
-    if (obj != obj_dude) {
+    if (obj != obj_dude && multiplayer::playerStateForActor(obj) == nullptr) {
         return -1;
     }
 
-    proto_ptr(obj_dude->pid, &proto);
+    multiplayer::ScopedActorPlayerContext playerContext(obj);
+    multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuild();
+    proto_ptr(obj->pid, &proto);
 
     if (amount > 0) {
         amount -= stat_level(obj, STAT_RADIATION_RESISTANCE) * amount / 100;
     }
 
     if (amount > 0) {
-        proto->critter.data.flags |= CRITTER_BARTER;
+        if (build != nullptr) build->prototypeFlags |= CRITTER_BARTER;
+        else proto->critter.data.flags |= CRITTER_BARTER;
     }
 
     if (amount > 0) {
         Object* item;
         Object* geiger_counter = NULL;
 
-        item = inven_left_hand(obj_dude);
+        item = inven_left_hand(obj);
         if (item != NULL) {
             if (item->pid == PROTO_ID_GEIGER_COUNTER_I || item->pid == PROTO_ID_GEIGER_COUNTER_II) {
                 geiger_counter = item;
             }
         }
 
-        item = inven_right_hand(obj_dude);
+        item = inven_right_hand(obj);
         if (item != NULL) {
             if (item->pid == PROTO_ID_GEIGER_COUNTER_I || item->pid == PROTO_ID_GEIGER_COUNTER_II) {
                 geiger_counter = item;
@@ -391,7 +403,7 @@ int critter_adjust_rads(Object* obj, int amount)
                     messageListItem.num = 1008;
                 }
 
-                if (message_search(&misc_message_file, &messageListItem)) {
+                if (multiplayer::isPresentedPlayerActor(obj) && message_search(&misc_message_file, &messageListItem)) {
                     display_print(messageListItem.text);
                 }
             }
@@ -402,7 +414,7 @@ int critter_adjust_rads(Object* obj, int amount)
         // You have received a large dose of radiation.
         messageListItem.num = 1007;
 
-        if (message_search(&misc_message_file, &messageListItem)) {
+        if (multiplayer::isPresentedPlayerActor(obj) && message_search(&misc_message_file, &messageListItem)) {
             display_print(messageListItem.text);
         }
     }
@@ -434,18 +446,23 @@ int critter_check_rads(Object* obj)
     int radiation;
     int radiation_level;
 
-    if (obj != obj_dude) {
+    if (obj != obj_dude && multiplayer::playerStateForActor(obj) == nullptr) {
         return 0;
     }
 
+    multiplayer::ScopedActorPlayerContext playerContext(obj);
+    multiplayer::CharacterBuild* build = multiplayer::actingCharacterBuild();
     proto_ptr(obj->pid, &proto);
-    if ((proto->critter.data.flags & CRITTER_BARTER) == 0) {
+    if (((build != nullptr ? build->prototypeFlags : proto->critter.data.flags) & CRITTER_BARTER) == 0) {
         return 0;
     }
 
     old_rad_level = 0;
 
+    Object* previousOwner = radiationQueueOwner;
+    radiationQueueOwner = obj;
     queue_clear_type(EVENT_TYPE_RADIATION, get_rad_damage_level);
+    radiationQueueOwner = previousOwner;
 
     // NOTE: Uninline
     radiation = critter_get_rads(obj);
@@ -480,7 +497,8 @@ int critter_check_rads(Object* obj)
         queue_add(GAME_TIME_TICKS_PER_HOUR * roll_random(4, 18), obj, radiationEvent, EVENT_TYPE_RADIATION);
     }
 
-    proto->critter.data.flags &= ~(CRITTER_BARTER);
+    if (build != nullptr) build->prototypeFlags &= ~CRITTER_BARTER;
+    else proto->critter.data.flags &= ~CRITTER_BARTER;
 
     return 0;
 }
@@ -490,7 +508,7 @@ static int get_rad_damage_level(Object* obj, void* data)
 {
     RadiationEvent* radiationEvent = (RadiationEvent*)data;
 
-    old_rad_level = radiationEvent->radiationLevel;
+    if (obj == radiationQueueOwner) old_rad_level = radiationEvent->radiationLevel;
 
     return 0;
 }
@@ -498,6 +516,7 @@ static int get_rad_damage_level(Object* obj, void* data)
 // 0x427E78
 static int clear_rad_damage(Object* obj, void* data)
 {
+    if (obj != radiationQueueOwner) return 0;
     RadiationEvent* radiationEvent = (RadiationEvent*)data;
 
     if (radiationEvent->isHealing) {
@@ -512,6 +531,7 @@ static int clear_rad_damage(Object* obj, void* data)
 // 0x427E90
 static void process_rads(Object* obj, int radiationLevel, bool isHealing)
 {
+    multiplayer::ScopedActorPlayerContext playerContext(obj);
     MessageListItem messageListItem;
 
     if (radiationLevel == RADIATION_LEVEL_NONE) {
@@ -521,7 +541,7 @@ static void process_rads(Object* obj, int radiationLevel, bool isHealing)
     int radiationLevelIndex = radiationLevel - 1;
     int modifier = isHealing ? -1 : 1;
 
-    if (obj == obj_dude) {
+    if (multiplayer::isPresentedPlayerActor(obj)) {
         // Radiation level message, higher is worse.
         messageListItem.num = 1000 + radiationLevelIndex;
         if (message_search(&misc_message_file, &messageListItem)) {
@@ -549,7 +569,7 @@ static void process_rads(Object* obj, int radiationLevel, bool isHealing)
     }
 
     if ((obj->data.critter.combat.results & DAM_DEAD) != 0) {
-        if (obj == obj_dude) {
+        if (multiplayer::isPresentedPlayerActor(obj)) {
             // You have died from radiation sickness.
             messageListItem.num = 1006;
             if (message_search(&misc_message_file, &messageListItem)) {
@@ -567,7 +587,10 @@ int critter_process_rads(Object* obj, void* data)
         // Schedule healing stats event in 7 days.
         RadiationEvent* newRadiationEvent = (RadiationEvent*)mem_malloc(sizeof(*newRadiationEvent));
         if (newRadiationEvent != NULL) {
+            Object* previousOwner = radiationQueueOwner;
+            radiationQueueOwner = obj;
             queue_clear_type(EVENT_TYPE_RADIATION, clear_rad_damage);
+            radiationQueueOwner = previousOwner;
             newRadiationEvent->radiationLevel = radiationEvent->radiationLevel;
             newRadiationEvent->isHealing = 1;
             queue_add(GAME_TIME_TICKS_PER_DAY * 7, obj, newRadiationEvent, EVENT_TYPE_RADIATION);
@@ -802,7 +825,8 @@ void critter_kill(Object* critter, int anim, bool refresh_window)
         tile_refresh_rect(&updatedRect, elevation);
     }
 
-    if (critter == obj_dude) {
+    // Shared player outcomes are decided by the multiplayer party policy.
+    if (critter == obj_dude && !multiplayer::networkWorldActive()) {
         game_user_wants_to_quit = 2;
     }
 }
@@ -1081,8 +1105,8 @@ void pc_flag_on(int pc_flag)
         playerActor = obj_dude;
     }
 
-    if (pc_flag == PC_FLAG_SNEAKING && playerActor == obj_dude) {
-        critter_sneak_check(NULL, NULL);
+    if (pc_flag == PC_FLAG_SNEAKING && playerActor != nullptr) {
+        critter_sneak_check(playerActor, NULL);
     }
 
     if (playerActor == obj_dude) {
@@ -1117,14 +1141,21 @@ bool is_pc_flag(int pc_flag)
 // 0x428A98
 int critter_sneak_check(Object* obj, void* data)
 {
-    sneak_working = skill_result(obj_dude, SKILL_SNEAK, 0, NULL) >= ROLL_SUCCESS;
-    queue_add(600, obj_dude, NULL, EVENT_TYPE_SNEAK);
+    if (multiplayer::networkRuntimeIsGuestReplica()) return 0;
+    Object* actor = obj != nullptr ? obj : multiplayer::actingPlayerActorOr(obj_dude);
+    multiplayer::ScopedActorPlayerContext context(actor);
+    if (!is_pc_flag(PC_FLAG_SNEAKING)) return 0;
+    bool working = skill_result(actor, SKILL_SNEAK, 0, NULL) >= ROLL_SUCCESS;
+    if (auto* build = multiplayer::actingCharacterBuildFor(actor)) build->sneakWorking = working;
+    else sneak_working = working;
+    queue_add(600, actor, NULL, EVENT_TYPE_SNEAK);
     return 0;
 }
 
 // 0x428ADC
 int critter_sneak_clear(Object* obj, void* data)
 {
+    multiplayer::ScopedActorPlayerContext context(obj != nullptr ? obj : obj_dude);
     pc_flag_off(PC_FLAG_SNEAKING);
     return 1;
 }
@@ -1136,7 +1167,8 @@ bool is_pc_sneak_working()
 {
     // NOTE: Uninline.
     if (is_pc_flag(PC_FLAG_SNEAKING)) {
-        return sneak_working;
+        auto* build = multiplayer::actingCharacterBuild();
+        return build != nullptr ? build->sneakWorking : sneak_working;
     }
 
     return false;

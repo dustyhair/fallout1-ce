@@ -1392,7 +1392,7 @@ int intface_toggle_items(bool animated)
         return -1;
     }
 
-    itemCurrentItem = 1 - itemCurrentItem;
+    int nextItem = 1 - itemCurrentItem;
 
     if (multiplayer::networkWorldActive()) {
         Object* actor = intface_player();
@@ -1400,13 +1400,14 @@ int intface_toggle_items(bool animated)
         equipment.leftHand = multiplayer::networkWorldFindEntity(inven_left_hand(actor)).value_or(multiplayer::EntityId {});
         equipment.rightHand = multiplayer::networkWorldFindEntity(inven_right_hand(actor)).value_or(multiplayer::EntityId {});
         equipment.armor = multiplayer::networkWorldFindEntity(inven_worn(actor)).value_or(multiplayer::EntityId {});
-        equipment.activeHand = itemCurrentItem;
+        equipment.activeHand = nextItem;
         if (multiplayer::networkWorldPhase() == multiplayer::SessionPhase::Combat) {
             equipment.turnRevision = multiplayer::networkWorldCombatTurnRevision();
         }
         multiplayer::networkRuntimeSubmitEquipment(equipment);
         intface_redraw_items();
     } else if (animated) {
+        itemCurrentItem = nextItem;
         Object* item = itemButtonItems[itemCurrentItem].item;
         int animationCode = 0;
         if (item != NULL) {
@@ -1417,6 +1418,7 @@ int intface_toggle_items(bool animated)
 
         intface_change_fid_animate((intface_player()->fid & 0xF000) >> 12, animationCode);
     } else {
+        itemCurrentItem = nextItem;
         intface_redraw_items();
     }
 
@@ -1522,6 +1524,7 @@ void intface_use_item()
                     }
                 }
             } else {
+                if (multiplayer::networkRuntimeHandleInventoryAction(ptr->item, multiplayer::InventoryAction::Reload)) return;
                 intface_item_reload();
             }
         } else {
@@ -1553,6 +1556,7 @@ void intface_use_item()
                 intface_update_move_points(player->data.critter.combat.ap, combat_free_move);
             }
         } else {
+            if (multiplayer::networkRuntimeHandleInventoryAction(ptr->item, multiplayer::InventoryAction::Use)) return;
             obj_use_item(intface_player(), ptr->item);
             intface_update_items(false);
         }

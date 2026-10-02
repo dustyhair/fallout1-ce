@@ -29,6 +29,8 @@
 #include "game/trait.h"
 #include "multiplayer/network_runtime.h"
 #include "multiplayer/network_world.h"
+#include "multiplayer/local_player_context.h"
+#include "multiplayer/presentation_bridge.h"
 #include "plib/color/color.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/input.h"
@@ -1139,6 +1141,7 @@ int action_get_an_object(Object* critter, Object* item)
         Art* art = art_ptr_lock(fid, &cacheEntry);
         if (art != NULL) {
             actionFrame = art_frame_action_frame(art);
+            art_ptr_unlock(cacheEntry);
         } else {
             actionFrame = -1;
         }
@@ -1169,7 +1172,7 @@ int action_get_an_object(Object* critter, Object* item)
         int actionFrame;
         CacheEntry* cacheEntry;
         Art* art = art_ptr_lock(fid, &cacheEntry);
-        if (art == NULL) {
+        if (art != NULL) {
             actionFrame = art_frame_action_frame(art);
             art_ptr_unlock(cacheEntry);
         } else {
@@ -1229,6 +1232,7 @@ int action_loot_container(Object* critter, Object* container)
 int action_skill_use(int skill)
 {
     if (skill == SKILL_SNEAK) {
+        if (multiplayer::networkRuntimeHandleLocalSkillUse(multiplayer::localPlayerActorOrStoryActor(), skill)) return 0;
         register_clear(obj_dude);
         pc_flag_toggle(PC_FLAG_SNEAKING);
         return 0;
@@ -1703,6 +1707,7 @@ int action_explode(int tile, int elevation, int minDamage, int maxDamage, Object
 // 0x412EBC
 static int report_explosion(Attack* attack, Object* a2)
 {
+    bool playerSource = a2 == obj_dude || multiplayer::playerStateForActor(a2) != nullptr;
     bool mainTargetWasDead;
     if (attack->defender != NULL) {
         mainTargetWasDead = (attack->defender->data.critter.combat.results & DAM_DEAD) != 0;
@@ -1724,7 +1729,7 @@ static int report_explosion(Attack* attack, Object* a2)
     if (a2 != NULL) {
         if (attack->defender != NULL && attack->defender != a2) {
             if ((attack->defender->data.critter.combat.results & DAM_DEAD) != 0) {
-                if (a2 == obj_dude && !mainTargetWasDead) {
+                if (playerSource && !mainTargetWasDead) {
                     xp += critter_kill_exps(attack->defender);
                 }
             } else {
@@ -1737,7 +1742,7 @@ static int report_explosion(Attack* attack, Object* a2)
             Object* critter = attack->extras[index];
             if (critter != a2) {
                 if ((critter->data.critter.combat.results & DAM_DEAD) != 0) {
-                    if (a2 == obj_dude && !extrasWasDead[index]) {
+                    if (playerSource && !extrasWasDead[index]) {
                         xp += critter_kill_exps(critter);
                     }
                 } else {
@@ -1769,7 +1774,7 @@ static int report_explosion(Attack* attack, Object* a2)
     mem_free(attack);
     game_ui_enable();
 
-    if (a2 == obj_dude) {
+    if (playerSource) {
         combat_give_exps(xp);
     }
 

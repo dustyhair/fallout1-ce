@@ -2,6 +2,9 @@
 
 set -euo pipefail
 
+# Headless tests should not open the workstation's audio device.
+export SDL_AUDIODRIVER=${SDL_AUDIODRIVER:-dummy}
+
 if [[ $# -lt 2 || $# -gt 3 ]]; then
     echo "usage: $0 FALLOUT_CE_BINARY FALLOUT_DATA_ROOT [OUTPUT_DIRECTORY]" >&2
     exit 2
@@ -125,6 +128,7 @@ run_scenario trade --multiplayer-smoke-scenario=trade
 run_scenario knife_gift --multiplayer-smoke-scenario=trade --multiplayer-smoke-knife-gift
 run_scenario knife_combat --multiplayer-smoke-scenario=combat-attack --multiplayer-smoke-weapon=knife
 run_scenario pistol_aimed_combat --multiplayer-smoke-scenario=combat-attack --multiplayer-smoke-weapon=pistol
+run_scenario inventory_actions --multiplayer-smoke-scenario=combat-attack --multiplayer-smoke-weapon=pistol --multiplayer-smoke-inventory-actions
 run_scenario rat_death --multiplayer-smoke-scenario=combat-kill
 run_scenario container --multiplayer-smoke-scenario=container
 run_scenario quest --multiplayer-smoke-scenario=quest
@@ -146,6 +150,9 @@ if [[ ${FALLOUT_CAMPAIGN_FULL:-0} == 1 ]]; then
         worldmap-takeover worldmap-town worldmap-town-guest worldmap-queue; do
         run_scenario "$scenario" "--multiplayer-smoke-scenario=$scenario"
     done
+    run_scenario guest_combat_start --multiplayer-smoke-scenario=combat-turn --multiplayer-smoke-guest-combat-start
+    run_scenario guest_first_attack --multiplayer-smoke-scenario=combat-attack --multiplayer-smoke-guest-combat-attack
+    run_scenario guest_floor_attack --multiplayer-smoke-scenario=combat-attack --multiplayer-smoke-guest-combat-attack --multiplayer-smoke-guest-combat-floor
     run_scenario rest_fixed --multiplayer-smoke-scenario=rest --multiplayer-smoke-rest-minutes=10
     run_scenario rest_healing --multiplayer-smoke-scenario=rest --multiplayer-smoke-rest-minutes=180
     run_scenario rest_until_healed --multiplayer-smoke-scenario=rest --multiplayer-smoke-rest-choice=until_healed

@@ -42,25 +42,20 @@ LocalSessionError LocalSession::start(Object* hostActor, Object* guestActor)
         return LocalSessionError::RegistryFailure;
     }
 
-    _hostActorId = host.entityId;
-    _guestActorId = guest.entityId;
-
     PlayerCharacterState hostState;
     hostState.id = kHostPlayerId;
-    hostState.actorId = _hostActorId;
+    hostState.actorId = host.entityId;
     hostState.ownership = PlayerOwnership::LocalControl;
     hostState.connection = ConnectionState::Local;
     PlayerCharacterState guestState;
     guestState.id = kGuestPlayerId;
-    guestState.actorId = _guestActorId;
+    guestState.actorId = guest.entityId;
     guestState.ownership = PlayerOwnership::LocalControl;
     guestState.connection = ConnectionState::Local;
     if (_players.registerPlayer(hostState, _entities) != PlayerStateError::None
         || _players.registerPlayer(guestState, _entities) != PlayerStateError::None) {
         _players.clear();
         _entities.clear();
-        _hostActorId = {};
-        _guestActorId = {};
         return LocalSessionError::RegistryFailure;
     }
 
@@ -87,8 +82,6 @@ void LocalSession::stop()
     _characterLobby.reset();
     _restoredPlayersReady = false;
     _entities.clear();
-    _hostActorId = {};
-    _guestActorId = {};
     _phase = SessionPhase::Lobby;
     _phaseRevision = 0;
     _active = false;
@@ -207,13 +200,8 @@ bool LocalSession::characterLobbyReady() const
 
 EntityId LocalSession::playerActorId(PlayerId playerId) const
 {
-    if (playerId == kHostPlayerId) {
-        return _hostActorId;
-    }
-    if (playerId == kGuestPlayerId) {
-        return _guestActorId;
-    }
-    return {};
+    const PlayerCharacterState* player = _players.find(playerId);
+    return player != nullptr ? player->actorId : EntityId {};
 }
 
 LocalSessionError LocalSession::rebindPlayerActor(PlayerId playerId, Object* replacement)

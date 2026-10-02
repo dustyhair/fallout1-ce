@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "agent_journal.h"
+#include "multiplayer/network_world.h"
 #include "game/art.h"
 #include "game/combat.h"
 #include "game/gmouse.h"
@@ -194,6 +195,7 @@ void display_print(char* str)
     static unsigned int lastTime;
 
     agentJournalWriteText("display", str);
+    if (multiplayer::networkWorldRoutePlayerFeedback(str)) return;
 
     if (!disp_init) {
         return;

@@ -92,19 +92,35 @@ struct DirectTradeExecution {
     bool inventoryChanged = false;
 };
 
+struct NpcBarterExecution {
+    CommandExecutionStatus status = CommandExecutionStatus::InvalidAction;
+    NpcBarterState state;
+};
+
 class CommandExecutor {
 public:
     virtual ~CommandExecutor() = default;
+    // Checked after identity/ownership validation and before native effects.
+    virtual bool actorCanExecute(Object*, const GameCommand&) const { return true; }
+    virtual CommandExecutionStatus startCombat(Object*, Object*, const StartCombatCommand&) { return CommandExecutionStatus::InvalidAction; }
+    virtual CommandExecutionStatus advanceCharacter(Object*, const CharacterAdvanceCommand&) { return CommandExecutionStatus::InvalidAction; }
+    virtual NpcBarterExecution npcBarter(Object*, const NpcBarterCommand&) { return {}; }
 
+    virtual bool movementRunning(Object*, bool requested)
+    {
+        return requested;
+    }
     virtual CommandExecutionStatus move(Object* actor, const MoveCommand& command) = 0;
     virtual CommandExecutionStatus face(Object* actor, const FaceCommand& command) = 0;
-    virtual DoorUseExecution useDoor(Object* actor, Object* target) = 0;
-    virtual CommandExecutionStatus pickup(Object* actor, Object* target) = 0;
-    virtual CommandExecutionStatus loot(Object* actor, Object* target) = 0;
+    virtual DoorUseExecution useDoor(Object* actor, Object* target, std::uint64_t turnRevision = 0) = 0;
+    virtual CommandExecutionStatus pickup(Object* actor, Object* target, std::uint64_t turnRevision = 0) = 0;
+    virtual CommandExecutionStatus loot(Object* actor, Object* target, std::uint64_t turnRevision = 0, bool targetChange = false) = 0;
     virtual CommandExecutionStatus useSkill(Object*, Object*, const UseSkillCommand&)
     {
         return CommandExecutionStatus::InvalidAction;
     }
+    virtual bool skillInventoryOpened(Object*, Object*) const { return false; }
+
     virtual CommandExecutionStatus useItemOn(Object*, Object*, Object*, const UseItemOnCommand&)
     {
         return CommandExecutionStatus::InvalidAction;
@@ -138,6 +154,10 @@ public:
         return CommandExecutionStatus::InvalidAction;
     }
     virtual CommandExecutionStatus combatReload(Object*, const CombatReloadCommand&)
+    {
+        return CommandExecutionStatus::InvalidAction;
+    }
+    virtual CommandExecutionStatus inventoryAction(Object*, const InventoryActionCommand&)
     {
         return CommandExecutionStatus::InvalidAction;
     }

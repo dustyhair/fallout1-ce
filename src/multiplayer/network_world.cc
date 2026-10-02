@@ -1,5 +1,6 @@
 #include "multiplayer/network_world.h"
 #include "multiplayer/network_runtime.h"
+#include "multiplayer/character_advancement.h"
 
 #include <algorithm>
 #include <array>
@@ -16,6 +17,7 @@
 #include <vector>
 
 #include "game/actions.h"
+#include "game/automap.h"
 #include "game/anim.h"
 #include "game/art.h"
 #include "game/combat.h"
@@ -39,7 +41,9 @@
 #include "game/proto.h"
 #include "game/queue.h"
 #include "game/roll.h"
+#include "game/reaction.h"
 #include "game/scripts.h"
+#include "game/skill.h"
 #include "game/stat.h"
 #include "game/tile.h"
 #include "game/worldmap.h"
@@ -70,6 +74,7 @@ CombatTurnController combatTurns;
 // Inventory access is charged once, as in handle_inventory. A turn change
 // invalidates access even if a disconnected client never sends CloseInventory.
 std::unordered_map<EntityId, std::uint64_t, EntityIdHash> openInventories;
+std::unordered_map<EntityId, std::uint64_t, EntityIdHash> openLootTurns;
 bool combatActionResolving = false;
 constexpr std::uint64_t kCombatTurnDurationMilliseconds = 60000;
 
@@ -92,6 +97,9 @@ std::unordered_map<EntityId, PendingPickup, EntityIdHash> pendingPickups;
 std::deque<GameEvent> deferredEvents;
 DialogueVoteController dialogueVotes;
 DirectTradeController directTradeController;
+std::optional<NpcBarterState> npcBarterState;
+std::optional<std::pair<EntityId, EntityId>> pendingScriptedNpcBarter;
+std::uint64_t nextNpcBarterRevision = 1;
 LootDistributionController lootDistribution;
 std::optional<DialoguePresentationEvent> dialoguePresentation;
 struct PendingTalk {
@@ -100,13 +108,29 @@ struct PendingTalk {
     CommandSequence causedBy;
 };
 std::optional<PendingTalk> pendingTalk;
+struct PendingCombatStart {
+    EntityId actorId;
+    StartCombatCommand command;
+    CommandSequence causedBy;
+    bool started = false;
+};
+std::optional<PendingCombatStart> pendingCombatStart;
 CommandSequence dialogueCause;
 std::uint64_t nextDialogueRevision = 1;
 std::deque<SharedActivityEntry> sharedActivity;
 std::uint64_t nextSharedActivityId = 1;
 std::uint32_t observedFirstVisits = 0;
 
+Object* playerFeedbackActor = nullptr;
 std::unordered_map<Object*, Object*> activeLootTargets;
+struct TheftAccess {
+    Object* target;
+    int attempts = 0;
+    int experience = 0;
+    int nextExperience = 10;
+};
+std::unordered_map<Object*, TheftAccess> theftAccess;
+void finishTheft(Object* actor, bool caught);
 struct ActiveSharedModal {
     EntityId actorId;
     SharedModalKind kind = SharedModalKind::Dialogue;
@@ -165,6 +189,12 @@ std::optional<PendingWorldMapProposal> pendingWorldMapProposal;
 bool inventoryTransferInProgress = false;
 bool itemDropInProgress = false;
 bool itemUseInProgress = false;
+struct PendingDialogueMapTransition {
+    MapTransition destination;
+    EntityId actorId;
+    CommandSequence cause;
+};
+std::optional<PendingDialogueMapTransition> pendingDialogueMapTransition;
 bool scriptedSceneryTransitionInProgress = false;
 std::optional<MapTransition> capturedSceneryMapTransition;
 struct PendingRestProposal {
@@ -453,6 +483,7 @@ bool worldMapProposalSourceReady()
 constexpr auto kRestProposalLifetime = std::chrono::seconds(90);
 constexpr auto kWorldMapProposalLifetime = std::chrono::seconds(90);
 NetworkLaunchMode worldMode = NetworkLaunchMode::Disabled;
+StoryPresentationState storyPresentation;
 
 void queueCombatTurnState()
 {
@@ -515,6 +546,13 @@ bool typedStairCanBeUsedIndependently(const Object* stair, int sourceMap)
         && stair->elevation == 0;
 }
 
+bool isWorldMapDestination(int map)
+{
+    // Native map_leave_map normalizes 0 to -2. -1 opens the town map
+    // before world travel; -2 opens world travel directly.
+    return map >= -2 && map <= 0;
+}
+
 bool exitGridDestination(const Object* exitGrid,
     int& map,
     int& tile,
@@ -528,8 +566,8 @@ bool exitGridDestination(const Object* exitGrid,
     tile = exitGrid->data.misc.tile;
     elevation = exitGrid->data.misc.elevation;
     rotation = exitGrid->data.misc.rotation;
-    if (map == 0) {
-        // Fallout's world-map exit has no destination map placement yet.
+    if (isWorldMapDestination(map)) {
+        // World travel has no destination map placement yet.
         return true;
     }
     return map > 0
@@ -917,6 +955,8 @@ bool applyActorAndCritterState(const WorldSnapshot& snapshot, bool preserveMovem
         // A replica applies the host's selected death and animation state; it
         // must never call critter_kill through critter_adjust_hits here.
         actor->data.critter.hp = actorState.hitPoints;
+        actor->data.critter.poison = actorState.poison;
+        actor->data.critter.radiation = actorState.radiation;
         actor->data.critter.combat.ap = actorState.actionPoints;
         actor->data.critter.combat.results = actorState.combatResults;
         actor->data.critter.combat.maneuver = actorState.combatManeuver;
@@ -966,6 +1006,12 @@ bool applyActorAndCritterState(const WorldSnapshot& snapshot, bool preserveMovem
         critter->data.critter.combat.team = critterState.team;
         critter->data.critter.combat.maneuver = critterState.combatManeuver;
         critter->data.critter.combat.damageLastTurn = critterState.damageLastTurn;
+        // Replicas retain native companion membership for inventory, travel
+        // and save/load lifecycle; only authority runs companion scripts/AI.
+        if (critterState.partyMember != isPartyMember(critter)) {
+            int result = critterState.partyMember ? partyMemberAdd(critter) : partyMemberRemove(critter);
+            if (result != 0) return false;
+        }
         if (dirty) {
             tile_refresh_rect(&dirtyRect, critterState.elevation);
         }
@@ -1016,22 +1062,6 @@ bool itemDescriptorsEqual(const ItemDescriptor& left, const ItemDescriptor& righ
         && left.extendedFlags == right.extendedFlags
         && left.data0 == right.data0
         && left.data1 == right.data1;
-}
-
-bool hasDirectItemWithDescriptor(const Object* holder, const ItemDescriptor& descriptor)
-{
-    if (holder == nullptr) {
-        return false;
-    }
-    const Inventory& inventory = holder->data.inventory;
-    for (int index = 0; index < inventory.length; index++) {
-        ItemDescriptor candidateDescriptor;
-        if (describeItem(inventory.items[index].item, candidateDescriptor)
-            && itemDescriptorsEqual(candidateDescriptor, descriptor)) {
-            return true;
-        }
-    }
-    return false;
 }
 
 bool snapshotSceneryLayoutMismatch(const WorldSnapshot& snapshot)
@@ -1344,14 +1374,24 @@ Object* topEnvironmentOrSelf(Object* object)
     return top != nullptr ? top : object;
 }
 
-bool lootTargetIsInRange(Object* actor, Object* target)
+bool lootTargetIsValid(Object* actor, Object* target)
 {
     return actor != nullptr
         && target != nullptr
         && actor != target
-        && FID_TYPE(target->fid) == OBJ_TYPE_CRITTER
+        && ((FID_TYPE(target->fid) == OBJ_TYPE_CRITTER && !critter_is_active(target))
+            || (FID_TYPE(target->fid) == OBJ_TYPE_ITEM && target->owner == nullptr
+                && item_get_type(target) == ITEM_TYPE_CONTAINER && !obj_is_locked(target)))
         && actor->elevation == target->elevation
-        && obj_dist(actor, target) == 1;
+        && actor->tile >= 0 && target->tile >= 0
+        && (target->flags & OBJECT_HIDDEN) == 0;
+}
+
+bool lootTargetIsInRange(Object* actor, Object* target)
+{
+    return lootTargetIsValid(actor, target)
+        // Native adjacency includes overlapping a large corpse's footprint.
+        && obj_dist(actor, target) <= 1;
 }
 
 bool isPlayerActor(Object* actor)
@@ -1360,12 +1400,89 @@ bool isPlayerActor(Object* actor)
     return actorId.has_value() && session.players().findByActor(*actorId) != nullptr;
 }
 
-bool isAdjacentPlayerActor(Object* actor, Object* target)
+bool approachInventoryTarget(Object* actor, Object* target, std::uint64_t turnRevision = 0)
 {
-    if (!lootTargetIsInRange(actor, target)) {
+    if (actor == nullptr || target == nullptr || actor->elevation != target->elevation
+        || !hexGridTileIsValid(actor->tile) || !hexGridTileIsValid(target->tile)) return false;
+    auto actorId = session.entities().findEntity(actor);
+    auto targetId = session.entities().findEntity(target);
+    if (!actorId.has_value() || !targetId.has_value() || register_clear(actor) == -2) return false;
+    if (obj_dist(actor, target) <= 1) return true;
+    if (register_begin(actor == obj_dude ? ANIMATION_REQUEST_RESERVED : ANIMATION_REQUEST_UNRESERVED) == -1)
+        return false;
+    // Some weapon sets have walking art but no armed running animation.
+    int runningFid = art_id(FID_TYPE(actor->fid), actor->fid & 0xFFF, ANIM_RUNNING,
+        (actor->fid & 0xF000) >> 12, actor->rotation + 1);
+    bool combat = turnRevision != 0;
+    int movementAp = combat ? actor->data.critter.combat.ap : -1;
+    int result = !combat && obj_dist(actor, target) >= 5 && art_exists(runningFid)
+        ? register_object_run_to_object(actor, target, -1, 0)
+        : register_object_move_to_object(actor, target, movementAp, 0);
+    int committed = register_end();
+    if (result == -1 || committed == -1) {
+        std::fprintf(stderr, "INVENTORY_APPROACH_REGISTRATION_FAILED actor=%u fid=%d result=%d committed=%d distance=%d\n",
+            actorId->value, actor->fid, result, committed, obj_dist(actor, target));
+        register_clear(actor);
         return false;
     }
-    return isPlayerActor(target);
+    // Finish host movement before publishing the skill event and checkpoint.
+    // Keep the authenticated acting-player context alive while callbacks run.
+    combatActionResolving = true;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (session.entities().findObject(*actorId) == actor
+        && session.entities().findObject(*targetId) == target
+        && anim_busy(actor) == -1 && std::chrono::steady_clock::now() < deadline) {
+        process_bk();
+        renderPresent();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    bool present = session.entities().findObject(*actorId) == actor
+        && session.entities().findObject(*targetId) == target;
+    if (session.entities().findObject(*actorId) == actor && anim_busy(actor) == -1) register_clear(actor);
+    combatActionResolving = false;
+    if (present && obj_dist(actor, target) > 1)
+        std::fprintf(stderr, "INVENTORY_APPROACH_UNREACHABLE actor=%u fid=%d tile=%d target=%d distance=%d\n",
+            actorId->value, actor->fid, actor->tile, target->tile, obj_dist(actor, target));
+    if (!present) return false;
+    bool phaseMatches = combat
+        ? session.phase() == SessionPhase::Combat && isInCombat()
+            && combatTurns.revision() == turnRevision && networkWorldCombatTurnMatches(actor)
+        : session.phase() == SessionPhase::Exploration && !isInCombat();
+    return present && phaseMatches
+        && critter_is_active(actor) && actor->elevation == target->elevation && obj_dist(actor, target) <= 1;
+}
+
+bool finishInteractionAnimation(Object* actor, Object* target)
+{
+    auto actorId = session.entities().findEntity(actor).value_or(EntityId {});
+    auto targetId = session.entities().findEntity(target).value_or(EntityId {});
+    combatActionResolving = true;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    auto busy = [&]() {
+        return anim_busy(actor) == -1
+            || (session.entities().findObject(targetId) == target && anim_busy(target) == -1);
+    };
+    while (session.entities().findObject(actorId) == actor && busy()
+        && std::chrono::steady_clock::now() < deadline) {
+        process_bk();
+        renderPresent();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    bool finished = session.entities().findObject(actorId) == actor && !busy();
+    if (!finished) {
+        if (session.entities().findObject(actorId) == actor) register_clear(actor);
+        if (session.entities().findObject(targetId) == target) register_clear(target);
+    }
+    combatActionResolving = false;
+    return finished;
+}
+
+bool isAdjacentPlayerActor(Object* actor, Object* target)
+{
+    // Gifts share the distance rule with loot, but the recipient is alive.
+    return actor != nullptr && target != nullptr && actor != target
+        && actor->elevation == target->elevation && obj_dist(actor, target) == 1
+        && isPlayerActor(target);
 }
 
 bool inventoryTransferWouldCycle(Object* destination, Object* item)
@@ -1516,6 +1633,15 @@ bool loadSharedMap(int map, bool snapshotRecovery = false)
         return false;
     }
 
+    // Loading destroys the peer object. Map entry scripts must use the native
+    // story actor, not the departing guest retained by the command's scope.
+    // Otherwise dude_obj can return freed memory while a script grants items.
+    auto* nativePlayer = session.players().find(worldMode == NetworkLaunchMode::Host
+        ? kHostPlayerId : kGuestPlayerId);
+    if (nativePlayer == nullptr || obj_dude == nullptr) return false;
+    ScopedActingPlayerContext mapContext(*nativePlayer, obj_dude);
+
+    DetachedActorQueueEvents preservedTimers(peerActor);
     PreservedPeerActor preserved;
     preserved.inventory = peerActor->data.inventory;
     preserved.critter = peerActor->data.critter;
@@ -1531,6 +1657,7 @@ bool loadSharedMap(int map, bool snapshotRecovery = false)
     worldCritters.clear();
     reservedPickupTargets.clear();
     pendingPickups.clear();
+    pendingCombatStart.reset();
     deferredEvents.clear();
     dialogueVotes.clear();
     dialoguePresentation.reset();
@@ -1538,6 +1665,7 @@ bool loadSharedMap(int map, bool snapshotRecovery = false)
     dialogueCause = {};
     nextDialogueRevision = 1;
     activeLootTargets.clear();
+    theftAccess.clear();
     activeSharedModal.reset();
     approvedWorldMapProposerActorId = {};
     approvedWorldMapProposalSequence = {};
@@ -1585,6 +1713,7 @@ bool loadSharedMap(int map, bool snapshotRecovery = false)
         return false;
     }
     peerActor = replacement;
+    preservedTimers.restore(replacement);
     return true;
 }
 
@@ -1702,6 +1831,7 @@ void healRemotePlayersForHours(int hours)
 bool advanceSharedRest(int minutes, bool untilHealed)
 {
     if (networkRuntimeSimulationStopped()) return true;
+    if (networkWorldPartyDefeated()) return true;
     constexpr int kTicksPerMinute = GAME_TIME_TICKS_PER_HOUR / 60;
     int endTime = game_time() + minutes * kTicksPerMinute;
     int nextHealingTime = game_time() + 3 * GAME_TIME_TICKS_PER_HOUR;
@@ -1734,7 +1864,8 @@ bool advanceSharedRest(int minutes, bool untilHealed)
         set_game_time(nextTime);
         if (nextEventTime > 0 && nextEventTime <= game_time()) {
             int queueResult = queue_process();
-            if (queueResult != 0 || game_user_wants_to_quit != 0 || networkRuntimeSimulationStopped()) {
+            if (queueResult != 0 || game_user_wants_to_quit != 0
+                || networkRuntimeSimulationStopped() || networkWorldPartyDefeated()) {
                 std::fprintf(stderr,
                     "Multiplayer rest interrupted by queue at time=%d result=%d quit=%d.\n",
                     game_time(), queueResult, game_user_wants_to_quit);
@@ -1780,6 +1911,19 @@ bool validateDirectTradePlan(const DirectTradeCommitPlan& plan)
                 return false;
             }
         }
+    }
+    return true;
+}
+
+bool registerUntrackedInventory(Object* owner)
+{
+    if (owner == nullptr) return false;
+    Inventory* inventory = &owner->data.inventory;
+    for (int index = 0; index < inventory->length; index++) {
+        Object* item = inventory->items[index].item;
+        if (!session.entities().findEntity(item).has_value()
+            && !registerItem(item)) return false;
+        if (!registerUntrackedInventory(item)) return false;
     }
     return true;
 }
@@ -1838,22 +1982,67 @@ bool discoverUntrackedWorldObjects()
     return true;
 }
 
-bool registerUntrackedInventory(Object* owner)
+bool npcBarterItemAvailable(Object* owner, Object* item, bool seller)
 {
-    if (owner == nullptr) return false;
-    Inventory* inventory = &owner->data.inventory;
-    for (int index = 0; index < inventory->length; index++) {
-        Object* item = inventory->items[index].item;
-        if (!session.entities().findEntity(item).has_value()
-            && !registerItem(item)) return false;
-        if (!registerUntrackedInventory(item)) return false;
+    if (owner == nullptr || item == nullptr || item->owner != owner || item->pid == PROTO_ID_MONEY
+        || (item->flags & (OBJECT_EQUIPPED | OBJECT_USED)) != 0 || item_queued(item)) return false;
+    if (seller && inven_right_hand(owner) == nullptr && item == inven_find_type(owner, ITEM_TYPE_WEAPON, nullptr)) return false;
+    return true;
+}
+
+bool validateNpcBarterOffer(Object* owner, const DirectTradeOffer& offer, bool seller)
+{
+    if (!isValidBarterOffer(offer) || offer.caps > static_cast<unsigned>(std::max(0, item_caps_total(owner)))) return false;
+    for (const auto& entry : offer.items) {
+        Object* item = session.entities().findObject(entry.itemId);
+        if (!npcBarterItemAvailable(owner, item, seller)
+            || entry.quantity > static_cast<unsigned>(item_count(owner, item))) return false;
     }
     return true;
 }
 
-bool applyDirectTradePlan(const DirectTradeCommitPlan& plan)
+std::uint32_t npcBarterOfferValue(const DirectTradeOffer& offer)
 {
-    if (!validateDirectTradePlan(plan)) return false;
+    std::int64_t value = offer.caps;
+    for (const auto& entry : offer.items) {
+        Object* item = session.entities().findObject(entry.itemId);
+        if (item == nullptr) return 0;
+        if (item_get_type(item) == ITEM_TYPE_AMMO) {
+            Proto* proto = nullptr;
+            if (proto_ptr(item->pid, &proto) != 0) return 0;
+            value += static_cast<std::int64_t>(proto->item.cost) * (entry.quantity - 1) + item_cost(item);
+        } else value += static_cast<std::int64_t>(item_cost(item)) * entry.quantity;
+    }
+    return static_cast<std::uint32_t>(std::clamp<std::int64_t>(value, 0, INT32_MAX));
+}
+
+void priceNpcBarter(Object* buyer, Object* seller, NpcBarterState& state)
+{
+    int modifier = 0;
+    switch (reaction_to_level(reaction_get(seller))) {
+    case NPC_REACTION_BAD: modifier = -25; break;
+    case NPC_REACTION_GOOD: modifier = 50; break;
+    default: break;
+    }
+    int rate = std::clamp(100 + 25 * (perk_level(PERK_MASTER_TRADER) != 0)
+        + skill_level(buyer, SKILL_BARTER) - skill_level(seller, SKILL_BARTER)
+        + gdialogGetBarterModifier() + modifier, 10, 300);
+    state.offeredValue = npcBarterOfferValue(state.buyerOffer);
+    auto goods = std::max<std::int64_t>(0, static_cast<std::int64_t>(npcBarterOfferValue(state.sellerOffer)) - state.sellerOffer.caps);
+    state.askingValue = static_cast<std::uint32_t>(std::min<std::int64_t>(INT32_MAX,
+        static_cast<std::int64_t>(goods) * 100 / rate + state.sellerOffer.caps));
+}
+
+bool applyDirectTradePlan(const DirectTradeCommitPlan& plan, bool npcBarter = false)
+{
+    if (!npcBarter && !validateDirectTradePlan(plan)) return false;
+    for (std::size_t index = 0; index < plan.legs.size(); ++index) {
+        Object* source = session.entities().findObject(plan.legs[index].sourceActorId);
+        if (source == nullptr) return false;
+        auto finalCaps = static_cast<std::int64_t>(item_caps_total(source))
+            - plan.legs[index].offer.caps + plan.legs[1 - index].offer.caps;
+        if (finalCaps < 0 || finalCaps > INT32_MAX) return false;
+    }
     struct AppliedItem {
         Object* source = nullptr;
         Object* destination = nullptr;
@@ -1918,18 +2107,130 @@ bool applyDirectTradePlan(const DirectTradeCommitPlan& plan)
         restoreDetached();
         return false;
     }
+    // Register split remainders and newly created cap stacks before delivery.
+    // After delivery a merge can destroy the previous representative, so a
+    // registration failure must still have a complete rollback path here.
+    if (!registerUntrackedInventory(session.entities().findObject(plan.legs[0].sourceActorId))
+        || !registerUntrackedInventory(session.entities().findObject(plan.legs[1].sourceActorId))) {
+        for (std::size_t index = 0; index < plan.legs.size(); ++index) {
+            if (capDeltas[index] != 0) item_caps_adjust(
+                session.entities().findObject(plan.legs[index].sourceActorId), -capDeltas[index]);
+        }
+        restoreDetached();
+        return false;
+    }
     for (const AppliedItem& transfer : applied) {
         item_add_force(transfer.destination, transfer.item,
             static_cast<int>(transfer.quantity));
     }
-    return registerUntrackedInventory(session.entities().findObject(
-               plan.legs[0].sourceActorId))
-        && registerUntrackedInventory(session.entities().findObject(
-            plan.legs[1].sourceActorId));
+    return true;
 }
 
 class NetworkCommandExecutor : public CommandExecutor {
 public:
+    bool actorCanExecute(Object* actor, const GameCommand& command) const override
+    {
+        // Closing a window and yielding a turn must remain possible after an
+        // injury. Neither grants an incapacitated actor a new world action.
+        if (std::holds_alternative<EndTurnCommand>(command.payload)) return true;
+        if (const auto* equipment = std::get_if<EquipmentCommand>(&command.payload);
+            equipment != nullptr && equipment->action == EquipmentAction::CloseInventory) return true;
+        if (const auto* modal = std::get_if<SharedModalCommand>(&command.payload);
+            modal != nullptr && !modal->open) return true;
+        if (const auto* barter = std::get_if<NpcBarterCommand>(&command.payload);
+            barter != nullptr && barter->action == NpcBarterAction::Cancel) return true;
+        if (const auto* trade = std::get_if<DirectTradeCommand>(&command.payload);
+            trade != nullptr && trade->action == DirectTradeAction::Cancel) return true;
+        return !storyPresentation.active && actor != nullptr && !critter_is_dead(actor)
+            && (actor->data.critter.combat.results & DAM_KNOCKED_OUT) == 0
+            && !networkWorldPartyDefeated();
+    }
+
+    CommandExecutionStatus startCombat(Object* actor, Object* target, const StartCombatCommand& command) override
+    {
+        auto actorId = session.entities().findEntity(actor);
+        if (worldMode != NetworkLaunchMode::Host || session.phase() != SessionPhase::Exploration
+            || isInCombat() || pendingCombatStart.has_value() || !isValid(command)
+            || !actorId.has_value() || !critter_is_active(actor)) return CommandExecutionStatus::InvalidAction;
+        if (isValid(command.targetId) && (target == nullptr || target == actor
+            || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER || !critter_is_active(target)
+            || target->elevation != actor->elevation
+            || combat_check_bad_shot(actor, target, command.hitMode, command.hitLocation != HIT_LOCATION_UNCALLED)
+                != COMBAT_BAD_SHOT_OK)) return CommandExecutionStatus::InvalidAction;
+        pendingCombatStart = PendingCombatStart { *actorId, command };
+        return CommandExecutionStatus::Applied;
+    }
+
+    CommandExecutionStatus advanceCharacter(Object* actor, const CharacterAdvanceCommand& command) override
+    {
+        auto* player = actingPlayerState();
+        if (!isValid(command) || player == nullptr || actingPlayerActor() != actor
+            || characterAdvancementFingerprint(player->build) != command.expectedBuild) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        PlayerCharacterState draft = *player;
+        {
+            ScopedActingPlayerContext context(draft, actor);
+            if (command.perk != -1) {
+                int selected = std::count_if(draft.build.perkRanks.begin(), draft.build.perkRanks.end(),
+                    [](int rank) { return rank > 0; });
+                if (draft.build.pendingPerks <= 0 || selected >= 7) return CommandExecutionStatus::InvalidAction;
+                if (command.perk == PERK_TAG) {
+                    if (command.taggedSkill < 0 || draft.build.taggedSkills[3] != -1
+                        || std::find(draft.build.taggedSkills.begin(), draft.build.taggedSkills.end(), command.taggedSkill)
+                            != draft.build.taggedSkills.end()) return CommandExecutionStatus::InvalidAction;
+                } else if (command.taggedSkill != -1) return CommandExecutionStatus::InvalidAction;
+                if (command.perk == PERK_MUTATE) {
+                    bool hasTraits = draft.build.traits[0] != -1;
+                    auto removed = std::find(draft.build.traits.begin(), draft.build.traits.end(), command.removedTrait);
+                    if (command.addedTrait < 0 || (hasTraits && (command.removedTrait < 0 || removed == draft.build.traits.end()))
+                        || (!hasTraits && command.removedTrait != -1)) return CommandExecutionStatus::InvalidAction;
+                    if (hasTraits) *removed = -1;
+                    if (std::find(draft.build.traits.begin(), draft.build.traits.end(), command.addedTrait)
+                        != draft.build.traits.end()) return CommandExecutionStatus::InvalidAction;
+                    if (draft.build.traits[0] == -1) std::swap(draft.build.traits[0], draft.build.traits[1]);
+                    draft.build.traits[hasTraits && draft.build.traits[0] != -1 ? 1 : 0] = command.addedTrait;
+                } else if (command.removedTrait != -1 || command.addedTrait != -1) {
+                    return CommandExecutionStatus::InvalidAction;
+                }
+                // Native prerequisite checks must run before Mutate changes
+                // the traits used to qualify for the selected perk.
+                if (command.perk == PERK_MUTATE) {
+                    auto newTraits = draft.build.traits;
+                    draft.build.traits = player->build.traits;
+                    if (perk_add(command.perk) != 0) return CommandExecutionStatus::InvalidAction;
+                    draft.build.traits = newTraits;
+                } else if (perk_add(command.perk) != 0) return CommandExecutionStatus::InvalidAction;
+                if (command.perk == PERK_TAG) draft.build.taggedSkills[3] = command.taggedSkill;
+                if (command.perk == PERK_LIFEGIVER) {
+                    stat_set_bonus(actor, STAT_MAXIMUM_HIT_POINTS, stat_get_bonus(actor, STAT_MAXIMUM_HIT_POINTS) + 4);
+                }
+                if (command.perk == PERK_EDUCATED) {
+                    stat_pc_set(PC_STAT_UNSPENT_SKILL_POINTS, stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS) + 2);
+                }
+                --draft.build.pendingPerks;
+                stat_recalc_derived(actor);
+            } else if (command.taggedSkill != -1 || command.removedTrait != -1 || command.addedTrait != -1) {
+                return CommandExecutionStatus::InvalidAction;
+            }
+            for (int skill = 0; skill < SKILL_COUNT; ++skill) {
+                for (int point = 0; point < command.skillIncrements[skill]; ++point) {
+                    if (skill_inc_point(actor, skill) != 0) return CommandExecutionStatus::InvalidAction;
+                }
+            }
+            draft.build.prototypeFlags &= ~(1U << PC_FLAG_LEVEL_UP_AVAILABLE);
+        }
+        player->build = draft.build;
+        if (command.perk == PERK_LIFEGIVER) critter_adjust_hits(actor, 4);
+        return CommandExecutionStatus::Applied;
+    }
+    bool movementRunning(Object* actor, bool requested) override
+    {
+        return requested && actor != nullptr
+            && (actor->data.critter.combat.results & DAM_CRIP_LEG_ANY) == 0
+            && art_exists(art_id(FID_TYPE(actor->fid), actor->fid & 0xFFF, ANIM_RUNNING, 0, actor->rotation + 1));
+    }
+
     bool combatActionAllowed(Object* actor, std::uint64_t revision) const
     {
         if (worldMode != NetworkLaunchMode::Host || !session.isActive()
@@ -1972,12 +2273,13 @@ public:
         }
         int scheduled = register_object_move_along_path(actor,
             command.destinationTile, command.elevation, path.data(),
-            pathLength, command.running, 0);
+            pathLength, movementRunning(actor, command.running), 0);
         int committed = register_end();
         if (scheduled == -1 || committed == -1) {
             register_clear(actor);
             return CommandExecutionStatus::InvalidAction;
         }
+        if (command.running && !perk_level(PERK_SILENT_RUNNING)) pc_flag_off(PC_FLAG_SNEAKING);
         combatActionResolving = true;
         auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
         while (anim_busy(actor) == -1 && std::chrono::steady_clock::now() < deadline) {
@@ -2012,8 +2314,13 @@ public:
             || actor->data.critter.combat.ap < 2) {
             return CommandExecutionStatus::InvalidAction;
         }
+        bool explosive = obj_is_explosive(item);
+        if (!isValidExplosiveTimerChoice(command.timerSeconds)
+            || (explosive ? command.timerSeconds == 0 || target != nullptr : command.timerSeconds != 0))
+            return CommandExecutionStatus::InvalidAction;
         combatActionResolving = true;
-        int result = target != nullptr
+        int result = explosive ? obj_arm_explosive(actor, item, command.timerSeconds)
+            : target != nullptr
             ? obj_use_item_on(actor, target, item)
             : proto_action_can_use_on(item->pid)
                 ? obj_use_item_on(actor, actor, item)
@@ -2111,6 +2418,7 @@ public:
             command.running,
             0);
         int endRc = register_end();
+        if (rc != -1 && endRc != -1 && command.running && !perk_level(PERK_SILENT_RUNNING)) pc_flag_off(PC_FLAG_SNEAKING);
         return rc != -1 && endRc != -1
             ? CommandExecutionStatus::Applied
             : CommandExecutionStatus::InvalidAction;
@@ -2129,16 +2437,38 @@ public:
         return CommandExecutionStatus::Applied;
     }
 
-    DoorUseExecution useDoor(Object* actor, Object* target) override
+    bool interactionAllowed(Object* actor, std::uint64_t turnRevision) const
+    {
+        return actor != nullptr && critter_is_active(actor) && !combatActionResolving
+            && (turnRevision != 0 ? combatActionAllowed(actor, turnRevision)
+                : worldMode == NetworkLaunchMode::Host && !isInCombat()
+                    && session.phase() == SessionPhase::Exploration);
+    }
+
+    bool combatLootAccess(Object* actor, std::uint64_t revision) const
+    {
+        auto actorId = session.entities().findEntity(actor).value_or(EntityId {});
+        auto access = openLootTurns.find(actorId);
+        auto target = activeLootTargets.find(actor);
+        return revision != 0 && access != openLootTurns.end() && access->second == revision
+            && target != activeLootTargets.end() && session.entities().findEntity(target->second).has_value()
+            && lootTargetIsInRange(actor, target->second);
+    }
+
+    DoorUseExecution useDoor(Object* actor, Object* target, std::uint64_t turnRevision = 0) override
     {
         DoorUseExecution execution;
-        if (isInCombat()
-            || target == nullptr
-            || actor->elevation != target->elevation
-            || !obj_is_a_portal(target)
-            || action_use_an_object(actor, target) == -1) {
-            return execution;
-        }
+        if (!interactionAllowed(actor, turnRevision) || target == nullptr
+            || actor->elevation != target->elevation || !obj_is_a_portal(target)
+            || !approachInventoryTarget(actor, target, turnRevision)) return execution;
+        auto actorId = session.entities().findEntity(actor).value_or(EntityId {});
+        auto targetId = session.entities().findEntity(target).value_or(EntityId {});
+        if ((turnRevision != 0 && actor->data.critter.combat.ap < 3)
+            || action_use_an_object(actor, target) == -1
+            || !finishInteractionAnimation(actor, target)
+            || session.entities().findObject(actorId) != actor
+            || session.entities().findObject(targetId) != target
+            || !interactionAllowed(actor, turnRevision)) return execution;
         execution.status = CommandExecutionStatus::Applied;
         execution.open = obj_is_open(target) != 0;
         execution.locked = obj_is_locked(target);
@@ -2146,27 +2476,157 @@ public:
         return execution;
     }
 
-    CommandExecutionStatus pickup(Object* actor, Object* target) override
+    CommandExecutionStatus pickup(Object* actor, Object* target, std::uint64_t turnRevision = 0) override
     {
-        return beginPickup(actor, target)
-            ? CommandExecutionStatus::Applied
-            : CommandExecutionStatus::InvalidAction;
+        if (turnRevision == 0) return interactionAllowed(actor, 0) && beginPickup(actor, target)
+            ? CommandExecutionStatus::Applied : CommandExecutionStatus::InvalidAction;
+        if (!interactionAllowed(actor, turnRevision) || target == nullptr
+            || FID_TYPE(target->fid) != OBJ_TYPE_ITEM || target->owner != nullptr
+            || actor->elevation != target->elevation
+            || (item_get_type(target) == ITEM_TYPE_CONTAINER && !proto_action_can_pickup(target->pid)))
+            return CommandExecutionStatus::InvalidAction;
+        auto actorId = session.entities().findEntity(actor).value_or(EntityId {});
+        auto targetId = session.entities().findEntity(target).value_or(EntityId {});
+        if (!isValid(targetId) || reservedPickupTargets.count(targetId) != 0
+            || !approachInventoryTarget(actor, target, turnRevision)
+            || actor->data.critter.combat.ap < 3) return CommandExecutionStatus::InvalidAction;
+        reservedPickupTargets.insert(targetId);
+        int started = action_get_an_object(actor, target);
+        bool finished = started != -1 && finishInteractionAnimation(actor, target);
+        reservedPickupTargets.erase(targetId);
+        return finished && session.entities().findObject(actorId) == actor
+            && interactionAllowed(actor, turnRevision)
+            ? CommandExecutionStatus::Applied : CommandExecutionStatus::InvalidAction;
     }
 
-    CommandExecutionStatus loot(Object* actor, Object* target) override
+    CommandExecutionStatus loot(Object* actor, Object* target, std::uint64_t turnRevision = 0, bool targetChange = false) override
     {
-        if (isInCombat()
-            || isPlayerActor(target)
-            || !lootTargetIsInRange(actor, target)) {
+        if (!interactionAllowed(actor, turnRevision) || isPlayerActor(target)
+            || !lootTargetIsValid(actor, target)) {
             return CommandExecutionStatus::InvalidAction;
         }
+        auto actorId = session.entities().findEntity(actor).value_or(EntityId {});
+        auto targetId = session.entities().findEntity(target).value_or(EntityId {});
+        if (targetChange) {
+            auto previous = activeLootTargets.find(actor);
+            if (previous == activeLootTargets.end() || !session.entities().findEntity(previous->second).has_value()
+                || !lootTargetIsInRange(actor, previous->second) || !lootTargetIsInRange(actor, target)
+                || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER || target->tile != previous->second->tile
+                || (turnRevision != 0 && !combatLootAccess(actor, turnRevision)))
+                return CommandExecutionStatus::InvalidAction;
+            if (!registerUntrackedInventory(target)) return CommandExecutionStatus::InvalidAction;
+            activeLootTargets[actor] = target;
+            return CommandExecutionStatus::Applied;
+        }
+        activeLootTargets.erase(actor);
+        openLootTurns.erase(actorId);
+        if (!approachInventoryTarget(actor, target, turnRevision)) return CommandExecutionStatus::InvalidAction;
+        auto current = [&]() {
+            return session.entities().findObject(actorId) == actor
+                && session.entities().findObject(targetId) == target
+                && (turnRevision != 0
+                    ? session.phase() == SessionPhase::Combat && isInCombat()
+                        && combatTurns.revision() == turnRevision && networkWorldCombatTurnMatches(actor)
+                    : session.phase() == SessionPhase::Exploration && !isInCombat())
+                && critter_is_active(actor) && !isPlayerActor(target)
+                && lootTargetIsInRange(actor, target);
+        };
+        if (!current() || check_scenery_ap_cost(actor, target) == -1) return CommandExecutionStatus::InvalidAction;
+        if (FID_TYPE(target->fid) == OBJ_TYPE_ITEM && target->frame == 0 && target->pid != 213) {
+            combatActionResolving = true;
+            int result = obj_use_container(actor, target);
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (result == 0 && current() && anim_busy(target) == -1
+                && std::chrono::steady_clock::now() < deadline) {
+                process_bk();
+                renderPresent();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            bool finished = current() && anim_busy(target) != -1;
+            if (current() && !finished) register_clear(target);
+            combatActionResolving = false;
+            if (result == -1 || !finished) return CommandExecutionStatus::InvalidAction;
+            int sid = -1;
+            Script* script = nullptr;
+            if (obj_sid(target, &sid) != -1
+                && (scr_ptr(sid, &script) == -1 || script->scriptOverrides)) {
+                return CommandExecutionStatus::InvalidAction;
+            }
+        }
+        int sid = -1;
+        if (obj_sid(target, &sid) != -1) {
+            scr_set_objs(sid, actor, nullptr);
+            exec_script_proc(sid, SCRIPT_PROC_PICKUP);
+            Script* script = nullptr;
+            if (!current() || scr_ptr(sid, &script) == -1 || script->scriptOverrides)
+                return CommandExecutionStatus::InvalidAction;
+        }
+        if (!current() || !registerUntrackedInventory(target)) return CommandExecutionStatus::InvalidAction;
         activeLootTargets[actor] = target;
+        if (turnRevision != 0) openLootTurns[actorId] = turnRevision;
         return CommandExecutionStatus::Applied;
     }
 
     CommandExecutionStatus useSkill(Object* actor, Object* target, const UseSkillCommand& command) override
     {
+        if (command.skill == ExplorationSkill::Steal) {
+            if (worldMode != NetworkLaunchMode::Host || isInCombat()
+                || combatActionResolving
+                || session.phase() != SessionPhase::Exploration || command.turnRevision != 0
+                || actor == nullptr || target == nullptr || actor == target || isPlayerActor(target)
+                || !critter_is_active(actor)
+                || actor->elevation != target->elevation || actor->tile < 0 || target->tile < 0
+                || theftAccess.count(actor) != 0
+                || std::any_of(theftAccess.begin(), theftAccess.end(),
+                    [target](const auto& entry) { return entry.second.target == target; }))
+                return CommandExecutionStatus::InvalidAction;
+            bool livingTarget = FID_TYPE(target->fid) == OBJ_TYPE_CRITTER && critter_is_active(target);
+            bool lootTarget = (FID_TYPE(target->fid) == OBJ_TYPE_CRITTER && !critter_is_active(target))
+                || (FID_TYPE(target->fid) == OBJ_TYPE_ITEM && target->owner == nullptr
+                    && item_get_type(target) == ITEM_TYPE_CONTAINER && !obj_is_locked(target));
+            if ((!livingTarget && !lootTarget) || !approachInventoryTarget(actor, target)
+                || !registerUntrackedInventory(target)) return CommandExecutionStatus::InvalidAction;
+            auto actorId = session.entities().findEntity(actor).value_or(EntityId {});
+            auto targetId = session.entities().findEntity(target).value_or(EntityId {});
+            activeLootTargets.erase(actor);
+            int scriptResult = obj_use_skill_script(actor, target, SKILL_STEAL);
+            // Scripts may move, destroy, or replace either object. Resolve IDs
+            // before dereferencing the old pointers or granting inventory access.
+            if (scriptResult == -1) return CommandExecutionStatus::InvalidAction;
+            if (scriptResult == 1) return CommandExecutionStatus::Applied;
+            if (session.entities().findObject(actorId) != actor
+                || session.entities().findObject(targetId) != target
+                || isInCombat() || session.phase() != SessionPhase::Exploration
+                || !critter_is_active(actor) || actor->elevation != target->elevation
+                || actor->tile < 0 || target->tile < 0 || obj_dist(actor, target) > 1
+                || (target->flags & OBJECT_HIDDEN) != 0 || isPlayerActor(target)
+                || !registerUntrackedInventory(target))
+                return CommandExecutionStatus::InvalidAction;
+            // A target can fall unconscious while the actor approaches it.
+            if (FID_TYPE(target->fid) != OBJ_TYPE_CRITTER || !critter_is_active(target)) {
+                CommandExecutionStatus result = loot(actor, target);
+                if (result == CommandExecutionStatus::Applied && actor == localPlayerActor())
+                    scripts_request_loot_container(actor, target);
+                return result;
+            }
+            theftAccess.emplace(actor, TheftAccess { target });
+            activeLootTargets[actor] = target;
+            if (actor == localPlayerActor()) scripts_request_steal_container(actor, target);
+            return CommandExecutionStatus::Applied;
+        }
+        if (command.skill == ExplorationSkill::Sneak) {
+            if (worldMode != NetworkLaunchMode::Host || actor == nullptr || actor != target
+                || (actor->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) != 0
+                || (isInCombat() ? !combatActionAllowed(actor, command.turnRevision)
+                    : session.phase() != SessionPhase::Exploration || command.turnRevision != 0)) {
+                return CommandExecutionStatus::InvalidAction;
+            }
+            register_clear(actor);
+            pc_flag_toggle(PC_FLAG_SNEAKING);
+            return CommandExecutionStatus::Applied;
+        }
         if (isInCombat()
+            || command.turnRevision != 0
             || actor == nullptr
             || target == nullptr
             || actor->elevation != target->elevation
@@ -2176,6 +2636,12 @@ public:
             return CommandExecutionStatus::InvalidAction;
         }
         return CommandExecutionStatus::Applied;
+    }
+
+    bool skillInventoryOpened(Object* actor, Object* target) const override
+    {
+        auto found = activeLootTargets.find(actor);
+        return found != activeLootTargets.end() && found->second == target;
     }
 
     CommandExecutionStatus useItemOn(Object* actor,
@@ -2331,7 +2797,7 @@ public:
             return execution;
         }
 
-        if (destinationMap == 0) {
+        if (isWorldMapDestination(destinationMap)) {
             SharedModalExecution proposal = setSharedModal(actor,
                 SharedModalCommand { SharedModalKind::WorldMap, true });
             if (proposal.status == CommandExecutionStatus::Applied
@@ -2420,7 +2886,7 @@ public:
             return execution;
         }
 
-        if (requestedWorldMap || (requestedTransition.has_value() && requestedTransition->map == 0)) {
+        if (requestedWorldMap || (requestedTransition.has_value() && isWorldMapDestination(requestedTransition->map))) {
             if (!companionReady) return execution;
             SharedModalExecution proposal = setSharedModal(actor,
                 SharedModalCommand { SharedModalKind::WorldMap, true });
@@ -2665,6 +3131,154 @@ public:
             : CommandExecutionStatus::InvalidAction;
     }
 
+    CommandExecutionStatus inventoryAction(Object* actor, const InventoryActionCommand& command) override
+    {
+        Object* item = session.entities().findObject(command.itemId);
+        if (worldMode != NetworkLaunchMode::Host || actor == nullptr
+            || combatActionResolving || !isValid(command)
+            || item == nullptr || topEnvironmentOrSelf(item) != actor
+            || FID_TYPE(item->fid) != OBJ_TYPE_ITEM || item->owner == nullptr || item_count(item->owner, item) < 1
+            || (actor->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) != 0) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        Object* holder = item->owner;
+        // Equipment belongs to the actor itself, never an owned container.
+        if (holder != actor && (item->flags & OBJECT_EQUIPPED) != 0)
+            return CommandExecutionStatus::InvalidAction;
+        bool combat = session.phase() == SessionPhase::Combat;
+        auto actorId = session.entities().findEntity(actor).value_or(EntityId {});
+        auto access = openInventories.find(actorId);
+        // Native inventory use, unload and ammo dragging cost only the opening
+        // charge. A command cannot claim that charge was paid without an open
+        // inventory for this exact combat turn.
+        if (combat ? !combatActionAllowed(actor, command.turnRevision)
+                || (command.action != InventoryAction::Scan
+                    && (access == openInventories.end() || access->second != command.turnRevision)
+                    && !combatLootAccess(actor, command.turnRevision))
+            : session.phase() != SessionPhase::Exploration || command.turnRevision != 0) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        if (command.action == InventoryAction::Scan) {
+            if (item->pid != PROTO_ID_MOTION_SENSOR || holder != actor
+                || (inven_left_hand(actor) != item && inven_right_hand(actor) != item))
+                return CommandExecutionStatus::InvalidAction;
+            return item_m_use_motion_sensor(item) == 0 && registerUntrackedInventory(actor)
+                ? CommandExecutionStatus::Applied : CommandExecutionStatus::InvalidAction;
+        }
+        if (command.action == InventoryAction::Drop) {
+            if (item_count(holder, item) < static_cast<int>(command.quantity)
+                || !hexGridTileIsValid(actor->tile) || !elevationIsValid(actor->elevation)) {
+                return CommandExecutionStatus::InvalidAction;
+            }
+            ScopedLocalPlayerBinding binding(actor);
+            Object* armor = inven_worn(actor);
+            bool armorDropped = item == armor;
+            bool activeWeaponDropped = (item->flags & (OBJECT_IN_LEFT_HAND | OBJECT_IN_RIGHT_HAND)) != 0
+                && item_get_type(item) == ITEM_TYPE_WEAPON
+                && item_w_anim_code(item) == ((actor->fid >> 12) & 0xF);
+            bool caps = item->pid == PROTO_ID_MONEY;
+            std::uint32_t count = caps ? 1 : command.quantity;
+            std::uint32_t dropped = 0;
+            for (; dropped < count; ++dropped) {
+                if (item == nullptr || !applyItemDrop(holder, item, caps ? command.quantity : 1)) break;
+                if (caps) item_caps_set_amount(item, command.quantity);
+                // The original stack object is on the ground. Its split copy
+                // remains in inventory with the identity registered by native removal.
+                item = session.entities().findObject(lastSplitEntityId);
+            }
+            if (dropped == 0) return CommandExecutionStatus::InvalidAction;
+            if (armorDropped) adjust_ac(actor, armor, nullptr);
+            int gender = stat_level(actor, STAT_GENDER) == GENDER_FEMALE ? GENDER_FEMALE : GENDER_MALE;
+            int baseArt = art_vault_person_nums[gender];
+            if (Object* remainingArmor = inven_worn(actor)) {
+                int armorArt = gender == GENDER_FEMALE
+                    ? item_ar_female_fid(remainingArmor) : item_ar_male_fid(remainingArmor);
+                if (armorArt != -1) baseArt = armorArt;
+            }
+            int weaponArt = activeWeaponDropped ? 0 : (actor->fid >> 12) & 0xF;
+            Rect bounds;
+            if (obj_change_fid(actor, art_id(OBJ_TYPE_CRITTER, baseArt, ANIM_STAND,
+                    weaponArt, actor->rotation + 1), &bounds) == 0) {
+                tile_refresh_rect(&bounds, actor->elevation);
+            }
+            return registerUntrackedInventory(actor)
+                ? CommandExecutionStatus::Applied : CommandExecutionStatus::InvalidAction;
+        }
+        if (command.action == InventoryAction::Use) {
+            bool explosive = obj_is_explosive(item);
+            if (explosive ? command.timerSeconds == 0 : command.timerSeconds != 0)
+                return CommandExecutionStatus::InvalidAction;
+            if (item_get_type(item) == ITEM_TYPE_CONTAINER
+                || (!proto_action_can_use(item->pid) && !proto_action_can_use_on(item->pid))) {
+                return CommandExecutionStatus::InvalidAction;
+            }
+            itemUseInProgress = true;
+            int result;
+            if (explosive) {
+                result = obj_arm_explosive(actor, item, command.timerSeconds);
+            } else if (item_get_type(item) == ITEM_TYPE_DRUG) {
+                // Native inventory drugs apply directly, without target-use
+                // scripts or the HUD's additional combat AP charge.
+                result = item_d_take_drug(actor, item) ? 0 : -1;
+                if (result == 0) obj_destroy(item);
+            } else {
+                result = proto_action_can_use(item->pid)
+                    ? obj_use_item(actor, item) : obj_use_item_on(actor, actor, item);
+            }
+            itemUseInProgress = false;
+            return result == 0 && registerUntrackedInventory(actor)
+                ? CommandExecutionStatus::Applied : CommandExecutionStatus::InvalidAction;
+        }
+        if (item_get_type(item) != ITEM_TYPE_WEAPON) return CommandExecutionStatus::InvalidAction;
+        Object* ammo = isValid(command.ammoId) ? session.entities().findObject(command.ammoId) : nullptr;
+        if (command.action == InventoryAction::Reload) {
+            if (item_w_curr_ammo(item) >= item_w_max_ammo(item)
+                || (isValid(command.ammoId) && (ammo == nullptr || topEnvironmentOrSelf(ammo) != actor
+                    || item_get_type(ammo) != ITEM_TYPE_AMMO
+                    || item_count(ammo->owner, ammo) < static_cast<int>(command.quantity)
+                    || !item_w_can_reload(item, ammo)))) {
+                return CommandExecutionStatus::InvalidAction;
+            }
+        } else if (!item_w_can_unload(item)) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        // A list entry may represent multiple identical loaded weapons. Detach
+        // one before editing its ammo, as the native inventory does.
+        int equippedFlags = item->flags & OBJECT_EQUIPPED;
+        if (item_remove_mult(holder, item, 1) != 0) return CommandExecutionStatus::InvalidAction;
+        bool changed = false;
+        if (command.action == InventoryAction::Unload) {
+            while (Object* unloaded = item_w_unload(item)) {
+                obj_disconnect(unloaded, nullptr);
+                item_add_force(holder, unloaded, 1);
+                changed = true;
+            }
+        } else if (ammo == nullptr) {
+            while (item_w_try_reload(holder, item) != -1) changed = true;
+        } else {
+            int ammoPid = ammo->pid;
+            Object* ammoHolder = ammo->owner;
+            for (std::uint32_t index = 0; index < command.quantity; ++index) {
+                if (item_w_curr_ammo(item) >= item_w_max_ammo(item)) break;
+                if (ammo == nullptr || item_remove_mult(ammoHolder, ammo, 1) != 0) break;
+                int result = item_w_reload(item, ammo);
+                if (result == 0) obj_destroy(ammo);
+                else item_add_force(ammoHolder, ammo, 1);
+                if (result == -1) break;
+                changed = true;
+                ammo = nullptr;
+                for (int slot = 0; slot < ammoHolder->data.inventory.length; ++slot) {
+                    Object* candidate = ammoHolder->data.inventory.items[slot].item;
+                    if (candidate->pid == ammoPid) { ammo = candidate; break; }
+                }
+            }
+        }
+        item->flags |= equippedFlags;
+        item_add_force(holder, item, 1);
+        return registerUntrackedInventory(actor) && changed
+            ? CommandExecutionStatus::Applied : CommandExecutionStatus::InvalidAction;
+    }
+
     CommandExecutionStatus setEquipment(Object* actor, const EquipmentCommand& command) override
     {
         auto reject = [&](const char* reason) {
@@ -2677,6 +3291,18 @@ public:
             if (actor == localPlayerActor()) display_print(message);
             return CommandExecutionStatus::InvalidAction;
         };
+        if (worldMode == NetworkLaunchMode::Host && actor != nullptr
+            && command.action == EquipmentAction::CloseInventory) {
+            auto id = session.entities().findEntity(actor);
+            if (!id.has_value()) return reject("actor is unregistered");
+            auto access = openInventories.find(*id);
+            if (access != openInventories.end() && access->second != command.turnRevision)
+                return reject("inventory access has changed");
+            openInventories.erase(*id);
+            openLootTurns.erase(*id);
+            activeLootTargets.erase(actor);
+            return CommandExecutionStatus::Applied;
+        }
         if (worldMode != NetworkLaunchMode::Host || actor == nullptr
             || combatActionResolving
             || (actor->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) != 0
@@ -2699,6 +3325,8 @@ public:
         bool inventoryOpen = access != openInventories.end() && access->second == command.turnRevision;
         if (command.action == EquipmentAction::CloseInventory) {
             openInventories.erase(actorId);
+            openLootTurns.erase(actorId);
+            activeLootTargets.erase(actor);
             return CommandExecutionStatus::Applied;
         }
         if (command.action == EquipmentAction::OpenInventory) {
@@ -2728,7 +3356,7 @@ public:
         Object* oldArmor = inven_worn(actor);
         bool changed = selected[0] != inven_left_hand(actor)
             || selected[1] != inven_right_hand(actor) || selected[2] != oldArmor;
-        int cost = combat && changed && !inventoryOpen ? std::max(0, 4 - perk_level(PERK_QUICK_POCKETS)) : 0;
+        int cost = combat && changed && !inventoryOpen && !combatLootAccess(actor, command.turnRevision) ? std::max(0, 4 - perk_level(PERK_QUICK_POCKETS)) : 0;
         if (cost > 0 && actor->data.critter.combat.ap < cost) return reject("not enough action points");
         int gender = stat_level(actor, STAT_GENDER) == GENDER_FEMALE ? GENDER_FEMALE : GENDER_MALE;
         int baseArt = art_vault_person_nums[gender];
@@ -2761,6 +3389,8 @@ public:
         if (selected[2] != nullptr) selected[2]->flags |= OBJECT_WORN;
         if (oldArmor != selected[2]) adjust_ac(actor, oldArmor, selected[2]);
         actor->data.critter.combat.ap -= cost;
+        auto* player = playerStateForActor(actor);
+        if (player != nullptr) player->build.activeHand = command.activeHand;
         tile_refresh_rect(&bounds, actor->elevation);
         return CommandExecutionStatus::Applied;
     }
@@ -2823,6 +3453,7 @@ public:
             || session.phase() != SessionPhase::Dialogue
             || !activeSharedModal.has_value()
             || activeSharedModal->kind != SharedModalKind::Dialogue
+            || npcBarterState.has_value()
             || !dialogueVotes.vote(playerId, command.revision, command.option)) {
             return CommandExecutionStatus::InvalidAction;
         }
@@ -2838,6 +3469,15 @@ public:
         }
 
         execution.actorId = *actorId;
+        if (command.kind == SharedModalKind::Theft) {
+            if (command.open || session.phase() != SessionPhase::Exploration
+                || theftAccess.count(actor) == 0) return execution;
+            finishTheft(actor, false);
+            execution.status = CommandExecutionStatus::Applied;
+            execution.phase = session.phase();
+            execution.phaseRevision = session.phaseRevision();
+            return execution;
+        }
         if (command.kind == SharedModalKind::WorldMap) {
             PlayerCharacterState* player = session.players().findByActor(*actorId);
             if (player == nullptr || isInCombat()) {
@@ -2904,8 +3544,16 @@ public:
                 && activeSharedModal->kind == SharedModalKind::WorldMap
                 && activeSharedModal->actorId == *actorId
                 && session.phase() == SessionPhase::Transition) {
-                if (worldMapDeparted) {
-                    execution.arrival = completeWorldMapTravel(WorldMapArrivalKind::Terrain, 0);
+                int cityMap = -1;
+                int cityEntrance = -1;
+                bool enterCity = worldmap_multiplayer_position_is_city()
+                    && worldmap_multiplayer_choose_destination(false, 0, true,
+                        &cityMap, &cityEntrance);
+                // Closing the map inside the same town keeps the current
+                // positions. A submap such as a cave returns to its town.
+                if (worldMapDeparted || (enterCity && cityMap != map_data.field_34)) {
+                    execution.arrival = completeWorldMapTravel(
+                        enterCity ? WorldMapArrivalKind::City : WorldMapArrivalKind::Terrain, 0);
                     if (!execution.arrival.has_value()) return execution;
                 } else {
                     if (session.transitionTo(SessionPhase::Exploration) != LocalSessionError::None) {
@@ -2944,6 +3592,8 @@ public:
                 return execution;
             }
             activeSharedModal.reset();
+            npcBarterState.reset();
+            pendingScriptedNpcBarter.reset();
         }
 
         execution.status = CommandExecutionStatus::Applied;
@@ -2972,6 +3622,74 @@ public:
         return CommandExecutionStatus::Applied;
     }
 
+    NpcBarterExecution npcBarter(Object* actor, const NpcBarterCommand& command) override
+    {
+        NpcBarterExecution execution;
+        Object* seller = session.entities().findObject(command.sellerId);
+        auto buyerId = session.entities().findEntity(actor).value_or(EntityId {});
+        if (worldMode != NetworkLaunchMode::Host || session.phase() != SessionPhase::Dialogue
+            || isInCombat() || actor == nullptr || seller == nullptr || isPlayerActor(seller)
+            || FID_TYPE(seller->fid) != OBJ_TYPE_CRITTER || !critter_is_active(seller)
+            || !critter_is_active(actor) || actor->elevation != seller->elevation
+            || !dialoguePresentation.has_value() || dialoguePresentation->targetId != command.sellerId
+            || !activeSharedModal.has_value() || activeSharedModal->kind != SharedModalKind::Dialogue
+            || !isValid(command)) return execution;
+        if (command.action == NpcBarterAction::Begin) {
+            Proto* proto = nullptr;
+            if (npcBarterState.has_value() || directTradeController.active()
+                || proto_ptr(seller->pid, &proto) != 0) return execution;
+            if ((proto->critter.data.flags & CRITTER_BARTER) == 0) {
+                ScopedPlayerFeedback feedback(actor);
+                MessageListItem message;
+                message.num = 903;
+                if (message_search(&proto_main_msg_file, &message)) display_print(message.text);
+                return execution;
+            }
+            if (!registerUntrackedInventory(seller)) return execution;
+            npcBarterState = NpcBarterState { buyerId, command.sellerId, nextNpcBarterRevision++ };
+        } else {
+            if (!npcBarterState.has_value() || npcBarterState->buyerId != buyerId
+                || npcBarterState->sellerId != command.sellerId || npcBarterState->revision != command.revision) return execution;
+            if (command.action == NpcBarterAction::Cancel) {
+                npcBarterState->status = NpcBarterStatus::Cancelled;
+            } else if (command.action == NpcBarterAction::Offer) {
+                if (!validateNpcBarterOffer(actor, command.buyerOffer, false)
+                    || !validateNpcBarterOffer(seller, command.sellerOffer, true)) return execution;
+                npcBarterState->buyerOffer = command.buyerOffer;
+                npcBarterState->sellerOffer = command.sellerOffer;
+                npcBarterState->status = NpcBarterStatus::Negotiating;
+            } else if (command.action == NpcBarterAction::Accept) {
+                auto& state = *npcBarterState;
+                priceNpcBarter(actor, seller, state);
+                bool valid = (!state.buyerOffer.items.empty() || state.buyerOffer.caps != 0)
+                    && validateNpcBarterOffer(actor, state.buyerOffer, false)
+                    && validateNpcBarterOffer(seller, state.sellerOffer, true)
+                    && state.offeredValue >= state.askingValue;
+                DirectTradeCommitPlan plan;
+                plan.legs[0] = { {}, buyerId, {}, command.sellerId, state.buyerOffer };
+                plan.legs[1] = { {}, command.sellerId, {}, buyerId, state.sellerOffer };
+                state.status = valid && applyDirectTradePlan(plan, true)
+                    ? NpcBarterStatus::Committed : NpcBarterStatus::Rejected;
+            }
+            npcBarterState->revision = nextNpcBarterRevision++;
+        }
+        if (npcBarterState->status == NpcBarterStatus::Negotiating) priceNpcBarter(actor, seller, *npcBarterState);
+        execution.state = *npcBarterState;
+        ScopedPlayerFeedback feedback(actor);
+        if (npcBarterState->status == NpcBarterStatus::Committed) {
+            char text[] = "Trade accepted."; display_print(text);
+        } else if (npcBarterState->status == NpcBarterStatus::Rejected) {
+            char text[] = "The offer was rejected."; display_print(text);
+        }
+        execution.status = CommandExecutionStatus::Applied;
+        if (npcBarterState->status == NpcBarterStatus::Committed || npcBarterState->status == NpcBarterStatus::Cancelled) {
+            dialogueVotes.deferDeadlineUntil(combatClockMilliseconds() + 60000);
+            npcBarterState.reset();
+            pendingScriptedNpcBarter.reset();
+        }
+        return execution;
+    }
+
     DirectTradeExecution directTrade(Object* actor, PlayerId playerId,
         const DirectTradeCommand& command) override
     {
@@ -2996,6 +3714,8 @@ public:
                 || session.transitionTo(SessionPhase::Dialogue)
                     != LocalSessionError::None) {
                 directTradeController.clear();
+                npcBarterState.reset();
+                pendingScriptedNpcBarter.reset();
                 return execution;
             }
             activeSharedModal = ActiveSharedModal {
@@ -3069,30 +3789,76 @@ public:
         const InventoryTransferCommand& command) override
     {
         InventoryTransferExecution execution;
-        if (actor == nullptr || source == nullptr || destination == nullptr) {
+        if (actor == nullptr || source == nullptr || destination == nullptr || item == nullptr) {
             return execution;
         }
         auto activeLoot = activeLootTargets.find(actor);
         Object* sourceTop = topEnvironmentOrSelf(source);
         Object* destinationTop = topEnvironmentOrSelf(destination);
         Object* otherTop = sourceTop == actor ? destinationTop : sourceTop;
+        bool theftTransfer = networkWorldIsTheftTarget(actor, otherTop);
         bool lootTransfer = activeLoot != activeLootTargets.end()
             && activeLoot->second == otherTop
             && !isPlayerActor(otherTop)
             && lootTargetIsInRange(actor, otherTop);
+        bool ownedTransfer = sourceTop == actor && destinationTop == actor;
+        // Native item_move does not protect against moving a container into
+        // itself or one of its descendants. Check before changing ownership.
+        for (Object* holder = destination; holder != nullptr; holder = holder->owner) {
+            if (holder == item) return execution;
+        }
+        bool takingLoot = lootTransfer && !theftTransfer && sourceTop == otherTop;
         bool playerGift = item != nullptr
             && source == actor
             && destination == destinationTop
             && isAdjacentPlayerActor(actor, destination)
             && (item->flags & (OBJECT_EQUIPPED | OBJECT_USED)) == 0;
-        if (isInCombat()
-            || (sourceTop != actor && destinationTop != actor)
-            || (!lootTransfer && !playerGift)) {
+        bool combat = session.phase() == SessionPhase::Combat;
+        auto actorId = session.entities().findEntity(actor).value_or(EntityId {});
+        auto access = openInventories.find(actorId);
+        bool lootOpen = combatLootAccess(actor, command.turnRevision);
+        if (combat ? (!ownedTransfer && !lootTransfer) || !combatActionAllowed(actor, command.turnRevision)
+                || (lootTransfer ? !lootOpen
+                    : (access == openInventories.end() || access->second != command.turnRevision) && !lootOpen)
+            : session.phase() != SessionPhase::Exploration || isInCombat() || command.turnRevision != 0) {
+            return execution;
+        }
+        if ((sourceTop != actor && destinationTop != actor)
+            || (sourceTop == actor && item != nullptr
+                && (item->flags & (OBJECT_EQUIPPED | OBJECT_USED)) != 0)
+            || (!lootTransfer && !theftTransfer && !playerGift && !ownedTransfer)) {
+            return execution;
+        }
+        if (theftTransfer) {
+            if (item->owner != source || item_count(source, item) != static_cast<int>(command.sourceQuantity)
+                || command.quantity == 0 || command.quantity > command.sourceQuantity
+                || (item->flags & (OBJECT_EQUIPPED | OBJECT_USED)) != 0
+                || !describeItem(item, execution.itemDescriptor)) return execution;
+            TheftAccess& access = theftAccess.at(actor);
+            int previousCount = gStealCount;
+            int previousSize = gStealSize;
+            access.attempts = std::min(access.attempts + 1, 1000000);
+            gStealCount = access.attempts;
+            gStealSize = item_size(item);
+            ScopedPlayerFeedback feedback(actor);
+            int stolen = skill_check_stealing(actor, otherTop, item, sourceTop == actor);
+            gStealCount = previousCount;
+            gStealSize = previousSize;
+            if (stolen != 1) {
+                if (stolen == 0) finishTheft(actor, true);
+                return execution;
+            }
+            if (!applyInventoryTransfer(source, destination, item, command.quantity, false)) return execution;
+            access.experience = std::min(300, access.experience + access.nextExperience);
+            access.nextExperience = std::min(300, access.nextExperience + 10);
+            execution.itemId = command.itemId;
+            execution.remainderItemId = lastSplitEntityId;
+            execution.status = CommandExecutionStatus::Applied;
             return execution;
         }
 
         LootDistributionState priorDistribution = lootDistribution.state();
-        if (lootTransfer && item != nullptr && item->pid == PROTO_ID_MONEY) {
+        if (takingLoot && item != nullptr && item->pid == PROTO_ID_MONEY) {
             if (item_count(source, item) != static_cast<int>(command.sourceQuantity)
                 || command.quantity > command.sourceQuantity) return execution;
             std::optional<std::vector<PlayerCapShare>> shares
@@ -3161,7 +3927,7 @@ public:
             return execution;
         }
 
-        if (lootTransfer && item != nullptr
+        if (takingLoot && item != nullptr
             && FID_TYPE(otherTop->fid) == OBJ_TYPE_CRITTER
             && critter_is_dead(otherTop)) {
             std::vector<PlayerId> eligible = lootDistribution.state().roster;
@@ -3179,45 +3945,11 @@ public:
             execution.destinationId = session.playerActorId(*priority);
         }
 
-        bool created = false;
-        if (item == nullptr) {
-            if (isValid(command.itemId)
-                || !hasItemDescriptor(command.itemDescriptor)
-                || sourceTop != actor
-                || hasDirectItemWithDescriptor(source, command.itemDescriptor)) {
-                return execution;
-            }
-            item = createItem(command.itemDescriptor);
-            if (item == nullptr
-                || item_add_force(source, item, static_cast<int>(command.sourceQuantity)) != 0) {
-                if (item != nullptr) {
-                    obj_erase_object(item, nullptr);
-                }
-                return execution;
-            }
-            EntityRegistrationResult registration = registerItem(item);
-            if (!registration) {
-                item_remove_mult(source, item, static_cast<int>(command.sourceQuantity));
-                obj_erase_object(item, nullptr);
-                return execution;
-            }
-            execution.itemId = registration.entityId;
-            created = true;
-        } else {
-            execution.itemId = command.itemId;
-        }
+        execution.itemId = command.itemId;
 
         if (item_count(source, item) != static_cast<int>(command.sourceQuantity)
             || !describeItem(item, execution.itemDescriptor)
             || !applyInventoryTransfer(source, destination, item, command.quantity, false)) {
-            if (created && item->owner == source) {
-                session.entities().unregisterEntity(execution.itemId);
-                worldItems.erase(std::remove_if(worldItems.begin(), worldItems.end(), [&](const auto& entry) {
-                    return entry.first == execution.itemId;
-                }), worldItems.end());
-                item_remove_mult(source, item, static_cast<int>(command.sourceQuantity));
-                obj_erase_object(item, nullptr);
-            }
             lootDistribution.restore(priorDistribution);
             return execution;
         }
@@ -3234,6 +3966,8 @@ public:
         ItemDropExecution execution;
         if (actor == nullptr
             || source == nullptr
+            || item == nullptr
+            || (item->flags & (OBJECT_EQUIPPED | OBJECT_USED)) != 0
             || isInCombat()
             || topEnvironmentOrSelf(source) != actor
             || !hexGridTileIsValid(actor->tile)
@@ -3241,45 +3975,12 @@ public:
             return execution;
         }
 
-        bool created = false;
-        if (item == nullptr) {
-            if (isValid(command.itemId)
-                || !hasItemDescriptor(command.itemDescriptor)
-                || hasDirectItemWithDescriptor(source, command.itemDescriptor)) {
-                return execution;
-            }
-            item = createItem(command.itemDescriptor);
-            if (item == nullptr
-                || item_add_force(source, item, static_cast<int>(command.sourceQuantity)) != 0) {
-                if (item != nullptr) {
-                    obj_erase_object(item, nullptr);
-                }
-                return execution;
-            }
-            EntityRegistrationResult registration = registerItem(item);
-            if (!registration) {
-                item_remove_mult(source, item, static_cast<int>(command.sourceQuantity));
-                obj_erase_object(item, nullptr);
-                return execution;
-            }
-            execution.itemId = registration.entityId;
-            created = true;
-        } else {
-            execution.itemId = command.itemId;
-        }
+        execution.itemId = command.itemId;
 
         if (item_count(source, item) != static_cast<int>(command.sourceQuantity)
             || (command.quantity > 1 && item->pid != PROTO_ID_MONEY)
             || !applyItemDrop(source, item, command.quantity)
             || !describeItem(item, execution.itemDescriptor)) {
-            if (created && item->owner == source) {
-                session.entities().unregisterEntity(execution.itemId);
-                worldItems.erase(std::remove_if(worldItems.begin(), worldItems.end(), [&](const auto& entry) {
-                    return entry.first == execution.itemId;
-                }), worldItems.end());
-                item_remove_mult(source, item, static_cast<int>(command.sourceQuantity));
-                obj_erase_object(item, nullptr);
-            }
             return execution;
         }
 
@@ -3293,10 +3994,37 @@ public:
 
 NetworkCommandExecutor commandExecutor;
 
+void finishTheft(Object* actor, bool caught)
+{
+    auto found = theftAccess.find(actor);
+    if (found == theftAccess.end()) return;
+    TheftAccess access = found->second;
+    theftAccess.erase(found);
+    activeLootTargets.erase(actor);
+    PlayerCharacterState* player = playerStateForActor(actor);
+    if (player == nullptr) return;
+    deferredEvents.push_back(GameEvent { {}, CommandSequence { UINT64_MAX },
+        SharedModalStateChangedEvent { player->actorId, SharedModalKind::Theft, false,
+            session.phase(), session.phaseRevision() } });
+    ScopedActingPlayerContext context(*player, actor);
+    ScopedPlayerFeedback feedback(actor);
+    if (!session.entities().findEntity(access.target).has_value()) return;
+    if (!caught) {
+        inven_steal_award_xp(actor, access.target, access.experience);
+    } else if (access.attempts > 0) {
+        int sid = -1;
+        if (obj_sid(access.target, &sid) != -1) {
+            scr_set_objs(sid, actor, nullptr);
+            exec_script_proc(sid, SCRIPT_PROC_PICKUP);
+        }
+    }
+}
+
 bool registerWorldObjects()
 {
     combatTurns.stop();
     openInventories.clear();
+    openLootTurns.clear();
     worldDoors.clear();
     worldScenery.clear();
     worldExitGrids.clear();
@@ -3311,6 +4039,7 @@ bool registerWorldObjects()
     dialogueCause = {};
     nextDialogueRevision = 1;
     activeLootTargets.clear();
+    theftAccess.clear();
     activeSharedModal.reset();
     approvedWorldMapProposerActorId = {};
     approvedWorldMapProposalSequence = {};
@@ -3386,12 +4115,18 @@ bool registerWorldObjects()
         return false;
     }
 
+    // Exit grids are absent from saved snapshots. Give the sorted map exits
+    // fixed IDs after the two players instead of depending on the allocator's
+    // history, which differs when a guest loads a host's saved map.
+    std::uint32_t exitId = 3;
     for (Object* exitGrid : exitGrids) {
-        EntityRegistrationResult registration = session.registerWorldObject(exitGrid);
-        if (!registration) {
+        EntityId entityId { exitId++ };
+        if (session.entities().findObject(entityId) != exitGrid
+            && session.entities().restoreObject(entityId, exitGrid)
+                != EntityRegistryError::None) {
             return false;
         }
-        worldExitGrids.emplace_back(registration.entityId, exitGrid);
+        worldExitGrids.emplace_back(entityId, exitGrid);
     }
 
     for (Object* door : doors) {
@@ -3590,7 +4325,10 @@ bool networkWorldEnter(NetworkLaunchMode mode,
     if (!registerWorldObjects()
         || lootDistribution.begin(session.players().playerIds())
             != LootDistributionError::None
-        || !refreshPlayer(kHostPlayerId)
+        // A loaded host already has native HP, poison and combat state. Its
+        // saved build is applied by RestoreMultiplayerSave below; refreshing
+        // against the temporary lobby sheet would heal or clip those values.
+        || ((seedStartingKit || mode != NetworkLaunchMode::Host) && !refreshPlayer(kHostPlayerId))
         || !refreshPlayer(kGuestPlayerId)) {
         session.stop();
         erasePeerActor();
@@ -3653,6 +4391,7 @@ bool networkWorldRestoreMultiplayerSave(const MultiplayerSaveSidecar& sidecar,
     guest->data.critter.combat.whoHitMe = nullptr;
     attachInventory(guest, savedGuestActor->data.inventory);
     savedGuestActor->data.inventory = {};
+    queue_bind_loaded_owner(savedGuestActor->id, guest);
 
     int savedFid = savedGuestActor->fid;
     int savedTile = savedGuestActor->tile;
@@ -3732,7 +4471,10 @@ bool networkWorldBeginEnding()
     }
     combatTurns.stop();
     openInventories.clear();
+    openLootTurns.clear();
     directTradeController.clear();
+    npcBarterState.reset();
+    pendingScriptedNpcBarter.reset();
     dialogueVotes.clear();
     dialoguePresentation.reset();
     activeSharedModal.reset();
@@ -3834,7 +4576,7 @@ bool networkWorldApplyPeerFacing(const ActorFacingChangedEvent& facing)
 
 bool networkWorldApplyPeerDoorUse(const DoorUseStartedEvent& doorUse)
 {
-    if (!session.isActive() || isInCombat()) {
+    if (!session.isActive()) {
         return false;
     }
 
@@ -3937,19 +4679,23 @@ bool networkWorldApplyPeerLoot(const LootStartedEvent& loot)
         || actor == nullptr
         || target == nullptr
         || isPlayerActor(target)
-        || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER
-        || !lootTargetIsInRange(actor, target)) {
+        || !lootTargetIsInRange(actor, target)
+        || (loot.turnRevision != 0
+            ? session.phase() != SessionPhase::Combat || combatTurns.revision() != loot.turnRevision
+                || !networkWorldCombatTurnMatches(actor)
+            : session.phase() != SessionPhase::Exploration)) {
         return false;
     }
     if (actor != obj_dude) {
         return true;
     }
     activeLootTargets[actor] = target;
+    if (loot.turnRevision != 0) openLootTurns[player->actorId] = loot.turnRevision;
     if (inven_loot_window_is_active()) {
         return true;
     }
     ScopedActingPlayerContext actingPlayer(*player, actor);
-    return action_loot_container(actor, target) != -1;
+    return scripts_request_loot_container(actor, target) == 0;
 }
 
 bool networkWorldApplyPeerSharedModal(const SharedModalStateChangedEvent& modal)
@@ -3959,6 +4705,14 @@ bool networkWorldApplyPeerSharedModal(const SharedModalStateChangedEvent& modal)
         || session.entities().findObject(modal.actorId) == nullptr
         || modal.phaseRevision == 0) {
         return false;
+    }
+    if (modal.kind == SharedModalKind::Theft) {
+        if (modal.open || modal.phase != SessionPhase::Exploration
+            || modal.phaseRevision != session.phaseRevision()) return false;
+        Object* actor = session.entities().findObject(modal.actorId);
+        theftAccess.erase(actor);
+        activeLootTargets.erase(actor);
+        return true;
     }
     if (modal.kind == SharedModalKind::WorldMap) {
         if (modal.open && modal.phase == SessionPhase::Exploration) {
@@ -4158,9 +4912,12 @@ bool networkWorldApplyPeerAttack(const AttackStartedEvent& attack)
 
 bool networkWorldApplyPeerSkillUse(const SkillUseStartedEvent& skillUse)
 {
-    if (!session.isActive() || isInCombat() || !isValid(skillUse.skill)) {
+    if (!session.isActive() || !isValid(skillUse.skill)
+        || (isInCombat() && skillUse.skill != ExplorationSkill::Sneak)
+        || (skillUse.skill == ExplorationSkill::Sneak && skillUse.actorId != skillUse.targetId)) {
         return false;
     }
+    if (skillUse.skill == ExplorationSkill::Steal && !skillUse.inventoryOpened) return true;
     PlayerCharacterState* player = session.players().findByActor(skillUse.actorId);
     Object* actor = player != nullptr ? session.entities().findObject(player->actorId) : nullptr;
     Object* target = session.entities().findObject(skillUse.targetId);
@@ -4175,6 +4932,16 @@ bool networkWorldApplyPeerSkillUse(const SkillUseStartedEvent& skillUse)
     // This is presentation-only on a replica. Calling action_use_skill_on or
     // obj_use_skill_on would rerun path callbacks, scripts, rolls, XP, and
     // target mutations. The next authoritative state carries those results.
+    if (skillUse.skill == ExplorationSkill::Steal) {
+        if (lootTargetIsInRange(actor, target))
+            return networkWorldApplyPeerLoot(LootStartedEvent { skillUse.actorId, skillUse.targetId });
+        if (isPlayerActor(target) || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER
+            || !critter_is_active(target) || obj_dist(actor, target) > 1) return false;
+        bool opened = theftAccess.emplace(actor, TheftAccess { target }).second;
+        activeLootTargets[actor] = target;
+        if (opened && actor == localPlayerActor()) scripts_request_steal_container(actor, target);
+    }
+    if (skillUse.skill == ExplorationSkill::Sneak) register_clear(actor);
     return true;
 }
 
@@ -4479,6 +5246,17 @@ void networkWorldClearRestProposal()
 bool networkWorldCaptureScriptedMapTransition(const MapTransition& transition)
 {
     if (!scriptedSceneryTransitionInProgress) {
+        if (worldMode == NetworkLaunchMode::Host && session.isActive()
+            && session.phase() == SessionPhase::Dialogue
+            && activeSharedModal.has_value()
+            && activeSharedModal->kind == SharedModalKind::Dialogue
+            && transition.map > 0 && dialogueCause.value != 0) {
+            if (!pendingDialogueMapTransition.has_value()) {
+                pendingDialogueMapTransition = PendingDialogueMapTransition {
+                    transition, activeSharedModal->actorId, dialogueCause };
+            }
+            return true;
+        }
         return false;
     }
     // A script may request departure more than once. Keep the first request
@@ -4494,6 +5272,968 @@ Object* networkWorldScriptedSceneryTransitionActor(Object* requestedActor)
     return scriptedSceneryTransitionInProgress && requestedActor == obj_dude
         ? actingPlayerActorOr(requestedActor)
         : requestedActor;
+}
+
+static bool runNpcBarterSmokeTest()
+{
+    Object* actor = networkWorldPlayerActor(kGuestPlayerId);
+    auto* player = playerStateForActor(actor);
+    if (player == nullptr || session.phase() != SessionPhase::Exploration) return false;
+    CharacterBuild savedBuild = player->build;
+    std::size_t eventStart = deferredEvents.size();
+    Object* seller = nullptr;
+    Object* payment = nullptr;
+    Object* stock = nullptr;
+    Object* reserved = nullptr;
+    Proto* proto = nullptr;
+    int oldFlags = 0;
+    auto countPid = [](Object* owner, int pid) {
+        int count = 0;
+        for (int i = 0; i < owner->data.inventory.length; ++i) {
+            auto& entry = owner->data.inventory.items[i];
+            if (entry.item->pid == pid) count += entry.quantity;
+        }
+        return count;
+    };
+    auto findPid = [](Object* owner, int pid) -> Object* {
+        for (int i = 0; i < owner->data.inventory.length; ++i) if (owner->data.inventory.items[i].item->pid == pid) return owner->data.inventory.items[i].item;
+        return nullptr;
+    };
+    int baselineStock = countPid(actor, PROTO_ID_STIMPACK);
+    int baselineCaps = item_caps_total(actor);
+    int baselinePayment = countPid(actor, PROTO_ID_FLARE);
+    bool passed = false;
+    if (obj_pid_new(&seller, 0x1000000) == 0 && seller != nullptr
+        && obj_move_to_tile(seller, actor->tile, actor->elevation, nullptr) == 0 && session.registerWorldObject(seller)
+        && proto_ptr(seller->pid, &proto) == 0
+        && obj_pid_new(&payment, PROTO_ID_FLARE) == 0 && obj_disconnect(payment, nullptr) == 0 && item_add_force(actor, payment, 3) == 0
+        && obj_pid_new(&stock, PROTO_ID_STIMPACK) == 0 && obj_disconnect(stock, nullptr) == 0 && item_add_force(seller, stock, 3) == 0
+        && obj_pid_new(&reserved, 8) == 0 && obj_disconnect(reserved, nullptr) == 0 && item_add_force(seller, reserved, 1) == 0
+        && item_caps_adjust(seller, 100) == 0 && registerUntrackedInventory(actor) && registerUntrackedInventory(seller)) {
+        oldFlags = proto->critter.data.flags;
+        proto->critter.data.flags |= CRITTER_BARTER;
+        ScopedActingPlayerContext context(*player, actor);
+        ScopedPlayerFeedback feedback(actor);
+        player->build.skillPoints[SKILL_BARTER] = 100;
+        auto buyerId = player->actorId;
+        auto sellerId = session.entities().findEntity(seller).value_or(EntityId {});
+        auto paymentId = session.entities().findEntity(payment).value_or(EntityId {});
+        auto stockId = session.entities().findEntity(stock).value_or(EntityId {});
+        session.transitionTo(SessionPhase::Dialogue);
+        activeSharedModal = ActiveSharedModal { buyerId, SharedModalKind::Dialogue };
+        dialoguePresentation = DialoguePresentationEvent {};
+        dialoguePresentation->actorId = buyerId; dialoguePresentation->targetId = sellerId;
+        auto command = [&](NpcBarterAction action, DirectTradeOffer buyer = {}, DirectTradeOffer requested = {}) {
+            return commandExecutor.npcBarter(actor, NpcBarterCommand { action, sellerId,
+                action == NpcBarterAction::Begin ? 0 : npcBarterState->revision, buyer, requested });
+        };
+        proto->critter.data.flags &= ~CRITTER_BARTER;
+        bool refuses = command(NpcBarterAction::Begin).status == CommandExecutionStatus::InvalidAction && !npcBarterState.has_value();
+        proto->critter.data.flags |= CRITTER_BARTER;
+        bool began = command(NpcBarterAction::Begin).status == CommandExecutionStatus::Applied;
+        bool reservedHidden = !npcBarterItemAvailable(seller, reserved, true);
+        auto staleRevision = npcBarterState->revision;
+        bool badQuantity = command(NpcBarterAction::Offer, {}, DirectTradeOffer { { { stockId, 4 } }, 0 }).status
+            == CommandExecutionStatus::InvalidAction;
+        payment->flags |= OBJECT_IN_RIGHT_HAND;
+        bool equipped = command(NpcBarterAction::Offer, DirectTradeOffer { { { paymentId, 1 } }, 0 }, {}).status
+            == CommandExecutionStatus::InvalidAction;
+        payment->flags &= ~OBJECT_IN_RIGHT_HAND;
+        bool staged = command(NpcBarterAction::Offer, DirectTradeOffer { { { paymentId, 1 } }, 0 },
+            DirectTradeOffer { { { stockId, 3 } }, 0 }).status == CommandExecutionStatus::Applied;
+        bool noStagingMoves = item_count(seller, stock) == 3 && countPid(actor, PROTO_ID_STIMPACK) == baselineStock;
+        bool unauthorized = commandExecutor.npcBarter(networkWorldPlayerActor(kHostPlayerId),
+            NpcBarterCommand { NpcBarterAction::Accept, sellerId, npcBarterState->revision }).status == CommandExecutionStatus::InvalidAction;
+        bool stale = commandExecutor.npcBarter(actor,
+            NpcBarterCommand { NpcBarterAction::Accept, sellerId, staleRevision }).status == CommandExecutionStatus::InvalidAction;
+        bool rejected = command(NpcBarterAction::Accept).state.status == NpcBarterStatus::Rejected
+            && item_count(seller, stock) == 3 && countPid(actor, PROTO_ID_STIMPACK) == baselineStock;
+        auto paymentQuantity = static_cast<unsigned>(item_count(actor, payment));
+        bool fair = command(NpcBarterAction::Offer, DirectTradeOffer { { { paymentId, paymentQuantity } }, 0 },
+            DirectTradeOffer { { { stockId, 1 } }, 7 }).status == CommandExecutionStatus::Applied;
+        auto goodPrice = npcBarterState->askingValue;
+        player->build.skillPoints[SKILL_BARTER] = 0;
+        priceNpcBarter(actor, seller, *npcBarterState);
+        bool skillPrice = npcBarterState->askingValue > goodPrice;
+        player->build.skillPoints[SKILL_BARTER] = 100;
+        stock->flags |= OBJECT_IN_RIGHT_HAND;
+        bool revalidated = command(NpcBarterAction::Accept).state.status == NpcBarterStatus::Rejected
+            && countPid(actor, PROTO_ID_STIMPACK) == baselineStock;
+        stock->flags &= ~OBJECT_IN_RIGHT_HAND;
+        command(NpcBarterAction::Offer, DirectTradeOffer { { { paymentId, paymentQuantity } }, 0 },
+            DirectTradeOffer { { { stockId, 1 } }, 7 });
+        auto committed = command(NpcBarterAction::Accept);
+        bool exchanged = committed.state.status == NpcBarterStatus::Committed && !npcBarterState.has_value()
+            && countPid(actor, PROTO_ID_STIMPACK) == baselineStock + 1 && item_caps_total(actor) == baselineCaps + 7
+            && countPid(seller, PROTO_ID_STIMPACK) == 2 && item_caps_total(seller) == 93;
+        bool reopened = command(NpcBarterAction::Begin).status == CommandExecutionStatus::Applied;
+        bool cancelled = command(NpcBarterAction::Cancel).state.status == NpcBarterStatus::Cancelled && !npcBarterState.has_value();
+        auto presentation = *dialoguePresentation;
+        dialoguePresentation.reset();
+        bool scriptedQueued = networkWorldRequestScriptedNpcBarter(seller);
+        networkWorldProcessScriptedNpcBarter();
+        bool waitedForPresentation = !npcBarterState.has_value();
+        dialoguePresentation = presentation;
+        networkWorldProcessScriptedNpcBarter();
+        bool scriptedGuest = npcBarterState.has_value() && npcBarterState->buyerId == buyerId;
+        networkWorldDirectTradeSetConnected(kHostPlayerId, false);
+        bool observerDeparture = npcBarterState.has_value();
+        networkWorldDirectTradeSetConnected(kGuestPlayerId, false);
+        bool buyerDeparture = !npcBarterState.has_value() && !deferredEvents.empty()
+            && std::get_if<NpcBarterStateChangedEvent>(&deferredEvents.back().payload) != nullptr
+            && std::get<NpcBarterStateChangedEvent>(deferredEvents.back().payload).state.status == NpcBarterStatus::Cancelled;
+        passed = refuses && began && reservedHidden && badQuantity && equipped && staged && noStagingMoves
+            && unauthorized && stale && rejected && fair && skillPrice && revalidated && exchanged && reopened && cancelled && scriptedQueued && waitedForPresentation && scriptedGuest && observerDeparture && buyerDeparture;
+        std::fprintf(stderr, "NATIVE_NPC_BARTER_%s begin=%d reserved=%d invalid=%d staged=%d owner=%d stale=%d reject=%d commit=%d cancel=%d observer=%d disconnect=%d\n",
+            passed ? "PASS" : "FAIL", began, reservedHidden, badQuantity && equipped, staged && noStagingMoves,
+            unauthorized, stale, rejected, exchanged, cancelled, observerDeparture, buyerDeparture);
+        proto->critter.data.flags = oldFlags;
+    }
+    npcBarterState.reset();
+    pendingScriptedNpcBarter.reset();
+    dialoguePresentation.reset(); dialogueVotes.clear(); activeSharedModal.reset();
+    if (session.phase() == SessionPhase::Dialogue) session.transitionTo(SessionPhase::Exploration);
+    player->build = savedBuild;
+    while (deferredEvents.size() > eventStart) deferredEvents.pop_back();
+    int excessStock = countPid(actor, PROTO_ID_STIMPACK) - baselineStock;
+    if (excessStock > 0) {
+        Object* item = findPid(actor, PROTO_ID_STIMPACK);
+        if (item != nullptr && item_remove_mult(actor, item, excessStock) == 0) obj_destroy(item);
+    }
+    item_caps_adjust(actor, baselineCaps - item_caps_total(actor));
+    // The fixture may merge its flares with the player's baseline stack.
+    int missingPayment = baselinePayment - countPid(actor, PROTO_ID_FLARE);
+    if (missingPayment > 0) {
+        Object* restored = nullptr;
+        if (obj_pid_new(&restored, PROTO_ID_FLARE) == 0) { obj_disconnect(restored, nullptr); item_add_force(actor, restored, missingPayment); }
+    } else if (missingPayment < 0) {
+        Object* item = findPid(actor, PROTO_ID_FLARE);
+        if (item != nullptr && item_remove_mult(actor, item, -missingPayment) == 0) obj_destroy(item);
+    }
+    if (seller != nullptr) {
+        while (seller->data.inventory.length > 0) {
+            Object* item = seller->data.inventory.items[0].item;
+            item_remove_mult(seller, item, item_count(seller, item)); obj_destroy(item);
+        }
+        obj_erase_object(seller, nullptr);
+    }
+    registerUntrackedInventory(actor);
+    return passed;
+}
+
+// Execute real interpreter opcodes inside host-owned USE_SKILL_ON and PICKUP fixtures.
+// The bytecode is deliberately small so it needs no external script compiler.
+static bool runTheftScriptAndSneakSmoke()
+{
+    std::array<int, 4> globals;
+    for (int index = 0; index < 4; ++index) globals[index] = game_get_global_var(index);
+    bool passed = true;
+    std::size_t eventStart = deferredEvents.size();
+    for (PlayerId id : session.players().playerIds()) {
+        Object* actor = networkWorldPlayerActor(id);
+        auto* player = playerStateForActor(actor);
+        if (actor == nullptr || player == nullptr) { passed = false; break; }
+        CharacterBuild savedBuild = player->build;
+        // Suppress a native UI request during this executor fixture.
+        PlayerId otherId;
+        for (PlayerId candidate : session.players().playerIds()) if (candidate != id) { otherId = candidate; break; }
+        ScopedLocalPlayerBinding otherLocal(session, otherId);
+        {
+            ScopedActingPlayerContext context(*player, actor);
+            player->build.prototypeFlags |= 1 << PC_FLAG_SNEAKING;
+            for (PlayerId queriedId : session.players().playerIds()) {
+                Object* queried = networkWorldPlayerActor(queriedId);
+                auto* queriedPlayer = playerStateForActor(queried);
+                bool expected = (queriedPlayer->build.prototypeFlags & (1 << PC_FLAG_SNEAKING)) != 0;
+                passed = intExtraUsingSkill(queried, SKILL_SNEAK) == expected
+                    && actingPlayerActor() == actor && passed;
+            }
+            passed = !intExtraUsingSkill(nullptr, SKILL_SNEAK)
+                && !intExtraUsingSkill(actor, SKILL_STEAL) && passed;
+            for (int testCase = 0; testCase < 10; ++testCase) {
+                bool ordinaryLoot = testCase >= 5;
+                int mode = testCase % 5;
+                Object* target = nullptr;
+                int sid = -1;
+                if (obj_pid_new(&target, mode == 4 ? 213 : 0x1000000) != 0 || target == nullptr
+                    || obj_move_to_tile(target, actor->tile, actor->elevation, nullptr) != 0
+                    || !session.registerWorldObject(target) || scr_new(&sid, SCRIPT_TYPE_CRITTER) != 0) {
+                    if (target != nullptr) obj_erase_object(target, nullptr);
+                    passed = false;
+                    break;
+                }
+                auto targetId = session.entities().findEntity(target).value_or(EntityId {});
+                target->sid = sid;
+                if (ordinaryLoot && mode != 4) target->data.critter.combat.results |= DAM_DEAD;
+                Program program {};
+                char name[] = "multiplayer-theft-fixture";
+                ProgramStack stack, returns;
+                std::vector<unsigned char> data(64, 0);
+                std::array<unsigned char, 64> procedures {};
+                // Procedure index 1 begins at byte 64, big endian address.
+                procedures[4 + sizeof(Procedure) + 19] = 64;
+                auto op = [&](int value) { data.push_back(value >> 8); data.push_back(value & 255); };
+                auto number = [&](int value) {
+                    op(VALUE_TYPE_INT);
+                    for (int shift = 24; shift >= 0; shift -= 8) data.push_back((value >> shift) & 255);
+                };
+                op(OPCODE_POP); // zero procedure arguments
+                number(0); number(0); op(0x80C5); number(1); op(OPCODE_ADD); op(0x80C6);
+                number(1); op(0x80BD); number(SKILL_SNEAK); op(0x80AB); op(0x80C6);
+                number(2); op(0x80BD); op(0x80BF); op(OPCODE_EQUAL); op(0x80C6);
+                number(3); op(0x80FA); op(0x80C6);
+                if (mode == 1) op(0x80B9); // script_overrides
+                if (mode == 2) {
+                    op(0x80BC); number(tile_num_in_direction(actor->tile, ROTATION_SE, 6));
+                    number(actor->elevation); op(0x80B6); op(OPCODE_POP);
+                }
+                if (mode == 3) { op(0x80BC); op(0x80F4); } // destroy self
+                op(OPCODE_POP_FLAGS_EXIT);
+                program.name = name; program.data = data.data(); program.procedures = procedures.data();
+                program.stackValues = &stack; program.returnStackValues = &returns;
+                Script* script = nullptr;
+                bool initialized = scr_ptr(sid, &script) == 0;
+                if (initialized) {
+                    script->owner = target; script->program = &program; script->scr_flags |= SCRIPT_FLAG_0x01;
+                    script->procs[SCRIPT_PROC_USE_SKILL_ON] = 1;
+                    script->procs[SCRIPT_PROC_PICKUP] = 1;
+                }
+                for (int index = 0; index < 4; ++index) game_set_global_var(index, 0);
+                if (mode == 4) {
+                    if (ordinaryLoot) obj_lock(target);
+                    else obj_jam_lock(target);
+                }
+                engineExecutionProbeBegin();
+                auto result = !initialized ? CommandExecutionStatus::InvalidAction
+                    : ordinaryLoot ? commandExecutor.loot(actor, target)
+                    : commandExecutor.useSkill(actor, target, UseSkillCommand { targetId, ExplorationSkill::Steal });
+                auto counts = engineExecutionProbeEnd();
+                bool exists = session.entities().findObject(targetId) == target;
+                bool opened = ordinaryLoot
+                    ? activeLootTargets.count(actor) != 0 && activeLootTargets.at(actor) == target
+                    : commandExecutor.skillInventoryOpened(actor, target);
+                bool expectedOpen = mode == 0;
+                bool outcome = (ordinaryLoot ? mode == 0 : mode < 2) ? result == CommandExecutionStatus::Applied
+                    : result == CommandExecutionStatus::InvalidAction;
+                bool effects = mode == 4 ? counts.scriptProcedures == 0 && game_get_global_var(0) == 0
+                    : counts.scriptProcedures == 1 && game_get_global_var(0) == 1
+                        && game_get_global_var(1) == 1 && game_get_global_var(2) == 1
+                        && (ordinaryLoot || game_get_global_var(3) == SKILL_STEAL);
+                bool npcRejected = !exists || !intExtraUsingSkill(target, SKILL_SNEAK);
+                if (opened && !ordinaryLoot) {
+                    theftAccess.at(actor).attempts = 1;
+                    finishTheft(actor, true);
+                    effects = game_get_global_var(0) == 2 && effects;
+                }
+                if (ordinaryLoot) activeLootTargets.erase(actor);
+                bool clean = !networkWorldHasTheftAccess(actor);
+                bool casePassed = outcome && effects && opened == expectedOpen && clean && npcRejected
+                    && (mode != 3 || !exists);
+                std::fprintf(stderr, "NATIVE_%s_SCRIPT_%s player=%u mode=%d hooks=%u open=%d effect=%d clean=%d\n",
+                    ordinaryLoot ? "LOOT" : "THEFT", casePassed ? "PASS" : "FAIL", id.value, mode, counts.scriptProcedures, opened, effects, clean);
+                passed = casePassed && passed;
+                if (exists) {
+                    // Detach the stack-owned program before destroying its script.
+                    if (scr_ptr(sid, &script) == 0) script->program = nullptr;
+                    obj_erase_object(target, nullptr);
+                }
+            }
+        }
+        player->build = savedBuild;
+    }
+    for (int index = 0; index < 4; ++index) game_set_global_var(index, globals[index]);
+    while (deferredEvents.size() > eventStart) deferredEvents.pop_back();
+    std::fprintf(stderr, "NATIVE_SCRIPT_SNEAK_%s explicit_players=1 npc_rejected=1 scope_restored=1\n", passed ? "PASS" : "FAIL");
+    return passed;
+}
+
+static bool runTheftTransactionSmokeTest()
+{
+    Object* actor = networkWorldPlayerActor(kGuestPlayerId);
+    PlayerCharacterState* player = playerStateForActor(actor);
+    if (player == nullptr) return false;
+    CharacterBuild savedBuild = player->build;
+    int savedHitPoints = actor->data.critter.hp;
+    std::size_t eventStart = deferredEvents.size();
+    Object* target = nullptr;
+    Object* item = nullptr;
+    bool passed = false;
+    // An unowned biped fixture, unlike a rat which cannot accept planted items.
+    if (obj_pid_new(&target, 0x1000000) == 0 && target != nullptr
+        && obj_move_to_tile(target, actor->tile, actor->elevation, nullptr) == 0
+        && session.registerWorldObject(target)
+        && obj_pid_new(&item, kAntidotePid) == 0 && item != nullptr
+        && item_add_force(target, item, 3) == 0 && registerItem(item)) {
+        ScopedActingPlayerContext context(*player, actor);
+        ScopedPlayerFeedback feedback(actor);
+        auto targetId = session.entities().findEntity(target).value_or(EntityId {});
+        auto actorId = player->actorId;
+        auto quantity = [](Object* holder) {
+            int result = 0;
+            for (int index = 0; index < holder->data.inventory.length; ++index) {
+                const auto& entry = holder->data.inventory.items[index];
+                if (entry.item->pid == kAntidotePid) result += entry.quantity;
+            }
+            return result;
+        };
+        auto open = [&]() {
+            return commandExecutor.useSkill(actor, target, UseSkillCommand { targetId, ExplorationSkill::Steal })
+                == CommandExecutionStatus::Applied;
+        };
+        auto close = [&]() {
+            return commandExecutor.setSharedModal(actor, SharedModalCommand { SharedModalKind::Theft, false }).status
+                == CommandExecutionStatus::Applied;
+        };
+        auto transfer = [&](Object* source, Object* destination, unsigned available) {
+            return commandExecutor.transferInventory(actor, source, destination, item, InventoryTransferCommand {
+                session.entities().findEntity(source).value_or(EntityId {}),
+                session.entities().findEntity(destination).value_or(EntityId {}),
+                session.entities().findEntity(item).value_or(EntityId {}), 1, available, {} }).status;
+        };
+        auto seedFor = [&](int outcome, bool planting) {
+            int savedCount = gStealCount;
+            gStealCount = theftAccess.count(actor) != 0 ? theftAccess.at(actor).attempts + 1 : 1;
+            int selected = -1;
+            for (int seed = 1; seed <= 100 && selected < 0; ++seed) {
+                roll_set_seed(seed);
+                if (skill_check_stealing(actor, target, item, planting) == outcome) selected = seed;
+            }
+            gStealCount = savedCount;
+            return selected;
+        };
+        player->build.skillPoints[SKILL_STEAL] = 100;
+        player->build.perkRanks[PERK_SWIFT_LEARNER] = 0;
+        int initialXp = player->build.experience;
+        bool opened = open();
+        engineExecutionProbeBegin();
+        bool staleRejected = transfer(target, actor, 4) == CommandExecutionStatus::InvalidAction;
+        item->flags |= OBJECT_IN_RIGHT_HAND;
+        bool equippedRejected = transfer(target, actor, 3) == CommandExecutionStatus::InvalidAction;
+        item->flags &= ~OBJECT_IN_RIGHT_HAND;
+        auto rejectedCounts = engineExecutionProbeEnd();
+        int takeSeed = seedFor(1, false);
+        roll_set_seed(takeSeed);
+        engineExecutionProbeBegin();
+        bool taken = takeSeed > 0 && transfer(target, actor, 3) == CommandExecutionStatus::Applied
+            && quantity(target) == 2 && item->owner == actor;
+        auto successCounts = engineExecutionProbeEnd();
+        int plantSeed = seedFor(1, true);
+        roll_set_seed(plantSeed);
+        bool planted = plantSeed > 0 && transfer(actor, target, 1) == CommandExecutionStatus::Applied
+            && quantity(target) == 3 && item->owner == target;
+        std::size_t beforeClose = deferredEvents.size();
+        bool closed = close() && !networkWorldHasTheftAccess(actor)
+            && player->build.experience == initialXp + 30;
+        bool xpFeedback = std::any_of(deferredEvents.begin() + beforeClose, deferredEvents.end(),
+            [actorId](const GameEvent& event) {
+                const auto* feedback = std::get_if<PlayerFeedbackEvent>(&event.payload);
+                return feedback != nullptr && feedback->actorId == actorId && !feedback->text.empty();
+            });
+        player->build.skillPoints[SKILL_STEAL] = 0;
+        int caughtXp = player->build.experience;
+        bool reopened = open();
+        int caughtSeed = seedFor(0, false);
+        roll_set_seed(caughtSeed);
+        engineExecutionProbeBegin();
+        bool caught = caughtSeed > 0 && transfer(target, actor, 3) == CommandExecutionStatus::InvalidAction
+            && !networkWorldHasTheftAccess(actor) && quantity(target) == 3
+            && player->build.experience == caughtXp;
+        auto caughtCounts = engineExecutionProbeEnd();
+        int originalTile = actor->tile;
+        int originalFid = actor->fid;
+        bool weaponArt = false;
+        for (int weapon = 1; weapon <= 10 && !weaponArt; ++weapon) {
+            int standing = art_id(FID_TYPE(originalFid), originalFid & 0xFFF, ANIM_STAND, weapon, actor->rotation + 1);
+            int walking = art_id(FID_TYPE(originalFid), originalFid & 0xFFF, ANIM_WALK, weapon, actor->rotation + 1);
+            if (art_exists(standing) && art_exists(walking))
+                weaponArt = obj_change_fid(actor, standing, nullptr) == 0;
+        }
+        bool approached = false;
+        for (int rotation = 0; rotation < ROTATION_COUNT && !approached; ++rotation) {
+            int remoteTile = tile_num_in_direction(target->tile, rotation, 6);
+            std::array<unsigned char, kMaximumMovementPathLength> path;
+            if (!hexGridTileIsValid(remoteTile) || obj_blocking_at(actor, remoteTile, actor->elevation) != nullptr
+                || make_path(actor, originalTile, remoteTile, path.data(), 1) <= 0) continue;
+            if (obj_move_to_tile(actor, remoteTile, actor->elevation, nullptr) == 0) {
+                bool wasDistant = obj_dist(actor, target) > 1;
+                approached = wasDistant && open() && obj_dist(actor, target) <= 1 && close();
+                register_clear(actor);
+                obj_move_to_tile(actor, originalTile, actor->elevation, nullptr);
+            }
+        }
+        obj_change_fid(actor, originalFid, nullptr);
+        int fallbackXp = player->build.experience;
+        target->data.critter.combat.results |= DAM_KNOCKED_OUT;
+        bool unconsciousLoot = open() && !networkWorldHasTheftAccess(actor)
+            && activeLootTargets.count(actor) != 0 && activeLootTargets.at(actor) == target;
+        activeLootTargets.erase(actor);
+        target->data.critter.combat.results = DAM_DEAD;
+        bool corpseLoot = open() && !networkWorldHasTheftAccess(actor)
+            && activeLootTargets.count(actor) != 0 && activeLootTargets.at(actor) == target
+            && player->build.experience == fallbackXp;
+        activeLootTargets.erase(actor);
+        Object* container = nullptr;
+        bool containerLoot = false;
+        bool lockedRejected = false;
+        if (obj_pid_new(&container, 213) == 0 && container != nullptr
+            && obj_move_to_tile(container, originalTile, actor->elevation, nullptr) == 0
+            && session.registerWorldObject(container)) {
+            auto containerId = session.entities().findEntity(container).value_or(EntityId {});
+            containerLoot = commandExecutor.useSkill(actor, container, UseSkillCommand { containerId, ExplorationSkill::Steal })
+                    == CommandExecutionStatus::Applied
+                && !networkWorldHasTheftAccess(actor) && activeLootTargets.count(actor) != 0
+                && activeLootTargets.at(actor) == container;
+            activeLootTargets.erase(actor);
+            obj_lock(container);
+            lockedRejected = commandExecutor.useSkill(actor, container, UseSkillCommand { containerId, ExplorationSkill::Steal })
+                    == CommandExecutionStatus::InvalidAction
+                && activeLootTargets.count(actor) == 0;
+        }
+        if (container != nullptr) obj_erase_object(container, nullptr);
+        target->data.critter.combat.results = 0;
+        passed = opened && staleRejected && equippedRejected && rejectedCounts.randomDraws == 0
+            && taken && successCounts.randomDraws > 0 && planted && closed && xpFeedback && reopened && caught
+            && caughtCounts.randomDraws > 0 && approached && weaponArt && unconsciousLoot && corpseLoot && containerLoot && lockedRejected;
+        std::fprintf(stderr, "NATIVE_THEFT_APPROACH_%s movement=%d weapon_art=%d unconscious=%d corpse=%d container=%d locked=%d\n",
+            approached && weaponArt && unconsciousLoot && corpseLoot && containerLoot && lockedRejected ? "PASS" : "FAIL",
+            approached, weaponArt, unconsciousLoot, corpseLoot, containerLoot, lockedRejected);
+        std::fprintf(stderr, "NATIVE_THEFT_TRANSACTIONS_%s open=%d stale=%d equipped=%d take=%d plant=%d close_xp=%d caught=%d host_rng=%u\n",
+            passed ? "PASS" : "FAIL", opened, staleRejected, equippedRejected, taken, planted, closed, caught,
+            successCounts.randomDraws + caughtCounts.randomDraws);
+    }
+    theftAccess.erase(actor);
+    activeLootTargets.erase(actor);
+    player->build = savedBuild;
+    actor->data.critter.hp = savedHitPoints;
+    while (deferredEvents.size() > eventStart) deferredEvents.pop_back();
+    // Split representatives are registered separately and may have merged.
+    std::vector<Object*> temporaryItems;
+    for (const auto& entry : worldItems) {
+        if ((target != nullptr && entry.second->owner == target) || (entry.second == item && entry.second->owner == actor))
+            temporaryItems.push_back(entry.second);
+    }
+    for (Object* temporary : temporaryItems) {
+        if (temporary->owner != nullptr) {
+            Object* owner = temporary->owner;
+            item_remove_mult(owner, temporary, item_count(owner, temporary));
+        }
+        obj_destroy(temporary);
+    }
+    if (target != nullptr) {
+        theftAccess.emplace(actor, TheftAccess { target });
+        activeLootTargets[actor] = target;
+        obj_erase_object(target, nullptr);
+        bool cleaned = !networkWorldHasTheftAccess(actor)
+            && activeLootTargets.count(actor) == 0 && !session.entities().findEntity(target).has_value();
+        std::fprintf(stderr, "NATIVE_THEFT_DESTROYED_TARGET_%s access_closed=%d registry_removed=%d\n",
+            cleaned ? "PASS" : "FAIL", !networkWorldHasTheftAccess(actor), !session.entities().findEntity(target).has_value());
+        passed = passed && cleaned;
+    }
+    return passed;
+}
+
+bool networkWorldPrepareCharacterEditorSmoke()
+{
+    if (worldMode != NetworkLaunchMode::Host || !session.isActive()) return false;
+    for (PlayerId id : session.players().playerIds()) {
+        auto* player = session.players().find(id);
+        Object* actor = networkWorldPlayerActor(id);
+        if (player == nullptr || actor == nullptr) return false;
+        player->build.baseStats[STAT_PERCEPTION] = 6;
+        player->build.baseStats[STAT_INTELLIGENCE] = 6;
+        player->build.level = player->build.processedLevel = 3;
+        player->build.experience = 3000;
+        player->build.unspentSkillPoints = 10;
+        player->build.pendingPerks = 1;
+        player->build.skillPoints.fill(0);
+        player->build.perkRanks.fill(0);
+        player->build.traits = { -1, -1 };
+        player->build.taggedSkills = { SKILL_SMALL_GUNS, SKILL_FIRST_AID, SKILL_REPAIR, -1 };
+        ScopedActingPlayerContext context(*player, actor);
+        stat_recalc_derived(actor);
+    }
+    return true;
+}
+
+static bool runCharacterAdvancementSmoke()
+{
+    bool passed = true;
+    for (PlayerId id : session.players().playerIds()) {
+        Object* actor = networkWorldPlayerActor(id);
+        auto* player = session.players().find(id);
+        if (actor == nullptr || player == nullptr) return false;
+        auto saved = player->build;
+        int hp = actor->data.critter.hp;
+        ScopedActingPlayerContext context(*player, actor);
+        CharacterBuild baseline;
+        baseline.baseStats = saved.baseStats;
+        baseline.baseStats[STAT_PERCEPTION] = 6;
+        baseline.baseStats[STAT_INTELLIGENCE] = 6;
+        baseline.baseStats[STAT_ENDURANCE] = 6;
+        baseline.level = baseline.processedLevel = 12;
+        baseline.pendingPerks = 1;
+        baseline.unspentSkillPoints = 10;
+        player->build = baseline;
+        stat_recalc_derived(actor);
+        baseline = player->build;
+        CharacterAdvanceCommand command;
+        command.expectedBuild = characterAdvancementFingerprint(baseline);
+        command.perk = PERK_AWARENESS;
+        command.skillIncrements[SKILL_FIRST_AID] = 3;
+        auto reject = [&](CharacterAdvanceCommand invalid) {
+            bool rejected = commandExecutor.advanceCharacter(actor, invalid) == CommandExecutionStatus::InvalidAction;
+            return rejected && player->build == baseline && actor->data.critter.hp == hp;
+        };
+        auto invalid = command;
+        ++invalid.expectedBuild;
+        passed = reject(invalid) && passed;
+        invalid = command;
+        invalid.skillIncrements[SKILL_FIRST_AID] = 99;
+        passed = reject(invalid) && passed;
+        invalid = command;
+        invalid.perk = PERK_SLAYER;
+        passed = reject(invalid) && passed;
+        bool committed = commandExecutor.advanceCharacter(actor, command) == CommandExecutionStatus::Applied;
+        passed = committed && player->build.skillPoints[SKILL_FIRST_AID] == 3
+            && player->build.unspentSkillPoints == 7 && player->build.perkRanks[PERK_AWARENESS] == 1
+            && player->build.pendingPerks == 0 && passed;
+        auto after = player->build;
+        passed = commandExecutor.advanceCharacter(actor, command) == CommandExecutionStatus::InvalidAction
+            && player->build == after && passed;
+        player->build = baseline;
+        command.skillIncrements.fill(0);
+        command.perk = PERK_TAG;
+        command.taggedSkill = SKILL_REPAIR;
+        passed = commandExecutor.advanceCharacter(actor, command) == CommandExecutionStatus::Applied
+            && player->build.taggedSkills[3] == SKILL_REPAIR && player->build.pendingPerks == 0 && passed;
+        player->build = baseline;
+        player->build.traits = { TRAIT_GIFTED, TRAIT_SKILLED };
+        command.expectedBuild = characterAdvancementFingerprint(player->build);
+        command.perk = PERK_MUTATE;
+        command.taggedSkill = -1;
+        command.removedTrait = TRAIT_SKILLED;
+        command.addedTrait = TRAIT_FAST_SHOT;
+        passed = commandExecutor.advanceCharacter(actor, command) == CommandExecutionStatus::Applied
+            && player->build.traits[0] == TRAIT_GIFTED && player->build.traits[1] == TRAIT_FAST_SHOT
+            && player->build.pendingPerks == 0 && passed;
+        player->build = saved;
+        actor->data.critter.hp = hp;
+    }
+    std::fprintf(stderr, "NATIVE_CHARACTER_ADVANCEMENT_%s actors=%zu stale=1 overdraw=1 prerequisites=1 skills=1 perks=1 tag=1 mutate=1\n",
+        passed ? "PASS" : "FAIL", session.players().size());
+    return passed;
+}
+
+bool networkWorldPrepareAutomapSmoke()
+{
+    if (worldMode != NetworkLaunchMode::Host) return false;
+    int floor = 0;
+    for (PlayerId id : session.players().playerIds()) {
+        Object* actor = networkWorldPlayerActor(id);
+        Object* sensor = nullptr;
+        if (actor == nullptr || obj_move_to_tile(actor, actor->tile, floor++ % ELEVATION_COUNT, nullptr) != 0
+            || obj_pid_new(&sensor, PROTO_ID_MOTION_SENSOR) != 0 || sensor == nullptr) return false;
+        obj_disconnect(sensor, nullptr);
+        item_m_set_charges(sensor, 2);
+        if (item_add_force(actor, sensor, 1) != 0 || !registerItem(sensor)) return false;
+        if (Object* held = inven_right_hand(actor)) held->flags &= ~OBJECT_IN_RIGHT_HAND;
+        sensor->flags |= OBJECT_IN_RIGHT_HAND;
+    }
+    return true;
+}
+
+static bool runAutomapScannerAuthoritySmoke()
+{
+    bool passed = true;
+    std::size_t eventStart = deferredEvents.size();
+    for (PlayerId id : session.players().playerIds()) {
+        Object* actor = networkWorldPlayerActor(id);
+        auto* player = playerStateForActor(actor);
+        if (actor == nullptr || player == nullptr) return false;
+        ScopedActingPlayerContext context(*player, actor);
+        ScopedLocalPlayerBinding binding(actor);
+        std::vector<std::pair<Object*, int>> flags;
+        for (int i = 0; i < actor->data.inventory.length; ++i) {
+            Object* item = actor->data.inventory.items[i].item;
+            flags.emplace_back(item, item->flags);
+            item->flags &= ~OBJECT_IN_RIGHT_HAND;
+        }
+        Object* sensor = nullptr;
+        bool ready = obj_pid_new(&sensor, PROTO_ID_MOTION_SENSOR) == 0 && sensor != nullptr;
+        if (ready) {
+            obj_disconnect(sensor, nullptr);
+            item_m_set_charges(sensor, 3);
+            ready = item_add_force(actor, sensor, 2) == 0 && registerItem(sensor);
+        }
+        bool tested = false;
+        if (ready) {
+            sensor->flags |= OBJECT_IN_RIGHT_HAND;
+            EntityId sensorId = networkWorldFindEntity(sensor).value_or(EntityId {});
+            int ap = actor->data.critter.combat.ap;
+            CommandProcessor processor;
+            GameCommand command { CommandSequence { 1 }, id, player->actorId, SessionPhase::Exploration,
+                session.phaseRevision(), InventoryActionCommand { 0, sensorId, InventoryAction::Scan } };
+            auto applied = processor.process(command, session, commandExecutor);
+            bool charged = applied.result.status == CommandStatus::Accepted
+                && item_m_curr_charges(sensor) == 2 && item_count(actor, sensor) == 1
+                && inven_right_hand(actor) == sensor && actor->data.critter.combat.ap == ap;
+            int sensors = 0, totalCharges = 0, equipped = 0;
+            for (int i = 0; i < actor->data.inventory.length; ++i) {
+                const auto& entry = actor->data.inventory.items[i];
+                if (entry.item->pid != PROTO_ID_MOTION_SENSOR) continue;
+                sensors += entry.quantity; totalCharges += entry.quantity * item_m_curr_charges(entry.item);
+                equipped += (entry.item->flags & OBJECT_IN_RIGHT_HAND) != 0;
+            }
+            bool stack = sensors == 2 && totalCharges == 5 && equipped == 1;
+            auto replay = processor.process(command, session, commandExecutor);
+            bool replaySafe = replay.replayed && item_m_curr_charges(sensor) == 2;
+            command.sequence.value++;
+            sensor->flags &= ~OBJECT_IN_RIGHT_HAND;
+            bool unequipped = processor.process(command, session, commandExecutor).result.status == CommandStatus::Rejected
+                && item_m_curr_charges(sensor) == 2;
+            sensor->flags |= OBJECT_IN_RIGHT_HAND;
+            command.sequence.value++;
+            item_m_set_charges(sensor, 0);
+            bool empty = processor.process(command, session, commandExecutor).result.status == CommandStatus::Rejected
+                && item_m_curr_charges(sensor) == 0;
+            item_m_set_charges(sensor, 2);
+            bool foreign = true, markers = automap_player_marker(actor, actor->elevation) == 1
+                && automap_player_marker(actor, actor->elevation + 1) == 0;
+            for (PlayerId otherId : session.players().playerIds()) {
+                if (otherId == id) continue;
+                Object* other = networkWorldPlayerActor(otherId);
+                auto* otherPlayer = playerStateForActor(other);
+                command.sequence.value = 1; command.playerId = otherId; command.actorId = otherPlayer->actorId;
+                foreign = processor.process(command, session, commandExecutor).result.status == CommandStatus::Rejected
+                    && item_m_curr_charges(sensor) == 2 && foreign;
+                markers = automap_player_marker(other, other->elevation) == 2
+                    && automap_player_marker(other, other->elevation + 1) == 0 && markers;
+            }
+            ItemDescriptor descriptor;
+            bool snapshot = describeItem(sensor, descriptor);
+            Object* copy = nullptr;
+            snapshot = obj_pid_new(&copy, PROTO_ID_MOTION_SENSOR) == 0 && copy != nullptr && snapshot;
+            if (copy != nullptr) {
+                applyItemDescriptor(copy, descriptor);
+                snapshot = item_m_curr_charges(copy) == 2 && snapshot;
+                obj_erase_object(copy, nullptr);
+            }
+            tested = charged && stack && replaySafe && unequipped && empty && foreign && markers && snapshot;
+            std::fprintf(stderr, "NATIVE_AUTOMAP_SCANNER_%s player=%u charge=%d stack=%d replay=%d unequipped=%d empty=%d foreign=%d markers=%d descriptor=%d\n",
+                tested ? "PASS" : "FAIL", id.value, charged, stack, replaySafe, unequipped, empty, foreign, markers, snapshot);
+        }
+        // This fixture's motion sensors have no baseline counterparts.
+        for (int i = actor->data.inventory.length - 1; i >= 0; --i) {
+            Object* item = actor->data.inventory.items[i].item;
+            if (item->pid == PROTO_ID_MOTION_SENSOR) {
+                item_remove_mult(actor, item, item_count(actor, item)); obj_erase_object(item, nullptr);
+            }
+        }
+        for (const auto& entry : flags) entry.first->flags = entry.second;
+        passed = tested && passed;
+    }
+    while (deferredEvents.size() > eventStart) deferredEvents.pop_back();
+    return passed;
+}
+
+bool networkWorldPrepareExplosiveTimerSmoke()
+{
+    if (worldMode != NetworkLaunchMode::Host || session.phase() != SessionPhase::Exploration) return false;
+    for (PlayerId id : session.players().playerIds()) {
+        Object* actor = networkWorldPlayerActor(id);
+        auto* player = session.players().find(id);
+        if (actor == nullptr || player == nullptr) return false;
+        player->build.skillPoints[SKILL_TRAPS] = 100;
+        player->build.baseStats[STAT_LUCK] = 10;
+        Object* explosive = nullptr;
+        if (obj_pid_new(&explosive, PROTO_ID_DYNAMITE_I) != 0 || explosive == nullptr
+            || obj_disconnect(explosive, nullptr) != 0
+            || item_add_force(actor, explosive, 2) != 0 || !registerItem(explosive)) return false;
+    }
+    return true;
+}
+
+static bool runExplosiveRollAndSourceSmoke()
+{
+    bool passed = true;
+    int savedTime = game_time();
+    set_game_time(std::max(savedTime, GAME_TIME_TICKS_PER_DAY * 2));
+    for (PlayerId id : session.players().playerIds()) {
+        Object* actor = networkWorldPlayerActor(id);
+        auto* player = session.players().find(id);
+        if (actor == nullptr || player == nullptr) { set_game_time(savedTime); return false; }
+        auto savedBuild = player->build;
+        ScopedActingPlayerContext context(*player, actor);
+        player->build.skillPoints[SKILL_TRAPS] = 0;
+        player->build.baseStats[STAT_PERCEPTION] = 2;
+        player->build.baseStats[STAT_AGILITY] = 2;
+        player->build.baseStats[STAT_LUCK] = 1;
+        player->build.traits = { -1, -1 };
+        player->build.perkRanks.fill(0);
+        bool sawSuccess = false, sawFailure = false, sawCritical = false;
+        // Native reseeding retains part of its shuffle table. Observe real
+        // host rolls rather than predicting a second roll by reseeding.
+        for (int attempt = 0; attempt < 300 && !(sawSuccess && sawFailure && sawCritical); ++attempt) {
+            Object* bomb = nullptr;
+            if (obj_pid_new(&bomb, PROTO_ID_PLASTIC_EXPLOSIVES_I) != 0 || bomb == nullptr) { passed = false; break; }
+            obj_disconnect(bomb, nullptr);
+            item_add_force(actor, bomb, 1);
+            bool armed = obj_arm_explosive(actor, bomb, 120) == 0;
+            std::vector<QueueEventState> events;
+            bool captured = queue_capture_state(events);
+            auto timer = std::find_if(events.begin(), events.end(), [&](const auto& event) { return event.owner == bomb; });
+            bool countdown = captured && timer != events.end() && timer->payloadCount == 1
+                && timer->payload[0] == static_cast<int>(id.value);
+            int type = EVENT_TYPE_PLAYER_EXPLOSION;
+            if (countdown) {
+                type = timer->eventType;
+                int delay = timer->time - game_time();
+                if (type == EVENT_TYPE_PLAYER_EXPLOSION && delay == 1200) sawSuccess = true;
+                else if (type == EVENT_TYPE_PLAYER_EXPLOSION_FAILURE && delay == 600) sawFailure = true;
+                else if (type == EVENT_TYPE_PLAYER_EXPLOSION_FAILURE && delay == 0) sawCritical = true;
+                else countdown = false;
+            }
+            passed = armed && countdown && passed;
+            PlayerExplosionEvent data { static_cast<int>(id.value) };
+            DB_FILE* file = db_fopen("explosive-event-smoke.bin", "wb");
+            bool written = file != nullptr && q_func[type].writeProc(file, &data) == 0;
+            if (file != nullptr) db_fclose(file);
+            file = db_fopen("explosive-event-smoke.bin", "rb");
+            void* loaded = nullptr;
+            bool read = file != nullptr && q_func[type].readProc(file, &loaded) == 0;
+            if (file != nullptr) db_fclose(file);
+            passed = written && read && loaded != nullptr
+                && static_cast<PlayerExplosionEvent*>(loaded)->playerId == static_cast<int>(id.value) && passed;
+            if (loaded != nullptr) mem_free(loaded);
+            queue_remove(bomb);
+            if (bomb->owner != nullptr) item_remove_mult(bomb->owner, bomb, 1);
+            obj_erase_object(bomb, nullptr);
+        }
+        passed = sawSuccess && sawFailure && sawCritical && passed;
+        // Detonation follows the planted item's holder/location, while damage
+        // attribution follows the original arming player after transfer/drop.
+        for (bool planted : { false, true }) {
+            Object* victim = nullptr;
+            Object* bomb = nullptr;
+            bool made = obj_pid_new(&victim, 0x100000B) == 0 && victim != nullptr
+                && obj_move_to_tile(victim, 18900, 1, nullptr) == 0
+                && obj_pid_new(&bomb, PROTO_ID_DYNAMITE_I) == 0 && bomb != nullptr;
+            if (made) {
+                victim->data.critter.hp = 200;
+                obj_disconnect(bomb, nullptr);
+                item_add_force(actor, bomb, 1);
+                made = obj_arm_explosive(actor, bomb, 120) == 0
+                    && item_remove_mult(actor, bomb, 1) == 0;
+                made = made && (planted ? item_add_force(victim, bomb, 1) == 0
+                    : obj_connect(bomb, victim->tile, victim->elevation, nullptr) == 0);
+            }
+            if (made) {
+                PlayerExplosionEvent data { static_cast<int>(id.value) };
+                q_func[EVENT_TYPE_PLAYER_EXPLOSION].field_14(bomb, &data);
+                bomb = nullptr; // Native detonation destroys the item.
+                passed = victim->data.critter.hp < 200
+                    && victim->data.critter.combat.whoHitMe == actor && passed;
+                Script requestOwner {};
+                requestOwner.owner = victim;
+                scripts_clear_combat_requests(&requestOwner);
+            } else passed = false;
+            if (bomb != nullptr) {
+                queue_remove(bomb);
+                if (bomb->owner != nullptr) item_remove_mult(bomb->owner, bomb, 1);
+                obj_erase_object(bomb, nullptr);
+            }
+            if (victim != nullptr) obj_erase_object(victim, nullptr);
+        }
+        player->build = savedBuild;
+    }
+    set_game_time(savedTime);
+    std::fprintf(stderr, "NATIVE_EXPLOSIVE_ROLL_SOURCE_%s success=1 failure_half_timer=1 critical_immediate=1 native_payload_save_load=1 dropped_source=1 planted_source=1\n", passed ? "PASS" : "FAIL");
+    return passed;
+}
+
+static bool runExplosiveTimerAuthoritySmoke()
+{
+    if (session.phase() != SessionPhase::Exploration) return false;
+    bool passed = true;
+    auto feedbackStart = deferredEvents.size();
+    for (PlayerId id : session.players().playerIds()) {
+        auto* player = session.players().find(id);
+        Object* actor = networkWorldPlayerActor(id);
+        if (player == nullptr || actor == nullptr) return false;
+        ScopedActingPlayerContext context(*player, actor);
+        int ap = actor->data.critter.combat.ap;
+        std::unordered_set<std::uint32_t> original;
+        for (const auto& entry : worldItems) original.insert(entry.first.value);
+        Object* explosive = nullptr;
+        if (obj_pid_new(&explosive, PROTO_ID_DYNAMITE_I) != 0 || explosive == nullptr
+            || obj_disconnect(explosive, nullptr) != 0
+            || item_add_force(actor, explosive, 2) != 0 || !registerItem(explosive)) return false;
+        EntityId itemId = networkWorldFindEntity(explosive).value_or(EntityId {});
+        CommandProcessor processor;
+        GameCommand command { CommandSequence { 1 }, player->id, player->actorId,
+            SessionPhase::Exploration, session.phaseRevision(),
+            InventoryActionCommand { 0, itemId, InventoryAction::Use, {}, 1, 0 } };
+        passed = processor.process(command, session, commandExecutor).result.status == CommandStatus::Rejected
+            && explosive->pid == PROTO_ID_DYNAMITE_I && item_count(actor, explosive) == 2 && passed;
+        command.sequence.value++;
+        std::get<InventoryActionCommand>(command.payload).timerSeconds = 120;
+        auto result = processor.process(command, session, commandExecutor);
+        passed = result.result.status == CommandStatus::Accepted && explosive->pid == PROTO_ID_DYNAMITE_II
+            && (explosive->flags & OBJECT_USED) != 0 && item_count(actor, explosive) == 1 && passed;
+        int unarmed = 0;
+        for (const auto& entry : worldItems) {
+            if (original.count(entry.first.value) == 0 && entry.second->owner == actor
+                && entry.second->pid == PROTO_ID_DYNAMITE_I) unarmed += item_count(actor, entry.second);
+        }
+        std::vector<QueueEventState> timers;
+        bool captured = queue_capture_state(timers);
+        auto count = [&](const auto& values) {
+            return std::count_if(values.begin(), values.end(), [&](const auto& event) {
+                return event.owner == explosive && (event.eventType == EVENT_TYPE_PLAYER_EXPLOSION
+                    || event.eventType == EVENT_TYPE_PLAYER_EXPLOSION_FAILURE);
+            });
+        };
+        passed = captured && unarmed == 1 && count(timers) == 1
+            && processor.process(command, session, commandExecutor).replayed && passed;
+        command.sequence.value++;
+        passed = processor.process(command, session, commandExecutor).result.status == CommandStatus::Rejected
+            && actor->data.critter.combat.ap == ap && passed;
+        command.sequence.value++;
+        command.playerId = player->id == kHostPlayerId ? kGuestPlayerId : kHostPlayerId;
+        command.actorId = session.playerActorId(command.playerId);
+        passed = processor.process(command, session, commandExecutor).result.status == CommandStatus::Rejected && passed;
+        std::vector<QueueEventState> after;
+        passed = queue_capture_state(after) && count(after) == 1 && passed;
+        // Restore the native queue from its serialized representation without
+        // losing the armed item's object binding or adding another timer.
+        passed = queue_replace_state(after) && queue_find(explosive,
+            queue_find(explosive, EVENT_TYPE_PLAYER_EXPLOSION) ? EVENT_TYPE_PLAYER_EXPLOSION : EVENT_TYPE_PLAYER_EXPLOSION_FAILURE) && passed;
+        std::vector<Object*> cleanup;
+        for (const auto& entry : worldItems) if (original.count(entry.first.value) == 0) cleanup.push_back(entry.second);
+        for (Object* item : cleanup) {
+            queue_remove(item);
+            if (item->owner != nullptr) item_remove_mult(item->owner, item, item_count(item->owner, item));
+            obj_erase_object(item, nullptr);
+        }
+    }
+    passed = runExplosiveRollAndSourceSmoke() && passed;
+    while (deferredEvents.size() > feedbackStart) deferredEvents.pop_back();
+    std::fprintf(stderr, "NATIVE_EXPLOSIVE_TIMER_%s actors=%zu missing_choice=1 split=1 replay=1 rearm_rejected=1 foreign_rejected=1 ap_unchanged=1 queue_recovery=1\n",
+        passed ? "PASS" : "FAIL", session.players().size());
+    return passed;
+}
+
+std::optional<WorldDiscoverySmokeFixture> networkWorldVerifyWorldDiscoverySmokeTest()
+{
+    WorldDiscoverySmokeFixture fixture;
+    Object* ground = nullptr;
+    Object* npc = nullptr;
+    for (const auto& entry : worldItems) {
+        Object* item = entry.second;
+        if (item->pid == 211 && item->tile == 38000 && item->elevation == 0 && item->owner == nullptr) {
+            fixture.groundId = entry.first;
+            ground = item;
+        }
+    }
+    if (ground == nullptr) return std::nullopt;
+    for (int index = 0; index < ground->data.inventory.length; ++index) {
+        const auto& entry = ground->data.inventory.items[index];
+        if (entry.item->pid == kAntidotePid && entry.quantity == 3) {
+            fixture.childId = session.entities().findEntity(entry.item).value_or(EntityId {});
+        }
+    }
+    for (const auto& entry : worldCritters) {
+        if (entry.second->pid == 0x0100000B && entry.second->tile == 38002 && entry.second->elevation == 0) {
+            fixture.npcId = entry.first;
+            npc = entry.second;
+        }
+    }
+    for (const auto& entry : worldScenery) {
+        if (entry.second->pid == 33554499 && entry.second->tile == 38004 && entry.second->elevation == 0) {
+            fixture.sceneryId = entry.first;
+        }
+    }
+    if (!isValid(fixture.childId) || !isValid(fixture.npcId) || !isValid(fixture.sceneryId)) return std::nullopt;
+    std::vector<QueueEventState> timers;
+    if (!queue_capture_state(timers)) return std::nullopt;
+    for (const auto& timer : timers) {
+        if (timer.owner == npc && timer.eventType == EVENT_TYPE_KNOCKOUT) fixture.timerTime = timer.time;
+    }
+    return fixture.timerTime > game_time() ? std::optional<WorldDiscoverySmokeFixture>(fixture) : std::nullopt;
+}
+
+std::optional<WorldDiscoverySmokeFixture> networkWorldPrepareWorldDiscoverySmokeTest()
+{
+    if (worldMode != NetworkLaunchMode::Host || !session.isActive()
+        || networkWorldVerifyWorldDiscoverySmokeTest().has_value()) return std::nullopt;
+    Object* ground = nullptr;
+    Object* child = nullptr;
+    Object* npc = nullptr;
+    Object* scenery = nullptr;
+    bool keep = false;
+    struct Cleanup {
+        Object*& ground;
+        Object*& npc;
+        Object*& scenery;
+        bool& keep;
+        ~Cleanup() {
+            if (keep) return;
+            for (Object* object : { ground, npc, scenery }) {
+                if (object != nullptr) {
+                    queue_remove(object);
+                    obj_erase_object(object, nullptr);
+                }
+            }
+        }
+    } cleanup { ground, npc, scenery, keep };
+    if (obj_pid_new(&ground, 211) != 0 || ground == nullptr
+        || obj_pid_new(&child, kAntidotePid) != 0 || child == nullptr) return std::nullopt;
+    if (item_add_force(ground, child, 3) != 0) {
+        obj_erase_object(child, nullptr);
+        return std::nullopt;
+    }
+    if (obj_disconnect(child, nullptr) != 0) return std::nullopt;
+    if (obj_move_to_tile(ground, 38000, 0, nullptr) != 0
+        || obj_pid_new(&npc, 0x0100000B) != 0 || npc == nullptr
+        || obj_move_to_tile(npc, 38002, 0, nullptr) != 0
+        || obj_pid_new(&scenery, 33554499) != 0 || scenery == nullptr
+        || obj_move_to_tile(scenery, 38004, 0, nullptr) != 0) return std::nullopt;
+    for (Object* object : { ground, npc, scenery }) {
+        object->flags = (object->flags | OBJECT_NO_SAVE) & ~OBJECT_NO_REMOVE;
+        if (object->sid != -1) {
+            scr_remove(object->sid);
+            object->sid = -1;
+        }
+    }
+    if (session.entities().findEntity(ground).has_value()
+        || session.entities().findEntity(child).has_value()
+        || session.entities().findEntity(npc).has_value()
+        || session.entities().findEntity(scenery).has_value()
+        || queue_add(1000000, npc, nullptr, EVENT_TYPE_KNOCKOUT) != 0) return std::nullopt;
+    WorldSnapshot snapshot;
+    if (!networkWorldCaptureSnapshot({}, snapshot)) return std::nullopt;
+    auto verified = networkWorldVerifyWorldDiscoverySmokeTest();
+    keep = verified.has_value();
+    return verified;
+}
+
+bool networkWorldEraseWorldDiscoverySmokeTest()
+{
+    if (worldMode != NetworkLaunchMode::Join) return false;
+    auto fixture = networkWorldVerifyWorldDiscoverySmokeTest();
+    if (!fixture.has_value()) return false;
+    for (EntityId id : { fixture->groundId, fixture->npcId, fixture->sceneryId }) {
+        Object* object = session.entities().findObject(id);
+        if (object == nullptr) return false;
+        queue_remove(object);
+        object->flags &= ~OBJECT_NO_REMOVE;
+        if (obj_erase_object(object, nullptr) != 0) return false;
+    }
+    return !networkWorldVerifyWorldDiscoverySmokeTest().has_value()
+        && session.entities().findObject(fixture->groundId) == nullptr
+        && session.entities().findObject(fixture->childId) == nullptr
+        && session.entities().findObject(fixture->npcId) == nullptr
+        && session.entities().findObject(fixture->sceneryId) == nullptr;
 }
 
 static bool runScriptCreatedWorldObjectSmokeTest()
@@ -4595,6 +6335,7 @@ static bool runScriptCreatedWorldObjectSmokeTest()
 bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts)
 {
     counts = {};
+    if (worldMode == NetworkLaunchMode::Host && (!runCharacterAdvancementSmoke() || !runExplosiveTimerAuthoritySmoke() || !runAutomapScannerAuthoritySmoke())) return false;
     if (!session.isActive()) {
         std::fprintf(stderr, "Multiplayer authority probe: inactive world.\n");
         return false;
@@ -4636,6 +6377,181 @@ bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts)
 
     if (worldMode == NetworkLaunchMode::Host) {
         if (!runScriptCreatedWorldObjectSmokeTest()) return false;
+        if (!runTheftScriptAndSneakSmoke() || !runTheftTransactionSmokeTest() || !runNpcBarterSmokeTest()) return false;
+        Object* corpse = nullptr;
+        if (obj_pid_new(&corpse, 0x100000B) != 0 || corpse == nullptr) return false;
+        corpse->flags |= OBJECT_MULTIHEX;
+        corpse->data.critter.combat.results |= DAM_DEAD;
+        bool overlap = obj_move_to_tile(corpse, hostActor->tile, hostActor->elevation, nullptr) == 0
+            && obj_dist(hostActor, corpse) == 0 && lootTargetIsInRange(hostActor, corpse);
+        int adjacentTile = tile_num_in_direction(hostActor->tile, ROTATION_SE, 2);
+        bool adjacent = obj_move_to_tile(corpse, adjacentTile, hostActor->elevation, nullptr) == 0
+            && obj_dist(hostActor, corpse) == 1 && lootTargetIsInRange(hostActor, corpse);
+        int distantTile = tile_num_in_direction(hostActor->tile, ROTATION_SE, 5);
+        bool distantRejected = obj_move_to_tile(corpse, distantTile, hostActor->elevation, nullptr) == 0
+            && !lootTargetIsInRange(hostActor, corpse);
+        Object* guestActor = networkWorldPlayerActor(kGuestPlayerId);
+        Object* testAntidote = nullptr;
+        if (guestActor == nullptr || obj_pid_new(&testAntidote, kAntidotePid) == -1
+            || testAntidote == nullptr) {
+            obj_erase_object(corpse, nullptr);
+            return false;
+        }
+        std::size_t feedbackStart = deferredEvents.size();
+        int failedUse = protinst_use_item_on(guestActor, corpse, testAntidote);
+        const auto* itemFeedback = deferredEvents.size() == feedbackStart + 1
+            ? std::get_if<PlayerFeedbackEvent>(&deferredEvents.back().payload) : nullptr;
+        bool failedUseRouted = failedUse == -1 && itemFeedback != nullptr
+            && itemFeedback->actorId == session.playerActorId(kGuestPlayerId)
+            && !itemFeedback->text.empty();
+        Object* testFlare = nullptr;
+        bool flareCreated = obj_pid_new(&testFlare, PROTO_ID_FLARE) == 0 && testFlare != nullptr
+            && item_add_force(corpse, testFlare, 2) == 0;
+        std::size_t flareFeedbackStart = deferredEvents.size();
+        int flareUse = flareCreated ? protinst_use_item(guestActor, testFlare) : -1;
+        const auto* flareFeedback = deferredEvents.size() == flareFeedbackStart + 1
+            ? std::get_if<PlayerFeedbackEvent>(&deferredEvents.back().payload) : nullptr;
+        bool flareUseRouted = flareUse == 0 && flareFeedback != nullptr
+            && flareFeedback->actorId == session.playerActorId(kGuestPlayerId)
+            && !flareFeedback->text.empty();
+        int unlitFlares = 0;
+        int litFlares = 0;
+        for (int index = 0; index < corpse->data.inventory.length; ++index) {
+            const auto& entry = corpse->data.inventory.items[index];
+            if (entry.item->pid == PROTO_ID_FLARE) unlitFlares += entry.quantity;
+            if (entry.item->pid == PROTO_ID_LIT_FLARE) litFlares += entry.quantity;
+        }
+        bool flareStackIsolated = flareUse == 0 && unlitFlares == 1 && litFlares == 1
+            && queue_find(testFlare, EVENT_TYPE_FLARE);
+        std::fprintf(stderr, "NATIVE_FLARE_STACK_USE_%s unlit=%d lit=%d timer=%d\n",
+            flareStackIsolated ? "PASS" : "FAIL", unlitFlares, litFlares,
+            testFlare != nullptr && queue_find(testFlare, EVENT_TYPE_FLARE));
+        if (testFlare != nullptr) obj_destroy(testFlare);
+        bool boundGuestRouted = false;
+        bool nestedHostKeptLocal = false;
+        bool guestScopeRestored = false;
+        {
+            ScopedLocalPlayerBinding binding(guestActor);
+            ScopedPlayerFeedback guestFeedback(guestActor);
+            boundGuestRouted = networkWorldRoutePlayerFeedback("Guest quest result");
+            {
+                ScopedPlayerFeedback hostFeedback(hostActor);
+                nestedHostKeptLocal = !networkWorldRoutePlayerFeedback("Host action result");
+            }
+            guestScopeRestored = networkWorldRoutePlayerFeedback("Guest quest continuation");
+        }
+        bool outsideScopeKeptLocal = !networkWorldRoutePlayerFeedback("Unrelated world result");
+        while (deferredEvents.size() > feedbackStart) deferredEvents.pop_back();
+        obj_erase_object(testAntidote, nullptr);
+        obj_erase_object(corpse, nullptr);
+        bool feedbackPassed = failedUseRouted && flareUseRouted && flareStackIsolated && boundGuestRouted
+            && nestedHostKeptLocal && guestScopeRestored && outsideScopeKeptLocal;
+        std::fprintf(stderr, "NATIVE_PLAYER_FEEDBACK_%s failed_item_use=%d flare_use=%d guest_binding=%d nested_host=%d scope_restored=%d unscoped_local=%d\n",
+            feedbackPassed ? "PASS" : "FAIL", failedUseRouted, flareUseRouted, boundGuestRouted,
+            nestedHostKeptLocal, guestScopeRestored, outsideScopeKeptLocal);
+        if (!feedbackPassed) return false;
+        std::fprintf(stderr, "NATIVE_MULTIHEX_LOOT_RANGE_%s overlap=%d adjacent=%d distant_rejected=%d\n",
+            overlap && adjacent && distantRejected ? "PASS" : "FAIL", overlap, adjacent, distantRejected);
+        if (!overlap || !adjacent || !distantRejected) return false;
+        Object* reward = nullptr;
+        bool rewardCreated = obj_pid_new(&reward, kAntidotePid) == 0
+            && reward != nullptr && item_add_force(guestActor, reward, 1) == 0;
+        bool initiallyUntracked = rewardCreated
+            && !session.entities().findEntity(reward).has_value();
+        WorldSnapshot rewardCheckpoint;
+        bool capturedReward = initiallyUntracked
+            && networkWorldCaptureSnapshot({}, rewardCheckpoint);
+        // A preceding skill can leave a door animation running. Capture must
+        // refuse that unstable state, just as it does during normal play;
+        // let the native animation finish rather than clearing it or treating
+        // a deferred checkpoint as a missing quest reward.
+        auto rewardDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (initiallyUntracked && !capturedReward
+            && std::chrono::steady_clock::now() < rewardDeadline) {
+            process_bk();
+            capturedReward = networkWorldCaptureSnapshot({}, rewardCheckpoint);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        auto rewardId = rewardCreated ? session.entities().findEntity(reward) : std::nullopt;
+        bool rewardDelivered = capturedReward && rewardId.has_value()
+            && std::any_of(rewardCheckpoint.items.begin(), rewardCheckpoint.items.end(),
+                [&](const ItemSnapshot& item) {
+                    return item.entityId == *rewardId
+                        && item.holderId == session.playerActorId(kGuestPlayerId)
+                        && item.itemDescriptor.pid == kAntidotePid && item.quantity == 1;
+                });
+        if (reward != nullptr) obj_destroy(reward);
+        std::fprintf(stdout, "NATIVE_SCRIPT_REWARD_CHECKPOINT_%s initially_untracked=%d guest_delivery=%d\n",
+            rewardDelivered ? "PASS" : "FAIL", initiallyUntracked, rewardDelivered);
+        if (!rewardDelivered) return false;
+        // Native scripts may put rewards on scenery or doors, with nested
+        // containers. They must enter the same complete checkpoint as actor
+        // inventory, without requiring a player to open that owner first.
+        bool staticRewardsPassed = true;
+        for (const auto* owners : { &worldDoors, &worldScenery }) {
+            auto ownerEntry = std::find_if(owners->begin(), owners->end(),
+                [](const auto& entry) { return entry.second->data.inventory.length == 0; });
+            if (ownerEntry == owners->end()) {
+                std::fprintf(stderr, "NATIVE_STATIC_SCRIPT_REWARD_FIXTURE_MISSING type=%s owners=%zu\n",
+                    owners == &worldDoors ? "door" : "scenery", owners->size());
+                staticRewardsPassed = false;
+                break;
+            }
+            auto ownerState = *ownerEntry;
+            Object* bag = nullptr;
+            Object* child = nullptr;
+            bool created = obj_pid_new(&bag, 211) == 0 && bag != nullptr
+                && obj_disconnect(bag, nullptr) == 0
+                && item_add_force(ownerState.second, bag, 1) == 0
+                && obj_pid_new(&child, kAntidotePid) == 0 && child != nullptr
+                && obj_disconnect(child, nullptr) == 0 && item_add_force(bag, child, 3) == 0;
+            bool untracked = created && !session.entities().findEntity(bag).has_value()
+                && !session.entities().findEntity(child).has_value();
+            WorldSnapshot checkpoint;
+            bool captured = untracked && networkWorldCaptureSnapshot({}, checkpoint);
+            auto bagId = session.entities().findEntity(bag);
+            auto childId = session.entities().findEntity(child);
+            auto contains = [&](EntityId id, EntityId holder, std::uint32_t quantity) {
+                return std::any_of(checkpoint.items.begin(), checkpoint.items.end(),
+                    [&](const ItemSnapshot& item) {
+                        return item.entityId == id && item.holderId == holder && item.quantity == quantity;
+                    });
+            };
+            std::vector<std::uint8_t> encoded;
+            bool delivered = captured && bagId.has_value() && childId.has_value()
+                && contains(*bagId, ownerState.first, 1) && contains(*childId, *bagId, 3)
+                && encodeSnapshot(checkpoint, encoded) == SnapshotError::None && decodeSnapshot(encoded);
+            bool indexed = delivered && registerWorldObjects()
+                && std::any_of(worldItems.begin(), worldItems.end(),
+                    [&](const auto& entry) { return entry.first == *bagId && entry.second == bag; })
+                && std::any_of(worldItems.begin(), worldItems.end(),
+                    [&](const auto& entry) { return entry.first == *childId && entry.second == child; });
+            bool retained = false;
+            if (delivered) {
+                Object* owner = ownerState.second;
+                int originalFlags = owner->flags;
+                owner->flags |= OBJECT_NO_REMOVE;
+                retained = obj_erase_object(owner, nullptr) == -1
+                    && session.entities().findObject(ownerState.first) == owner
+                    && session.entities().findObject(*bagId) == bag
+                    && session.entities().findObject(*childId) == child;
+                owner->flags = originalFlags;
+            }
+            std::fprintf(stderr, "NATIVE_STATIC_SCRIPT_REWARD_OWNER type=%s created=%d untracked=%d captured=%d bag=%u child=%u delivered=%d\n",
+                owners == &worldDoors ? "door" : "scenery", created, untracked, captured,
+                bagId.value_or(EntityId {}).value, childId.value_or(EntityId {}).value, delivered);
+            if (child != nullptr && child->owner != bag) obj_destroy(child);
+            if (bag != nullptr) obj_destroy(bag);
+            bool removed = bagId.has_value() && childId.has_value()
+                && session.entities().findObject(*bagId) == nullptr
+                && session.entities().findObject(*childId) == nullptr;
+            std::fprintf(stderr, "NATIVE_STATIC_SCRIPT_REWARD_LIFETIME type=%s indexed=%d retained=%d removed_nested=%d\n",
+                owners == &worldDoors ? "door" : "scenery", indexed, retained, removed);
+            staticRewardsPassed = staticRewardsPassed && delivered && indexed && retained && removed;
+        }
+        std::fprintf(stdout, "NATIVE_STATIC_SCRIPT_REWARD_CHECKPOINT_%s doors=1 scenery=1 nested_quantity=3\n",
+            staticRewardsPassed ? "PASS" : "FAIL");
+        if (!staticRewardsPassed) return false;
         engineExecutionProbeBegin();
         int doorRc = obj_use_door(hostActor, scriptedDoor, 0);
         EngineExecutionProbeCounts doorCounts = engineExecutionProbeEnd();
@@ -5022,6 +6938,48 @@ bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts)
     if (!objectPresentationControl(newItemZero, "new_hidden_item_frame_zero")) return false;
     std::fprintf(stderr, "NATIVE_SNAPSHOT_REJECTION_PREFLIGHT_PASS\n");
 
+    WorldSnapshot sceneryBaseline;
+    if (!networkWorldCaptureSnapshot({}, sceneryBaseline) || sceneryBaseline.scenery.empty()) return false;
+    WorldSnapshot changedScenery = sceneryBaseline;
+    std::uint32_t nextSceneryId = 1;
+    auto includeIds = [&nextSceneryId](const auto& entries) {
+        for (const auto& entry : entries) nextSceneryId = std::max(nextSceneryId, entry.first.value + 1);
+    };
+    includeIds(worldScenery);
+    includeIds(worldDoors);
+    includeIds(worldExitGrids);
+    includeIds(worldCritters);
+    includeIds(worldItems);
+    for (const ActorSnapshot& actor : sceneryBaseline.actors) {
+        nextSceneryId = std::max(nextSceneryId, actor.entityId.value + 1);
+    }
+    ScenerySnapshot extraScenery = changedScenery.scenery.front();
+    extraScenery.entityId = EntityId { nextSceneryId++ };
+    changedScenery.scenery.push_back(extraScenery);
+    extraScenery.entityId = EntityId { nextSceneryId++ };
+    changedScenery.scenery.push_back(extraScenery);
+    changedScenery.scenery.erase(changedScenery.scenery.begin());
+    engineExecutionProbeBegin();
+    bool sceneryApplied = networkWorldApplySnapshot(changedScenery);
+    WorldSnapshot reconstructedScenery;
+    bool sceneryCaptured = sceneryApplied && networkWorldCaptureSnapshot({}, reconstructedScenery);
+    bool sceneryRestored = networkWorldApplySnapshot(sceneryBaseline);
+    auto expectedSceneryDigest = computeSnapshotDigest(changedScenery);
+    auto actualSceneryDigest = computeSnapshotDigest(reconstructedScenery);
+    EngineExecutionProbeCounts sceneryCounts = engineExecutionProbeEnd();
+    if (!sceneryCaptured || !sceneryRestored
+        || !expectedSceneryDigest || !actualSceneryDigest
+        || expectedSceneryDigest.digest.scenery != actualSceneryDigest.digest.scenery
+        || sceneryCounts.scriptProcedures != 0
+        || sceneryCounts.combatAttacks != 0
+        || sceneryCounts.randomDraws != 0) {
+        std::fprintf(stderr, "Multiplayer scenery reconstruction probe failed: applied=%d captured=%d restored=%d scripts=%u attacks=%u rng=%u.\n",
+            sceneryApplied, sceneryCaptured, sceneryRestored, sceneryCounts.scriptProcedures,
+            sceneryCounts.combatAttacks, sceneryCounts.randomDraws);
+        return false;
+    }
+    std::fprintf(stderr, "NATIVE_SCENERY_RECONSTRUCTION_PASS added=2 removed=1 restored=1 replica_scripts=0\n");
+
     engineExecutionProbeBegin();
     bool doorApplied = networkWorldApplyPeerDoorUse(DoorUseStartedEvent {
         hostActorId,
@@ -5179,7 +7137,970 @@ bool networkWorldPrepareHostWeaponAttackSmoke()
     return false;
 }
 
-bool networkWorldPrepareEquipmentSmoke(int weaponPid)
+std::optional<EntityId> networkWorldPrepareCombatLootSmoke()
+{
+    Object* actor = networkWorldPlayerActor(kGuestPlayerId);
+    if (actor == nullptr) return std::nullopt;
+    for (const auto& entry : worldItems) {
+        Object* item = entry.second;
+        if (item->pid == 211 && item->owner == nullptr && item->tile == actor->tile
+            && item->elevation == actor->elevation) return entry.first;
+    }
+    if (worldMode != NetworkLaunchMode::Host) return std::nullopt;
+    Object* container = nullptr;
+    if (obj_pid_new(&container, 211) != 0 || container == nullptr
+        || obj_move_to_tile(container, actor->tile, actor->elevation, nullptr) != 0)
+        return std::nullopt;
+    auto registered = registerItem(container);
+    if (!registered) return std::nullopt;
+    for (int pid : { 4, 30 }) {
+        Object* item = nullptr;
+        if (obj_pid_new(&item, pid) != 0 || item == nullptr
+            || obj_disconnect(item, nullptr) != 0 || item_add_force(container, item, 1) != 0
+            || !registerItem(item)) return std::nullopt;
+    }
+    return registered.entityId;
+}
+
+std::optional<EntityId> networkWorldPrepareGroundContainerLootSmokeTest(PlayerId looterId)
+{
+    Object* actor = networkWorldPlayerActor(looterId);
+    if (actor == nullptr) return std::nullopt;
+    for (const auto& entry : worldItems) {
+        Object* container = entry.second;
+        if (container->pid != 211 || container->owner != nullptr || item_get_type(container) != ITEM_TYPE_CONTAINER) continue;
+        if (worldMode == NetworkLaunchMode::Host) {
+            anim_stop();
+            for (int rotation = 0; rotation < ROTATION_COUNT; ++rotation) {
+                int tile = tile_num_in_direction(container->tile, rotation, 5);
+                if (!hexGridTileIsValid(tile) || obj_blocking_at(actor, tile, container->elevation) != nullptr) continue;
+                std::array<unsigned char, kMaximumMovementPathLength> path;
+                int flags = container->flags;
+                container->flags |= OBJECT_HIDDEN;
+                int pathLength = make_path(actor, tile, container->tile, path.data(), 0);
+                container->flags = flags;
+                if (hexGridTileIsValid(tile) && obj_blocking_at(actor, tile, container->elevation) == nullptr
+                    && pathLength > 0
+                    && obj_move_to_tile(actor, tile, container->elevation, nullptr) == 0) break;
+            }
+            bool wasLocked = obj_is_locked(container);
+            if (obj_lock(container) != 0) return std::nullopt;
+            bool rejected = commandExecutor.loot(actor, container) == CommandExecutionStatus::InvalidAction;
+            if (!wasLocked) obj_unlock(container);
+            if (!rejected) return std::nullopt;
+            std::fprintf(stderr, "NATIVE_CONTAINER_LOCKED_REJECT_PASS target=%u\n", entry.first.value);
+        }
+        return lootTargetIsValid(actor, container) && obj_dist(actor, container) == 5
+            ? std::optional<EntityId>(entry.first) : std::nullopt;
+    }
+    if (worldMode == NetworkLaunchMode::Host) {
+        std::fprintf(stderr, "NATIVE_CONTAINER_FIXTURE_MISSING map=%s items=%zu\n", map_data.name, worldItems.size());
+        for (const auto& entry : worldItems) {
+            if (entry.second->owner == nullptr && item_get_type(entry.second) == ITEM_TYPE_CONTAINER)
+                std::fprintf(stderr, "NATIVE_CONTAINER_CANDIDATE id=%u pid=%d tile=%d\n", entry.first.value, entry.second->pid, entry.second->tile);
+        }
+    }
+    return std::nullopt;
+}
+
+static bool nestedInventoryActionsSmokeTest(Object* actor, std::uint64_t revision)
+{
+    Object* bag = nullptr;
+    Object* inner = nullptr;
+    Object* drug = nullptr;
+    Object* pistol = nullptr;
+    Object* ammo = nullptr;
+    int hp = actor->data.critter.hp;
+    int ap = actor->data.critter.combat.ap;
+    bool passed = false;
+    auto create = [](Object** object, int pid) {
+        return obj_pid_new(object, pid) == 0 && *object != nullptr
+            && obj_disconnect(*object, nullptr) == 0;
+    };
+    if (create(&bag, 211) && create(&inner, 211) && create(&drug, 40)
+        && create(&pistol, 8) && create(&ammo, 29)
+        && item_add_force(actor, bag, 1) == 0 && item_add_force(bag, inner, 1) == 0
+        && item_add_force(inner, drug, 2) == 0 && item_add_force(inner, pistol, 2) == 0
+        && item_add_force(inner, ammo, 2) == 0 && registerUntrackedInventory(actor)) {
+        item_w_set_curr_ammo(pistol, 12);
+        item_w_set_curr_ammo(ammo, item_w_max_ammo(ammo));
+        auto drugId = networkWorldFindEntity(drug).value_or(EntityId {});
+        auto pistolId = networkWorldFindEntity(pistol).value_or(EntityId {});
+        auto actorId = networkWorldFindEntity(actor).value_or(EntityId {});
+        auto bagId = networkWorldFindEntity(bag).value_or(EntityId {});
+        auto innerId = networkWorldFindEntity(inner).value_or(EntityId {});
+        InventoryTransferCommand transfer { innerId, bagId, drugId, 1, 2, {}, revision };
+        transfer.turnRevision = revision + 1;
+        bool staleRejected = commandExecutor.transferInventory(actor, inner, bag, drug, transfer).status
+            == CommandExecutionStatus::InvalidAction && item_count(inner, drug) == 2;
+        transfer.turnRevision = revision;
+        auto access = openInventories.find(actorId);
+        std::optional<std::uint64_t> savedAccess = access != openInventories.end()
+            ? std::optional<std::uint64_t>(access->second) : std::nullopt;
+        openInventories.erase(actorId);
+        bool closedRejected = commandExecutor.transferInventory(actor, inner, bag, drug, transfer).status
+            == CommandExecutionStatus::InvalidAction && item_count(inner, drug) == 2;
+        if (savedAccess) openInventories[actorId] = *savedAccess;
+        auto moved = commandExecutor.transferInventory(actor, inner, bag, drug, transfer);
+        bool movedToParent = moved.status == CommandExecutionStatus::Applied
+            && isValid(moved.remainderItemId) && drug->owner == bag && item_count(bag, drug) == 1;
+        transfer.sourceId = bagId;
+        transfer.destinationId = innerId;
+        transfer.sourceQuantity = 1;
+        auto returned = commandExecutor.transferInventory(actor, bag, inner, drug, transfer);
+        bool movedBack = returned.status == CommandExecutionStatus::Applied
+            && drug->owner == inner && item_count(inner, drug) == 2;
+        bool transferPassed = staleRejected && closedRejected && movedToParent && movedBack
+            && actor->data.critter.combat.ap == ap;
+        std::fprintf(stderr, "NATIVE_COMBAT_CONTAINER_TRANSFER_%s stale_rejected=%d closed_rejected=%d split=%d return=%d ap_unchanged=%d\n",
+            transferPassed ? "PASS" : "FAIL", staleRejected, closedRejected, movedToParent, movedBack,
+            actor->data.critter.combat.ap == ap);
+
+        auto act = [&](Object* acting, EntityId id, InventoryAction action, EntityId ammoId = {}) {
+            return commandExecutor.inventoryAction(acting, InventoryActionCommand {
+                revision, id, action, ammoId, 1 });
+        };
+        Object* foreign = networkWorldPlayerActor(actor == networkWorldPlayerActor(kHostPlayerId)
+            ? kGuestPlayerId : kHostPlayerId);
+        actor->data.critter.hp = std::max(1, stat_level(actor, STAT_MAXIMUM_HIT_POINTS) - 20);
+        int wounded = actor->data.critter.hp;
+        bool rejected = act(foreign, drugId, InventoryAction::Use) == CommandExecutionStatus::InvalidAction;
+        bool used = act(actor, drugId, InventoryAction::Use) == CommandExecutionStatus::Applied;
+        // Consuming a representative leaves a newly registered stack copy.
+        drug = nullptr;
+        int drugs = 0;
+        for (int index = 0; index < inner->data.inventory.length; ++index) {
+            auto entry = inner->data.inventory.items[index];
+            if (entry.item->pid == 40) drugs += entry.quantity;
+        }
+        bool unloaded = act(actor, pistolId, InventoryAction::Unload) == CommandExecutionStatus::Applied
+            && pistol->owner == inner && item_w_curr_ammo(pistol) == 0
+            && item_count(inner, pistol) == 1;
+        // Native ammo stacking replaces its representative when unloading.
+        ammo = nullptr;
+        int beforeUnits = 0;
+        for (int index = 0; index < inner->data.inventory.length; ++index) {
+            auto entry = inner->data.inventory.items[index];
+            if (entry.item->pid == 29) {
+                ammo = entry.item;
+                beforeUnits += item_w_curr_ammo(entry.item)
+                    + (entry.quantity - 1) * item_w_max_ammo(entry.item);
+            }
+        }
+        auto ammoId = networkWorldFindEntity(ammo).value_or(EntityId {});
+        bool loaded = act(actor, pistolId, InventoryAction::Reload, ammoId) == CommandExecutionStatus::Applied;
+        int afterUnits = item_w_curr_ammo(pistol);
+        for (int index = 0; index < inner->data.inventory.length; ++index) {
+            auto entry = inner->data.inventory.items[index];
+            if (entry.item->pid == 29) afterUnits += item_w_curr_ammo(entry.item)
+                + (entry.quantity - 1) * item_w_max_ammo(entry.item);
+        }
+        bool roundsLoaded = item_w_curr_ammo(pistol) == 12;
+        auto loadedId = networkWorldFindEntity(pistol).value_or(EntityId {});
+        bool dropped = act(actor, loadedId, InventoryAction::Drop) == CommandExecutionStatus::Applied
+            && pistol->owner == nullptr && pistol->tile == actor->tile
+            && pistol->elevation == actor->elevation;
+        if (pistol->owner == nullptr) obj_erase_object(pistol, nullptr);
+        passed = transferPassed && rejected && used && drugs == 1 && actor->data.critter.hp > wounded
+            && unloaded && loaded && beforeUnits == afterUnits && roundsLoaded
+            && dropped && actor->data.critter.combat.ap == ap;
+        // All fixture contents remain under the two private holders.
+        pistol = nullptr;
+        ammo = nullptr;
+    }
+    actor->data.critter.hp = hp;
+    // Remove children explicitly so no inventory representative remains live
+    // in the entity registry after its holder is freed.
+    if (inner != nullptr) {
+        while (inner->data.inventory.length > 0) {
+            auto entry = inner->data.inventory.items[0];
+            item_remove_mult(inner, entry.item, entry.quantity);
+            obj_erase_object(entry.item, nullptr);
+        }
+        if (inner->owner != nullptr) item_remove_mult(inner->owner, inner, 1);
+        obj_erase_object(inner, nullptr);
+    }
+    if (bag != nullptr) {
+        if (bag->owner != nullptr) item_remove_mult(bag->owner, bag, 1);
+        obj_erase_object(bag, nullptr);
+    }
+    std::fprintf(stderr, "NATIVE_NESTED_INVENTORY_ACTIONS_%s use=1 unload_stack=1 reload=1 drop=1 ammo_conserved=1 foreign_rejected=1 ap_unchanged=1\n",
+        passed ? "PASS" : "FAIL");
+    return passed;
+}
+
+static bool combatScannerSmoke(Object* actor, std::uint64_t revision)
+{
+    int ap = actor->data.critter.combat.ap;
+    EntityId actorId = networkWorldFindEntity(actor).value_or(EntityId {});
+    auto savedAccess = openInventories.at(actorId);
+    Object* originalHand = inven_right_hand(actor);
+    Object* sensor = nullptr;
+    bool passed = obj_pid_new(&sensor, PROTO_ID_MOTION_SENSOR) == 0 && sensor != nullptr;
+    if (passed) {
+        obj_disconnect(sensor, nullptr); item_m_set_charges(sensor, 3);
+        passed = item_add_force(actor, sensor, 1) == 0 && registerItem(sensor);
+    }
+    if (passed) {
+        if (originalHand != nullptr) originalHand->flags &= ~OBJECT_IN_RIGHT_HAND;
+        sensor->flags |= OBJECT_IN_RIGHT_HAND;
+        auto id = networkWorldFindEntity(sensor).value_or(EntityId {});
+        InventoryActionCommand scan { revision, id, InventoryAction::Scan };
+        openInventories.erase(actorId);
+        scan.turnRevision++;
+        passed = commandExecutor.inventoryAction(actor, scan) == CommandExecutionStatus::InvalidAction && passed;
+        scan.turnRevision = revision;
+        passed = commandExecutor.inventoryAction(actor, scan) == CommandExecutionStatus::Applied
+            && item_m_curr_charges(sensor) == 2 && actor->data.critter.combat.ap == ap && passed;
+        scan.action = InventoryAction::Use;
+        passed = commandExecutor.inventoryAction(actor, scan) == CommandExecutionStatus::InvalidAction && passed;
+        openInventories[actorId] = savedAccess;
+        passed = commandExecutor.inventoryAction(actor, scan) == CommandExecutionStatus::Applied
+            && item_m_curr_charges(sensor) == 1 && actor->data.critter.combat.ap == ap && passed;
+        passed = commandExecutor.combatItem(actor, CombatItemCommand { revision, id }) == CommandExecutionStatus::Applied
+            && item_m_curr_charges(sensor) == 0 && actor->data.critter.combat.ap == ap - 2 && passed;
+        passed = commandExecutor.combatItem(actor, CombatItemCommand { revision, id }) == CommandExecutionStatus::InvalidAction
+            && actor->data.critter.combat.ap == ap - 2 && passed;
+    }
+    openInventories[actorId] = savedAccess;
+    actor->data.critter.combat.ap = ap;
+    if (sensor != nullptr) {
+        if (sensor->owner != nullptr) item_remove_mult(sensor->owner, sensor, item_count(sensor->owner, sensor));
+        obj_erase_object(sensor, nullptr);
+    }
+    if (originalHand != nullptr) originalHand->flags |= OBJECT_IN_RIGHT_HAND;
+    std::fprintf(stderr, "NATIVE_COMBAT_SCANNER_%s stale_rejected=1 automap_ap=0 inventory_ap=0 hud_ap=2 empty_rejected=1\n", passed ? "PASS" : "FAIL");
+    return passed;
+}
+
+static bool combatExplosiveTimerSmoke(Object* actor, std::uint64_t revision)
+{
+    int originalAp = actor->data.critter.combat.ap;
+    auto actorId = networkWorldFindEntity(actor).value_or(EntityId {});
+    auto access = openInventories.find(actorId);
+    if (access == openInventories.end()) return false;
+    auto savedAccess = access->second;
+    Object* bomb = nullptr;
+    bool passed = obj_pid_new(&bomb, PROTO_ID_DYNAMITE_I) == 0 && bomb != nullptr
+        && obj_disconnect(bomb, nullptr) == 0 && item_add_force(actor, bomb, 2) == 0 && registerItem(bomb);
+    if (passed) {
+        auto id = networkWorldFindEntity(bomb).value_or(EntityId {});
+        InventoryActionCommand arm { revision, id, InventoryAction::Use, {}, 1, 120 };
+        arm.turnRevision++;
+        passed = commandExecutor.inventoryAction(actor, arm) == CommandExecutionStatus::InvalidAction && passed;
+        arm.turnRevision = revision;
+        openInventories.erase(actorId);
+        passed = commandExecutor.inventoryAction(actor, arm) == CommandExecutionStatus::InvalidAction && passed;
+        openInventories[actorId] = savedAccess;
+        passed = commandExecutor.inventoryAction(actor, arm) == CommandExecutionStatus::Applied
+            && actor->data.critter.combat.ap == originalAp && item_count(actor, bomb) == 1 && passed;
+        queue_remove(bomb);
+        item_remove_mult(actor, bomb, 1);
+        obj_erase_object(bomb, nullptr);
+        bomb = nullptr;
+        Object* remaining = session.entities().findObject(lastSplitEntityId);
+        // Removal of the armed singleton does not create a new split, so this
+        // identity still names the unarmed remainder from the initial arming.
+        passed = remaining != nullptr && remaining->pid == PROTO_ID_DYNAMITE_I && passed;
+        if (remaining != nullptr) {
+            auto remainingId = networkWorldFindEntity(remaining).value_or(EntityId {});
+            passed = commandExecutor.combatItem(actor, CombatItemCommand { revision + 1, remainingId, {}, 120 })
+                == CommandExecutionStatus::InvalidAction && passed;
+            passed = commandExecutor.combatItem(actor, CombatItemCommand { revision, remainingId, {}, 120 })
+                == CommandExecutionStatus::Applied && actor->data.critter.combat.ap == originalAp - 2 && passed;
+            queue_remove(remaining);
+            item_remove_mult(actor, remaining, 1);
+            obj_erase_object(remaining, nullptr);
+        }
+    }
+    if (bomb != nullptr) {
+        queue_remove(bomb);
+        if (bomb->owner != nullptr) item_remove_mult(bomb->owner, bomb, item_count(bomb->owner, bomb));
+        obj_erase_object(bomb, nullptr);
+    }
+    actor->data.critter.combat.ap = originalAp;
+    std::fprintf(stderr, "NATIVE_COMBAT_EXPLOSIVE_TIMER_%s stale_rejected=1 closed_inventory_rejected=1 inventory_ap=0 hud_ap=2\n", passed ? "PASS" : "FAIL");
+    return passed;
+}
+
+static bool combatInteractionSmoke()
+{
+    CombatTurnState savedTurns = combatTurns.snapshot(combatClockMilliseconds());
+    int savedFreeMove = combat_free_move;
+    std::size_t savedEvents = deferredEvents.size();
+    bool passed = true;
+    for (PlayerId id : session.players().playerIds()) {
+        Object* actor = networkWorldPlayerActor(id);
+        auto* player = playerStateForActor(actor);
+        if (actor == nullptr || player == nullptr) return false;
+        CombatTurnState turn = savedTurns;
+        auto found = std::find_if(turn.initiative.begin(), turn.initiative.end(),
+            [&](const auto& entry) { return entry.actorId == player->actorId; });
+        if (found == turn.initiative.end()) return false;
+        turn.activeIndex = static_cast<unsigned>(found - turn.initiative.begin());
+        if (!combatTurns.restore(turn, combatClockMilliseconds())) return false;
+        ScopedActingPlayerContext context(*player, actor);
+        ScopedLocalPlayerBinding binding(actor);
+        int savedAp = actor->data.critter.combat.ap;
+        int savedFid = actor->fid;
+        int originalTile = actor->tile;
+        auto actorId = player->actorId;
+        auto previousAccess = openInventories.find(actorId);
+        std::optional<std::uint64_t> savedAccess = previousAccess == openInventories.end()
+            ? std::nullopt : std::optional<std::uint64_t>(previousAccess->second);
+        openInventories.erase(actorId);
+        combat_free_move = 0;
+        obj_change_fid(actor, art_id(OBJ_TYPE_CRITTER, savedFid & 0xFFF, ANIM_STAND, 0, actor->rotation + 1), nullptr);
+        Object* corpse = nullptr;
+        Object* resource = nullptr;
+        Object* ground = nullptr;
+        Object* door = nullptr;
+        bool prepared = obj_pid_new(&corpse, 0x1000000) == 0 && corpse != nullptr
+            && obj_move_to_tile(corpse, originalTile, actor->elevation, nullptr) == 0
+            && session.registerWorldObject(corpse)
+            && obj_pid_new(&resource, 213) == 0 && resource != nullptr
+            && obj_disconnect(resource, nullptr) == 0 && item_add_force(corpse, resource, 1) == 0
+            && registerItem(resource);
+        bool loot = false, transfer = false, closed = false, pickup = false, doorUsed = false, approached = false;
+        if (prepared) {
+            corpse->data.critter.combat.results |= DAM_DEAD;
+            auto corpseId = networkWorldFindEntity(corpse).value_or(EntityId {});
+            auto resourceId = networkWorldFindEntity(resource).value_or(EntityId {});
+            actor->data.critter.combat.ap = 12;
+            bool stale = commandExecutor.loot(actor, corpse, turn.revision + 1) == CommandExecutionStatus::InvalidAction
+                && actor->data.critter.combat.ap == 12;
+            actor->data.critter.combat.ap = 2;
+            bool insufficient = commandExecutor.loot(actor, corpse, turn.revision) == CommandExecutionStatus::InvalidAction
+                && actor->data.critter.combat.ap == 2 && !commandExecutor.combatLootAccess(actor, turn.revision);
+            actor->data.critter.combat.ap = 12;
+            loot = stale && insufficient && commandExecutor.loot(actor, corpse, turn.revision) == CommandExecutionStatus::Applied
+                && actor->data.critter.combat.ap == 9 && commandExecutor.combatLootAccess(actor, turn.revision);
+            loot = loot && commandExecutor.loot(actor, corpse, turn.revision, true) == CommandExecutionStatus::Applied
+                && actor->data.critter.combat.ap == 9;
+            for (PlayerId otherId : session.players().playerIds()) {
+                if (otherId == id) continue;
+                Object* other = networkWorldPlayerActor(otherId);
+                int otherAp = other->data.critter.combat.ap;
+                loot = commandExecutor.loot(other, corpse, turn.revision) == CommandExecutionStatus::InvalidAction
+                    && other->data.critter.combat.ap == otherAp && loot;
+            }
+            InventoryTransferCommand take { corpseId, actorId, resourceId, 1, 1, {}, turn.revision };
+            transfer = loot && commandExecutor.transferInventory(actor, corpse, actor, resource, take).status == CommandExecutionStatus::Applied
+                && resource->owner == actor && actor->data.critter.combat.ap == 9;
+            EquipmentCommand close; close.turnRevision = turn.revision; close.action = EquipmentAction::CloseInventory;
+            closed = commandExecutor.setEquipment(actor, close) == CommandExecutionStatus::Applied
+                && !commandExecutor.combatLootAccess(actor, turn.revision)
+                && commandExecutor.loot(actor, corpse, turn.revision, true) == CommandExecutionStatus::InvalidAction;
+            take.sourceId = actorId; take.destinationId = corpseId;
+            closed = closed && commandExecutor.transferInventory(actor, actor, corpse, resource, take).status == CommandExecutionStatus::InvalidAction;
+            EquipmentCommand open; open.turnRevision = turn.revision; open.action = EquipmentAction::OpenInventory;
+            closed = closed && commandExecutor.setEquipment(actor, open) == CommandExecutionStatus::Applied
+                && actor->data.critter.combat.ap == 5;
+            commandExecutor.setEquipment(actor, close);
+            // Check the native route and its exact movement charge, including detours.
+            for (int distance = 2; distance <= 6 && !approached; ++distance) {
+                for (int rotation = 0; rotation < ROTATION_COUNT && !approached; ++rotation) {
+                    int remote = tile_num_in_direction(originalTile, rotation, distance);
+                    std::array<unsigned char, kMaximumMovementPathLength> path;
+                    if (!hexGridTileIsValid(remote) || obj_blocking_at(actor, remote, actor->elevation) != nullptr) continue;
+                    int flags = corpse->flags; corpse->flags |= OBJECT_HIDDEN;
+                    int length = make_path(actor, remote, originalTile, path.data(), 0);
+                    corpse->flags = flags;
+                    if (length <= 1 || length > 8) continue;
+                    obj_move_to_tile(actor, remote, actor->elevation, nullptr);
+                    actor->data.critter.combat.ap = 40;
+                    int expectedAp = 40 - critter_compute_ap_from_distance(actor, length - 1) - 3;
+                    auto result = commandExecutor.loot(actor, corpse, turn.revision);
+                    approached = result == CommandExecutionStatus::Applied && obj_dist(actor, corpse) <= 1
+                        && actor->data.critter.combat.ap == expectedAp;
+                    std::fprintf(stderr, "COMBAT_INTERACTION_APPROACH player=%u status=%d ap=%d expected=%d length=%d\n",
+                        id.value, static_cast<int>(result), actor->data.critter.combat.ap, expectedAp, length);
+                    commandExecutor.setEquipment(actor, close);
+                    obj_move_to_tile(actor, originalTile, actor->elevation, nullptr);
+                }
+            }
+            if (obj_pid_new(&ground, PROTO_ID_FLARE) == 0 && ground != nullptr) {
+                ground->flags |= OBJECT_USED;
+                obj_move_to_tile(ground, originalTile, actor->elevation, nullptr);
+                auto groundId = session.registerWorldObject(ground).entityId;
+                actor->data.critter.combat.ap = 12;
+                bool stalePickup = commandExecutor.pickup(actor, ground, turn.revision + 1) == CommandExecutionStatus::InvalidAction;
+                pickup = stalePickup && commandExecutor.pickup(actor, ground, turn.revision) == CommandExecutionStatus::Applied
+                    && session.entities().findObject(groundId) == ground && ground->owner == actor
+                    && actor->data.critter.combat.ap == 9;
+            }
+            if (!worldDoors.empty() && obj_pid_new(&door, worldDoors.begin()->second->pid) == 0 && door != nullptr) {
+                obj_move_to_tile(door, originalTile, actor->elevation, nullptr);
+                auto doorId = session.registerWorldObject(door).entityId;
+                actor->data.critter.combat.ap = 12;
+                auto used = commandExecutor.useDoor(actor, door, turn.revision);
+                doorUsed = used.status == CommandExecutionStatus::Applied && session.entities().findObject(doorId) == door
+                    && actor->data.critter.combat.ap == 9 && used.open == (obj_is_open(door) != 0)
+                    && used.frame == door->frame;
+            }
+        }
+        std::fprintf(stderr, "COMBAT_INTERACTION_%s player=%u loot=%d transfer=%d close=%d approach=%d pickup=%d door=%d\n",
+            loot && transfer && closed && approached && pickup && doorUsed ? "PASS" : "FAIL", id.value,
+            loot, transfer, closed, approached, pickup, doorUsed);
+        passed = loot && transfer && closed && approached && pickup && doorUsed && passed;
+        for (Object* object : { resource, ground, corpse, door }) {
+            if (object == nullptr || !session.entities().findEntity(object).has_value()) continue;
+            if (object->owner != nullptr) item_remove_mult(object->owner, object, item_count(object->owner, object));
+            obj_erase_object(object, nullptr);
+        }
+        openLootTurns.erase(actorId); activeLootTargets.erase(actor);
+        openInventories.erase(actorId); if (savedAccess) openInventories[actorId] = *savedAccess;
+        actor->data.critter.combat.ap = savedAp;
+        obj_change_fid(actor, savedFid, nullptr);
+        obj_move_to_tile(actor, originalTile, actor->elevation, nullptr);
+    }
+    combat_free_move = savedFreeMove;
+    while (deferredEvents.size() > savedEvents) deferredEvents.pop_back();
+    return combatTurns.restore(savedTurns, combatClockMilliseconds()) && passed;
+}
+
+bool networkWorldRunCombatInventoryDropSmokeTest()
+{
+    Object* actor = networkWorldPlayerActor(kHostPlayerId);
+    auto* player = playerStateForActor(actor);
+    if (player == nullptr || inven_worn(actor) != nullptr) return false;
+    ScopedActingPlayerContext context(*player, actor);
+    ScopedLocalPlayerBinding binding(actor);
+    CharacterBuild savedBuild = player->build;
+    int savedFid = actor->fid;
+    int ap = actor->data.critter.combat.ap;
+    std::unordered_set<std::uint32_t> originalItems;
+    for (const auto& entry : worldItems) originalItems.insert(entry.first.value);
+    auto fixtureItem = [&](int pid, int quantity) {
+        Object* item = nullptr;
+        if (obj_pid_new(&item, pid) == -1 || item == nullptr) return static_cast<Object*>(nullptr);
+        item->flags |= OBJECT_USED; // Keep test stacks separate from the player's possessions.
+        if (obj_disconnect(item, nullptr) == -1 || item_add_force(actor, item, quantity) != 0 || !registerItem(item)) {
+            obj_erase_object(item, nullptr);
+            return static_cast<Object*>(nullptr);
+        }
+        return item;
+    };
+    auto drop = [&](Object* item, std::uint32_t quantity, std::uint64_t revision) {
+        return commandExecutor.inventoryAction(actor, InventoryActionCommand {
+            revision, networkWorldFindEntity(item).value_or(EntityId {}), InventoryAction::Drop, {}, quantity });
+    };
+    Object* flares = fixtureItem(PROTO_ID_FLARE, 3);
+    Object* caps = fixtureItem(PROTO_ID_MONEY, 10);
+    Object* armor = fixtureItem(1, 1); // Leather armor.
+    bool passed = flares != nullptr && caps != nullptr && armor != nullptr;
+    std::uint64_t revision = combatTurns.revision();
+    passed = passed && combatInteractionSmoke() && combatScannerSmoke(actor, revision) && combatExplosiveTimerSmoke(actor, revision)
+        && nestedInventoryActionsSmokeTest(actor, revision);
+    if (passed) {
+        passed = drop(flares, 2, revision + 1) == CommandExecutionStatus::InvalidAction
+            && item_count(actor, flares) == 3 && passed;
+        passed = drop(flares, 4, revision) == CommandExecutionStatus::InvalidAction
+            && item_count(actor, flares) == 3 && passed;
+        passed = drop(flares, 2, revision) == CommandExecutionStatus::Applied && passed;
+        int onGround = 0;
+        int remaining = 0;
+        for (const auto& entry : worldItems) {
+            Object* item = entry.second;
+            if (originalItems.count(entry.first.value) != 0 || item->pid != PROTO_ID_FLARE) continue;
+            if (item->owner == actor) remaining += item_count(actor, item);
+            else if (item->owner == nullptr && item->tile == actor->tile && item->elevation == actor->elevation) ++onGround;
+        }
+        passed = onGround == 2 && remaining == 1 && passed;
+        passed = drop(caps, 7, revision) == CommandExecutionStatus::Applied
+            && item_caps_get_amount(caps) == 7 && caps->owner == nullptr && passed;
+        Object* remainder = session.entities().findObject(lastSplitEntityId);
+        passed = remainder != nullptr && item_count(actor, remainder) == 3
+            && drop(remainder, 1, revision) == CommandExecutionStatus::Applied
+            && item_caps_get_amount(remainder) == 1 && passed;
+        armor->flags |= OBJECT_WORN;
+        adjust_ac(actor, nullptr, armor);
+        passed = stat_get_bonus(actor, STAT_ARMOR_CLASS) == savedBuild.bonusStats[STAT_ARMOR_CLASS] + item_ar_ac(armor)
+            && drop(armor, 1, revision) == CommandExecutionStatus::Applied
+            && inven_worn(actor) == nullptr
+            && player->build.bonusStats == savedBuild.bonusStats && passed;
+        passed = actor->data.critter.combat.ap == ap && passed;
+        EquipmentCommand close;
+        close.turnRevision = revision;
+        close.action = EquipmentAction::CloseInventory;
+        passed = commandExecutor.setEquipment(actor, close) == CommandExecutionStatus::Applied && passed;
+        Object* noAccessItem = session.entities().findObject(lastSplitEntityId);
+        if (noAccessItem == nullptr) {
+            for (const auto& entry : worldItems) {
+                if (originalItems.count(entry.first.value) == 0 && entry.second->owner == actor) {
+                    noAccessItem = entry.second;
+                    break;
+                }
+            }
+        }
+        passed = noAccessItem != nullptr && drop(noAccessItem, 1, revision) == CommandExecutionStatus::InvalidAction && passed;
+        // Restore the already-paid open session without another AP charge.
+        openInventories[session.playerActorId(kHostPlayerId)] = revision;
+    }
+    std::vector<EntityId> created;
+    for (const auto& entry : worldItems) if (originalItems.count(entry.first.value) == 0) created.push_back(entry.first);
+    for (EntityId id : created) {
+        Object* item = session.entities().findObject(id);
+        if (item == nullptr) continue;
+        if (item->owner != nullptr) item_remove_mult(item->owner, item, item_count(item->owner, item));
+        obj_erase_object(item, nullptr);
+    }
+    player->build = savedBuild;
+    obj_change_fid(actor, savedFid, nullptr);
+    std::fprintf(stderr, "COMBAT_INVENTORY_DROP_%s ap=%d stacks=2 caps=7+1 armor=removed\n",
+        passed ? "PASS" : "FAIL", actor->data.critter.combat.ap);
+    return passed;
+}
+
+bool networkWorldRunPartyRecoverySmokeTest(bool (*processDefeat)())
+{
+    if (processDefeat == nullptr) return false;
+    if (worldMode == NetworkLaunchMode::Join) {
+        // Mirror phase revisions without executing any replica queue rules.
+        bool passed = true;
+        int originalQuit = game_user_wants_to_quit;
+        for (PlayerId playerId : session.players().playerIds()) {
+            Object* actor = networkWorldPlayerActor(playerId);
+            if (actor == nullptr) return false;
+            int flags = actor->data.critter.combat.results;
+            actor->data.critter.combat.results |= DAM_DEAD;
+            for (SessionPhase phase : { SessionPhase::Dialogue, SessionPhase::Transition }) {
+                passed = session.transitionTo(phase) == LocalSessionError::None && passed;
+                passed = !processDefeat() && game_user_wants_to_quit == originalQuit && passed;
+                passed = session.transitionTo(SessionPhase::Exploration) == LocalSessionError::None && passed;
+            }
+            actor->data.critter.combat.results = flags;
+        }
+        std::fprintf(stderr, "PARTY_RECOVERY_%s role=guest awaiting_authoritative_ending=checked\n",
+            passed ? "PASS" : "FAIL");
+        return passed;
+    }
+    if (worldMode != NetworkLaunchMode::Host) return false;
+    if (session.phase() != SessionPhase::Exploration || isInCombat()) return false;
+    std::vector<QueueEventState> originalQueue;
+    if (!queue_capture_state(originalQueue)) return false;
+    int originalTime = game_time();
+    int originalQuit = game_user_wants_to_quit;
+    WorldMapState originalMap;
+    WorldMapTravelProgress originalTravel;
+    worldmap_capture_state(originalMap);
+    worldmap_capture_travel_progress(originalTravel);
+    bool passed = true;
+    for (PlayerId playerId : session.players().playerIds()) {
+        Object* actor = networkWorldPlayerActor(playerId);
+        if (actor == nullptr) { passed = false; break; }
+        CritterCombatData originalCombat = actor->data.critter.combat;
+        int originalFlags = actor->flags;
+        int originalFid = actor->fid;
+        int originalHp = actor->data.critter.hp;
+        queue_clear();
+        actor->data.critter.combat.results = DAM_KNOCKED_OUT;
+        passed = !processDefeat() && game_user_wants_to_quit == originalQuit && passed;
+        // A blocked vote command must not leave the awake talker waiting for
+        // the knockout player's ballot until the normal sixty-second deadline.
+        auto roster = session.players().playerIds();
+        auto awakePlayer = std::find_if(roster.begin(), roster.end(), [&](PlayerId id) { return id != playerId; });
+        if (awakePlayer == roster.end()) return false;
+        PlayerId awake = *awakePlayer;
+        passed = dialogueVotes.begin(1, awake, kHostPlayerId,
+            session.players().playerIds(), 2, DialogueVotingPolicy::MajorityStatsRandomTie, 1000) && passed;
+        networkWorldDialogueSetConnected(playerId, true);
+        passed = !dialogueVotes.vote(playerId, 1, 1) && passed;
+        for (PlayerId voter : roster) {
+            if (voter != playerId) passed = dialogueVotes.vote(voter, 1, 0) && passed;
+        }
+        passed = dialogueVotes.resolve(1) == std::optional<std::uint8_t> { 0 } && passed;
+        dialogueVotes.clear();
+        passed = queue_add(1, actor, nullptr, EVENT_TYPE_KNOCKOUT) == 0 && passed;
+        set_game_time(originalTime + 1);
+        queue_process();
+        passed = !queue_find(actor, EVENT_TYPE_KNOCKOUT)
+            && (actor->data.critter.combat.results & DAM_KNOCKED_OUT) == 0
+            && !networkWorldPartyDefeated() && passed;
+        register_clear(actor);
+        obj_change_fid(actor, originalFid, nullptr);
+        actor->data.critter.combat = originalCombat;
+
+        // Dialogue and travel use nested native input loops. The host must
+        // unwind them even though the ordinary main loop is not running.
+        actor->data.critter.combat.results |= DAM_DEAD;
+        passed = session.transitionTo(SessionPhase::Dialogue) == LocalSessionError::None && passed;
+        game_user_wants_to_quit = 0;
+        passed = processDefeat() && game_user_wants_to_quit == 2 && passed;
+        game_user_wants_to_quit = originalQuit;
+        passed = session.transitionTo(SessionPhase::Exploration) == LocalSessionError::None && passed;
+        passed = session.transitionTo(SessionPhase::Transition) == LocalSessionError::None && passed;
+        game_user_wants_to_quit = 0;
+        passed = processDefeat() && game_user_wants_to_quit == 2 && passed;
+        game_user_wants_to_quit = originalQuit;
+        passed = session.transitionTo(SessionPhase::Exploration) == LocalSessionError::None && passed;
+        int beforeRest = game_time();
+        passed = advanceSharedRest(180, false) && game_time() == beforeRest && passed;
+        WorldMapState travelFixture = originalMap;
+        travelFixture.x = 1325; travelFixture.y = 325;
+        if (worldmap_apply_state(travelFixture) && worldmap_authoritative_travel_begin(1328, 325)) {
+            auto step = worldmap_authoritative_travel_step();
+            passed = step.status == WorldMapTravelStepStatus::QueueInterrupted
+                && game_time() == beforeRest && passed;
+        } else {
+            passed = false;
+        }
+        worldmap_authoritative_travel_cancel();
+        actor->data.critter.combat = originalCombat;
+        // Simulate a scripted lethal outcome whose native queue callback
+        // returns zero. Rest/travel must still stop at this exact boundary.
+        struct RestoreQueueHandler {
+            QueueEventHandler* handler = q_func[EVENT_TYPE_KNOCKOUT].handlerProc;
+            ~RestoreQueueHandler() { q_func[EVENT_TYPE_KNOCKOUT].handlerProc = handler; }
+        } restoreHandler;
+        q_func[EVENT_TYPE_KNOCKOUT].handlerProc = [](Object* owner, void*) {
+            owner->data.critter.hp = 0;
+            owner->data.critter.combat.results |= DAM_DEAD;
+            return 0;
+        };
+        for (bool travel : { false, true }) {
+            queue_clear();
+            actor->data.critter.combat = originalCombat;
+            actor->data.critter.hp = originalHp;
+            set_game_time(originalTime);
+            if (queue_add(1, actor, nullptr, EVENT_TYPE_KNOCKOUT) != 0) {
+                passed = false;
+                continue;
+            }
+            if (travel) {
+                if (worldmap_apply_state(travelFixture) && worldmap_authoritative_travel_begin(1328, 325)) {
+                    WorldMapTravelStepResult step;
+                    for (int attempt = 0; attempt < 32; ++attempt) {
+                        step = worldmap_authoritative_travel_step();
+                        if (step.status != WorldMapTravelStepStatus::Moving) break;
+                    }
+                    bool stoppedAtDeath = step.status == WorldMapTravelStepStatus::QueueInterrupted
+                        && game_time() == originalTime + 1;
+                    if (!stoppedAtDeath) std::fprintf(stderr,
+                        "PARTY_RECOVERY_TRAVEL_FAILED status=%d elapsed=%d defeated=%d\n",
+                        static_cast<int>(step.status), game_time() - originalTime, networkWorldPartyDefeated());
+                    passed = stoppedAtDeath && passed;
+                } else passed = false;
+                worldmap_authoritative_travel_cancel();
+            } else {
+                passed = advanceSharedRest(180, false)
+                    && game_time() == originalTime + 1 && passed;
+            }
+            passed = networkWorldPartyDefeated() && passed;
+        }
+        actor->data.critter.combat = originalCombat;
+        actor->data.critter.hp = originalHp;
+        actor->flags = originalFlags;
+        set_game_time(originalTime);
+    }
+    game_user_wants_to_quit = originalQuit;
+    passed = queue_replace_state(originalQueue) && passed;
+    passed = worldmap_apply_state(originalMap) && passed;
+    passed = worldmap_apply_travel_progress(originalTravel) && passed;
+    set_game_time(originalTime);
+    std::fprintf(stderr, "PARTY_RECOVERY_%s roster=%zu queue_wake=checked incapacitated_ballot=excluded nested_defeat=checked terminal_rest_travel=blocked zero_return_lethal_queue=checked\n",
+        passed ? "PASS" : "FAIL", session.players().size());
+    return passed;
+}
+
+static bool partyFailureSmokeTest()
+{
+    struct Saved { Object* actor; int flags; int hp; };
+    std::vector<Saved> saved;
+    for (PlayerId playerId : session.players().playerIds()) {
+        Object* actor = networkWorldPlayerActor(playerId);
+        if (actor == nullptr) return false;
+        saved.push_back({ actor, actor->data.critter.combat.results, actor->data.critter.hp });
+    }
+    if (saved.size() < 2) return false;
+    for (const auto& entry : saved) {
+        entry.actor->data.critter.combat.results = 0;
+        entry.actor->data.critter.hp = std::max(1, entry.hp);
+    }
+    bool passed = !networkWorldPartyDefeated();
+    Object* nonPlayer = worldCritters.empty() ? nullptr : worldCritters.front().second;
+    if (nonPlayer != nullptr) {
+        int flags = nonPlayer->data.critter.combat.results;
+        nonPlayer->data.critter.combat.results |= DAM_DEAD;
+        passed = !networkWorldPartyDefeated() && passed;
+        nonPlayer->data.critter.combat.results = flags;
+    }
+    for (const auto& entry : saved) {
+        GameCommand action;
+        action.payload = MoveCommand { entry.actor->tile, entry.actor->elevation };
+        entry.actor->data.critter.combat.results = DAM_KNOCKED_OUT;
+        passed = !networkWorldPartyDefeated()
+            && !commandExecutor.actorCanExecute(entry.actor, action) && passed;
+        EquipmentCommand close;
+        close.action = EquipmentAction::CloseInventory;
+        action.payload = close;
+        passed = commandExecutor.actorCanExecute(entry.actor, action) && passed;
+        action.payload = EndTurnCommand { 1 };
+        passed = commandExecutor.actorCanExecute(entry.actor, action) && passed;
+        entry.actor->data.critter.combat.results = DAM_DEAD;
+        passed = networkWorldPartyDefeated() && passed;
+        entry.actor->data.critter.combat.results = 0;
+        entry.actor->data.critter.hp = 0;
+        passed = networkWorldPartyDefeated() && passed;
+        entry.actor->data.critter.hp = std::max(1, entry.hp);
+    }
+    for (const auto& entry : saved) entry.actor->data.critter.combat.results = DAM_KNOCKED_OUT;
+    passed = networkWorldPartyDefeated() && passed;
+    for (const auto& entry : saved) {
+        entry.actor->data.critter.combat.results = entry.flags;
+        entry.actor->data.critter.hp = entry.hp;
+    }
+    std::fprintf(stderr, "PARTY_FAILURE_%s roster=%zu death=any knockout=all corpse=excluded action_gate=checked\n",
+        passed ? "PASS" : "FAIL", saved.size());
+    return passed;
+}
+
+bool networkWorldRunPlayerRulesSmokeTest()
+{
+    Object* host = networkWorldPlayerActor(kHostPlayerId);
+    Object* guest = networkWorldPlayerActor(kGuestPlayerId);
+    auto* hostPlayer = playerStateForActor(host);
+    auto* guestPlayer = playerStateForActor(guest);
+    Object* target = !worldCritters.empty() ? worldCritters.front().second : nullptr;
+    if (worldMode != NetworkLaunchMode::Host || hostPlayer == nullptr
+        || guestPlayer == nullptr || target == nullptr || inven_right_hand(guest) == nullptr) return false;
+    CharacterBuild savedHost = hostPlayer->build;
+    CharacterBuild savedGuest = guestPlayer->build;
+    guestPlayer->build.traits = { -1, -1 };
+    guestPlayer->build.perkRanks.fill(0);
+    hostPlayer->build.baseStats[STAT_ENDURANCE] = 3;
+    guestPlayer->build.baseStats[STAT_ENDURANCE] = 8;
+    guestPlayer->build.baseStats[STAT_MAXIMUM_HIT_POINTS] = 57;
+    guestPlayer->build.bonusStats[STAT_ENDURANCE] = 0;
+    guestPlayer->build.bonusStats[STAT_MAXIMUM_HIT_POINTS] = 0;
+    bool passed = partyFailureSmokeTest();
+    {
+        ScopedActingPlayerContext hostContext(*hostPlayer, host);
+        passed = stat_get_base_direct(guest, STAT_ENDURANCE) == 8
+            && stat_level(guest, STAT_MAXIMUM_HIT_POINTS) == 57 && passed;
+        stat_set_bonus(guest, STAT_DAMAGE_RESISTANCE, 17);
+        passed = passed && guestPlayer->build.bonusStats[STAT_DAMAGE_RESISTANCE] == 17
+            && hostPlayer->build.bonusStats[STAT_DAMAGE_RESISTANCE] == savedHost.bonusStats[STAT_DAMAGE_RESISTANCE]
+            && actingPlayerActor() == host;
+    }
+    {
+        ScopedActingPlayerContext hostContext(*hostPlayer, host);
+        CharacterBuild queryGuest = guestPlayer->build;
+        guestPlayer->build.traits = { TRAIT_GIFTED, -1 };
+        guestPlayer->build.baseStats[STAT_STRENGTH] = 6;
+        int hostStrength = hostPlayer->build.baseStats[STAT_STRENGTH];
+        passed = inc_stat(guest, STAT_STRENGTH) == 0
+            && guestPlayer->build.baseStats[STAT_STRENGTH] == 7 && passed;
+        passed = dec_stat(guest, STAT_STRENGTH) == 0
+            && guestPlayer->build.baseStats[STAT_STRENGTH] == 6
+            && hostPlayer->build.baseStats[STAT_STRENGTH] == hostStrength
+            && actingPlayerActor() == host && passed;
+        guestPlayer->build.traits = { -1, -1 };
+        int hostCost = item_w_mp_cost(host, HIT_MODE_RIGHT_WEAPON_PRIMARY, false);
+        int guestCost = item_w_mp_cost(guest, HIT_MODE_RIGHT_WEAPON_PRIMARY, false);
+        guestPlayer->build.traits = { TRAIT_FAST_SHOT, -1 };
+        passed = guestCost > 1
+            && item_w_mp_cost(guest, HIT_MODE_RIGHT_WEAPON_PRIMARY, false) == guestCost - 1
+            && item_w_called_shot(guest, HIT_MODE_RIGHT_WEAPON_PRIMARY) == 0
+            && item_w_mp_cost(host, HIT_MODE_RIGHT_WEAPON_PRIMARY, false) == hostCost
+            && actingPlayerActor() == host && passed;
+        guestPlayer->build.perkRanks[PERK_SPEAKER] = 1;
+        passed = perk_adjust_skill(guest, SKILL_SPEECH) == 20 && actingPlayerActor() == host && passed;
+        {
+            ScopedActingPlayerContext guestContext(*guestPlayer, guest);
+            passed = item_w_mp_cost(host, HIT_MODE_RIGHT_WEAPON_PRIMARY, false) == hostCost
+                && actingPlayerActor() == guest && passed;
+        }
+        Object* grenade = nullptr;
+        Object* pistol = inven_right_hand(guest);
+        int pistolFlags = pistol->flags;
+        if (obj_pid_new(&grenade, 25) == 0 && grenade != nullptr
+            && obj_disconnect(grenade, nullptr) == 0
+            && item_add_force(guest, grenade, 1) == 0) {
+            pistol->flags &= ~OBJECT_IN_RIGHT_HAND;
+            grenade->flags |= OBJECT_IN_RIGHT_HAND;
+            guestPlayer->build.traits = { -1, -1 };
+            guestPlayer->build.baseStats[STAT_STRENGTH] = 1;
+            guestPlayer->build.bonusStats[STAT_STRENGTH] = 0;
+            int throwRange = item_w_range(guest, HIT_MODE_RIGHT_WEAPON_PRIMARY);
+            guestPlayer->build.perkRanks[PERK_HEAVE_HO] = 1;
+            passed = throwRange == 3 && item_w_range(guest, HIT_MODE_RIGHT_WEAPON_PRIMARY) == 9
+                && actingPlayerActor() == host && passed;
+            item_remove_mult(guest, grenade, 1);
+            obj_erase_object(grenade, nullptr);
+        } else {
+            if (grenade != nullptr) obj_erase_object(grenade, nullptr);
+            passed = false;
+        }
+        pistol->flags = pistolFlags;
+        guestPlayer->build = queryGuest;
+    }
+    {
+        ScopedActingPlayerContext context(*hostPlayer, host);
+        hostPlayer->build.healingSkillUses = {};
+        guestPlayer->build.healingSkillUses = {};
+        for (int attempt = 0; attempt < 3; ++attempt) passed = skill_use_slot_add(SKILL_FIRST_AID) == 0 && passed;
+        passed = skill_use_slot_available(SKILL_FIRST_AID) == -1 && passed;
+        {
+            ScopedActingPlayerContext guestContext(*guestPlayer, guest);
+            passed = skill_use_slot_available(SKILL_FIRST_AID) == 0 && passed;
+            passed = skill_use_slot_add(SKILL_DOCTOR) == 0 && passed;
+        }
+        passed = skill_use_slot_available(SKILL_DOCTOR) == 0 && passed;
+    }
+    {
+        ScopedActingPlayerContext context(*hostPlayer, host);
+        guestPlayer->build.unspentSkillPoints = 2;
+        int originalPoints = guestPlayer->build.skillPoints[SKILL_SPEECH];
+        passed = skill_inc_point(guest, SKILL_SPEECH) == 0 && passed;
+        passed = guestPlayer->build.skillPoints[SKILL_SPEECH] == originalPoints + 1
+            && guestPlayer->build.unspentSkillPoints == 1 && actingPlayerActor() == host && passed;
+        passed = skill_dec_point(guest, SKILL_SPEECH) == 0 && passed;
+        passed = guestPlayer->build.skillPoints[SKILL_SPEECH] == originalPoints
+            && guestPlayer->build.unspentSkillPoints == 2 && passed;
+        hostPlayer->build.addictions = 0;
+        guestPlayer->build.addictions = 0;
+        item_d_set_addict(PROTO_ID_BUFF_OUT);
+        {
+            ScopedActingPlayerContext guestContext(*guestPlayer, guest);
+            passed = !item_d_check_addict(PROTO_ID_BUFF_OUT) && passed;
+            item_d_set_addict(PROTO_ID_BEER);
+            passed = item_d_check_addict(PROTO_ID_BOOZE) && passed;
+            item_d_unset_addict(PROTO_ID_BOOZE);
+            passed = !item_d_check_addict(-1) && !is_pc_flag(PC_FLAG_ADDICTED) && passed;
+        }
+        passed = item_d_check_addict(PROTO_ID_BUFF_OUT) && is_pc_flag(PC_FLAG_ADDICTED) && passed;
+        item_d_unset_addict(PROTO_ID_BUFF_OUT);
+        passed = !item_d_check_addict(-1) && passed;
+    }
+    {
+        // Exercise actual native effects under the other player's ambient
+        // context, then restore every timer and native value for later tests.
+        ScopedActingPlayerContext context(*hostPlayer, host);
+        std::vector<QueueEventState> savedQueue;
+        bool effectsPassed = queue_capture_state(savedQueue);
+        int savedTime = game_time();
+        int hostPoison = host->data.critter.poison;
+        int guestPoison = guest->data.critter.poison;
+        int guestRadiation = guest->data.critter.radiation;
+        int hostHp = host->data.critter.hp;
+        int guestHp = guest->data.critter.hp;
+        int hostFlags = host->flags;
+        int guestFlags = guest->flags;
+        CharacterBuild beforeHost = hostPlayer->build;
+        CharacterBuild beforeGuest = guestPlayer->build;
+        effectsPassed = queue_replace_state({}) && effectsPassed;
+        host->data.critter.poison = 0;
+        guest->data.critter.poison = 0;
+        guest->data.critter.radiation = 0;
+        guestPlayer->build.bonusStats[STAT_POISON_RESISTANCE] = 0;
+        guestPlayer->build.baseStats[STAT_POISON_RESISTANCE] = 50;
+        hostPlayer->build.baseStats[STAT_POISON_RESISTANCE] = 0;
+        hostPlayer->build.bonusStats[STAT_POISON_RESISTANCE] = 0;
+        effectsPassed = critter_adjust_poison(host, 2) == 0
+            && critter_adjust_poison(guest, 12) == 0
+            && guest->data.critter.poison == 6
+            && host->data.critter.poison == 2
+            && queue_find(host, EVENT_TYPE_POISON) && queue_find(guest, EVENT_TYPE_POISON)
+            && actingPlayerActor() == host && effectsPassed;
+        set_game_time(savedTime + 10 * (505 - 5 * 6));
+        queue_process();
+        effectsPassed = guest->data.critter.poison == 4
+            && guest->data.critter.hp == guestHp - 1
+            && host->data.critter.hp == hostHp && host->data.critter.poison == 2
+            && queue_find(host, EVENT_TYPE_POISON) && queue_find(guest, EVENT_TYPE_POISON)
+            && effectsPassed;
+        queue_remove_this(host, EVENT_TYPE_POISON);
+        queue_remove_this(guest, EVENT_TYPE_POISON);
+        guestPlayer->build.baseStats[STAT_RADIATION_RESISTANCE] = 50;
+        guestPlayer->build.bonusStats[STAT_RADIATION_RESISTANCE] = 0;
+        hostPlayer->build.prototypeFlags &= ~CRITTER_BARTER;
+        guestPlayer->build.prototypeFlags &= ~CRITTER_BARTER;
+        effectsPassed = critter_adjust_rads(guest, 800) == 0
+            && guest->data.critter.radiation == 400
+            && (guestPlayer->build.prototypeFlags & CRITTER_BARTER) != 0
+            && (hostPlayer->build.prototypeFlags & CRITTER_BARTER) == 0
+            && actingPlayerActor() == host && effectsPassed;
+        WorldSnapshot toxinsSnapshot;
+        bool capturedToxins = networkWorldCaptureSnapshot(EventSequence {}, toxinsSnapshot);
+        auto capturedGuest = std::find_if(toxinsSnapshot.actors.begin(), toxinsSnapshot.actors.end(),
+            [](const ActorSnapshot& actor) { return actor.ownerId == kGuestPlayerId; });
+        effectsPassed = capturedToxins && capturedGuest != toxinsSnapshot.actors.end()
+            && capturedGuest->poison == 4 && capturedGuest->radiation == 400 && effectsPassed;
+        if (capturedToxins) {
+            guest->data.critter.poison = 0;
+            guest->data.critter.radiation = 0;
+            effectsPassed = applyActorAndCritterState(toxinsSnapshot, false)
+                && guest->data.critter.poison == 4 && guest->data.critter.radiation == 400
+                && host->data.critter.poison == 2 && effectsPassed;
+        }
+        // Curing poison must remove the outstanding timer. A stale callback
+        // must not damage either player after the numeric effect is gone.
+        effectsPassed = queue_add(10, guest, nullptr, EVENT_TYPE_POISON) == 0 && effectsPassed;
+        int beforeCureHp = guest->data.critter.hp;
+        effectsPassed = critter_adjust_poison(guest, -100) == 0
+            && guest->data.critter.poison == 0 && !queue_find(guest, EVENT_TYPE_POISON)
+            && critter_check_poison(guest, nullptr) == 0
+            && guest->data.critter.hp == beforeCureHp && host->data.critter.hp == hostHp
+            && effectsPassed;
+        int targetPoison = target->data.critter.poison;
+        int targetRadiation = target->data.critter.radiation;
+        effectsPassed = critter_adjust_poison(target, 10) == -1
+            && critter_adjust_rads(target, 10) == -1
+            && target->data.critter.poison == targetPoison
+            && target->data.critter.radiation == targetRadiation && effectsPassed;
+        RadiationEvent* hostHealing = static_cast<RadiationEvent*>(mem_malloc(sizeof(RadiationEvent)));
+        if (hostHealing != nullptr) {
+            *hostHealing = { RADIATION_LEVEL_FATAL, 1 };
+            effectsPassed = queue_add(GAME_TIME_TICKS_PER_DAY, host, hostHealing, EVENT_TYPE_RADIATION) == 0 && effectsPassed;
+            critter_check_rads(guest);
+            effectsPassed = queue_find(guest, EVENT_TYPE_RADIATION)
+                && queue_find(host, EVENT_TYPE_RADIATION)
+                && (guestPlayer->build.prototypeFlags & CRITTER_BARTER) == 0
+                && effectsPassed;
+            int guestStrength = stat_get_bonus(guest, STAT_STRENGTH);
+            int hostStrength = stat_get_bonus(host, STAT_STRENGTH);
+            RadiationEvent damage { RADIATION_LEVEL_ADVANCED, 0 };
+            critter_process_rads(guest, &damage);
+            effectsPassed = stat_get_bonus(guest, STAT_STRENGTH) == guestStrength - 1
+                && stat_get_bonus(host, STAT_STRENGTH) == hostStrength
+                && queue_find(host, EVENT_TYPE_RADIATION)
+                && queue_find(guest, EVENT_TYPE_RADIATION)
+                && actingPlayerActor() == host && effectsPassed;
+            RadiationEvent healing { RADIATION_LEVEL_ADVANCED, 1 };
+            critter_process_rads(guest, &healing);
+            effectsPassed = stat_get_bonus(guest, STAT_STRENGTH) == guestStrength
+                && stat_get_bonus(host, STAT_STRENGTH) == hostStrength
+                && queue_find(host, EVENT_TYPE_RADIATION) && effectsPassed;
+        } else effectsPassed = false;
+        set_game_time(savedTime);
+        effectsPassed = queue_replace_state(savedQueue) && effectsPassed;
+        hostPlayer->build = beforeHost;
+        guestPlayer->build = beforeGuest;
+        host->data.critter.poison = hostPoison;
+        guest->data.critter.poison = guestPoison;
+        guest->data.critter.radiation = guestRadiation;
+        host->data.critter.hp = hostHp;
+        guest->data.critter.hp = guestHp;
+        host->flags = hostFlags;
+        guest->flags = guestFlags;
+        std::fprintf(stderr, "NATIVE_PLAYER_TOXINS_%s poison_tick=1 cure_timer=1 stale_tick=1 radiation_damage=1 radiation_heal=1 owner_isolation=1 numeric_replica=1 npc_unchanged=1\n",
+            effectsPassed ? "PASS" : "FAIL");
+        passed = effectsPassed && passed;
+    }
+    guestPlayer->build.skillPoints[SKILL_SMALL_GUNS] = 0;
+    int baseline = determine_to_hit_no_range(guest, target, HIT_LOCATION_TORSO, HIT_MODE_RIGHT_WEAPON_PRIMARY);
+    guestPlayer->build.traits[0] = TRAIT_ONE_HANDER;
+    int adjusted = determine_to_hit_no_range(guest, target, HIT_LOCATION_TORSO, HIT_MODE_RIGHT_WEAPON_PRIMARY);
+    passed = passed && !item_w_is_2handed(inven_right_hand(guest)) && baseline < 75 && adjusted == baseline + 20;
+    hostPlayer->build = savedHost;
+    guestPlayer->build = savedGuest;
+    std::fprintf(stderr, "PLAYER_RULES_SMOKE_%s guest_stat=8 guest_hp=57 accuracy=%d one_hander=%d\n",
+        passed ? "PASS" : "FAIL", baseline, adjusted);
+    return passed;
+}
+
+bool networkWorldPrepareEquipmentSmoke(int weaponPid, bool ownedContainer)
 {
     if (worldMode != NetworkLaunchMode::Host) return false;
     for (PlayerId playerId : { kHostPlayerId, kGuestPlayerId }) {
@@ -5199,6 +8120,12 @@ bool networkWorldPrepareEquipmentSmoke(int weaponPid)
                 || obj_disconnect(extra, nullptr) == -1
                 || item_add_force(actor, extra, 1) != 0) return false;
             weapon = inven_pid_is_carried_ptr(actor, weaponPid);
+        }
+        if (ownedContainer) {
+            Object* bag = nullptr;
+            if (obj_pid_new(&bag, 211) != 0 || bag == nullptr
+                || obj_disconnect(bag, nullptr) == -1
+                || item_add_force(actor, bag, 1) != 0 || !registerItem(bag)) return false;
         }
         if (weapon == nullptr || item_count(actor, weapon) < 1) return false;
         item_w_set_curr_ammo(weapon, item_w_max_ammo(weapon));
@@ -5280,6 +8207,10 @@ bool networkWorldPrepareCombatAttackSmoke(bool lethal)
     if (worldMode != NetworkLaunchMode::Host || worldCritters.empty()) {
         return false;
     }
+    // Native UI testing may leave a fidget registered while its synthetic
+    // fixture only pumps networking. Settle it before placing the combatants
+    // and capturing their authoritative starting state.
+    anim_stop();
     Object* guest = networkWorldPlayerActor(kGuestPlayerId);
     Object* target = worldCritters.front().second;
     if (guest == nullptr || target == nullptr || guest == target
@@ -5412,8 +8343,11 @@ std::optional<EntityId> networkWorldPrepareLootSmokeTest()
             int tile = tile_num_in_direction(critter->tile, rotation, 1);
             if (hexGridTileIsValid(tile)
                 && obj_blocking_at(actor, tile, critter->elevation) == nullptr
-                && obj_move_to_tile(actor, tile, critter->elevation, nullptr) == 0
-                && lootTargetIsInRange(actor, critter)) {
+                && obj_move_to_tile(actor, tile, critter->elevation, nullptr) == 0) {
+                // This fixture represents corpse loot, not unchecked theft
+                // from a living NPC. Prepare the same corpse on both peers.
+                critter->data.critter.combat.results |= DAM_DEAD;
+                critter->data.critter.hp = 0;
                 return entry.first;
             }
         }
@@ -5826,7 +8760,7 @@ std::optional<MapTransitionSmokeFixture> networkWorldPrepareMapTransitionSmokeTe
         if (!capsRegistered) {
             return std::nullopt;
         }
-        return MapTransitionSmokeFixture {
+        MapTransitionSmokeFixture fixture {
             elevatorType,
             destinationLevel,
             destinationMap,
@@ -5835,6 +8769,37 @@ std::optional<MapTransitionSmokeFixture> networkWorldPrepareMapTransitionSmokeTe
             session.playerActorId(kHostPlayerId),
             session.playerActorId(kGuestPlayerId),
         };
+        if (worldMode == NetworkLaunchMode::Host) {
+            fixture.peerTimerTime = game_time() + 1000;
+            fixture.peerTimerAgility = stat_get_bonus(guest, STAT_AGILITY);
+            perk_add_effect(guest, PERK_BUFFOUT_ADDICTION);
+            guest->data.critter.combat.results |= DAM_KNOCKED_DOWN;
+            for (int index = 0; index < guest->data.inventory.length; ++index) {
+                const auto& entry = guest->data.inventory.items[index];
+                if (entry.item->pid == 79) fixture.peerFlareCount += entry.quantity;
+            }
+            auto* drug = static_cast<DrugEffectEvent*>(mem_malloc(sizeof(DrugEffectEvent)));
+            auto* withdrawal = static_cast<WithdrawalEvent*>(mem_malloc(sizeof(WithdrawalEvent)));
+            auto* radiation = static_cast<RadiationEvent*>(mem_malloc(sizeof(RadiationEvent)));
+            if (drug == nullptr || withdrawal == nullptr || radiation == nullptr) {
+                mem_free(drug); mem_free(withdrawal); mem_free(radiation);
+                return std::nullopt;
+            }
+            *drug = DrugEffectEvent { PROTO_ID_BUFF_OUT, { STAT_AGILITY, -1, -1 }, { 1, 0, 0 } };
+            *withdrawal = WithdrawalEvent { 0, PROTO_ID_BUFF_OUT, PERK_BUFFOUT_ADDICTION };
+            *radiation = RadiationEvent { 1, 1 };
+            if (queue_add(1000, guest, drug, EVENT_TYPE_DRUG) != 0
+                || queue_add(1000, guest, withdrawal, EVENT_TYPE_WITHDRAWAL) != 0
+                || queue_add(1000, guest, radiation, EVENT_TYPE_RADIATION) != 0
+                || queue_add(1000, guest, nullptr, EVENT_TYPE_POISON) != 0
+                || queue_add(1000, guest, nullptr, EVENT_TYPE_KNOCKOUT) != 0) return std::nullopt;
+            Object* flare = nullptr;
+            if (obj_pid_new(&flare, 79) != 0 || flare == nullptr) return std::nullopt;
+            flare->flags |= OBJECT_USED;
+            if (item_add_force(guest, flare, 1) != 0 || !registerItem(flare)
+                || queue_add(1000, flare, nullptr, EVENT_TYPE_FLARE) != 0) return std::nullopt;
+        }
+        return fixture;
     }
     return std::nullopt;
 }
@@ -5843,6 +8808,48 @@ bool networkWorldVerifyMapTransitionSmokeTest(const MapTransitionSmokeFixture& f
 {
     Object* host = session.entities().findObject(fixture.hostActorId);
     Object* guest = session.entities().findObject(fixture.guestActorId);
+    if (fixture.peerTimerTime != 0 && guest != nullptr
+        && map_data.field_34 == fixture.destinationMap && session.phase() == SessionPhase::Exploration) {
+        if (queue_find(guest, EVENT_TYPE_DRUG)) {
+            if ((guest->data.critter.combat.results & (DAM_KNOCKED_OUT | DAM_KNOCKED_DOWN)) != 0) return false;
+            std::vector<QueueEventState> state;
+            if (!queue_capture_state(state)) return false;
+            for (int type : { EVENT_TYPE_DRUG, EVENT_TYPE_WITHDRAWAL, EVENT_TYPE_POISON, EVENT_TYPE_RADIATION, EVENT_TYPE_KNOCKOUT }) {
+                auto event = std::find_if(state.begin(), state.end(), [&](const auto& entry) {
+                    return entry.owner == guest && entry.eventType == type;
+                });
+                if (event == state.end() || event->time != fixture.peerTimerTime) {
+                    std::fprintf(stderr, "NATIVE_MAP_PEER_TIMERS_FAIL missing_type=%d\n", type);
+                    return false;
+                }
+            }
+            int flareCount = 0;
+            for (int index = 0; index < guest->data.inventory.length; ++index) {
+                const auto& entry = guest->data.inventory.items[index];
+                if (entry.item->pid == 79) flareCount += entry.quantity;
+            }
+            if (flareCount != fixture.peerFlareCount) return false;
+            int savedTime = game_time();
+            set_game_time(fixture.peerTimerTime);
+            for (int attempt = 0; attempt < 8; ++attempt) {
+                queue_process();
+                if (!queue_find(guest, EVENT_TYPE_DRUG) && !queue_find(guest, EVENT_TYPE_WITHDRAWAL)
+                    && !queue_find(guest, EVENT_TYPE_POISON) && !queue_find(guest, EVENT_TYPE_RADIATION)
+                    && !queue_find(guest, EVENT_TYPE_KNOCKOUT)) break;
+            }
+            set_game_time(savedTime);
+            bool processed = stat_get_bonus(guest, STAT_AGILITY) == fixture.peerTimerAgility + 1;
+            for (int type : { EVENT_TYPE_DRUG, EVENT_TYPE_WITHDRAWAL, EVENT_TYPE_POISON, EVENT_TYPE_RADIATION, EVENT_TYPE_KNOCKOUT })
+                processed = processed && !queue_find(guest, type);
+            std::fprintf(stderr, "NATIVE_MAP_PEER_TIMERS_%s owner_rebound=1 absolute_time=1 native_item_destroy=1 native_wake=1 handlers_processed=%d agility=%d expected=%d pending=%d/%d/%d/%d/%d\n",
+                processed ? "PASS" : "FAIL", processed, stat_get_bonus(guest, STAT_AGILITY), fixture.peerTimerAgility + 1,
+                queue_find(guest, EVENT_TYPE_DRUG), queue_find(guest, EVENT_TYPE_WITHDRAWAL), queue_find(guest, EVENT_TYPE_POISON),
+                queue_find(guest, EVENT_TYPE_RADIATION), queue_find(guest, EVENT_TYPE_KNOCKOUT));
+            if (!processed) return false;
+        } else if (stat_get_bonus(guest, STAT_AGILITY) != fixture.peerTimerAgility + 1) {
+            return false;
+        }
+    }
     bool capsRegistered = false;
     if (guest != nullptr) {
         Inventory& inventory = guest->data.inventory;
@@ -6204,6 +9211,215 @@ bool networkWorldVerifySceneryTransitionSmokeTest(const SceneryTransitionSmokeFi
     return verified;
 }
 
+static bool nestedCapsSmokeTest()
+{
+    std::array<Object*, 3> wallets {};
+    bool created = true;
+    for (Object*& wallet : wallets) {
+        if (obj_pid_new(&wallet, 211) != 0 || wallet == nullptr
+            || item_get_type(wallet) != ITEM_TYPE_CONTAINER) { created = false; break; }
+    }
+    bool passed = created
+        && item_add_force(wallets[0], wallets[1], 1) == 0
+        && item_add_force(wallets[0], wallets[2], 1) == 0
+        && item_caps_adjust(wallets[0], 2) == 0
+        && item_caps_adjust(wallets[1], 3) == 0
+        && item_caps_adjust(wallets[2], 4) == 0
+        && item_caps_total(wallets[0]) == 9
+        && item_caps_adjust(wallets[0], -7) == 0
+        && item_caps_total(wallets[0]) == 2
+        && item_caps_total(wallets[1]) == 0 && item_caps_total(wallets[2]) == 2;
+    for (auto it = wallets.rbegin(); it != wallets.rend(); ++it) {
+        Object* wallet = *it;
+        if (wallet == nullptr) continue;
+        item_caps_adjust(wallet, -item_caps_total(wallet));
+        if (wallet->owner != nullptr) item_remove_mult(wallet->owner, wallet, 1);
+        obj_erase_object(wallet, nullptr);
+    }
+    std::fprintf(stdout, "NATIVE_NESTED_CAPS_%s initial=9 spent=7 remaining=2\n", passed ? "PASS" : "FAIL");
+    return passed;
+}
+
+static bool ownedContainerSmokeTest(Object* actor)
+{
+    ScopedLocalPlayerBinding binding(actor);
+    Object* bag = nullptr;
+    Object* inner = nullptr;
+    Object* ammo = nullptr;
+    bool passed = false;
+    if (obj_pid_new(&bag, 211) == 0 && obj_pid_new(&inner, 211) == 0
+        && obj_pid_new(&ammo, 10) == 0
+        && item_add_force(actor, bag, 1) == 0
+        && item_add_force(bag, inner, 1) == 0
+        && item_add_force(bag, ammo, 3) == 0
+        && registerUntrackedInventory(actor)) {
+        auto actorId = session.entities().findEntity(actor).value_or(EntityId {});
+        auto bagId = session.entities().findEntity(bag).value_or(EntityId {});
+        auto innerId = session.entities().findEntity(inner).value_or(EntityId {});
+        auto ammoId = session.entities().findEntity(ammo).value_or(EntityId {});
+        InventoryTransferCommand put { bagId, innerId, ammoId, 2, 3, {} };
+        auto deposit = commandExecutor.transferInventory(actor, bag, inner, ammo, put);
+        InventoryTransferCommand nested { innerId, bagId, ammoId, 1, 2, {} };
+        auto move = commandExecutor.transferInventory(actor, inner, bag, ammo, nested);
+        InventoryTransferCommand take { bagId, innerId, ammoId, 1, 2, {} };
+        auto withdraw = commandExecutor.transferInventory(actor, bag, inner, ammo, take);
+        // Withdrawing merges equivalent ammunition; resolve the surviving item
+        // from inventory rather than dereferencing the discarded representative.
+        ammo = nullptr;
+        InventoryTransferCommand cycle { actorId, innerId, bagId, 1, 1, {} };
+        auto rejected = commandExecutor.transferInventory(actor, actor, inner, bag, cycle);
+        Object* other = networkWorldPlayerActor(kHostPlayerId);
+        InventoryTransferCommand steal { actorId, innerId, bagId, 1, 1, {} };
+        auto foreign = commandExecutor.transferInventory(other, actor, inner, bag, steal);
+        std::fprintf(stdout, "OWNED_CONTAINER_DIAGNOSTICS deposit=%d split=%u move=%d split2=%u withdraw=%d cycle=%d foreign=%d\n", static_cast<int>(deposit.status), deposit.remainderItemId.value,
+            static_cast<int>(move.status), move.remainderItemId.value,
+            static_cast<int>(withdraw.status), static_cast<int>(rejected.status), static_cast<int>(foreign.status));
+        passed = deposit.status == CommandExecutionStatus::Applied
+            && isValid(deposit.remainderItemId)
+            && move.status == CommandExecutionStatus::Applied
+            && isValid(move.remainderItemId)
+            && withdraw.status == CommandExecutionStatus::Applied
+            && rejected.status == CommandExecutionStatus::InvalidAction
+            && foreign.status == CommandExecutionStatus::InvalidAction
+            && bag->owner == actor && inner->owner == bag;
+    }
+    // These fixture objects have no gameplay value. Remove contents before
+    // deleting their holders so the normal native cleanup owns every object.
+    if (ammo != nullptr && ammo->owner == nullptr) obj_erase_object(ammo, nullptr);
+    if (inner != nullptr && inner->owner == nullptr) obj_erase_object(inner, nullptr);
+    if (bag != nullptr) {
+        if (inner != nullptr && inner->owner == bag) {
+            while (inner->data.inventory.length > 0) {
+                auto entry = inner->data.inventory.items[0];
+                item_remove_mult(inner, entry.item, entry.quantity);
+                obj_erase_object(entry.item, nullptr);
+            }
+            item_remove_mult(bag, inner, 1);
+            obj_erase_object(inner, nullptr);
+        }
+        while (bag->data.inventory.length > 0) {
+            auto entry = bag->data.inventory.items[0];
+            item_remove_mult(bag, entry.item, entry.quantity);
+            obj_erase_object(entry.item, nullptr);
+        }
+        if (bag->owner != nullptr) item_remove_mult(bag->owner, bag, 1);
+        obj_erase_object(bag, nullptr);
+    }
+    std::fprintf(stdout, "NATIVE_OWNED_CONTAINER_%s split=1 nested=1 withdraw=1 cycle_rejected=1 foreign_rejected=1\n", passed ? "PASS" : "FAIL");
+    return passed;
+}
+
+static bool lootDirectionSmokeTest(Object* actor, Object* target)
+{
+    if (worldMode != NetworkLaunchMode::Host) return true;
+    auto* player = playerStateForActor(actor);
+    Object* host = networkWorldPlayerActor(kHostPlayerId);
+    auto actorId = session.entities().findEntity(actor);
+    auto targetId = session.entities().findEntity(target);
+    if (player == nullptr || host == nullptr || !actorId || !targetId) return false;
+    ScopedActingPlayerContext context(*player, actor);
+    Proto* targetPrototype = nullptr;
+    if (proto_ptr(target->pid, &targetPrototype) == -1) return false;
+    // Native inventory refuses deposits into animals. Exercise a human corpse
+    // in this cave fixture, then restore the prototype before gameplay resumes.
+    int bodyType = targetPrototype->critter.data.bodyType;
+    targetPrototype->critter.data.bodyType = BODY_TYPE_BIPED;
+    LootDistributionState distribution = lootDistribution.state();
+    auto previousLoot = activeLootTargets.find(actor);
+    Object* previousTarget = previousLoot != activeLootTargets.end() ? previousLoot->second : nullptr;
+    int results = target->data.critter.combat.results;
+    target->data.critter.combat.results &= ~(DAM_DEAD | DAM_KNOCKED_OUT | DAM_LOSE_TURN);
+    bool activeRejected = commandExecutor.loot(actor, target) == CommandExecutionStatus::InvalidAction;
+    target->data.critter.combat.results = results;
+    activeLootTargets[actor] = target;
+
+    int hostCaps = item_caps_total(host);
+    int actorCaps = item_caps_total(actor);
+    int targetCaps = item_caps_total(target);
+    bool capsDeposited = false;
+    bool capsTaken = false;
+    if (item_caps_adjust(actor, 7) == 0 && registerUntrackedInventory(actor)) {
+        Object* caps = nullptr;
+        for (int index = 0; index < actor->data.inventory.length; ++index) {
+            Object* candidate = actor->data.inventory.items[index].item;
+            if (candidate->pid == PROTO_ID_MONEY) { caps = candidate; break; }
+        }
+        if (caps != nullptr) {
+            InventoryTransferCommand command { *actorId, *targetId,
+                session.entities().findEntity(caps).value_or(EntityId {}), 3,
+                static_cast<std::uint32_t>(item_count(actor, caps)), {} };
+            auto deposit = commandExecutor.transferInventory(actor, actor, target, caps, command);
+            capsDeposited = deposit.status == CommandExecutionStatus::Applied
+                && deposit.capShares.empty() && item_caps_total(actor) == actorCaps + 4
+                && item_caps_total(target) == targetCaps + 3 && item_caps_total(host) == hostCaps
+                && lootDistribution.state().nextCapExtraIndex == distribution.nextCapExtraIndex;
+            if (capsDeposited && registerUntrackedInventory(target)) {
+                Object* deposited = nullptr;
+                for (int index = 0; index < target->data.inventory.length; ++index) {
+                    Object* candidate = target->data.inventory.items[index].item;
+                    if (candidate->pid == PROTO_ID_MONEY) { deposited = candidate; break; }
+                }
+                command.sourceId = *targetId;
+                command.destinationId = *actorId;
+                command.itemId = session.entities().findEntity(deposited).value_or(EntityId {});
+                command.sourceQuantity = static_cast<std::uint32_t>(item_count(target, deposited));
+                auto take = commandExecutor.transferInventory(actor, target, actor, deposited, command);
+                capsTaken = take.status == CommandExecutionStatus::Applied
+                    && take.capShares.size() == 2 && item_caps_total(target) == targetCaps
+                    && item_caps_total(host) + item_caps_total(actor) == hostCaps + actorCaps + 7;
+            }
+        }
+    }
+    item_caps_adjust(host, hostCaps - item_caps_total(host));
+    item_caps_adjust(actor, actorCaps - item_caps_total(actor));
+    item_caps_adjust(target, targetCaps - item_caps_total(target));
+
+    Object* weapon = nullptr;
+    bool equippedRejected = false;
+    bool equippedDropRejected = false;
+    bool itemDeposited = false;
+    bool itemTaken = false;
+    if (obj_pid_new(&weapon, 1) == 0 && weapon != nullptr
+        && item_add_force(actor, weapon, 1) == 0) {
+        auto registration = registerItem(weapon);
+        if (registration) {
+            InventoryTransferCommand command { *actorId, *targetId, registration.entityId, 1, 1, {} };
+            int flags = weapon->flags;
+            weapon->flags |= OBJECT_IN_RIGHT_HAND;
+            auto equipped = commandExecutor.transferInventory(actor, actor, target, weapon, command);
+            equippedRejected = equipped.status == CommandExecutionStatus::InvalidAction && weapon->owner == actor;
+            ItemDropCommand drop { *actorId, registration.entityId, 1, 1, {} };
+            auto equippedDrop = commandExecutor.dropItem(actor, actor, weapon, drop);
+            equippedDropRejected = equippedDrop.status == CommandExecutionStatus::InvalidAction && weapon->owner == actor;
+            weapon->flags = flags;
+            auto deposit = commandExecutor.transferInventory(actor, actor, target, weapon, command);
+            itemDeposited = deposit.status == CommandExecutionStatus::Applied && weapon->owner == target
+                && !isValid(deposit.destinationId)
+                && lootDistribution.state().nextLootPriorityIndex == distribution.nextLootPriorityIndex;
+            if (itemDeposited) {
+                command.sourceId = *targetId;
+                command.destinationId = *actorId;
+                auto take = commandExecutor.transferInventory(actor, target, actor, weapon, command);
+                itemTaken = take.status == CommandExecutionStatus::Applied
+                    && isPlayerActor(weapon->owner) && isValid(take.destinationId);
+            }
+        }
+    }
+    if (weapon != nullptr) {
+        if (weapon->owner != nullptr) item_remove_mult(weapon->owner, weapon, 1);
+        obj_erase_object(weapon, nullptr);
+    }
+    lootDistribution.restore(distribution);
+    targetPrototype->critter.data.bodyType = bodyType;
+    if (previousTarget != nullptr) activeLootTargets[actor] = previousTarget;
+    else activeLootTargets.erase(actor);
+    bool passed = activeRejected && equippedRejected && equippedDropRejected && capsDeposited && capsTaken && itemDeposited && itemTaken
+        && nestedCapsSmokeTest() && ownedContainerSmokeTest(actor);
+    std::fprintf(stdout, "NATIVE_LOOT_DIRECTION_%s active_rejected=%d equipped_rejected=%d equipped_drop_rejected=%d caps_deposit=%d caps_split=%d item_deposit=%d item_priority=%d\n",
+        passed ? "PASS" : "FAIL", activeRejected, equippedRejected, equippedDropRejected, capsDeposited, capsTaken, itemDeposited, itemTaken);
+    return passed;
+}
+
 bool networkWorldVerifyLootRangeSmokeTest(EntityId targetId)
 {
     Object* actor = session.entities().findObject(session.playerActorId(kGuestPlayerId));
@@ -6218,7 +9434,9 @@ bool networkWorldVerifyLootRangeSmokeTest(EntityId targetId)
     for (int distance = 2; distance <= 4 && remoteTile == -1; distance++) {
         for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
             int candidate = tile_num_in_direction(target->tile, rotation, distance);
+            std::array<unsigned char, kMaximumMovementPathLength> path;
             if (hexGridTileIsValid(candidate)
+                && make_path(actor, adjacentTile, candidate, path.data(), 1) > 0
                 && obj_blocking_at(actor, candidate, elevation) == nullptr) {
                 remoteTile = candidate;
                 break;
@@ -6237,15 +9455,21 @@ bool networkWorldVerifyLootRangeSmokeTest(EntityId targetId)
     command.expectedPhaseRevision = session.phaseRevision();
     command.payload = LootCommand { targetId };
     AuthoritativeCommandResult outcome = networkWorldProcessCommand(command);
-    bool rejected = outcome.result.status == CommandStatus::Rejected
+    bool approached = worldMode != NetworkLaunchMode::Host || (outcome.result.status == CommandStatus::Accepted
+        && outcome.event.has_value() && lootTargetIsInRange(actor, target)
+        && activeLootTargets.count(actor) != 0 && activeLootTargets.at(actor) == target);
+    activeLootTargets.erase(actor);
+    command.sequence = CommandSequence { 2 };
+    bool movedFloor = obj_move_to_tile(actor, adjacentTile, (elevation + 1) % ELEVATION_COUNT, nullptr) == 0;
+    outcome = networkWorldProcessCommand(command);
+    bool rejected = movedFloor && outcome.result.status == CommandStatus::Rejected
         && outcome.result.rejection == CommandRejection::InvalidAction
-        && !outcome.event.has_value()
-        && activeLootTargets.find(actor) == activeLootTargets.end();
+        && !outcome.event.has_value() && activeLootTargets.count(actor) == 0;
 
     commandProcessor.reset();
     bool restored = obj_move_to_tile(actor, adjacentTile, elevation, nullptr) == 0
         && lootTargetIsInRange(actor, target);
-    return rejected && restored;
+    return approached && rejected && restored && lootDirectionSmokeTest(actor, target);
 }
 
 std::optional<EntityId> networkWorldPreparePlayerTransferSmokeTest()
@@ -6273,6 +9497,8 @@ std::optional<EntityId> networkWorldPreparePlayerTransferSmokeTest()
         || (existingHostCaps > 0 && item_caps_adjust(hostActor, -existingHostCaps) != 0)
         || (existingGuestCaps > 0 && item_caps_adjust(guestActor, -existingGuestCaps) != 0)
         || item_caps_adjust(guestActor, 7) != 0) {
+        std::fprintf(stderr, "PLAYER_TRANSFER_PREPARE_FAIL placed=%d host_caps=%d guest_caps=%d\n",
+            placed, item_caps_total(hostActor), item_caps_total(guestActor));
         return std::nullopt;
     }
 
@@ -6284,6 +9510,7 @@ std::optional<EntityId> networkWorldPreparePlayerTransferSmokeTest()
             return registration ? std::optional<EntityId>(registration.entityId) : std::nullopt;
         }
     }
+    std::fprintf(stderr, "PLAYER_TRANSFER_CAPS_MISSING total=%d entries=%d\n", item_caps_total(guestActor), inventory.length);
     return std::nullopt;
 }
 
@@ -6293,18 +9520,79 @@ bool networkWorldPrepareRecoverySmokeTest()
         return false;
     }
     if (worldMode == NetworkLaunchMode::Host) {
+        Object* hostActor = networkWorldPlayerActor(kHostPlayerId);
+        if (hostActor == nullptr) return false;
+        playerStateForActor(hostActor)->build.activeHand = 0;
+        intface_select_item(0);
+        hostActor->data.critter.hp = 17;
+        hostActor->data.critter.poison = 7;
+        hostActor->data.critter.radiation = 11;
+        hostActor->data.critter.combat.results |= DAM_CRIP_ARM_LEFT;
+        Object* guestActor = networkWorldPlayerActor(kGuestPlayerId);
+        auto* guestPlayer = playerStateForActor(guestActor);
+        if (guestPlayer == nullptr) return false;
+        ScopedActingPlayerContext guestContext(*guestPlayer, guestActor);
+        guestPlayer->build.activeHand = 1;
+        pc_flag_on(PC_FLAG_SNEAKING);
+        guestPlayer->build.healingSkillUses[0] = { 100, 200, 300 };
+        item_d_set_addict(PROTO_ID_BUFF_OUT);
+        auto* drug = static_cast<DrugEffectEvent*>(mem_malloc(sizeof(DrugEffectEvent)));
+        auto* withdrawal = static_cast<WithdrawalEvent*>(mem_malloc(sizeof(WithdrawalEvent)));
+        if (drug == nullptr || withdrawal == nullptr) { mem_free(drug); mem_free(withdrawal); return false; }
+        *drug = DrugEffectEvent { PROTO_ID_BUFF_OUT, { STAT_AGILITY, -1, -1 }, { 2, 0, 0 } };
+        *withdrawal = WithdrawalEvent { 1, PROTO_ID_BUFF_OUT, PERK_BUFFOUT_ADDICTION };
+        if (queue_add(1000000, guestActor, drug, EVENT_TYPE_DRUG) != 0) {
+            mem_free(drug); mem_free(withdrawal); return false;
+        }
+        if (queue_add(1000000, guestActor, withdrawal, EVENT_TYPE_WITHDRAWAL) != 0) {
+            mem_free(withdrawal); return false;
+        }
+        // Keep one player incapacitated across the real disk/session boundary.
+        guestActor->data.critter.combat.results |= DAM_KNOCKED_OUT;
+        queue_remove_this(guestActor, EVENT_TYPE_KNOCKOUT);
+        if (queue_add(500000, guestActor, nullptr, EVENT_TYPE_KNOCKOUT) != 0) return false;
         publishSharedActivity(SharedActivityKind::WorldOutcome, 77, 1,
             "Recovery smoke checkpoint");
+    } else if (worldMode == NetworkLaunchMode::Join) {
+        // Reproduce a fresh MAP missing scenery present in the saved host map.
+        // The next checkpoint is the durable Ending boundary.
+        if (worldScenery.empty()) return false;
+        auto missing = worldScenery.back();
+        worldScenery.pop_back();
+        session.entities().unregisterEntity(missing.first);
+        if (obj_erase_object(missing.second, nullptr) == -1) return false;
+        std::fprintf(stderr, "NATIVE_ENDING_SCENERY_DIVERGENCE missing=1\n");
     }
     return true;
 }
 
 bool networkWorldVerifyRecoverySmokeTest()
 {
+    Object* host = networkWorldPlayerActor(kHostPlayerId);
     Object* guest = networkWorldPlayerActor(kGuestPlayerId);
+    auto* player = playerStateForActor(guest);
+    std::vector<QueueEventState> timers;
+    bool knockoutTimerIntact = queue_capture_state(timers)
+        && std::count_if(timers.begin(), timers.end(), [&](const auto& timer) {
+            return timer.owner == guest && timer.eventType == EVENT_TYPE_KNOCKOUT
+                && timer.time == game_time() + 500000;
+        }) == 1;
     return session.isActive()
         && session.phase() == SessionPhase::Exploration
-        && guest != nullptr
+        && host != nullptr && host->data.critter.hp == 17
+        && host->data.critter.poison == 7 && host->data.critter.radiation == 11
+        && (host->data.critter.combat.results & DAM_CRIP_ARM_LEFT) != 0
+        && guest != nullptr && player != nullptr
+        && (guest->data.critter.combat.results & DAM_KNOCKED_OUT) != 0
+        && !networkWorldPartyDefeated() && knockoutTimerIntact
+        && playerStateForActor(host)->build.activeHand == 0 && player->build.activeHand == 1
+        && intface_is_item_right_hand() == localPlayerState()->build.activeHand
+        && (player->build.prototypeFlags & (1 << PC_FLAG_SNEAKING)) != 0
+        && player->build.healingSkillUses[0] == std::array<std::int32_t, 3> { 100, 200, 300 }
+        && player->build.addictions != 0
+        && queue_find(guest, EVENT_TYPE_SNEAK)
+        && queue_find(guest, EVENT_TYPE_DRUG)
+        && queue_find(guest, EVENT_TYPE_WITHDRAWAL)
         && item_caps_total(guest) == 7
         && !sharedActivity.empty()
         && sharedActivity.back().kind == SharedActivityKind::WorldOutcome
@@ -6326,6 +9614,11 @@ bool networkWorldVerifyPlayerTransferRangeSmokeTest(EntityId itemId)
         || item_count(guestActor, item) != 7
         || !isAdjacentPlayerActor(guestActor, hostActor)
         || !describeItem(item, descriptor)) {
+        std::fprintf(stderr, "PLAYER_TRANSFER_FIXTURE_INVALID active=%d host=%p guest=%p item=%p owner=%p quantity=%d adjacent=%d\n",
+            session.isActive(), static_cast<void*>(hostActor), static_cast<void*>(guestActor), static_cast<void*>(item),
+            item != nullptr ? static_cast<void*>(item->owner) : nullptr,
+            guestActor != nullptr && item != nullptr ? item_count(guestActor, item) : -1,
+            isAdjacentPlayerActor(guestActor, hostActor));
         return false;
     }
 
@@ -6420,7 +9713,43 @@ bool networkWorldVerifyPlayerTransferRangeSmokeTest(EntityId itemId)
         && item_caps_total(hostActor) == 0;
 
     commandProcessor.reset();
+    if (!(rejected && restored && playerLootRejected && gifted && takingRejected && rolledBack)) {
+        std::fprintf(stderr, "PLAYER_TRANSFER_RANGE_FAIL far=%d restored=%d player_loot=%d gift=%d taking=%d rollback=%d gift_status=%d gift_rejection=%d\n",
+            rejected, restored, playerLootRejected, gifted, takingRejected, rolledBack,
+            static_cast<int>(giftOutcome.result.status), static_cast<int>(giftOutcome.result.rejection));
+    }
     return rejected && restored && playerLootRejected && gifted && takingRejected && rolledBack;
+}
+
+static bool worldMapControllerRulesSmokeTest()
+{
+    if (worldMode != NetworkLaunchMode::Host) return true;
+    auto* guest = session.players().find(kGuestPlayerId);
+    auto* host = session.players().find(kHostPlayerId);
+    Object* guestActor = session.entities().findObject(session.playerActorId(kGuestPlayerId));
+    Object* hostActor = session.entities().findObject(session.playerActorId(kHostPlayerId));
+    if (guest == nullptr || host == nullptr || guestActor == nullptr || hostActor == nullptr
+        || networkWorldWorldMapControllerActor() != guestActor) return false;
+    CharacterBuild savedGuest = guest->build;
+    WorldMapTravelProgress savedProgress;
+    worldmap_capture_travel_progress(savedProgress);
+    WorldMapState position;
+    worldmap_capture_state(position);
+    guest->build.skillPoints[SKILL_OUTDOORSMAN] = 200;
+    guest->build.perkRanks[PERK_PATHFINDER] = 2;
+    bool passed;
+    {
+        ScopedActingPlayerContext hostContext(*host, hostActor);
+        passed = worldmap_authoritative_travel_begin(position.x, position.y);
+        WorldMapTravelProgress progress;
+        worldmap_capture_travel_progress(progress);
+        passed = passed && progress.dayLength == 120 && progress.timeAdder == 3600;
+    }
+    guest->build = savedGuest;
+    passed = worldmap_apply_travel_progress(savedProgress) && passed;
+    std::fprintf(stderr, "NATIVE_WORLD_MAP_CONTROLLER_RULES_%s guest_controller=1 outdoorsman=100 pathfinder=2 day=120 ticks=3600\n",
+        passed ? "PASS" : "FAIL");
+    return passed;
 }
 
 bool networkWorldRunSharedModalSmokeTest()
@@ -6437,7 +9766,7 @@ bool networkWorldRunSharedModalSmokeTest()
     if (guestForExit != nullptr && hostForExit != nullptr) {
         for (const auto& entry : worldExitGrids) {
             Object* exitGrid = entry.second;
-            if (!isExitGrid(exitGrid) || exitGrid->data.misc.map != 0) continue;
+            if (!isExitGrid(exitGrid) || !isWorldMapDestination(exitGrid->data.misc.map)) continue;
             int oldGuestTile = guestForExit->tile;
             int oldGuestElevation = guestForExit->elevation;
             int oldHostTile = hostForExit->tile;
@@ -6472,6 +9801,8 @@ bool networkWorldRunSharedModalSmokeTest()
                 && proposalEvent->open
                 && proposalEvent->phase == SessionPhase::Exploration
                 && session.phase() == SessionPhase::Exploration;
+            std::fprintf(stderr, "NATIVE_WORLD_EXIT_PROPOSAL map=%d tile=%d accepted=%d\n",
+                exitGrid->data.misc.map, exitGrid->tile, worldMapExitProposes ? 1 : 0);
             GameCommand withdraw = entryCommand;
             withdraw.sequence = CommandSequence { 2 };
             withdraw.payload = SharedModalCommand { SharedModalKind::WorldMap, false };
@@ -6486,6 +9817,18 @@ bool networkWorldRunSharedModalSmokeTest()
         }
     }
     int startingWorldTime = game_time();
+    struct RestoreWorldMapFixture {
+        WorldMapState saved;
+        ~RestoreWorldMapFixture() { worldmap_apply_state(saved); }
+    } restoreWorldMap;
+    worldmap_capture_state(restoreWorldMap.saved);
+    // These controller checks cancel without leaving the installed map.
+    // Use a terrain position so cancellation does not enter a city's main
+    // map and invalidate the NPC/item pointers used by the next fixture.
+    WorldMapState cancellationPosition = restoreWorldMap.saved;
+    cancellationPosition.x = 725;
+    cancellationPosition.y = 616;
+    if (!worldmap_apply_state(cancellationPosition)) return false;
     WorldMapState startingWorldMap;
     worldmap_capture_state(startingWorldMap);
     // The headless stepper must never execute on a replica. An already-reached
@@ -6560,6 +9903,9 @@ bool networkWorldRunSharedModalSmokeTest()
         && routeSnapshot.worldMapTravel.proposerActorId == actorId
         && routeSnapshot.worldMapTravel.targetX == 725
         && routeSnapshot.worldMapTravel.targetY == 616;
+    proposerCanRoute = proposerCanRoute && networkWorldRunWorldMapRouteStopSmokeTest()
+        && worldmap_multiplayer_render_smoke_test()
+        && worldMapControllerRulesSmokeTest();
     bool hostTravelProgressRoundTrip = true;
     if (worldMode == NetworkLaunchMode::Host) {
         WorldMapState travelFixture = startingWorldMap;
@@ -6910,12 +10256,14 @@ bool networkWorldBeginLocalLoot(Object* target)
         || obj_dude == nullptr
         || target == nullptr
         || isPlayerActor(target)
-        || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER
+        || (FID_TYPE(target->fid) != OBJ_TYPE_CRITTER
+            && (FID_TYPE(target->fid) != OBJ_TYPE_ITEM || target->owner != nullptr
+                || item_get_type(target) != ITEM_TYPE_CONTAINER))
         || obj_dude->elevation != target->elevation) {
         return false;
     }
     activeLootTargets[obj_dude] = target;
-    return action_loot_container(obj_dude, target) != -1;
+    return scripts_request_loot_container(obj_dude, target) == 0;
 }
 
 bool networkWorldSetLocalLootTarget(Object* target)
@@ -6932,19 +10280,42 @@ bool networkWorldSetLocalLootTarget(Object* target)
     return true;
 }
 
+bool networkWorldIsTheftTarget(const Object* actor, const Object* target)
+{
+    auto found = theftAccess.find(const_cast<Object*>(actor));
+    return session.isActive() && session.phase() == SessionPhase::Exploration
+        && found != theftAccess.end() && found->second.target == target
+        && session.entities().findEntity(target).has_value()
+        && session.entities().findEntity(actor).has_value()
+        && actor->tile >= 0 && target->tile >= 0 && actor->elevation == target->elevation
+        && obj_dist(const_cast<Object*>(actor), const_cast<Object*>(target)) <= 1
+        && critter_is_active(const_cast<Object*>(target));
+}
+
+bool networkWorldHasTheftAccess(const Object* actor)
+{
+    return session.isActive() && theftAccess.count(const_cast<Object*>(actor)) != 0;
+}
+
 bool networkWorldIsLocalInventoryTransfer(Object* source, Object* destination)
 {
-    if (!session.isActive() || obj_dude == nullptr || source == nullptr || destination == nullptr) {
-        return false;
-    }
-    auto activeLoot = activeLootTargets.find(obj_dude);
-    if (activeLoot == activeLootTargets.end()) {
+    Object* localActor = localPlayerActor();
+    if (!session.isActive() || localActor == nullptr || source == nullptr || destination == nullptr) {
         return false;
     }
     Object* sourceTop = topEnvironmentOrSelf(source);
     Object* destinationTop = topEnvironmentOrSelf(destination);
-    return (sourceTop == obj_dude && destinationTop == activeLoot->second)
-        || (destinationTop == obj_dude && sourceTop == activeLoot->second);
+    if (sourceTop == localActor && destinationTop == localActor) {
+        // Host scripts already run authoritatively. Only intercept native UI
+        // moves here; scripts may rearrange inventory during other phases.
+        return inven_network_inventory_window_is_active();
+    }
+    auto activeLoot = activeLootTargets.find(localActor);
+    if (activeLoot == activeLootTargets.end()) {
+        return false;
+    }
+    return (sourceTop == localActor && destinationTop == activeLoot->second)
+        || (destinationTop == localActor && sourceTop == activeLoot->second);
 }
 
 bool networkWorldIsLocalItemDrop(Object* source, Object* item)
@@ -6964,17 +10335,38 @@ bool networkWorldItemUseInProgress()
 
 void networkWorldHandleObjectDestroyed(Object* object)
 {
-    if (!session.isActive() || object == nullptr || FID_TYPE(object->fid) != OBJ_TYPE_ITEM) {
+    if (!session.isActive() || object == nullptr) {
         return;
+    }
+    for (auto it = theftAccess.begin(); it != theftAccess.end();) {
+        if (it->first == object || it->second.target == object) {
+            activeLootTargets.erase(it->first);
+            it = theftAccess.erase(it);
+        } else ++it;
+    }
+    for (auto it = activeLootTargets.begin(); it != activeLootTargets.end();) {
+        if (it->first == object || it->second == object) it = activeLootTargets.erase(it);
+        else ++it;
     }
     std::optional<EntityId> entityId = session.entities().findEntity(object);
     if (!entityId.has_value()) {
         return;
     }
+    if (npcBarterState.has_value() && (npcBarterState->buyerId == *entityId || npcBarterState->sellerId == *entityId)) {
+        npcBarterState.reset();
+        pendingScriptedNpcBarter.reset();
+    }
     session.entities().unregisterEntity(*entityId);
-    worldItems.erase(std::remove_if(worldItems.begin(), worldItems.end(), [&](const auto& entry) {
-        return entry.first == *entityId;
-    }), worldItems.end());
+    auto remove = [object](auto& entries) {
+        entries.erase(std::remove_if(entries.begin(), entries.end(), [object](const auto& entry) {
+            return entry.second == object;
+        }), entries.end());
+    };
+    remove(worldItems);
+    remove(worldCritters);
+    remove(worldScenery);
+    remove(worldDoors);
+    remove(worldExitGrids);
 }
 
 void networkWorldHandleItemReplacement(Object* removed, Object* replacement)
@@ -7381,10 +10773,17 @@ AuthoritativeCommandResult networkWorldProcessCommand(const GameCommand& command
         }
     }
 
+    const auto* combatPickup = std::get_if<PickupCommand>(&command.payload);
+    bool tracksCombatPickup = combatPickup != nullptr && combatPickup->turnRevision != 0
+        && pendingPickups.count(combatPickup->targetId) == 0;
+    if (tracksCombatPickup) pendingPickups[combatPickup->targetId] = PendingPickup { command.actorId, command.sequence };
     AuthoritativeCommandResult result = commandProcessor.process(command, session, commandExecutor);
+    if (tracksCombatPickup) pendingPickups.erase(combatPickup->targetId);
     if (result.result.status == CommandStatus::Accepted && !result.replayed
         && result.event.has_value()) {
-        if (std::holds_alternative<DialogueRequestedEvent>(result.event->payload)) {
+        if (std::holds_alternative<CombatRequestedEvent>(result.event->payload)) {
+            if (pendingCombatStart.has_value()) pendingCombatStart->causedBy = command.sequence;
+        } else if (std::holds_alternative<DialogueRequestedEvent>(result.event->payload)) {
             if (pendingTalk.has_value()) pendingTalk->causedBy = command.sequence;
             dialogueCause = command.sequence;
         } else if (const auto* modal = std::get_if<SharedModalStateChangedEvent>(
@@ -7417,7 +10816,8 @@ AuthoritativeCommandResult networkWorldProcessCommand(const GameCommand& command
             movement->startingTile = startingTile;
             movement->path = std::move(path);
         } else if (const auto* pickup = std::get_if<ItemPickupStartedEvent>(&result.event->payload);
-            pickup != nullptr && !result.replayed) {
+            pickup != nullptr && !result.replayed
+                && (combatPickup == nullptr || combatPickup->turnRevision == 0)) {
             pendingPickups[pickup->targetId] = PendingPickup {
                 pickup->actorId,
                 result.event->causedBy,
@@ -7475,6 +10875,7 @@ bool networkWorldPublishDialogue(const std::string& reply,
     }
     for (const DialogueBallot& ballot : dialogueVotes.ballots()) {
         Object* voter = networkWorldPlayerActor(ballot.playerId);
+        networkWorldDialogueSetConnected(ballot.playerId, true);
         PlayerCharacterState* voterState = session.players().find(ballot.playerId);
         if (voter == nullptr || voterState == nullptr) return false;
         ScopedActingPlayerContext acting(*voterState, voter);
@@ -7489,7 +10890,7 @@ bool networkWorldPublishDialogue(const std::string& reply,
 
 std::optional<std::uint8_t> networkWorldResolveDialogue()
 {
-    if (worldMode != NetworkLaunchMode::Host || !dialogueVotes.active()) return std::nullopt;
+    if (worldMode != NetworkLaunchMode::Host || !dialogueVotes.active() || npcBarterState.has_value()) return std::nullopt;
     std::uint64_t now = combatClockMilliseconds();
     // Start the voting timeout when a player participates, keeping the other
     // players' response window after a long idle conversation.
@@ -7531,8 +10932,55 @@ std::string networkWorldDialoguePlayerName(PlayerId playerId)
 void networkWorldDialogueSetConnected(PlayerId playerId, bool connected)
 {
     if (worldMode == NetworkLaunchMode::Host) {
-        dialogueVotes.setConnected(playerId, connected);
+        Object* actor = networkWorldPlayerActor(playerId);
+        dialogueVotes.setConnected(playerId, connected && actor != nullptr
+            && !critter_is_dead(actor)
+            && (actor->data.critter.combat.results & DAM_KNOCKED_OUT) == 0);
     }
+}
+
+ScopedPlayerFeedback::ScopedPlayerFeedback(Object* actor)
+    : previous(playerFeedbackActor)
+{
+    playerFeedbackActor = actor;
+}
+
+ScopedPlayerFeedback::~ScopedPlayerFeedback()
+{
+    playerFeedbackActor = previous;
+}
+
+bool networkWorldCapturingPlayerFeedback(const Object* actor)
+{
+    return worldMode == NetworkLaunchMode::Host && session.isActive()
+        && actor != nullptr && actor == playerFeedbackActor
+        && playerStateForActor(actor) != nullptr;
+}
+
+bool networkWorldRoutePlayerFeedback(const char* text)
+{
+    if (worldMode != NetworkLaunchMode::Host || !session.isActive()
+        || playerFeedbackActor == nullptr || text == nullptr || text[0] == '\0') return false;
+    auto* player = playerStateForActor(playerFeedbackActor);
+    // Local bindings can temporarily select a guest for legacy inventory and
+    // dialogue helpers. The physical host monitor still belongs to the host.
+    if (player == nullptr || player->id == kHostPlayerId) return false;
+    deferredEvents.push_back(GameEvent { {}, CommandSequence { UINT64_MAX },
+        PlayerFeedbackEvent { player->actorId, std::string(text).substr(0, 512) } });
+    return true;
+}
+
+bool networkWorldApplyPeerPlayerFeedback(const PlayerFeedbackEvent& event)
+{
+    if (worldMode != NetworkLaunchMode::Join || !session.isActive()
+        || session.players().findByActor(event.actorId) == nullptr
+        || event.text.empty() || event.text.size() > 512
+        || event.text.find('\0') != std::string::npos) return false;
+    if (localPlayerState() != nullptr && localPlayerState()->actorId == event.actorId) {
+        std::string text = event.text;
+        display_print(text.data());
+    }
+    return true;
 }
 
 void networkWorldRecordQuestActivity(int globalVar, int value)
@@ -7645,6 +11093,43 @@ bool networkWorldMovePartyNearDialogueTarget(EntityId targetId)
         }
     }
     return false;
+}
+
+// Run after the native dialogue and its acting-player scopes have unwound.
+// Loading inside gdialog_exit would destroy its script and talker objects.
+void networkWorldProcessDialogueMapTransition()
+{
+    if (worldMode != NetworkLaunchMode::Host || !session.isActive()
+        || session.phase() != SessionPhase::Exploration
+        || !pendingDialogueMapTransition.has_value()) return;
+    auto pending = *pendingDialogueMapTransition;
+    pendingDialogueMapTransition.reset();
+    const auto* player = session.players().findByActor(pending.actorId);
+    if (player == nullptr) return;
+    PlayerId proposer = player->id;
+    if (session.transitionTo(SessionPhase::Transition) != LocalSessionError::None
+        || !loadSharedMap(pending.destination.map)) return;
+    Object* host = networkWorldPlayerActor(kHostPlayerId);
+    int tile = pending.destination.tile;
+    int elevation = pending.destination.elevation;
+    int rotation = pending.destination.rotation;
+    if (!hexGridTileIsValid(tile) || !elevationIsValid(elevation)) {
+        tile = host != nullptr ? host->tile : -1;
+        elevation = host != nullptr ? host->elevation : -1;
+    }
+    if (rotation < 0 || rotation >= ROTATION_COUNT) {
+        rotation = host != nullptr ? host->rotation : ROTATION_SE;
+    }
+    if (!placePlayerRosterAtDestination(proposer, tile, elevation, rotation)
+        || localPlayerActor() == nullptr
+        || map_set_elevation(localPlayerActor()->elevation) != 0
+        || !registerWorldObjects()
+        || session.transitionTo(SessionPhase::Exploration) != LocalSessionError::None) return;
+    // The close event is followed by a complete checkpoint, including the new
+    // map, party placement, script locals, quest globals and inventories.
+    deferredEvents.push_back(GameEvent { {}, pending.cause,
+        SharedModalStateChangedEvent { pending.actorId, SharedModalKind::Dialogue,
+            false, SessionPhase::Exploration, session.phaseRevision() } });
 }
 
 bool networkWorldEndDialogue()
@@ -7815,7 +11300,7 @@ std::optional<EntityId> networkWorldReadyLocalExitGrid()
             continue;
         }
         bool ready = true;
-        for (PlayerId playerId : { kHostPlayerId, kGuestPlayerId }) {
+        for (PlayerId playerId : session.players().playerIds()) {
             Object* playerActor = session.entities().findObject(session.playerActorId(playerId));
             if (playerActor == nullptr
                 || playerActor->elevation != exitGrid->elevation
@@ -7834,12 +11319,35 @@ std::optional<EntityId> networkWorldReadyLocalExitGrid()
 bool networkWorldIsWorldMapExitGrid(EntityId exitId)
 {
     Object* exitGrid = session.isActive() ? session.entities().findObject(exitId) : nullptr;
-    return isExitGrid(exitGrid) && exitGrid->data.misc.map == 0;
+    return isExitGrid(exitGrid) && isWorldMapDestination(exitGrid->data.misc.map);
 }
+
+const StoryPresentationState& networkWorldStory() { return storyPresentation; }
+
+bool networkWorldBeginStory(StoryPresentationState state)
+{
+    if (worldMode != NetworkLaunchMode::Host || storyPresentation.active
+        || state.revision <= storyPresentation.revision) return false;
+    state.active = true;
+    state.completed.clear();
+    storyPresentation = std::move(state);
+    return true;
+}
+
+bool networkWorldCompleteStory(PlayerId player, std::uint64_t revision)
+{
+    if (worldMode != NetworkLaunchMode::Host || !storyPresentation.active
+        || revision != storyPresentation.revision || session.players().find(player) == nullptr) return false;
+    if (std::find(storyPresentation.completed.begin(), storyPresentation.completed.end(), player) == storyPresentation.completed.end())
+        storyPresentation.completed.push_back(player);
+    return true;
+}
+
+void networkWorldFinishStory() { if (worldMode == NetworkLaunchMode::Host) storyPresentation.active = false; }
 
 bool networkWorldSharedModalActive()
 {
-    return activeSharedModal.has_value()
+    return storyPresentation.active || activeSharedModal.has_value()
         || session.phase() == SessionPhase::Dialogue
         || session.phase() == SessionPhase::Transition;
 }
@@ -7852,6 +11360,12 @@ bool networkWorldLocalWorldMapController()
         && activeSharedModal->kind == SharedModalKind::WorldMap
         && activeSharedModal->actorId == session.playerActorId(
             worldMode == NetworkLaunchMode::Host ? kHostPlayerId : kGuestPlayerId);
+}
+
+Object* networkWorldWorldMapControllerActor()
+{
+    return networkWorldWorldMapTravelApproved()
+        ? session.entities().findObject(activeSharedModal->actorId) : nullptr;
 }
 
 std::optional<PlayerId> networkWorldPendingWorldMapProposer()
@@ -7887,6 +11401,86 @@ void networkWorldHealRemotePlayersForTravelDay()
 std::optional<std::pair<std::int32_t, std::int32_t>> networkWorldSelectedWorldMapRoute()
 {
     return selectedWorldMapRoute;
+}
+
+bool networkWorldStopWorldMapRoute()
+{
+    if (worldMode != NetworkLaunchMode::Host || !networkWorldWorldMapTravelApproved()
+        || !selectedWorldMapRoute.has_value()) return false;
+    WorldMapRouteSelectedEvent stopped { activeSharedModal->actorId, -1, -1, true };
+    selectedWorldMapRoute.reset();
+    worldmap_authoritative_travel_cancel();
+    deferredEvents.push_back(GameEvent { {}, approvedWorldMapProposalSequence, stopped });
+    return true;
+}
+
+bool networkWorldRunWorldMapRouteStopSmokeTest()
+{
+    if (worldMode != NetworkLaunchMode::Host) return true;
+    if (!networkWorldWorldMapTravelApproved()
+        || activeSharedModal->actorId != session.playerActorId(kGuestPlayerId)
+        || networkWorldLocalWorldMapController()) return false;
+    WorldMapState savedMap;
+    worldmap_capture_state(savedMap);
+    WorldMapTravelProgress savedProgress;
+    worldmap_capture_travel_progress(savedProgress);
+    auto savedRoute = selectedWorldMapRoute;
+    bool savedDeparted = worldMapDeparted;
+    int savedTime = game_time();
+    std::size_t savedEventCount = deferredEvents.size();
+    std::vector<QueueEventState> savedQueue;
+    if (!queue_capture_state(savedQueue)) return false;
+    queue_clear();
+    int savedWater = game_global_vars[GVAR_VAULT_WATER];
+    int savedVats = game_global_vars[GVAR_VATS_COUNTDOWN];
+    int savedMaster = game_global_vars[GVAR_COUNTDOWN_TO_DESTRUCTION];
+    game_global_vars[GVAR_VAULT_WATER] = 1;
+    game_global_vars[GVAR_VATS_COUNTDOWN] = 0;
+    game_global_vars[GVAR_COUNTDOWN_TO_DESTRUCTION] = 0;
+    bool blocked = false;
+    // Exercise the real walkmask rather than manufacturing a Blocked result.
+    for (int y = 100; y < 1400 && !blocked; y += 100) {
+        for (int x = 100; x < 1000 && !blocked; x += 100) {
+            WorldMapState fixture = savedMap;
+            fixture.x = x;
+            fixture.y = y;
+            set_game_time(savedTime);
+            if (!worldmap_apply_state(fixture)) continue;
+            worldmap_authoritative_travel_cancel();
+            selectedWorldMapRoute = std::make_pair(x + 10, y);
+            WorldMapTravelStepResult step = worldmap_multiplayer_advance_travel();
+            if (step.status != WorldMapTravelStepStatus::Blocked) continue;
+            int stoppedTime = game_time();
+            blocked = !selectedWorldMapRoute.has_value()
+                && worldmap_multiplayer_advance_travel().status == WorldMapTravelStepStatus::Invalid
+                && game_time() == stoppedTime;
+        }
+    }
+    WorldMapState terrain = savedMap;
+    terrain.x = 1200;
+    terrain.y = 1200;
+    bool arrived = worldmap_apply_state(terrain);
+    worldmap_authoritative_travel_cancel();
+    selectedWorldMapRoute = std::make_pair(terrain.x, terrain.y);
+    WorldMapTravelStepResult arrival = worldmap_multiplayer_advance_travel();
+    arrived = arrived && arrival.status == WorldMapTravelStepStatus::Arrived
+        && !selectedWorldMapRoute.has_value();
+    const auto* event = deferredEvents.size() > savedEventCount
+        ? std::get_if<WorldMapRouteSelectedEvent>(&deferredEvents.back().payload) : nullptr;
+    bool published = event != nullptr && event->clear
+        && event->actorId == session.playerActorId(kGuestPlayerId);
+    while (deferredEvents.size() > savedEventCount) deferredEvents.pop_back();
+    selectedWorldMapRoute = savedRoute;
+    worldMapDeparted = savedDeparted;
+    set_game_time(savedTime);
+    game_global_vars[GVAR_VAULT_WATER] = savedWater;
+    game_global_vars[GVAR_VATS_COUNTDOWN] = savedVats;
+    game_global_vars[GVAR_COUNTDOWN_TO_DESTRUCTION] = savedMaster;
+    bool restored = worldmap_apply_state(savedMap)
+        && worldmap_apply_travel_progress(savedProgress) && queue_replace_state(savedQueue);
+    std::fprintf(stderr, "NATIVE_WORLD_MAP_ROUTE_STOP_%s guest_controller=1 blocked=%d terrain_arrived=%d published=%d restored=%d\n",
+        blocked && arrived && published && restored ? "PASS" : "FAIL", blocked, arrived, published, restored);
+    return blocked && arrived && published && restored;
 }
 
 WorldMapTravelStepResult networkWorldAdvanceWorldMapTravel()
@@ -7947,11 +11541,43 @@ const SnapshotCaptureDiagnostic& networkWorldLastSnapshotCaptureDiagnostic()
     return lastCaptureDiagnostic;
 }
 
+bool networkWorldRunStoppedRestSmoke()
+{
+    Object* host = networkWorldPlayerActor(kHostPlayerId);
+    Object* guest = networkWorldPlayerActor(kGuestPlayerId);
+    if (!networkRuntimeSimulationStopped() || host == nullptr || guest == nullptr) return false;
+    int time = game_time(), hostHp = critter_get_hits(host), guestHp = critter_get_hits(guest);
+    return advanceSharedRest(180, false) && game_time() == time
+        && critter_get_hits(host) == hostHp && critter_get_hits(guest) == guestHp;
+}
+
+bool networkWorldRunVariableCapacitySmoke(bool (*capture)(EventSequence, WorldSnapshot&))
+{
+    if (worldMode != NetworkLaunchMode::Host || capture == nullptr) return false;
+    struct Restore {
+        int count = num_game_global_vars;
+        ~Restore() { num_game_global_vars = count; }
+    } restore;
+    // Reject the count before reading native storage. This exercises the real
+    // capture path without allocating thousands of campaign objects.
+    num_game_global_vars = static_cast<int>(kMaxSnapshotVariables) + 1;
+    WorldSnapshot snapshot;
+    snapshot.mapId = -99;
+    bool rejected = !capture({}, snapshot);
+    return rejected && snapshot.mapId == -99
+        && lastCaptureDiagnostic.failure == SnapshotCaptureFailure::SnapshotValidation
+        && lastCaptureDiagnostic.snapshotError == SnapshotError::TooManyVariables;
+}
+
 bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot& snapshot)
 {
     lastCaptureDiagnostic = {};
     if (!session.isActive()) {
         return captureFailure(SnapshotCaptureFailure::InactiveSession, "session");
+    }
+    if (session.phase() != SessionPhase::Exploration) {
+        for (const auto& entry : theftAccess) activeLootTargets.erase(entry.first);
+        theftAccess.clear();
     }
 
     // Native dialogue scripts can create rewards directly in an inventory.
@@ -7992,6 +11618,7 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
         captured.combatFreeMove = combat_free_move;
     }
     captured.gameTime = game_time();
+    captured.story = storyPresentation;
     captured.sharedActivity.assign(sharedActivity.begin(), sharedActivity.end());
     if (directTradeController.active()) {
         captured.directTrade = directTradeController.state();
@@ -8019,7 +11646,7 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
             captured.worldMapTravel.targetY = selectedWorldMapRoute->second;
         }
     }
-    for (PlayerId playerId : { kHostPlayerId, kGuestPlayerId }) {
+    for (PlayerId playerId : session.players().playerIds()) {
         EntityId actorId = session.playerActorId(playerId);
         Object* actor = session.entities().findObject(actorId);
         PlayerCharacterState* player = session.players().find(playerId);
@@ -8048,6 +11675,8 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
             session.entities().findEntity(actor->data.critter.combat.whoHitMe)
                 .value_or(EntityId {}),
             player->build,
+            std::max(actor->data.critter.poison, 0),
+            std::max(actor->data.critter.radiation, 0),
         });
     }
     for (const auto& entry : worldScenery) {
@@ -8101,6 +11730,7 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
             critter->data.critter.combat.damageLastTurn,
             session.entities().findEntity(critter->data.critter.combat.whoHitMe)
                 .value_or(EntityId {}),
+            isPartyMember(critter),
         });
     }
     for (const auto& entry : worldDoors) {
@@ -8308,8 +11938,16 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
         return false;
     }
 
+    if (snapshot.phase != SessionPhase::Dialogue || snapshot.phaseRevision != session.phaseRevision()) {
+        npcBarterState.reset();
+        pendingScriptedNpcBarter.reset();
+    }
     reconciliation.commit();
     bool sceneryLayoutMismatch = reconciliation.reconstructScenery;
+    if (snapshot.phase != SessionPhase::Exploration) {
+        for (const auto& entry : theftAccess) activeLootTargets.erase(entry.first);
+        theftAccess.clear();
+    }
     if (networkWorldReplicaSessionActive() && sceneryLayoutMismatch) {
         // Saved terrain and map-enter scripts can have a different scenery
         // population from the installed MAP. Replicas reconstruct descriptors
@@ -8479,6 +12117,18 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
         }
         for (Object* stale : localCritters) {
             if (reboundCritters.find(stale) == reboundCritters.end()) {
+                // localItems still contains this critter's inventory pointers.
+                // Preserve those objects until the item reconciliation below;
+                // erasing an owner normally frees its entire inventory tree.
+                while (stale->data.inventory.length > 0) {
+                    InventoryItem entry = stale->data.inventory.items[0];
+                    if (item_remove_mult(stale, entry.item, entry.quantity) != 0) return false;
+                }
+                for (auto it = activeLootTargets.begin(); it != activeLootTargets.end();) {
+                    if (it->second == stale) it = activeLootTargets.erase(it);
+                    else ++it;
+                }
+                if (isPartyMember(stale) && partyMemberRemove(stale) != 0) return false;
                 obj_erase_object(stale, nullptr);
             }
         }
@@ -8487,6 +12137,9 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
             return false;
         }
     }
+    // Item IDs describe identity, not nesting order. An older item can move
+    // into a newly created container with a higher ID. Restore holders first;
+    // the snapshot validator has already rejected dangling owners and cycles.
     const auto& orderedItems = reconciliation.orderedItems;
     std::unordered_set<Object*> reboundItems;
     for (const ItemSnapshot* orderedItem : orderedItems) {
@@ -8516,17 +12169,30 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
             removedItemPointers.insert(item);
         }
     }
-    for (Object* item : removedItemPointers) {
-        if (item != nullptr && removedItemPointers.find(item->owner) == removedItemPointers.end()) {
-            obj_destroy(item);
+    // A retained child must survive if an obsolete container is removed.
+    for (Object* item : reboundItems) {
+        if (item->owner != nullptr && removedItemPointers.count(item->owner) != 0) {
+            Object* owner = item->owner;
+            int quantity = item_count(owner, item);
+            if (quantity <= 0 || item_remove_mult(owner, item, quantity) != 0) return false;
         }
     }
+    // Determine roots before deleting anything. Destroying a container also
+    // frees its children, so iterating their pointers afterward is unsafe.
+    std::vector<Object*> removedRoots;
+    for (Object* item : removedItemPointers) {
+        if (item != nullptr && removedItemPointers.count(item->owner) == 0) {
+            removedRoots.push_back(item);
+        }
+    }
+    for (Object* item : removedRoots) obj_destroy(item);
 
     if (session.applyAuthoritativePhase(snapshot.phase, snapshot.phaseRevision) != LocalSessionError::None
         || !applyActorAndCritterState(snapshot, preserveMovement)) {
         std::fprintf(stderr, "Multiplayer snapshot failed phase or actor application.\n");
         return false;
     }
+    storyPresentation = snapshot.story;
     if (snapshot.phase == SessionPhase::Combat && !snapshot.combat.initiative.empty()) {
         if (!combatTurns.restore(snapshot.combat, combatClockMilliseconds())) {
             return false;
@@ -8534,6 +12200,7 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
     } else {
         combatTurns.stop();
         openInventories.clear();
+        openLootTurns.clear();
     }
     combat_free_move = snapshot.combatFreeMove;
     sharedActivity.assign(snapshot.sharedActivity.begin(), snapshot.sharedActivity.end());
@@ -8583,6 +12250,8 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
         }
     } else {
         directTradeController.clear();
+        npcBarterState.reset();
+        pendingScriptedNpcBarter.reset();
         activeSharedModal.reset();
         dialoguePresentation.reset();
         dialogueVotes.clear();
@@ -8691,6 +12360,7 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
                 return false;
             }
         } else if (item->tile < 0) {
+            // Move the existing floating node without allocating another one.
             if (obj_move_to_tile(item, itemState.tile, itemState.elevation, nullptr) == -1) {
                 return false;
             }
@@ -8764,6 +12434,7 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
             activeSharedModal.reset();
         }
     }
+    if (localPlayerState() != nullptr) intface_select_item(localPlayerState()->build.activeHand);
     intface_redraw();
     return true;
 }
@@ -8799,6 +12470,57 @@ std::optional<PlayerId> networkWorldCombatOwner(const Object* actor)
     return player != nullptr ? std::optional<PlayerId>(player->id) : std::nullopt;
 }
 
+void networkWorldExecutePendingCombatStart()
+{
+    if (worldMode != NetworkLaunchMode::Host || !pendingCombatStart.has_value() || pendingCombatStart->started) return;
+    if (session.phase() != SessionPhase::Exploration || isInCombat()) {
+        pendingCombatStart.reset();
+        return;
+    }
+    Object* actor = session.entities().findObject(pendingCombatStart->actorId);
+    Object* target = isValid(pendingCombatStart->command.targetId)
+        ? session.entities().findObject(pendingCombatStart->command.targetId) : nullptr;
+    if (actor == nullptr || !critter_is_active(actor)
+        || (isValid(pendingCombatStart->command.targetId)
+            && (target == nullptr || !critter_is_active(target) || actor->elevation != target->elevation))) {
+        pendingCombatStart.reset();
+        return;
+    }
+    pendingCombatStart->started = true;
+    STRUCT_664980 request {};
+    request.attacker = actor;
+    request.defender = target;
+    request.maxDamage = std::numeric_limits<int>::max();
+    combat(&request);
+    pendingCombatStart.reset();
+}
+
+bool networkWorldCombatRunInitialAttack(Object* actor)
+{
+    if (worldMode != NetworkLaunchMode::Host || !pendingCombatStart.has_value()
+        || !pendingCombatStart->started
+        || session.entities().findObject(pendingCombatStart->actorId) != actor) return false;
+    auto pending = *pendingCombatStart;
+    pendingCombatStart.reset();
+    if (!isValid(pending.command.targetId)) return true;
+    Object* target = session.entities().findObject(pending.command.targetId);
+    auto* player = session.players().findByActor(pending.actorId);
+    if (target == nullptr || player == nullptr) return true;
+    ScopedActingPlayerContext context(*player, actor);
+    ScopedPlayerFeedback feedback(actor);
+    AttackCommand attack { pending.command.targetId, pending.command.hitMode,
+        pending.command.hitLocation, combatTurns.revision() };
+    if (commandExecutor.attack(actor, target, attack) == CommandExecutionStatus::Applied) {
+        deferredEvents.push_back(GameEvent { {}, pending.causedBy,
+            AttackStartedEvent { pending.actorId, pending.command.targetId,
+                pending.command.hitMode, pending.command.hitLocation } });
+    } else {
+        char message[] = "The initial attack is no longer possible.";
+        display_print(message);
+    }
+    return true;
+}
+
 bool networkWorldCombatBeginRound(Object* const* actors, int count)
 {
     if (worldMode != NetworkLaunchMode::Host || !session.isActive()
@@ -8807,6 +12529,7 @@ bool networkWorldCombatBeginRound(Object* const* actors, int count)
         return false;
     }
     openInventories.clear();
+    openLootTurns.clear();
     std::vector<CombatTurnEntry> order;
     order.reserve(count);
     for (int index = 0; index < count; index++) {
@@ -8877,7 +12600,10 @@ void networkWorldCombatSetPlayerConnected(PlayerId playerId, bool connected)
 {
     if (worldMode == NetworkLaunchMode::Host && combatTurns.active()) {
         combatTurns.setConnected(playerId, connected);
-        if (!connected) openInventories.erase(session.playerActorId(playerId));
+        if (!connected) {
+            openInventories.erase(session.playerActorId(playerId));
+            openLootTurns.erase(session.playerActorId(playerId));
+        }
     }
 }
 
@@ -8908,6 +12634,7 @@ void networkWorldCombatStop()
     }
     combatTurns.stop();
     openInventories.clear();
+    openLootTurns.clear();
     queueCombatTurnState();
 }
 
@@ -8948,6 +12675,7 @@ bool networkWorldApplyPeerCombatTurn(const CombatTurnStateChangedEvent& event)
     if (event.phase == SessionPhase::Exploration || event.state.initiative.empty()) {
         combatTurns.stop();
         openInventories.clear();
+        openLootTurns.clear();
     } else if (!combatTurns.restore(event.state, combatClockMilliseconds())) {
         return false;
     }
@@ -9004,6 +12732,27 @@ Object* networkWorldPlayerActor(PlayerId playerId)
     return session.entities().findObject(session.playerActorId(playerId));
 }
 
+bool networkWorldPartyDefeated()
+{
+    if (!session.isActive()) return false;
+    bool hasPlayer = false;
+    bool allKnockedOut = true;
+    for (PlayerId playerId : session.players().playerIds()) {
+        Object* actor = networkWorldPlayerActor(playerId);
+        // A missing body is a recovery/binding error, not proof of death.
+        if (actor == nullptr) {
+            allKnockedOut = false;
+            continue;
+        }
+        hasPlayer = true;
+        if (critter_is_dead(actor)) return true;
+        if ((actor->data.critter.combat.results & DAM_KNOCKED_OUT) == 0) {
+            allKnockedOut = false;
+        }
+    }
+    return hasPlayer && allKnockedOut;
+}
+
 MultiplayerSaveError networkWorldCaptureMultiplayerSave(
     std::uint64_t generation,
     std::uint64_t saveDatDigest,
@@ -9013,6 +12762,7 @@ MultiplayerSaveError networkWorldCaptureMultiplayerSave(
     if (worldMode != NetworkLaunchMode::Host || !session.isActive()) {
         return MultiplayerSaveError::PlayerMissing;
     }
+    if (storyPresentation.active) return MultiplayerSaveError::InvalidActivity;
     MultiplayerSaveSidecar captured;
     MultiplayerSaveError error = captureMultiplayerSave(session.players(),
         generation, saveDatDigest, captured);
@@ -9071,6 +12821,8 @@ bool networkWorldApplyPeerDirectTrade(
         || event.state.status == DirectTradeStatus::Cancelled) {
         if (event.phase != SessionPhase::Exploration) return false;
         directTradeController.clear();
+        npcBarterState.reset();
+        pendingScriptedNpcBarter.reset();
         activeSharedModal.reset();
     } else {
         return false;
@@ -9080,6 +12832,22 @@ bool networkWorldApplyPeerDirectTrade(
 
 void networkWorldDirectTradeSetConnected(PlayerId playerId, bool connected)
 {
+    if (!connected && npcBarterState.has_value() && npcBarterState->buyerId == session.playerActorId(playerId)) {
+        NpcBarterState state = *npcBarterState;
+        npcBarterState.reset();
+        pendingScriptedNpcBarter.reset();
+        if (worldMode == NetworkLaunchMode::Host) {
+            dialogueVotes.deferDeadlineUntil(combatClockMilliseconds() + 60000);
+            state.status = NpcBarterStatus::Cancelled;
+            state.revision = nextNpcBarterRevision++;
+            deferredEvents.push_back(GameEvent { {}, {}, NpcBarterStateChangedEvent { state, session.phaseRevision() } });
+        }
+    }
+    if (!connected) {
+        Object* actor = networkWorldPlayerActor(playerId);
+        theftAccess.erase(actor);
+        activeLootTargets.erase(actor);
+    }
     if (worldMode != NetworkLaunchMode::Host || connected
         || !directTradeController.active()) return;
     DirectTradeState state = directTradeController.state();
@@ -9094,6 +12862,62 @@ void networkWorldDirectTradeSetConnected(PlayerId playerId, bool connected)
             session.phase(), session.phaseRevision(), false } });
 }
 
+bool networkWorldRequestScriptedNpcBarter(Object* seller)
+{
+    Object* buyer = actingPlayerActorOr(obj_dude);
+    auto buyerId = session.entities().findEntity(buyer);
+    auto sellerId = session.entities().findEntity(seller);
+    auto* player = playerStateForActor(buyer);
+    if (worldMode != NetworkLaunchMode::Host || session.phase() != SessionPhase::Dialogue
+        || !activeSharedModal.has_value() || activeSharedModal->kind != SharedModalKind::Dialogue
+        || !buyerId.has_value() || !sellerId.has_value() || player == nullptr
+        || player->connection == ConnectionState::Disconnected || activeSharedModal->actorId != *buyerId
+        || npcBarterState.has_value() || pendingScriptedNpcBarter.has_value()) return false;
+    pendingScriptedNpcBarter = std::make_pair(*buyerId, *sellerId);
+    return true;
+}
+
+void networkWorldProcessScriptedNpcBarter()
+{
+    if (worldMode != NetworkLaunchMode::Host || !pendingScriptedNpcBarter.has_value()) return;
+    if (session.phase() != SessionPhase::Dialogue) { pendingScriptedNpcBarter.reset(); return; }
+    if (!dialoguePresentation.has_value()) return;
+    auto request = *pendingScriptedNpcBarter;
+    pendingScriptedNpcBarter.reset();
+    Object* buyer = session.entities().findObject(request.first);
+    auto* player = playerStateForActor(buyer);
+    if (player == nullptr || player->connection == ConnectionState::Disconnected
+        || dialoguePresentation->actorId != request.first || dialoguePresentation->targetId != request.second) return;
+    ScopedActingPlayerContext context(*player, buyer);
+    auto result = commandExecutor.npcBarter(buyer, NpcBarterCommand { NpcBarterAction::Begin, request.second });
+    if (result.status == CommandExecutionStatus::Applied)
+        deferredEvents.push_back(GameEvent { {}, dialogueCause,
+            NpcBarterStateChangedEvent { std::move(result.state), session.phaseRevision() } });
+}
+
+const NpcBarterState* networkWorldNpcBarterState()
+{
+    return npcBarterState.has_value() ? &*npcBarterState : nullptr;
+}
+
+bool networkWorldNpcBarterItemAvailable(Object* owner, Object* item, bool seller)
+{
+    return npcBarterItemAvailable(owner, item, seller);
+}
+
+bool networkWorldApplyPeerNpcBarter(const NpcBarterStateChangedEvent& event)
+{
+    if (session.phase() != SessionPhase::Dialogue || session.phaseRevision() != event.phaseRevision
+        || session.entities().findObject(event.state.buyerId) == nullptr
+        || session.entities().findObject(event.state.sellerId) == nullptr
+        || session.players().findByActor(event.state.buyerId) == nullptr) return false;
+    if (event.state.status == NpcBarterStatus::Committed || event.state.status == NpcBarterStatus::Cancelled) {
+        npcBarterState.reset();
+        pendingScriptedNpcBarter.reset();
+    } else npcBarterState = event.state;
+    return true;
+}
+
 std::optional<DirectTradeState> networkWorldDirectTradeState()
 {
     return directTradeController.active()
@@ -9103,9 +12927,11 @@ std::optional<DirectTradeState> networkWorldDirectTradeState()
 
 void networkWorldLeave()
 {
+    pendingCombatStart.reset();
     combatActionResolving = false;
     combatTurns.stop();
     openInventories.clear();
+    openLootTurns.clear();
     session.stop();
     intExtraResetDialogueActors();
     worldDoors.clear();
@@ -9122,11 +12948,14 @@ void networkWorldLeave()
     dialogueVotes.clear();
     dialoguePresentation.reset();
     directTradeController.clear();
+    npcBarterState.reset();
+    pendingScriptedNpcBarter.reset();
     lootDistribution.clear();
     pendingTalk.reset();
     dialogueCause = {};
     nextDialogueRevision = 1;
     activeLootTargets.clear();
+    theftAccess.clear();
     activeSharedModal.reset();
     approvedWorldMapProposerActorId = {};
     approvedWorldMapProposalSequence = {};
@@ -9139,10 +12968,12 @@ void networkWorldLeave()
     itemDropInProgress = false;
     itemUseInProgress = false;
     scriptedSceneryTransitionInProgress = false;
+    pendingDialogueMapTransition.reset();
     capturedSceneryMapTransition.reset();
     pendingRestProposal.reset();
     expectedSplitEntityId = {};
     lastSplitEntityId = {};
+    storyPresentation = {};
     worldMode = NetworkLaunchMode::Disabled;
     erasePeerActor();
 }
@@ -9155,6 +12986,122 @@ bool networkWorldInventoryTransferInProgress()
 bool networkWorldItemDropInProgress()
 {
     return itemDropInProgress;
+}
+
+bool networkWorldRunCompanionCleanupSmoke(Object* retained)
+{
+    if (worldMode != NetworkLaunchMode::Host || retained == nullptr
+        || retained->pid != 0x100004C || !isPartyMember(retained)) return false;
+    const int retainedSid = retained->sid;
+    const int retainedHp = critter_get_hits(retained);
+    const int retainedCaps = item_caps_total(retained);
+    Object* retainedWeapon = inven_right_hand(retained);
+    if (retainedWeapon == nullptr) return false;
+    const int retainedAmmo = retainedWeapon != nullptr ? item_w_curr_ammo(retainedWeapon) : -1;
+    auto retainedId = networkWorldFindEntity(retained);
+    auto timersFor = [](const std::vector<QueueEventState>& events, Object* owner) {
+        std::vector<QueueEventState> result;
+        for (const auto& event : events) if (event.owner == owner) result.push_back(event);
+        return result;
+    };
+    auto sameTimers = [](const auto& first, const auto& second) {
+        if (first.size() != second.size()) return false;
+        for (std::size_t index = 0; index < first.size(); ++index) {
+            const auto& a = first[index]; const auto& b = second[index];
+            if (a.time != b.time || a.eventType != b.eventType || a.owner != b.owner
+                || a.payloadCount != b.payloadCount || a.payload != b.payload) return false;
+        }
+        return true;
+    };
+    for (bool sharedSid : { false, true }) {
+        Object* orphan = nullptr;
+        Object* bag = nullptr;
+        Object* flare = nullptr;
+        Object* rounds = nullptr;
+        const char* mode = sharedSid ? "shared" : "distinct";
+        auto fail = [&](const char* gate) {
+            std::fprintf(stderr, "NATIVE_COMPANION_CLEANUP_FAIL sid_mode=%s gate=%s\n", mode, gate);
+            return false;
+        };
+        // Deliberately construct a duplicate native companion and nested
+        // resources. Recruitment of the retained Ian happened in real dialogue.
+        if (obj_pid_new(&orphan, retained->pid) != 0 || orphan == nullptr
+            || obj_move_to_tile(orphan, 0, 0, nullptr) != 0
+            || (orphan->sid == -1 && obj_new_sid_inst(orphan, SCRIPT_TYPE_CRITTER, retained->field_80) != 0)
+            || obj_pid_new(&bag, 211) != 0 || bag == nullptr
+            || obj_disconnect(bag, nullptr) != 0
+            || item_add_force(orphan, bag, 1) != 0
+            || obj_pid_new(&flare, PROTO_ID_FLARE) != 0 || flare == nullptr
+            || obj_disconnect(flare, nullptr) != 0
+            || item_add_force(bag, flare, 1) != 0
+            || protinst_use_item(orphan, flare) != 0
+            || !queue_find(flare, EVENT_TYPE_FLARE)
+            || obj_pid_new(&rounds, 29) != 0 || rounds == nullptr
+            || obj_disconnect(rounds, nullptr) != 0
+            || item_add_force(bag, rounds, 3) != 0) return fail("native_setup");
+        int ownedSid = orphan->sid;
+        Script* ownedScript = nullptr;
+        if (ownedSid == -1 || ownedSid == retainedSid || scr_ptr(ownedSid, &ownedScript) != 0
+            || ownedScript->owner != orphan) return fail("owned_script");
+        if (sharedSid) {
+            if (scr_remove(ownedSid) != 0) return fail("replace_alias");
+            orphan->sid = retainedSid;
+        }
+        auto* timer = static_cast<ScriptEvent*>(mem_malloc(sizeof(ScriptEvent)));
+        if (timer == nullptr) return fail("timer_allocation");
+        timer->sid = orphan->sid;
+        timer->fixedParam = -701;
+        if (queue_add(1000000, orphan, timer, EVENT_TYPE_SCRIPT) != 0
+            || queue_add(1000000, orphan, nullptr, EVENT_TYPE_POISON) != 0) return fail("orphan_timers");
+        WorldSnapshot before;
+        if (!networkWorldCaptureAuthoritativeState({}, before)) return fail("setup_capture");
+        auto orphanId = networkWorldFindEntity(orphan);
+        auto bagId = networkWorldFindEntity(bag);
+        auto flareId = networkWorldFindEntity(flare);
+        auto roundsId = networkWorldFindEntity(rounds);
+        if (!retainedId || !orphanId || !bagId || !flareId || !roundsId) return fail("native_registration");
+        int repeatedVisits = 0;
+        for (Object* object = obj_find_first(); object != nullptr; object = obj_find_next())
+            if (object == orphan) ++repeatedVisits;
+        if (repeatedVisits != 2) return fail("first_tile_replay");
+        std::vector<QueueEventState> beforeQueue;
+        if (!queue_capture_state(beforeQueue)) return fail("queue_before");
+        auto realTimers = timersFor(beforeQueue, retained);
+        if (realTimers.empty()) return fail("retained_native_timer");
+        DB_FILE* stream = db_fopen("companion-cleanup-party.dat", "wb");
+        bool saved = stream != nullptr && partyMemberSave(stream) == 0;
+        if (stream != nullptr && db_fclose(stream) != 0) saved = false;
+        if (!saved) return fail("party_save");
+        stream = db_fopen("companion-cleanup-party.dat", "rb");
+        bool loaded = stream != nullptr && partyMemberLoad(stream) == 0;
+        if (stream != nullptr && db_fclose(stream) != 0) loaded = false;
+        if (!loaded) return fail("party_load");
+        // Never dereference the removed pointers after native cleanup.
+        std::vector<QueueEventState> afterQueue;
+        if (!queue_capture_state(afterQueue)) return fail("queue_after");
+        for (const auto& event : afterQueue) {
+            if (event.owner == orphan || event.owner == bag || event.owner == flare || event.owner == rounds)
+                return fail("dangling_timer");
+        }
+        if (!sameTimers(realTimers, timersFor(afterQueue, retained))) return fail("retained_timer_changed");
+        if (networkWorldFindObject(*orphanId) != nullptr || networkWorldFindObject(*bagId) != nullptr
+            || networkWorldFindObject(*flareId) != nullptr || networkWorldFindObject(*roundsId) != nullptr)
+            return fail("dangling_native_entity");
+        Script* actualScript = nullptr;
+        if ((!sharedSid && scr_ptr(ownedSid, &actualScript) == 0)
+            || scr_ptr(retainedSid, &actualScript) != 0 || actualScript->owner != retained
+            || retained->sid != retainedSid || partyMemberFindObjFromPid(retained->pid) != retained
+            || !isPartyMember(retained) || networkWorldFindObject(*retainedId) != retained
+            || critter_get_hits(retained) != retainedHp || item_caps_total(retained) != retainedCaps
+            || inven_right_hand(retained) != retainedWeapon || item_w_curr_ammo(retainedWeapon) != retainedAmmo)
+            return fail("retained_script_or_resources");
+        WorldSnapshot after;
+        if (!networkWorldCaptureAuthoritativeState({}, after)) return fail("post_cleanup_capture");
+        std::fprintf(stderr,
+            "NATIVE_COMPANION_CLEANUP_PASS sid_mode=%s first_tile_visits=%d native_party_load=1 orphan_removed=1 nested_ids_removed=1 root_timers_removed=1 child_timer_removed=1 retained_script_owner=1 retained_timer_exact=1 retained_resources=1\n",
+            mode, repeatedVisits);
+    }
+    return true;
 }
 
 PartyExperienceResult networkWorldAwardPartyExperience(int xp)

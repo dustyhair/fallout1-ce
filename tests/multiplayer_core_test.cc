@@ -14,6 +14,7 @@
 #include "game/object_types.h"
 #include "multiplayer/acting_player_context.h"
 #include "multiplayer/character_lobby.h"
+#include "multiplayer/character_advancement.h"
 #include "multiplayer/combat_turn_controller.h"
 #include "multiplayer/command_processor.h"
 #include "multiplayer/connection_handshake.h"
@@ -107,11 +108,18 @@ WorldSnapshot sampleSnapshot()
         ActorSnapshot { EntityId { 2 }, kGuestPlayerId, 20102, 0, 3, 28 },
         ActorSnapshot { EntityId { 1 }, kHostPlayerId, 20100, 0, 1, 34 },
     };
+    snapshot.actors[0].poison = 7;
+    snapshot.actors[0].radiation = 211;
+    snapshot.actors[1].poison = 3;
+    snapshot.actors[1].radiation = 11;
     snapshot.actors[0].build.level = 2;
     snapshot.actors[0].build.experience = 2500;
     snapshot.actors[0].build.unspentSkillPoints = 7;
     snapshot.actors[0].build.prototypeFlags = 1 << 3; // PC_FLAG_LEVEL_UP_AVAILABLE.
     snapshot.actors[1].build.experience = 125;
+    snapshot.actors[0].build.healingSkillUses = {{{ 100, 200, 300 }, { 400, 0, 0 }}};
+    snapshot.actors[0].build.sneakWorking = true;
+    snapshot.actors[0].build.addictions = 2;
     snapshot.actors[1].fid = 0x01000000;
     snapshot.actors[0].fid = 0x01000002;
     snapshot.actors[0].frame = 2;
@@ -811,6 +819,22 @@ void testMultiplayerSaveSidecar()
             && resolveSavedPlayerSlot(sidecar, kGuestPlayerId, {}, false)
                 == SavedPlayerSlotResolution::MissingAllowed,
         "an explicitly replaceable guest slot can remain absent or be claimed");
+    MultiplayerSaveSidecar actionState = sidecar;
+    actionState.players[0].build.healingSkillUses = {{{ 100, 200, 300 }, { 400, 0, 0 }}};
+    actionState.players[1].build.sneakWorking = true;
+    actionState.players[1].build.addictions = 4;
+    expect(encodeMultiplayerSave(actionState, packet) == MultiplayerSaveError::None, "player action state saves");
+    auto actionDecoded = decodeMultiplayerSave(packet);
+    expect(actionDecoded && actionDecoded.sidecar.players == actionState.players,
+        "saved healing history and sneak results survive reconnect and load independently");
+    actionState.version = 4;
+    expect(encodeMultiplayerSave(actionState, packet) == MultiplayerSaveError::None, "older action-state-free saves encode");
+    actionDecoded = decodeMultiplayerSave(packet);
+    expect(actionDecoded && !actionDecoded.sidecar.players[1].build.sneakWorking
+            && actionDecoded.sidecar.players[1].build.addictions == 0
+            && actionDecoded.sidecar.players[0].build.healingSkillUses[0][0] == 0,
+        "version 4 saves remain readable with default new action state");
+    encodeMultiplayerSave(sidecar, packet);
     MultiplayerSaveSidecar claimed = sidecar;
     std::vector<std::uint8_t> savedGuestObject
         = claimed.players[1].objectData;
@@ -895,6 +919,17 @@ void testMultiplayerSaveSidecar()
     invalid = sidecar;
     invalid.players[1].build.taggedSkills[0] = SKILL_COUNT;
     expect(validateMultiplayerSave(invalid) == MultiplayerSaveError::InvalidBuild, "sidecar rejects invalid restored build values");
+    invalid = sidecar;
+    invalid.players[1].build.healingSkillUses[1][2] = -1;
+    expect(encodeMultiplayerSave(invalid, packet) == MultiplayerSaveError::InvalidBuild,
+        "sidecar rejects negative guest healing timestamps before saving");
+    invalid = sidecar;
+    invalid.players[0].build.addictions = 1U << 7;
+    expect(encodeMultiplayerSave(invalid, packet) == MultiplayerSaveError::InvalidBuild,
+        "sidecar rejects unknown addiction bits before saving");
+    invalid.players[0].build.addictions = 1U << 6;
+    expect(encodeMultiplayerSave(invalid, packet) == MultiplayerSaveError::InvalidBuild,
+        "sidecar rejects an alcohol alias bit that no drug can clear");
     invalid = sidecar;
     invalid.sharedActivity[1].id = invalid.sharedActivity[0].id;
     expect(validateMultiplayerSave(invalid) == MultiplayerSaveError::InvalidActivity,
@@ -1096,6 +1131,21 @@ void testLocalPlayerContext()
         expect(actingPlayerActor() == asGameObject(guestActor), "local presentation scope installs the selected actor mechanically");
     }
     expect(actingPlayerState() == nullptr, "local presentation scope restores the prior acting context");
+    {
+        ScopedLocalPlayerContext guestContext;
+        {
+            ScopedActorPlayerContext hostContext(asGameObject(hostActor));
+            expect(actingPlayerActor() == asGameObject(hostActor), "reading a host target selects its own build inside guest action");
+            {
+                ScopedActorPlayerContext guestTarget(asGameObject(guestActor));
+                expect(actingPlayerState() == session.players().find(kGuestPlayerId), "nested target lookup selects guest build");
+            }
+            expect(actingPlayerState() == session.players().find(kHostPlayerId), "nested lookup restores host build");
+        }
+        expect(actingPlayerState() == session.players().find(kGuestPlayerId), "target lookup restores guest action build");
+    }
+    expect(actingPlayerState() == nullptr, "target scopes leave no acting player behind");
+
 
     expect(bindLocalPlayer(session, kHostPlayerId) == LocalPlayerError::None, "host can become the persistent presentation player");
     {
@@ -1340,6 +1390,52 @@ ProtocolEnvelope gameplayEnvelope(std::uint64_t sequence)
     return envelope;
 }
 
+void testNpcBarterWire()
+{
+    DialogueVoteController votes;
+    expect(votes.begin(9, kGuestPlayerId, kHostPlayerId, { kHostPlayerId, kGuestPlayerId },
+        3, DialogueVotingPolicy::TalkerDecides, 100), "barter timer fixture starts");
+    votes.deferDeadlineUntil(200);
+    expect(!votes.resolve(150).has_value(), "barter return defers expired dialogue deadline");
+    expect(votes.vote(kGuestPlayerId, 9, 2), "barter return keeps vote revision");
+    votes.deferDeadlineUntil(180);
+    expect(!votes.resolve(199).has_value(), "barter deadline cannot move backward");
+    expect(votes.resolve(200) == std::optional<std::uint8_t>(2), "barter timer keeps the ballot");
+    NpcBarterCommand offer { NpcBarterAction::Offer, EntityId { 40 }, 7,
+        DirectTradeOffer { { { EntityId { 43 }, 2 } }, 10 },
+        DirectTradeOffer { { { EntityId { 44 }, 1 } }, 3 } };
+    GameCommand command { CommandSequence { 20 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Dialogue, 3, offer };
+    ProtocolEnvelope envelope = gameplayEnvelope(30);
+    expect(encodeGameCommand(command, envelope) == GameplayWireError::None, "NPC barter offer encodes");
+    auto decoded = decodeGameCommand(envelope);
+    const auto* received = decoded ? std::get_if<NpcBarterCommand>(&decoded.command.payload) : nullptr;
+    expect(received != nullptr && received->sellerId == offer.sellerId && received->revision == 7
+        && received->buyerOffer == offer.buyerOffer && received->sellerOffer == offer.sellerOffer,
+        "NPC barter preserves both offers");
+    auto truncated = envelope; truncated.payload.pop_back();
+    expect(!decodeGameCommand(truncated), "NPC barter rejects truncated second offer");
+    offer.buyerOffer.items.push_back({ EntityId { 43 }, 1 });
+    command.payload = offer;
+    expect(encodeGameCommand(command, envelope) == GameplayWireError::InvalidTrade, "NPC barter rejects duplicate items");
+    offer.buyerOffer.items.pop_back(); offer.action = NpcBarterAction::Accept; command.payload = offer;
+    expect(encodeGameCommand(command, envelope) == GameplayWireError::InvalidTrade, "NPC barter accept cannot replace offers");
+    offer.action = NpcBarterAction::Offer; command.payload = offer; command.expectedPhase = SessionPhase::Exploration;
+    expect(encodeGameCommand(command, envelope) == GameplayWireError::InvalidTrade, "NPC barter requires dialogue");
+    for (auto status : { NpcBarterStatus::Negotiating, NpcBarterStatus::Rejected, NpcBarterStatus::Committed, NpcBarterStatus::Cancelled }) {
+        NpcBarterState state { EntityId { 20 }, EntityId { 40 }, 8, status, offer.buyerOffer, offer.sellerOffer, 100, 90 };
+        GameEvent event { EventSequence { 1 }, CommandSequence { 20 }, NpcBarterStateChangedEvent { state, 3 } };
+        envelope = gameplayEnvelope(31);
+        expect(encodeGameEvent(event, envelope) == GameplayWireError::None, "NPC barter state encodes");
+        auto result = decodeGameEvent(envelope);
+        auto* replica = result ? std::get_if<NpcBarterStateChangedEvent>(&result.event.payload) : nullptr;
+        expect(replica != nullptr && replica->state.status == status && replica->state.offeredValue == 100
+            && replica->state.askingValue == 90 && replica->state.buyerOffer == state.buyerOffer
+            && replica->state.sellerOffer == state.sellerOffer, "NPC barter result round trips");
+        envelope.payload.push_back(0);
+        expect(!decodeGameEvent(envelope), "NPC barter rejects trailing state bytes");
+    }
+}
+
 void testGameplayWireFormat()
 {
     std::vector<GameCommand> commands = {
@@ -1382,6 +1478,33 @@ void testGameplayWireFormat()
             "gameplay command header round trips");
     }
 
+    for (GameCommandPayload payload : { GameCommandPayload(InteractCommand { EntityId { 40 }, 123456789 }),
+             GameCommandPayload(PickupCommand { EntityId { 41 }, 123456789 }),
+             GameCommandPayload(LootCommand { EntityId { 42 }, 123456789 }) }) {
+        GameCommand interaction { CommandSequence { 100 }, kGuestPlayerId, EntityId { 20 }, SessionPhase::Combat, 3, payload };
+        ProtocolEnvelope encoded = gameplayEnvelope(100);
+        expect(encodeGameCommand(interaction, encoded) == GameplayWireError::None, "combat interaction encodes");
+        auto decoded = decodeGameCommand(encoded);
+        std::uint64_t revision = std::visit([](const auto& command) -> std::uint64_t {
+            using T = std::decay_t<decltype(command)>;
+            if constexpr (std::is_same_v<T, InteractCommand> || std::is_same_v<T, PickupCommand> || std::is_same_v<T, LootCommand>)
+                return command.turnRevision;
+            return 0;
+        }, decoded.command.payload);
+        expect(decoded && revision == 123456789, "combat interaction preserves turn revision");
+        encoded.payload.resize(encoded.payload.size() - 8);
+        expect(!decodeGameCommand(encoded), "combat interaction rejects legacy payload without turn revision");
+        interaction.expectedPhase = SessionPhase::Exploration;
+        expect(encodeGameCommand(interaction, encoded) == GameplayWireError::InvalidPhase, "combat interaction rejects exploration phase");
+    }
+    {
+        GameEvent loot { EventSequence { 100 }, CommandSequence { 99 }, LootStartedEvent { EntityId { 20 }, EntityId { 42 }, 123456789 } };
+        ProtocolEnvelope encoded = gameplayEnvelope(101);
+        expect(encodeGameEvent(loot, encoded) == GameplayWireError::None, "combat loot event encodes");
+        auto decoded = decodeGameEvent(encoded);
+        expect(decoded && std::get<LootStartedEvent>(decoded.event.payload).turnRevision == 123456789,
+            "combat loot presentation preserves original turn");
+    }
     ProtocolEnvelope moveEnvelope = gameplayEnvelope(20);
     expect(encodeGameCommand(commands[0], moveEnvelope) == GameplayWireError::None, "movement command encodes for payload checks");
     GameCommandDecodeResult decodedMove = decodeGameCommand(moveEnvelope);
@@ -1427,12 +1550,34 @@ void testGameplayWireFormat()
             && transfer->sourceQuantity == 5
             && transfer->itemDescriptor.data1 == 9,
         "inventory transfer command round trips every authoritative entity and quantity");
+    GameCommand combatTransfer = commands[5];
+    combatTransfer.expectedPhase = SessionPhase::Combat;
+    std::get<InventoryTransferCommand>(combatTransfer.payload).turnRevision = 0x123456789ABCDEF0ULL;
+    ProtocolEnvelope combatTransferEnvelope = gameplayEnvelope(26);
+    expect(encodeGameCommand(combatTransfer, combatTransferEnvelope) == GameplayWireError::None,
+        "combat transfer encodes its turn revision");
+    auto decodedCombatTransfer = decodeGameCommand(combatTransferEnvelope);
+    const auto* combatTransferPayload = decodedCombatTransfer
+        ? std::get_if<InventoryTransferCommand>(&decodedCombatTransfer.command.payload) : nullptr;
+    expect(combatTransferPayload != nullptr
+            && combatTransferPayload->turnRevision == 0x123456789ABCDEF0ULL,
+        "combat transfer preserves all 64 turn revision bits");
+    combatTransfer.expectedPhase = SessionPhase::Exploration;
+    expect(encodeGameCommand(combatTransfer, combatTransferEnvelope) == GameplayWireError::InvalidPhase,
+        "exploration transfer cannot claim a combat turn revision");
+    combatTransfer.expectedPhase = SessionPhase::Combat;
+    std::get<InventoryTransferCommand>(combatTransfer.payload).turnRevision = 0;
+    expect(encodeGameCommand(combatTransfer, combatTransferEnvelope) == GameplayWireError::InvalidPhase,
+        "combat transfer requires a turn revision");
+    transferEnvelope.payload.resize(transferEnvelope.payload.size() - 8);
+    expect(decodeGameCommand(transferEnvelope).error == GameplayWireError::InvalidLength,
+        "transfer decoding rejects a missing turn revision field");
     GameCommand dynamicTransfer = commands[5];
     InventoryTransferCommand& dynamicPayload = std::get<InventoryTransferCommand>(dynamicTransfer.payload);
     dynamicPayload.itemId = {};
     ProtocolEnvelope dynamicTransferEnvelope = gameplayEnvelope(26);
     expect(encodeGameCommand(dynamicTransfer, dynamicTransferEnvelope) == GameplayWireError::None,
-        "an unregistered item can request host identity from its bounded descriptor");
+        "legacy descriptor-only requests remain decodable for host validation");
     GameCommandDecodeResult decodedDynamicTransfer = decodeGameCommand(dynamicTransferEnvelope);
     const InventoryTransferCommand* decodedDynamicPayload = decodedDynamicTransfer
         ? std::get_if<InventoryTransferCommand>(&decodedDynamicTransfer.command.payload)
@@ -1504,6 +1649,17 @@ void testGameplayWireFormat()
             && std::get<SharedModalCommand>(decodeGameCommand(modalEnvelope).command.payload).kind == SharedModalKind::WorldMap,
         "world-map consent uses an authenticated semantic command");
     GameCommand routeCommand = commands[8];
+    GameCommand theftClose = commands[8];
+    theftClose.expectedPhase = SessionPhase::Exploration;
+    theftClose.payload = SharedModalCommand { SharedModalKind::Theft, false };
+    expect(sharedModalPhase(SharedModalKind::Theft) == SessionPhase::Exploration,
+        "closing a private theft inventory stays in Exploration");
+    expect(encodeGameCommand(theftClose, modalEnvelope) == GameplayWireError::None
+            && std::get<SharedModalCommand>(decodeGameCommand(modalEnvelope).command.payload).kind == SharedModalKind::Theft,
+        "theft close round trips without opening an unauthenticated inventory");
+    std::get<SharedModalCommand>(theftClose.payload).open = true;
+    expect(encodeGameCommand(theftClose, modalEnvelope) == GameplayWireError::InvalidModal,
+        "theft inventory must be opened through a validated skill action");
     routeCommand.expectedPhase = SessionPhase::Transition;
     routeCommand.payload = WorldMapRouteCommand { 1399, 1499, false };
     expect(encodeGameCommand(routeCommand, modalEnvelope) == GameplayWireError::None
@@ -1527,6 +1683,34 @@ void testGameplayWireFormat()
             && skill->targetId == EntityId { 40 }
             && skill->skill == ExplorationSkill::Traps,
         "targeted skill command round trips its target and skill");
+    GameCommand sneakCommand = commands[9];
+    sneakCommand.payload = UseSkillCommand { sneakCommand.actorId, ExplorationSkill::Sneak };
+    expect(encodeGameCommand(sneakCommand, skillEnvelope) == GameplayWireError::None,
+        "self-targeted sneak command encodes");
+    decodedSkill = decodeGameCommand(skillEnvelope);
+    skill = decodedSkill ? std::get_if<UseSkillCommand>(&decodedSkill.command.payload) : nullptr;
+    expect(skill != nullptr && skill->targetId == sneakCommand.actorId && skill->skill == ExplorationSkill::Sneak,
+        "sneak command preserves its actor target across the wire");
+    sneakCommand.expectedPhase = SessionPhase::Combat;
+    std::get<UseSkillCommand>(sneakCommand.payload).turnRevision = 17;
+    expect(encodeGameCommand(sneakCommand, skillEnvelope) == GameplayWireError::None,
+        "combat sneak command encodes its authoritative turn revision");
+    decodedSkill = decodeGameCommand(skillEnvelope);
+    expect(decodedSkill && std::get<UseSkillCommand>(decodedSkill.command.payload).turnRevision == 17,
+        "combat sneak revision survives the wire round trip");
+    std::get<UseSkillCommand>(sneakCommand.payload).turnRevision = 0;
+    expect(encodeGameCommand(sneakCommand, skillEnvelope) == GameplayWireError::InvalidSkill,
+        "combat sneak rejects a missing turn revision");
+    std::get<UseSkillCommand>(sneakCommand.payload) = { sneakCommand.actorId, ExplorationSkill::Doctor, 17 };
+    expect(encodeGameCommand(sneakCommand, skillEnvelope) == GameplayWireError::InvalidSkill,
+        "combat cannot use exploration healing skills");
+    std::get<UseSkillCommand>(sneakCommand.payload) = { EntityId { 40 }, ExplorationSkill::Sneak, 17 };
+    expect(encodeGameCommand(sneakCommand, skillEnvelope) == GameplayWireError::InvalidSkill,
+        "sneak cannot toggle another actor's state");
+    sneakCommand.expectedPhase = SessionPhase::Exploration;
+    std::get<UseSkillCommand>(sneakCommand.payload) = { sneakCommand.actorId, ExplorationSkill::Sneak, 17 };
+    expect(encodeGameCommand(sneakCommand, skillEnvelope) == GameplayWireError::InvalidSkill,
+        "exploration sneak rejects a combat turn revision");
     GameCommand invalidSkill = commands[9];
     std::get<UseSkillCommand>(invalidSkill.payload).skill = static_cast<ExplorationSkill>(99);
     expect(encodeGameCommand(invalidSkill, skillEnvelope) == GameplayWireError::InvalidSkill,
@@ -1689,6 +1873,26 @@ void testGameplayWireFormat()
                 && decoded.event.causedBy == events[index].causedBy,
             "gameplay event header round trips");
     }
+
+    GameEvent feedbackEvent { EventSequence { 24 }, CommandSequence { UINT64_MAX },
+        PlayerFeedbackEvent { EntityId { 20 }, "You fail to do any healing." } };
+    ProtocolEnvelope feedbackEnvelope = gameplayEnvelope(39);
+    expect(encodeGameEvent(feedbackEvent, feedbackEnvelope) == GameplayWireError::None,
+        "remote skill feedback encodes");
+    auto decodedFeedback = decodeGameEvent(feedbackEnvelope);
+    const auto* feedback = decodedFeedback
+        ? std::get_if<PlayerFeedbackEvent>(&decodedFeedback.event.payload) : nullptr;
+    expect(feedback != nullptr && feedback->actorId == EntityId { 20 }
+            && feedback->text == "You fail to do any healing.",
+        "remote skill feedback preserves recipient and text");
+    feedbackEnvelope.payload.pop_back();
+    expect(!decodeGameEvent(feedbackEnvelope), "truncated feedback is rejected");
+    std::get<PlayerFeedbackEvent>(feedbackEvent.payload).text = std::string(513, 'x');
+    expect(encodeGameEvent(feedbackEvent, feedbackEnvelope) != GameplayWireError::None,
+        "oversized feedback is rejected");
+    std::get<PlayerFeedbackEvent>(feedbackEvent.payload).text = std::string("bad\0text", 8);
+    expect(encodeGameEvent(feedbackEvent, feedbackEnvelope) != GameplayWireError::None,
+        "embedded NUL feedback is rejected");
 
     ProtocolEnvelope movementEventEnvelope = gameplayEnvelope(40);
     encodeGameEvent(events[0], movementEventEnvelope);
@@ -1973,6 +2177,24 @@ void testGameplayWireFormat()
             && skillEvent->skill == ExplorationSkill::Traps,
         "skill-use event round trips without requesting replica-side rules");
 
+    GameEvent theftEvent = events[10];
+    theftEvent.payload = SkillUseStartedEvent { EntityId { 20 }, EntityId { 40 }, ExplorationSkill::Steal, true };
+    expect(encodeGameEvent(theftEvent, skillEventEnvelope) == GameplayWireError::None
+            && decodeGameEvent(skillEventEnvelope)
+            && std::get<SkillUseStartedEvent>(decodeGameEvent(skillEventEnvelope).event.payload).inventoryOpened,
+        "theft event explicitly carries an authorized inventory opening");
+    std::get<SkillUseStartedEvent>(theftEvent.payload).inventoryOpened = false;
+    expect(encodeGameEvent(theftEvent, skillEventEnvelope) == GameplayWireError::None
+            && decodeGameEvent(skillEventEnvelope)
+            && !std::get<SkillUseStartedEvent>(decodeGameEvent(skillEventEnvelope).event.payload).inventoryOpened,
+        "script-handled theft event preserves its closed inventory outcome");
+    skillEventEnvelope.payload[32] = 2;
+    expect(!decodeGameEvent(skillEventEnvelope), "invalid theft opening flag is rejected");
+    std::get<SkillUseStartedEvent>(theftEvent.payload).skill = ExplorationSkill::Sneak;
+    std::get<SkillUseStartedEvent>(theftEvent.payload).inventoryOpened = true;
+    expect(encodeGameEvent(theftEvent, skillEventEnvelope) == GameplayWireError::InvalidSkill,
+        "only Steal may authorize an inventory opening");
+
     ProtocolEnvelope itemUseEventEnvelope = gameplayEnvelope(49);
     encodeGameEvent(events[11], itemUseEventEnvelope);
     GameEventDecodeResult decodedItemUseEvent = decodeGameEvent(itemUseEventEnvelope);
@@ -2207,6 +2429,140 @@ std::optional<Packet> receiveTcpPacket(Transport& transport, Transport* peer = n
     return std::nullopt;
 }
 
+void testSnapshotNativeDescriptorValidation()
+{
+    WorldSnapshot empty = sampleSnapshot();
+    empty.actors.clear();
+    empty.critters.clear();
+    empty.doors.clear();
+    empty.scenery.clear();
+    empty.items.clear();
+    empty.timedEvents.clear();
+    auto rejectChecksumValidField = [](const WorldSnapshot& valid, std::size_t fieldOffset,
+                                       std::uint32_t value, SnapshotError expected,
+                                       const std::string& message) {
+        Packet packet;
+        expect(encodeSnapshot(valid, packet) == SnapshotError::None,
+            "native descriptor fixture starts with a valid checkpoint");
+        std::size_t offset = kSnapshotHeaderSize + 52 + fieldOffset;
+        for (int byte = 0; byte < 4; ++byte) {
+            packet[offset + byte] = static_cast<std::uint8_t>(value >> (24 - 8 * byte));
+        }
+        std::uint64_t digest = 14695981039346656037ULL;
+        for (std::size_t index = 20; index < packet.size(); ++index) {
+            digest ^= packet[index];
+            digest *= 1099511628211ULL;
+        }
+        for (int byte = 0; byte < 8; ++byte) {
+            packet[12 + byte] = static_cast<std::uint8_t>(digest >> (56 - 8 * byte));
+        }
+        expect(decodeSnapshot(packet).error == expected, message);
+    };
+    WorldSnapshot actor = empty;
+    actor.actors.push_back(sampleSnapshot().actors[0]);
+    actor.actors[0].whoHitMeId = {};
+    // Art encodes weapon, animation and facing in the higher bits. Death and
+    // armor art must still pass the critter category check.
+    actor.actors[0].fid = 0x61303123;
+    actor.actors[0].rotation = 5;
+    actor.actors[0].tile = HEX_GRID_SIZE - 1;
+    actor.actors[0].hitPoints = 0;
+    actor.actors[0].combatResults = 0x80;
+    Packet packet;
+    expect(encodeSnapshot(actor, packet) == SnapshotError::None && decodeSnapshot(packet),
+        "dead armored actor art with native facing bits and last legal tile round trips");
+    for (std::uint32_t fid : { 0x00000001u, 0x02000001u }) {
+        rejectChecksumValidField(actor, 32, fid, SnapshotError::InvalidActorState,
+            "checksum-valid actor cannot change native art category");
+    }
+    for (std::uint32_t tile : { static_cast<std::uint32_t>(HEX_GRID_SIZE), 0x7FFFFFFFu }) {
+        rejectChecksumValidField(actor, 8, tile, SnapshotError::InvalidActorState,
+            "checksum-valid actor cannot leave the native hex grid");
+    }
+    actor.actors[0].tile = HEX_GRID_SIZE;
+    expect(encodeSnapshot(actor, packet) == SnapshotError::InvalidActorState && packet.empty(),
+        "authority rejects an invalid actor tile without publishing a partial checkpoint");
+
+    WorldSnapshot critter = empty;
+    critter.critters.push_back(sampleSnapshot().critters[0]);
+    critter.critters[0].whoHitMeId = {};
+    critter.critters[0].fid = 0x61303123;
+    critter.critters[0].rotation = 5;
+    critter.critters[0].tile = HEX_GRID_SIZE - 1;
+    critter.critters[0].hitPoints = 0;
+    expect(encodeSnapshot(critter, packet) == SnapshotError::None && decodeSnapshot(packet),
+        "native corpse critter art retains facing bits and a legal edge tile");
+    rejectChecksumValidField(critter, 4, 0x02000001, SnapshotError::InvalidCritterState,
+        "checksum-valid critter cannot request a scenery prototype");
+    rejectChecksumValidField(critter, 36, 0x00000001, SnapshotError::InvalidCritterState,
+        "checksum-valid critter cannot become item art");
+    rejectChecksumValidField(critter, 8, HEX_GRID_SIZE, SnapshotError::InvalidCritterState,
+        "checksum-valid critter cannot leave the native hex grid");
+
+    WorldSnapshot scenery = empty;
+    scenery.scenery.push_back(sampleSnapshot().scenery[0]);
+    rejectChecksumValidField(scenery, 12, HEX_GRID_SIZE, SnapshotError::InvalidSceneryState,
+        "checksum-valid scenery cannot leave the native hex grid");
+    WorldSnapshot item = empty;
+    item.items.push_back(sampleSnapshot().items[1]);
+    rejectChecksumValidField(item, 8, HEX_GRID_SIZE, SnapshotError::InvalidItemState,
+        "checksum-valid ground item cannot leave the native hex grid");
+}
+
+void testDenseSnapshotLimits()
+{
+    WorldSnapshot dense = sampleSnapshot();
+    dense.critters.clear();
+    dense.doors.clear();
+    dense.scenery.clear();
+    dense.items.clear();
+    dense.timedEvents.clear();
+    for (auto& actor : dense.actors) actor.whoHitMeId = {};
+    for (std::size_t index = 0; index < kMaxSnapshotScenery; ++index) {
+        dense.scenery.push_back(ScenerySnapshot { EntityId { static_cast<std::uint32_t>(index + 100) },
+            0x02000001, 0x02000002, 20108, 0, 2 });
+    }
+    Packet encoded;
+    expect(encodeSnapshot(dense, encoded) == SnapshotError::None,
+        "maximum scenery population has a complete encodable checkpoint");
+    std::size_t sceneryPacketSize = encoded.size();
+    std::size_t itemRoom = (kMaxSnapshotPayloadSize - (encoded.size() - kSnapshotHeaderSize)) / 56;
+    for (std::size_t index = 0; index < itemRoom; ++index) {
+        dense.items.push_back(ItemSnapshot { EntityId { static_cast<std::uint32_t>(index + 10000) },
+            EntityId { 1 }, -1, -1, 3, ItemDescriptor { 40, 0, 0, 0 } });
+    }
+    expect(encodeSnapshot(dense, encoded) == SnapshotError::None
+            && encoded.size() <= kMaxSnapshotPayloadSize + kSnapshotHeaderSize && decodeSnapshot(encoded),
+        "dense checkpoint round trips just below the total payload bound without losing quantities");
+    ProtocolEnvelope envelope;
+    envelope.kind = MessageKind::Snapshot;
+    envelope.sessionId = SessionId { 7 };
+    envelope.sequence = 1;
+    envelope.payload = { 0, 4, 2, 0 }; // Recovery v4, complete snapshot.
+    envelope.payload.insert(envelope.payload.end(), encoded.begin(), encoded.end());
+    Packet outer;
+    expect(encodeEnvelope(envelope, outer) == ProtocolError::None
+            && outer.size() <= kMaxTransportPacketSize && decodeEnvelope(outer),
+        "maximum admitted dense checkpoint fits its recovery and transport envelopes");
+    dense.items.push_back(ItemSnapshot { EntityId { static_cast<std::uint32_t>(10000 + itemRoom) },
+        EntityId { 1 }, -1, -1, 1, ItemDescriptor { 40, 0, 0, 0 } });
+    expect(validateSnapshot(dense) == SnapshotError::PayloadTooLarge
+            && encodeSnapshot(dense, encoded) == SnapshotError::PayloadTooLarge && encoded.empty(),
+        "exhausted aggregate checkpoint capacity fails before emitting a partial snapshot");
+    std::cout << "DENSE_SNAPSHOT_LIMIT scenery=" << kMaxSnapshotScenery
+              << " scenery_packet_bytes=" << sceneryPacketSize << " admitted_items=" << itemRoom
+              << " payload_limit=" << kMaxSnapshotPayloadSize << '\n';
+    encoded.assign(kSnapshotHeaderSize, 0);
+    encoded[0] = 0x46; encoded[1] = 0x43; encoded[2] = 0x4D; encoded[3] = 0x53;
+    encoded[4] = static_cast<std::uint8_t>(kSnapshotVersion >> 8);
+    encoded[5] = static_cast<std::uint8_t>(kSnapshotVersion);
+    std::uint32_t oversized = kMaxSnapshotPayloadSize + 1;
+    for (std::size_t index = 0; index < 4; ++index)
+        encoded[8 + index] = static_cast<std::uint8_t>(oversized >> (24 - index * 8));
+    expect(decodeSnapshot(encoded).error == SnapshotError::PayloadTooLarge,
+        "oversized declared checkpoint rejects before allocation or checksum processing");
+}
+
 void testTcpQueueBounds()
 {
     TcpListenResult listening = listenTcp(0);
@@ -2349,6 +2705,46 @@ void testTcpTransportAndHandshake()
     expect(host->send(std::move(multiRecordPacket)) == TransportSendResult::Sent
             && receiveTcpPacket(*joining.transport, host.get()) == expectedMultiRecordPacket,
         "TLS framing preserves a packet split across multiple encrypted records");
+
+    // Hold the receiver idle until nonblocking TLS writes hit socket
+    // backpressure, then append differently sized framed packets while the
+    // same partially written TLS record still needs to be retried.
+    constexpr std::size_t queuedPacketCount = 4096;
+    auto queuedPacket = [](std::size_t number) {
+        Packet packet(4009 + number % 13);
+        for (std::size_t index = 0; index < packet.size(); index++) {
+            packet[index] = static_cast<std::uint8_t>((number + index) & 0xFF);
+        }
+        return packet;
+    };
+    bool queued = true;
+    for (std::size_t number = 0; number < queuedPacketCount && queued; number++) {
+        queued = host->send(queuedPacket(number)) == TransportSendResult::Sent;
+    }
+    expect(queued, "TLS backpressure queues framed packets without disconnecting");
+    bool drained = queued;
+    for (std::size_t number = 0; number < queuedPacketCount && drained; number++) {
+        drained = receiveTcpPacket(*joining.transport, host.get()) == queuedPacket(number);
+    }
+    expect(drained, "TLS backpressure preserves every snapshot byte and frame boundary across write retries");
+    if (!drained) return;
+
+    // Both send queues must still make progress when their socket buffers are
+    // full: reading the peer is necessary to release bilateral backpressure.
+    bool bilateralQueued = true;
+    for (std::size_t number = 0; number < queuedPacketCount && bilateralQueued; number++) {
+        bilateralQueued = host->send(queuedPacket(number)) == TransportSendResult::Sent;
+    }
+    for (std::size_t number = 0; number < queuedPacketCount && bilateralQueued; number++) {
+        bilateralQueued = joining.transport->send(queuedPacket(number + queuedPacketCount)) == TransportSendResult::Sent;
+    }
+    bool bilateralDrained = bilateralQueued;
+    for (std::size_t number = 0; number < queuedPacketCount && bilateralDrained; number++) {
+        bilateralDrained = receiveTcpPacket(*joining.transport, host.get()) == queuedPacket(number)
+            && receiveTcpPacket(*host, joining.transport.get()) == queuedPacket(number + queuedPacketCount);
+    }
+    expect(bilateralDrained, "TLS bilateral backpressure drains both peers without stalling or corrupting frames");
+    if (!bilateralDrained) return;
 
     Packet oversized(kMaxTransportPacketSize + 1);
     expect(host->send(std::move(oversized)) == TransportSendResult::PacketTooLarge, "TCP transport rejects oversized packets without disconnecting");
@@ -2612,69 +3008,6 @@ void testSnapshotCapacityAbort()
         "capacity failure remains explicit after further polling");
 }
 
-void testCheckpointAcknowledgementDisconnect()
-{
-    auto pair = createLoopbackTransportPair();
-    Transport* hostWire = pair.first.get();
-    NetworkLobby host, guest;
-    SessionId sessionId { 0xACCE551ULL };
-    expect(host.start(NetworkLaunchMode::Host, sessionId, std::move(pair.first))
-            && guest.start(NetworkLaunchMode::Join, sessionId, std::move(pair.second)),
-        "checkpoint acknowledgement peers start");
-    host.submitLocalSheet(sampleCharacterSheet(kHostPlayerId, "Host"));
-    guest.submitLocalSheet(sampleCharacterSheet(kGuestPlayerId, "Guest"));
-    pollNetworkLobbies(host, guest);
-    expect(host.requestStart(), "checkpoint acknowledgement session starts");
-    guest.poll();
-    for (int rotation = 1; rotation <= 3; ++rotation) {
-        expect(host.sendLocalFacing(rotation), "checkpoint acknowledgement host advances authority");
-    }
-    WorldSnapshot snapshot = sampleSnapshot();
-    snapshot.lastIncludedEvent = host.latestAuthoritativeEvent();
-    expect(host.sendAuthoritativeState(snapshot), "checkpoint acknowledgement checkpoint is published");
-    guest.poll();
-    auto checkpoint = guest.takeAuthoritativeState();
-    expect(checkpoint.has_value() && checkpoint->lastIncludedEvent == EventSequence { 3 }
-            && guest.lastAppliedEvent() == EventSequence {},
-        "checkpoint acknowledgement remains unapplied until native reconstruction");
-    // Native reconstruction has finished. The host disappears at the exact
-    // boundary before the guest's Applied ACK can be written.
-    hostWire->close();
-    expect(checkpoint && !guest.confirmSnapshotApplied(checkpoint->lastIncludedEvent)
-            && guest.state() == NetworkLobbyState::Disconnected
-            && guest.lastAppliedEvent() == EventSequence { 3 },
-        "failed checkpoint ACK preserves the actual applied boundary");
-    guest.abortRecovery(); // Runtime uses this after a failed confirmation.
-    expect(guest.state() == NetworkLobbyState::Disconnected
-            && guest.error() == NetworkLobbyError::Disconnected,
-        "recovery abort preserves a reconnectable transport disconnect");
-    host.poll();
-    auto reconnect = createLoopbackTransportPair();
-    expect(host.reattachTransport(std::move(reconnect.first))
-            && guest.reattachTransport(std::move(reconnect.second)),
-        "failed checkpoint ACK allows a fresh authenticated stream");
-    expect(host.queueRecovery(EventSequence { 3 })
-            && guest.beginReconnectRecovery(EventSequence { 3 }),
-        "failed checkpoint ACK resumes from the reconstructed boundary");
-    auto request = host.takeRecoveryRequest();
-    expect(request && host.sendRecovery(*request, snapshot),
-        "failed checkpoint ACK receives recovery completion");
-    guest.poll();
-    expect(guest.state() == NetworkLobbyState::Ready && !guest.recoveryInProgress()
-            && guest.lastAppliedEvent() == EventSequence { 3 },
-        "failed checkpoint ACK completes recovery without replaying applied work");
-    expect(host.sendLocalFacing(4), "failed checkpoint ACK permits later authority");
-    guest.poll();
-    auto next = guest.takePeerEvent();
-    expect(next && next->sequence == EventSequence { 4 }
-            && guest.confirmPeerEventApplied(next->sequence),
-        "failed checkpoint ACK delivers the next event once");
-    guest.abortRecovery();
-    expect(guest.state() == NetworkLobbyState::Failed
-            && guest.error() == NetworkLobbyError::ProtocolError,
-        "native application failure on a connected stream remains fatal");
-}
-
 void testNetworkCombatTurnTransport()
 {
     SessionId sessionId { 0xACCE5510ULL };
@@ -2766,6 +3099,250 @@ void testNetworkCombatTurnTransport()
         "guest receives confirmed transition to host AI without simulating it");
     expect(next && guest.confirmPeerEventApplied(next->sequence),
         "guest confirms next combat turn event");
+}
+
+void testCheckpointAcknowledgementDisconnect()
+{
+    auto pair = createLoopbackTransportPair();
+    Transport* hostWire = pair.first.get();
+    NetworkLobby host, guest;
+    SessionId sessionId { 0xACCE551ULL };
+    expect(host.start(NetworkLaunchMode::Host, sessionId, std::move(pair.first))
+            && guest.start(NetworkLaunchMode::Join, sessionId, std::move(pair.second)),
+        "checkpoint acknowledgement peers start");
+    host.submitLocalSheet(sampleCharacterSheet(kHostPlayerId, "Host"));
+    guest.submitLocalSheet(sampleCharacterSheet(kGuestPlayerId, "Guest"));
+    pollNetworkLobbies(host, guest);
+    expect(host.requestStart(), "checkpoint acknowledgement session starts");
+    guest.poll();
+    for (int rotation = 1; rotation <= 3; ++rotation) {
+        expect(host.sendLocalFacing(rotation), "checkpoint acknowledgement host advances authority");
+    }
+    WorldSnapshot snapshot = sampleSnapshot();
+    snapshot.lastIncludedEvent = host.latestAuthoritativeEvent();
+    expect(host.sendAuthoritativeState(snapshot), "checkpoint acknowledgement checkpoint is published");
+    guest.poll();
+    auto checkpoint = guest.takeAuthoritativeState();
+    expect(checkpoint.has_value() && checkpoint->lastIncludedEvent == EventSequence { 3 }
+            && guest.lastAppliedEvent() == EventSequence {},
+        "checkpoint acknowledgement remains unapplied until native reconstruction");
+    // Native reconstruction has finished. The host disappears at the exact
+    // boundary before the guest's Applied ACK can be written.
+    hostWire->close();
+    expect(checkpoint && !guest.confirmSnapshotApplied(checkpoint->lastIncludedEvent)
+            && guest.state() == NetworkLobbyState::Disconnected
+            && guest.lastAppliedEvent() == EventSequence { 3 },
+        "failed checkpoint ACK preserves the actual applied boundary");
+    guest.abortRecovery(); // Runtime uses this after a failed confirmation.
+    expect(guest.state() == NetworkLobbyState::Disconnected
+            && guest.error() == NetworkLobbyError::Disconnected,
+        "recovery abort preserves a reconnectable transport disconnect");
+    host.poll();
+    auto reconnect = createLoopbackTransportPair();
+    expect(host.reattachTransport(std::move(reconnect.first))
+            && guest.reattachTransport(std::move(reconnect.second)),
+        "failed checkpoint ACK allows a fresh authenticated stream");
+    expect(host.queueRecovery(EventSequence { 3 })
+            && guest.beginReconnectRecovery(EventSequence { 3 }),
+        "failed checkpoint ACK resumes from the reconstructed boundary");
+    auto request = host.takeRecoveryRequest();
+    expect(request && host.sendRecovery(*request, snapshot),
+        "failed checkpoint ACK receives recovery completion");
+    guest.poll();
+    expect(guest.state() == NetworkLobbyState::Ready && !guest.recoveryInProgress()
+            && guest.lastAppliedEvent() == EventSequence { 3 },
+        "failed checkpoint ACK completes recovery without replaying applied work");
+    expect(host.sendLocalFacing(4), "failed checkpoint ACK permits later authority");
+    guest.poll();
+    auto next = guest.takePeerEvent();
+    expect(next && next->sequence == EventSequence { 4 }
+            && guest.confirmPeerEventApplied(next->sequence),
+        "failed checkpoint ACK delivers the next event once");
+    guest.abortRecovery();
+    expect(guest.state() == NetworkLobbyState::Failed
+            && guest.error() == NetworkLobbyError::ProtocolError,
+        "native application failure on a connected stream remains fatal");
+}
+
+void testAuthoritativeCheckpointCursor()
+{
+    SessionId sessionId { 0xC0FFEE41ULL };
+    LoopbackTransportPair pair = createLoopbackTransportPair();
+    Transport* hostWire = pair.first.get();
+    NetworkLobby host;
+    NetworkLobby guest;
+    expect(host.start(NetworkLaunchMode::Host, sessionId, std::move(pair.first))
+            && guest.start(NetworkLaunchMode::Join, sessionId, std::move(pair.second)),
+        "checkpoint cursor peers start");
+    expect(host.submitLocalSheet(sampleCharacterSheet(kHostPlayerId, "Host")) == CharacterLobbyError::None
+            && guest.submitLocalSheet(sampleCharacterSheet(kGuestPlayerId, "Guest")) == CharacterLobbyError::None,
+        "checkpoint cursor peers submit sheets");
+    pollNetworkLobbies(host, guest);
+    expect(host.requestStart(), "checkpoint cursor host starts world");
+    guest.poll();
+    auto injectEvent = [&](std::uint64_t sequence, bool poll = true, std::uint64_t envelopeOffset = 0,
+                           bool equipmentEffects = false) {
+        ProtocolEnvelope envelope;
+        envelope.sessionId = sessionId;
+        envelope.sequence = guest.nextReceiveSequence() + envelopeOffset;
+        GameEvent event { EventSequence { sequence }, CommandSequence { 1 },
+            ActorFacingChangedEvent { EntityId { 1 }, 2 } };
+        if (equipmentEffects) event.payload = EquipmentChangedEvent { EntityId { 1 } };
+        Packet packet;
+        bool encoded = encodeGameEvent(event, envelope) == GameplayWireError::None
+            && encodeEnvelope(envelope, packet) == ProtocolError::None;
+        expect(encoded && hostWire->send(std::move(packet)) == TransportSendResult::Sent,
+            "checkpoint cursor injects an ordered transport event");
+        if (poll) guest.poll();
+    };
+    auto injectState = [&](std::uint64_t sequence, bool poll = true) {
+        WorldSnapshot state = sampleSnapshot();
+        state.lastIncludedEvent = EventSequence { sequence };
+        ProtocolEnvelope envelope;
+        envelope.kind = MessageKind::Combat;
+        envelope.sessionId = sessionId;
+        envelope.sequence = guest.nextReceiveSequence();
+        Packet packet;
+        bool encoded = encodeSnapshot(state, envelope.payload) == SnapshotError::None
+            && encodeEnvelope(envelope, packet) == ProtocolError::None;
+        expect(encoded && hostWire->send(std::move(packet)) == TransportSendResult::Sent,
+            "checkpoint cursor injects a complete authoritative state");
+        if (poll) guest.poll();
+    };
+    // A freshly loaded guest can receive its first complete state after the
+    // host has already advanced the live event history.
+    injectState(41);
+    auto initial = guest.takeAuthoritativeState();
+    expect(initial && initial->lastIncludedEvent == EventSequence { 41 }
+            && guest.lastAppliedEvent() == EventSequence {},
+        "receiving an initial checkpoint does not acknowledge application");
+    expect(!guest.confirmSnapshotApplied(EventSequence { 42 }),
+        "initial checkpoint cannot acknowledge an unseen future boundary");
+    expect(!guest.requestRecovery(EventSequence { 41 })
+            && !guest.beginReconnectRecovery(EventSequence { 41 }),
+        "recovery cannot turn an unapplied received checkpoint into retained history");
+    expect(initial && guest.confirmSnapshotApplied(initial->lastIncludedEvent)
+            && guest.lastAppliedEvent() == EventSequence { 41 },
+        "applied initial checkpoint advances a fresh event cursor");
+    injectEvent(40);
+    injectEvent(41);
+    expect(guest.state() == NetworkLobbyState::Ready && !guest.recoveryInProgress() && !guest.takePeerEvent(),
+        "late events already covered by an applied checkpoint do not replay or disconnect");
+    injectEvent(42);
+    auto following = guest.takePeerEvent();
+    expect(following && following->sequence == EventSequence { 42 }
+            && guest.confirmPeerEventApplied(following->sequence)
+            && guest.lastAppliedEvent() == EventSequence { 42 },
+        "first live event after loaded checkpoint resumes exact ordering");
+    injectState(40);
+    guest.takeAuthoritativeState();
+    expect(!guest.confirmSnapshotApplied(EventSequence { 40 })
+            && guest.lastAppliedEvent() == EventSequence { 42 }
+            && guest.state() == NetworkLobbyState::Ready,
+        "stale checkpoint cannot rewind an applied live event cursor");
+    injectEvent(43);
+    injectState(44);
+    auto covering = guest.takeAuthoritativeState();
+    expect(covering && covering->lastIncludedEvent == EventSequence { 44 }
+            && guest.confirmSnapshotApplied(covering->lastIncludedEvent)
+            && !guest.takePeerEvent(),
+        "applied checkpoint discards queued covered events before native application");
+    injectEvent(45);
+    auto resumed = guest.takePeerEvent();
+    expect(resumed && resumed->sequence == EventSequence { 45 }
+            && guest.confirmPeerEventApplied(resumed->sequence)
+            && !guest.confirmSnapshotApplied(EventSequence { 46 }),
+        "covered queue cleanup preserves following event order and future rejection");
+    injectState(46, false);
+    injectEvent(46, false, 1);
+    injectEvent(47, false, 2);
+    guest.poll();
+    expect(!guest.takePeerEvent(),
+        "engine event-first drain waits for a queued checkpoint to establish missing native state");
+    auto pipelined = guest.takeAuthoritativeState();
+    expect(pipelined
+            && !guest.recoveryInProgress()
+            && guest.lastAppliedEvent() == EventSequence { 45 }
+            && guest.confirmSnapshotApplied(pipelined->lastIncludedEvent),
+        "queued checkpoint establishes native state without early acknowledgement");
+    auto pipelinedEvent = guest.takePeerEvent();
+    expect(pipelinedEvent && pipelinedEvent->sequence == EventSequence { 47 }
+            && guest.confirmPeerEventApplied(pipelinedEvent->sequence) && !guest.takePeerEvent(),
+        "event-first drain resumes next event once after covering checkpoint application");
+    injectState(55);
+    expect(guest.takeAuthoritativeState().has_value()
+            && guest.disconnectForReconnect() && host.disconnectForReconnect(),
+        "received but unapplied checkpoint is interrupted by disconnection");
+    pair = createLoopbackTransportPair();
+    hostWire = pair.first.get();
+    expect(host.reattachTransport(std::move(pair.first))
+            && guest.reattachTransport(std::move(pair.second))
+            && !guest.confirmSnapshotApplied(EventSequence { 55 })
+            && guest.lastAppliedEvent() == EventSequence { 47 },
+        "reconnect retains applied cursor and discards unconfirmed checkpoint coverage");
+    injectState(49);
+    auto reconnected = guest.takeAuthoritativeState();
+    expect(reconnected && guest.confirmSnapshotApplied(reconnected->lastIncludedEvent),
+        "new complete checkpoint reconstructs coverage after reconnect");
+    injectEvent(50);
+    auto afterReconnect = guest.takePeerEvent();
+    expect(afterReconnect && afterReconnect->sequence == EventSequence { 50 }
+            && guest.confirmPeerEventApplied(afterReconnect->sequence),
+        "live events resume exactly once after reconstructed checkpoint boundary");
+    injectEvent(51, true, 0, true);
+    auto awaitingAck = guest.takePeerEvent();
+    injectEvent(52, true, 0, true);
+    injectState(52);
+    auto nextCue = guest.takePeerEvent();
+    expect(awaitingAck && awaitingAck->sequence == EventSequence { 51 }
+            && nextCue && nextCue->sequence == EventSequence { 52 }
+            && std::holds_alternative<EquipmentChangedEvent>(awaitingAck->payload)
+            && std::holds_alternative<EquipmentChangedEvent>(nextCue->payload)
+            && guest.lastAppliedEvent() == EventSequence { 50 },
+        "contiguous presentation events remain deliverable while preceding effects await checkpoint ack");
+    auto effectsCheckpoint = guest.takeAuthoritativeState();
+    expect(effectsCheckpoint && guest.confirmSnapshotApplied(effectsCheckpoint->lastIncludedEvent)
+            && guest.lastAppliedEvent() == EventSequence { 52 },
+        "effects checkpoint acknowledges delivered presentation cues together");
+    injectEvent(53);
+    injectEvent(55);
+    expect(guest.state() == NetworkLobbyState::Ready && guest.recoveryInProgress()
+            && guest.lastAppliedEvent() == EventSequence { 52 }
+            && !guest.takePeerEvent() && !guest.takeAuthoritativeState(),
+        "event gap requests applied history and discards queued unapplied work");
+    for (std::uint64_t sequence : { 53ULL, 54ULL, 55ULL }) {
+        injectEvent(sequence);
+        auto replayed = guest.takePeerEvent();
+        expect(replayed && replayed->sequence == EventSequence { sequence }
+                && guest.confirmPeerEventApplied(replayed->sequence) && !guest.takePeerEvent(),
+            "recovery replays each previously unapplied event exactly once");
+    }
+    injectState(std::numeric_limits<std::uint64_t>::max());
+    expect(guest.state() == NetworkLobbyState::Failed
+            && guest.error() == NetworkLobbyError::ProtocolError,
+        "checkpoint rejects maximum boundary before event cursor overflow");
+    pair = createLoopbackTransportPair();
+    hostWire = pair.first.get();
+    expect(host.start(NetworkLaunchMode::Host, sessionId, std::move(pair.first))
+            && guest.start(NetworkLaunchMode::Join, sessionId, std::move(pair.second))
+            && host.submitLocalSheet(sampleCharacterSheet(kHostPlayerId, "Host")) == CharacterLobbyError::None
+            && guest.submitLocalSheet(sampleCharacterSheet(kGuestPlayerId, "Guest")) == CharacterLobbyError::None,
+        "checkpoint peers reset into a new session");
+    pollNetworkLobbies(host, guest);
+    expect(host.requestStart(), "reset checkpoint world starts");
+    guest.poll();
+    expect(!guest.confirmSnapshotApplied(EventSequence { 41 })
+            && !guest.confirmSnapshotApplied(EventSequence { std::numeric_limits<std::uint64_t>::max() })
+            && guest.lastAppliedEvent() == EventSequence {},
+        "new session clears received checkpoint boundary and refuses overflow confirmation");
+    injectEvent(1);
+    auto first = guest.takePeerEvent();
+    expect(first && guest.confirmPeerEventApplied(first->sequence),
+        "reset session starts event ordering from one");
+    injectEvent(1);
+    expect(guest.state() == NetworkLobbyState::Failed
+            && guest.error() == NetworkLobbyError::UnexpectedMessage,
+        "duplicate live event without a covering checkpoint remains invalid");
 }
 
 void testNetworkCharacterLobby()
@@ -3159,6 +3736,14 @@ void testNetworkCharacterLobby()
     expect(receivedState.has_value()
             && host.acknowledgedEndingPhaseRevision() == receivedState->phaseRevision,
         "host receives the exact ending checkpoint revision acknowledgement");
+    expect(!host.confirmStoryPresentationCompleted(12) && !guest.confirmStoryPresentationCompleted(0),
+        "story completion requires a guest and nonzero revision");
+    expect(guest.confirmStoryPresentationCompleted(12), "guest sends native story completion separately from checkpoint application");
+    host.poll();
+    auto storyCompletion = host.takeStoryPresentationCompleted();
+    expect(storyCompletion.has_value() && storyCompletion->playerId == kGuestPlayerId && storyCompletion->revision == 12
+            && !host.takeStoryPresentationCompleted().has_value(),
+        "host receives each authenticated story completion once");
     expect(host.takeTransport() != nullptr && guest.takeTransport() != nullptr,
         "ready lobbies hand the connection to the game session");
 
@@ -3325,6 +3910,51 @@ void testLocalSessionLifecycle()
             && !session.entities().findEntity(asGameObject(replacementGuest)).has_value(),
         "map replacement restores the stable player identity, ownership and build after actual body destruction");
 
+    // Actor lookup follows the roster, including future additional players.
+    TestObject thirdActor;
+    TestObject fourthActor;
+    TestObject replacementThird;
+    const PlayerId thirdPlayer { 3 };
+    const PlayerId fourthPlayer { 4 };
+    auto third = session.entities().registerObject(asGameObject(thirdActor), thirdPlayer);
+    auto fourth = session.entities().registerObject(asGameObject(fourthActor), fourthPlayer);
+    PlayerCharacterState thirdState;
+    thirdState.id = thirdPlayer;
+    thirdState.actorId = third.entityId;
+    PlayerCharacterState fourthState;
+    fourthState.id = fourthPlayer;
+    fourthState.actorId = fourth.entityId;
+    expect(third && fourth
+            && session.players().registerPlayer(thirdState, session.entities()) == PlayerStateError::None
+            && session.players().registerPlayer(fourthState, session.entities()) == PlayerStateError::None,
+        "session actor lookup fixture registers four roster members");
+    expect(session.playerActorId(thirdPlayer) == third.entityId
+            && session.playerActorId(fourthPlayer) == fourth.entityId,
+        "additional roster players resolve their own actor identities");
+    expect(session.rebindPlayerActor(thirdPlayer, asGameObject(replacementThird)) == LocalSessionError::None
+            && session.entities().findObject(third.entityId) == asGameObject(replacementThird),
+        "additional player actor can be rebound during map replacement");
+
+    // A retained body and a new active body must have different entity IDs.
+    PlayerCharacterState returningPlayer = *session.players().find(kGuestPlayerId);
+    expect(session.players().unregisterPlayer(kGuestPlayerId) == PlayerStateError::None
+            && !isValid(session.playerActorId(kGuestPlayerId)),
+        "retiring a roster actor removes its active session lookup");
+    expect(session.entities().clearOwner(guestId) == EntityRegistryError::None,
+        "retained old body becomes an unowned world entity");
+    auto newBody = session.entities().registerObject(asGameObject(guestActor), kGuestPlayerId);
+    returningPlayer.actorId = newBody.entityId;
+    expect(newBody && session.players().registerPlayer(returningPlayer, session.entities()) == PlayerStateError::None
+            && session.playerActorId(kGuestPlayerId) == newBody.entityId
+            && session.playerActorId(kGuestPlayerId) != guestId,
+        "returning player keeps player identity and resolves a distinct new body");
+    expect(session.entities().findObject(guestId) == asGameObject(loadedGuest)
+            && session.players().findByActor(guestId) == nullptr
+            && !session.owns(kGuestPlayerId, guestId)
+            && session.players().find(kGuestPlayerId)->build == guestBuild
+            && session.players().bindingsMatch(session.entities()),
+        "old body remains independently registered while character progression survives");
+
     session.stop();
     expect(!session.isActive(), "stopped local session is inactive");
     expect(session.entities().size() == 0, "stopping clears the local entity registry");
@@ -3336,6 +3966,8 @@ void testLocalSessionLifecycle()
 
 class RecordingCommandExecutor : public CommandExecutor {
 public:
+    bool actorAllowed = true;
+    bool actorCanExecute(Object*, const GameCommand&) const override { return actorAllowed; }
     CommandExecutionStatus move(Object* actor, const MoveCommand& command) override
     {
         moveCalls++;
@@ -3354,38 +3986,50 @@ public:
         return nextStatus;
     }
 
-    DoorUseExecution useDoor(Object* actor, Object* target) override
+    DoorUseExecution useDoor(Object* actor, Object* target, std::uint64_t turnRevision = 0) override
     {
         doorCalls++;
         lastActor = actor;
         lastTarget = target;
         recordContext();
+        lastCombatTurnRevision = turnRevision;
+        if (turnRevision != 0 && combatActionAllowed(actor, turnRevision) != CommandExecutionStatus::Applied) return DoorUseExecution {};
         return DoorUseExecution { nextStatus, true, false, 3 };
     }
 
-    CommandExecutionStatus pickup(Object* actor, Object* target) override
+    CommandExecutionStatus pickup(Object* actor, Object* target, std::uint64_t turnRevision = 0) override
     {
         pickupCalls++;
         lastActor = actor;
         lastTarget = target;
         recordContext();
+        lastCombatTurnRevision = turnRevision;
+        if (turnRevision != 0 && combatActionAllowed(actor, turnRevision) != CommandExecutionStatus::Applied) return CommandExecutionStatus::InvalidAction;
         if (reservePickups && !reservedPickupTargets.insert(target).second) {
             return CommandExecutionStatus::InvalidAction;
         }
         return nextStatus;
     }
 
-    CommandExecutionStatus loot(Object* actor, Object* target) override
+    CommandExecutionStatus loot(Object* actor, Object* target, std::uint64_t turnRevision = 0, bool targetChange = false) override
     {
         lootCalls++;
         lastActor = actor;
         lastTarget = target;
         recordContext();
+        lastCombatTurnRevision = turnRevision;
+        if (turnRevision != 0 && combatActionAllowed(actor, turnRevision) != CommandExecutionStatus::Applied) return CommandExecutionStatus::InvalidAction;
         return nextStatus;
     }
 
     CommandExecutionStatus useSkill(Object* actor, Object* target, const UseSkillCommand& command) override
     {
+        if (command.turnRevision != 0 && combatTurns != nullptr) {
+            const auto* turn = combatTurns->current();
+            auto actorId = modalSession->entities().findEntity(actor);
+            if (turn == nullptr || !actorId.has_value() || turn->actorId != *actorId
+                || combatTurns->revision() != command.turnRevision) return CommandExecutionStatus::InvalidAction;
+        }
         skillCalls++;
         lastActor = actor;
         lastTarget = target;
@@ -3704,9 +4348,9 @@ void testPendingCommandsAcrossTlsReconnect()
     public:
         int stock = 3;
         int inventory = 0;
-        CommandExecutionStatus pickup(Object* actor, Object* target) override
+        CommandExecutionStatus pickup(Object* actor, Object* target, std::uint64_t turnRevision = 0) override
         {
-            auto result = RecordingCommandExecutor::pickup(actor, target);
+            auto result = RecordingCommandExecutor::pickup(actor, target, turnRevision);
             if (result == CommandExecutionStatus::Applied && stock > 0) {
                 --stock;
                 ++inventory;
@@ -3941,6 +4585,205 @@ void testCombatTurnCommandsAndReplication()
         "combat snapshot rejects mismatched player ownership");
 }
 
+void testInventoryActionCommands()
+{
+    TestObject host, guest;
+    LocalSession session;
+    expect(session.start(asGameObject(host), asGameObject(guest)) == LocalSessionError::None, "inventory action session starts");
+    submitBothCharacterSheets(session);
+    session.transitionTo(SessionPhase::Loading);
+    session.transitionTo(SessionPhase::Exploration);
+    class InventoryExecutor : public RecordingCommandExecutor {
+    public:
+        int calls = 0;
+        CommandExecutionStatus inventoryAction(Object*, const InventoryActionCommand&) override
+        {
+            expect(actingPlayerActor() != nullptr, "inventory action installs player rule context");
+            ++calls;
+            return CommandExecutionStatus::Applied;
+        }
+    } executor;
+    CommandProcessor processor;
+    GameCommand command { CommandSequence { 1 }, kGuestPlayerId, EntityId { 2 },
+        SessionPhase::Exploration, session.phaseRevision(),
+        InventoryActionCommand { 0, EntityId { 42 }, InventoryAction::Reload, EntityId { 43 }, 3 } };
+    ProtocolEnvelope envelope = gameplayEnvelope(1);
+    expect(encodeGameCommand(command, envelope) == GameplayWireError::None, "selected ammo reload encodes");
+    auto decoded = decodeGameCommand(envelope);
+    const auto* reload = decoded ? std::get_if<InventoryActionCommand>(&decoded.command.payload) : nullptr;
+    expect(reload && reload->ammoId.value == 43 && reload->quantity == 3 && reload->itemId.value == 42,
+        "selected ammo and quantity survive wire transport");
+    auto result = processor.process(command, session, executor);
+    expect(result.result.status == CommandStatus::Accepted && result.event && std::holds_alternative<EquipmentChangedEvent>(result.event->payload),
+        "inventory edits require a following authoritative inventory checkpoint");
+    expect(processor.process(command, session, executor).replayed && executor.calls == 1,
+        "retransmission does not consume ammo twice");
+    envelope.payload.pop_back();
+    expect(!decodeGameCommand(envelope), "truncated inventory action is rejected");
+    for (InventoryAction action : { InventoryAction::Use, InventoryAction::Unload, InventoryAction::Reload }) {
+        command.payload = InventoryActionCommand { 0, EntityId { 42 }, action, {}, 1 };
+        expect(encodeGameCommand(command, envelope) == GameplayWireError::None && decodeGameCommand(envelope),
+            "inventory action without selected ammo round trips");
+    }
+    auto invalid = InventoryActionCommand { 0, EntityId { 42 }, InventoryAction::Unload, EntityId { 43 }, 1 };
+    command.sequence.value = 2;
+    command.payload = invalid;
+    expect(encodeGameCommand(command, envelope) != GameplayWireError::None, "unload cannot carry a hidden ammo selection");
+    expect(processor.process(command, session, executor).result.rejection == CommandRejection::Malformed,
+        "direct command processing rejects malformed inventory payloads");
+    invalid.action = InventoryAction::Reload;
+    invalid.quantity = 0;
+    command.payload = invalid;
+    expect(encodeGameCommand(command, envelope) != GameplayWireError::None, "zero reload quantity rejected");
+    invalid.quantity = 1;
+    invalid.action = static_cast<InventoryAction>(5);
+    command.payload = invalid;
+    expect(encodeGameCommand(command, envelope) != GameplayWireError::None, "unknown inventory action rejected");
+    command.sequence.value = 3;
+    command.actorId = EntityId { 1 };
+    command.payload = InventoryActionCommand { 0, EntityId { 42 }, InventoryAction::Use };
+    expect(processor.process(command, session, executor).result.rejection == CommandRejection::NotOwner && executor.calls == 1,
+        "guest cannot edit host inventory");
+    session.transitionTo(SessionPhase::Combat);
+    command.sequence.value = 4;
+    command.actorId = EntityId { 2 };
+    expect(processor.process(command, session, executor).result.rejection == CommandRejection::WrongPhase,
+        "exploration inventory action cannot cross into combat");
+    command.expectedPhase = SessionPhase::Combat;
+    command.expectedPhaseRevision = session.phaseRevision();
+    command.payload = InventoryActionCommand { 9, EntityId { 42 }, InventoryAction::Unload };
+    expect(encodeGameCommand(command, envelope) == GameplayWireError::None && decodeGameCommand(envelope),
+        "combat inventory edit carries its turn revision");
+    command.payload = InventoryActionCommand { 9, EntityId { 42 }, InventoryAction::Scan };
+    expect(encodeGameCommand(command, envelope) == GameplayWireError::None && decodeGameCommand(envelope)
+            && std::get<InventoryActionCommand>(decodeGameCommand(envelope).command.payload).action == InventoryAction::Scan,
+        "automap scan preserves stable sensor identity and combat turn across the wire");
+    command.payload = InventoryActionCommand { 9, EntityId { 42 }, InventoryAction::Scan, {}, 2 };
+    expect(encodeGameCommand(command, envelope) != GameplayWireError::None, "scan cannot consume an arbitrary quantity");
+    command.payload = InventoryActionCommand { 9, EntityId { 42 }, InventoryAction::Scan, {}, 1, 60 };
+    expect(encodeGameCommand(command, envelope) != GameplayWireError::None, "scan cannot hide an explosive timer");
+    command.payload = InventoryActionCommand { 9, EntityId { 42 }, InventoryAction::Drop, {}, 3 };
+    expect(encodeGameCommand(command, envelope) == GameplayWireError::None,
+        "combat inventory drop encodes selected quantity");
+    decoded = decodeGameCommand(envelope);
+    const auto* drop = decoded ? std::get_if<InventoryActionCommand>(&decoded.command.payload) : nullptr;
+    expect(drop != nullptr && drop->action == InventoryAction::Drop && drop->quantity == 3 && drop->turnRevision == 9,
+        "combat inventory drop preserves quantity and turn revision across the wire");
+    command.payload = InventoryActionCommand { 9, EntityId { 42 }, InventoryAction::Drop, EntityId { 43 }, 3 };
+    expect(encodeGameCommand(command, envelope) != GameplayWireError::None,
+        "inventory drop rejects a hidden ammo selection");
+    command.payload = InventoryActionCommand { 0, EntityId { 42 }, InventoryAction::Use };
+    expect(encodeGameCommand(command, envelope) != GameplayWireError::None, "combat inventory action requires turn revision");
+}
+
+void testCombatStartCommands()
+{
+    TestObject host, guest;
+    LocalSession session;
+    expect(session.start(asGameObject(host), asGameObject(guest)) == LocalSessionError::None,
+        "combat start session begins");
+    submitBothCharacterSheets(session);
+    session.transitionTo(SessionPhase::Loading);
+    session.transitionTo(SessionPhase::Exploration);
+    class StartExecutor : public RecordingCommandExecutor {
+    public:
+        int calls = 0;
+        Object* actor = nullptr;
+        CommandExecutionStatus startCombat(Object* source, Object*, const StartCombatCommand&) override
+        {
+            ++calls;
+            actor = source;
+            return CommandExecutionStatus::Applied;
+        }
+    } executor;
+    CommandProcessor processor;
+    GameCommand command { CommandSequence { 1 }, kGuestPlayerId,
+        session.playerActorId(kGuestPlayerId), SessionPhase::Exploration,
+        session.phaseRevision(), StartCombatCommand {} };
+    ProtocolEnvelope envelope = gameplayEnvelope(1);
+    expect(encodeGameCommand(command, envelope) == GameplayWireError::None,
+        "manual combat start intent encodes");
+    auto decoded = decodeGameCommand(envelope);
+    expect(decoded && std::holds_alternative<StartCombatCommand>(decoded.command.payload),
+        "manual combat start intent round trips");
+    auto result = processor.process(command, session, executor);
+    expect(result.result.status == CommandStatus::Accepted && executor.calls == 1
+        && executor.actor == asGameObject(guest) && result.event.has_value()
+        && std::holds_alternative<CombatRequestedEvent>(result.event->payload),
+        "guest starts combat using its owned actor");
+    expect(result.event && encodeGameEvent(*result.event, envelope) == GameplayWireError::None
+        && decodeGameEvent(envelope), "combat request event round trips");
+    expect(processor.process(command, session, executor).replayed && executor.calls == 1,
+        "repeated combat entry cannot execute twice");
+    command.sequence.value++;
+    command.actorId = session.playerActorId(kHostPlayerId);
+    expect(processor.process(command, session, executor).result.rejection == CommandRejection::NotOwner,
+        "guest cannot initiate combat as the host");
+    command.sequence.value++;
+    command.actorId = session.playerActorId(kGuestPlayerId);
+    command.payload = StartCombatCommand { EntityId { 999999 }, 4, 8 };
+    expect(processor.process(command, session, executor).result.rejection == CommandRejection::MissingEntity,
+        "combat entry rejects a missing initial target");
+    command.sequence.value++;
+    command.payload = StartCombatCommand { {}, 6, 8 };
+    expect(encodeGameCommand(command, envelope) != GameplayWireError::None,
+        "reload mode cannot initiate an attack");
+    expect(processor.process(command, session, executor).result.rejection == CommandRejection::Malformed,
+        "malformed combat entry is rejected before execution");
+    command.sequence.value++;
+    command.payload = StartCombatCommand {};
+    session.transitionTo(SessionPhase::Combat);
+    expect(processor.process(command, session, executor).result.rejection == CommandRejection::WrongPhase
+        && executor.calls == 1, "combat entry cannot nest an existing battle");
+}
+
+void testExplosiveTimerCommands()
+{
+    ProtocolEnvelope envelope = gameplayEnvelope(1);
+    GameCommand command { CommandSequence { 1 }, kGuestPlayerId, EntityId { 2 },
+        SessionPhase::Exploration, 1,
+        InventoryActionCommand { 0, EntityId { 42 }, InventoryAction::Use, {}, 1, 120 } };
+    expect(encodeGameCommand(command, envelope) == GameplayWireError::None, "explosive inventory timer encodes");
+    auto decoded = decodeGameCommand(envelope);
+    expect(decoded && std::get<InventoryActionCommand>(decoded.command.payload).timerSeconds == 120,
+        "acting player's timer survives inventory transport");
+    for (int seconds : { -1, 1, 9, 15, 181, 190 }) {
+        std::get<InventoryActionCommand>(command.payload).timerSeconds = seconds;
+        expect(encodeGameCommand(command, envelope) != GameplayWireError::None,
+            "invalid explosive countdown rejected before transport");
+    }
+    command.payload = InventoryActionCommand { 0, EntityId { 42 }, InventoryAction::Drop, {}, 1, 60 };
+    expect(encodeGameCommand(command, envelope) != GameplayWireError::None,
+        "drop cannot conceal an arming operation");
+    command.expectedPhase = SessionPhase::Combat;
+    command.payload = CombatItemCommand { 7, EntityId { 42 }, {}, 180 };
+    expect(encodeGameCommand(command, envelope) == GameplayWireError::None, "HUD arming carries combat revision");
+    decoded = decodeGameCommand(envelope);
+    expect(decoded && std::get<CombatItemCommand>(decoded.command.payload).timerSeconds == 180,
+        "HUD countdown round trips");
+    std::get<CombatItemCommand>(command.payload).targetId = EntityId { 99 };
+    expect(encodeGameCommand(command, envelope) != GameplayWireError::None,
+        "arming cannot silently use a different target");
+    auto state = sampleSnapshot();
+    TimedEventSnapshot timer;
+    timer.time = 302700;
+    timer.eventType = 13;
+    timer.ownerId = EntityId { 10 };
+    timer.payloadCount = 1;
+    timer.payload[0] = kGuestPlayerId.value;
+    state.timedEvents.push_back(timer);
+    std::vector<std::uint8_t> bytes;
+    expect(encodeSnapshot(state, bytes) == SnapshotError::None,
+        "armed countdown includes the arming player's stable identity");
+    auto restored = decodeSnapshot(bytes);
+    expect(restored && restored.snapshot.timedEvents.back().payload[0] == static_cast<int>(kGuestPlayerId.value),
+        "arming source survives snapshot recovery independently of the item holder");
+    state.timedEvents.back().payload[0] = 99;
+    expect(validateSnapshot(state) == SnapshotError::InvalidTimedEventState,
+        "explosive recovery cannot name an unknown arming player");
+
+}
+
 void testEquipmentCommands()
 {
     TestObject host, guest;
@@ -4012,6 +4855,81 @@ void testEquipmentCommands()
     command.payload = EquipmentCommand { 9, {}, {}, {}, 1, static_cast<EquipmentAction>(3) };
     expect(encodeGameCommand(command, envelope) == GameplayWireError::InvalidCombatTurn,
         "unknown inventory action rejected");
+}
+
+void testActorActionGateAndReplay()
+{
+    TestObject host, guest;
+    LocalSession session;
+    session.start(asGameObject(host), asGameObject(guest));
+    submitBothCharacterSheets(session);
+    session.transitionTo(SessionPhase::Loading);
+    session.transitionTo(SessionPhase::Exploration);
+    RecordingCommandExecutor executor;
+    CommandProcessor processor;
+    for (PlayerId player : session.players().playerIds()) {
+        GameCommand command { CommandSequence { 1 }, player, session.playerActorId(player),
+            SessionPhase::Exploration, session.phaseRevision(), MoveCommand { 12345, 0 } };
+        int before = executor.moveCalls;
+        executor.actorAllowed = false;
+        auto rejected = processor.process(command, session, executor);
+        expect(rejected.result.rejection == CommandRejection::InvalidAction
+                && !rejected.event.has_value() && executor.moveCalls == before,
+            "incapacitated actor is rejected before native execution");
+        executor.actorAllowed = true;
+        auto replay = processor.process(command, session, executor);
+        expect(replay.replayed && replay.result.rejection == CommandRejection::InvalidAction
+                && executor.moveCalls == before,
+            "recovery cannot turn a replayed rejected command into a world action");
+        command.sequence = CommandSequence { 2 };
+        expect(processor.process(command, session, executor).result.status == CommandStatus::Accepted
+                && executor.moveCalls == before + 1,
+            "recovered actor can execute a new command");
+    }
+}
+
+void testCombatInteractionOwnershipAndReplay()
+{
+    TestObject host, guest, target;
+    LocalSession session;
+    session.start(asGameObject(host), asGameObject(guest));
+    submitBothCharacterSheets(session);
+    session.transitionTo(SessionPhase::Loading);
+    session.transitionTo(SessionPhase::Exploration);
+    session.transitionTo(SessionPhase::Combat);
+    EntityId targetId = session.registerWorldObject(asGameObject(target)).entityId;
+    CombatTurnController turns;
+    turns.begin({ { session.playerActorId(kHostPlayerId), kHostPlayerId },
+                    { session.playerActorId(kGuestPlayerId), kGuestPlayerId } }, 100, 60000);
+    RecordingCommandExecutor executor;
+    executor.modalSession = &session; executor.combatTurns = &turns;
+    CommandProcessor processor;
+    std::array<GameCommandPayload, 3> actions { InteractCommand { targetId, 1 },
+        PickupCommand { targetId, 1 }, LootCommand { targetId, 1 } };
+    for (std::size_t index = 0; index < actions.size(); ++index) {
+        GameCommand command { CommandSequence { index + 1 }, kHostPlayerId,
+            session.playerActorId(kHostPlayerId), SessionPhase::Combat, session.phaseRevision(), actions[index] };
+        auto applied = processor.process(command, session, executor);
+        int calls = executor.doorCalls + executor.pickupCalls + executor.lootCalls;
+        expect(applied.result.status == CommandStatus::Accepted && executor.lastCombatTurnRevision == 1,
+            "combat interaction forwards validated turn revision");
+        auto replay = processor.process(command, session, executor);
+        expect(replay.replayed && replay.result.status == CommandStatus::Accepted
+                && executor.doorCalls + executor.pickupCalls + executor.lootCalls == calls,
+            "combat interaction replay cannot repeat native execution");
+        GameCommand other { CommandSequence { index + 1 }, kGuestPlayerId,
+            session.playerActorId(kGuestPlayerId), SessionPhase::Combat, session.phaseRevision(), actions[index] };
+        auto denied = processor.process(other, session, executor);
+        expect(denied.result.status == CommandStatus::Rejected && denied.result.rejection == CommandRejection::InvalidAction,
+            "other player cannot interact during current owner's combat turn");
+    }
+    GameCommand stale { CommandSequence { 4 }, kHostPlayerId, session.playerActorId(kHostPlayerId),
+        SessionPhase::Combat, session.phaseRevision(), LootCommand { targetId, 2 } };
+    expect(processor.process(stale, session, executor).result.status == CommandStatus::Rejected,
+        "stale combat loot turn rejected");
+    stale.sequence = CommandSequence { 5 }; stale.expectedPhase = SessionPhase::Exploration;
+    expect(processor.process(stale, session, executor).result.rejection == CommandRejection::WrongPhase,
+        "combat loot phase mismatch rejected before execution");
 }
 
 void testCombatActionCommandsAndReplication()
@@ -4160,6 +5078,59 @@ void testCombatActionCommandsAndReplication()
         "shared XP event rejects duplicate participant results");
 }
 
+void testCombatSneakCommands()
+{
+    TestObject hostActor;
+    TestObject guestActor;
+    LocalSession session;
+    expect(session.start(asGameObject(hostActor), asGameObject(guestActor)) == LocalSessionError::None,
+        "combat sneak session starts");
+    submitBothCharacterSheets(session);
+    session.transitionTo(SessionPhase::Loading);
+    session.transitionTo(SessionPhase::Exploration);
+    session.transitionTo(SessionPhase::Combat);
+    CombatTurnController turns;
+    turns.begin({ { session.playerActorId(kGuestPlayerId), kGuestPlayerId },
+        { session.playerActorId(kHostPlayerId), kHostPlayerId } }, 100, 60000);
+    RecordingCommandExecutor executor;
+    executor.modalSession = &session;
+    executor.combatTurns = &turns;
+    CommandProcessor processor;
+    GameCommand command { CommandSequence { 1 }, kGuestPlayerId,
+        session.playerActorId(kGuestPlayerId), SessionPhase::Combat, session.phaseRevision(),
+        UseSkillCommand { session.playerActorId(kGuestPlayerId), ExplorationSkill::Sneak, turns.revision() } };
+    auto accepted = processor.process(command, session, executor);
+    expect(accepted.result.status == CommandStatus::Accepted && executor.skillCalls == 1
+            && executor.lastSkill.turnRevision == turns.revision()
+            && executor.lastActingPlayerId == kGuestPlayerId
+            && accepted.event.has_value() && std::holds_alternative<SkillUseStartedEvent>(accepted.event->payload),
+        "guest can toggle self sneak on its combat turn under its own build");
+    expect(processor.process(command, session, executor).replayed && executor.skillCalls == 1,
+        "replayed combat sneak does not toggle a second time");
+    command.sequence.value++;
+    std::get<UseSkillCommand>(command.payload).turnRevision++;
+    expect(processor.process(command, session, executor).result.rejection == CommandRejection::InvalidAction,
+        "stale combat sneak turn is rejected");
+    command.sequence.value++;
+    std::get<UseSkillCommand>(command.payload) = { command.actorId, ExplorationSkill::FirstAid, turns.revision() };
+    expect(processor.process(command, session, executor).result.rejection == CommandRejection::Malformed,
+        "healing cannot enter combat through the sneak command path");
+    command.sequence.value++;
+    std::get<UseSkillCommand>(command.payload) = { session.playerActorId(kHostPlayerId), ExplorationSkill::Sneak, turns.revision() };
+    expect(processor.process(command, session, executor).result.rejection == CommandRejection::Malformed,
+        "combat sneak cannot target another player");
+    command.sequence.value++;
+    std::get<UseSkillCommand>(command.payload) = { command.actorId, ExplorationSkill::Sneak, 0 };
+    expect(processor.process(command, session, executor).result.rejection == CommandRejection::WrongPhase,
+        "combat sneak must name its combat revision");
+    command.playerId = kHostPlayerId;
+    command.actorId = session.playerActorId(kHostPlayerId);
+    command.sequence.value = 1;
+    std::get<UseSkillCommand>(command.payload) = { command.actorId, ExplorationSkill::Sneak, turns.revision() };
+    expect(processor.process(command, session, executor).result.rejection == CommandRejection::InvalidAction,
+        "other combat player cannot toggle sneak outside its turn");
+}
+
 void testAuthoritativeCommandProcessing()
 {
     TestObject hostActor;
@@ -4280,6 +5251,14 @@ void testAuthoritativeCommandProcessing()
             && executor.skillCalls == 1
             && !invalidSkillUse.event.has_value(),
         "command processor rejects unsupported skills before engine execution");
+
+    useSkill.sequence.value = 3;
+    std::get<UseSkillCommand>(useSkill.payload) = {
+        session.playerActorId(kHostPlayerId), ExplorationSkill::Steal };
+    AuthoritativeCommandResult remoteTheft = skillProcessor.process(useSkill, session, executor);
+    expect(remoteTheft.result.rejection == CommandRejection::InvalidAction
+            && executor.skillCalls == 1 && !remoteTheft.event.has_value(),
+        "theft cannot target another player");
 
     CommandProcessor itemUseProcessor;
     GameCommand useItem;
@@ -4513,17 +5492,10 @@ void testAuthoritativeCommandProcessing()
         ItemDescriptor { 40, 0, 0, 0 },
     };
     AuthoritativeCommandResult dynamicTransferred = processor.process(transfer, session, executor);
-    const InventoryTransferredEvent* dynamicTransferEvent = dynamicTransferred.event.has_value()
-        ? std::get_if<InventoryTransferredEvent>(&dynamicTransferred.event->payload)
-        : nullptr;
-    expect(dynamicTransferred.result.status == CommandStatus::Accepted
-            && executor.lastTarget == nullptr
-            && dynamicTransferEvent != nullptr
-            && dynamicTransferEvent->itemId == EntityId { 88 }
-            && dynamicTransferEvent->remainderItemId == EntityId { 89 }
-            && dynamicTransferEvent->sourceQuantity == 4
-            && dynamicTransferEvent->itemDescriptor.pid == 40,
-        "host execution assigns identities to a dynamic item and its split remainder");
+    expect(dynamicTransferred.result.status == CommandStatus::Rejected
+            && dynamicTransferred.result.rejection == CommandRejection::Malformed
+            && !dynamicTransferred.event.has_value() && executor.transferCalls == 1,
+        "guest descriptors cannot mint items absent from authoritative inventory");
 
     GameCommand drop;
     drop.sequence.value = 7;
@@ -4553,6 +5525,23 @@ void testAuthoritativeCommandProcessing()
             && dropEvent->tile == 12345
             && dropEvent->elevation == 1,
         "host execution emits authoritative identity and placement for a dropped stack item");
+
+    CommandProcessor descriptorDropProcessor;
+    GameCommand descriptorDrop = drop;
+    descriptorDrop.sequence = CommandSequence { 1 };
+    std::get<ItemDropCommand>(descriptorDrop.payload).itemId = {};
+    auto mintedDrop = descriptorDropProcessor.process(descriptorDrop, session, executor);
+    expect(mintedDrop.result.status == CommandStatus::Rejected
+            && mintedDrop.result.rejection == CommandRejection::Malformed
+            && !mintedDrop.event.has_value() && executor.dropCalls == 1,
+        "guest drop descriptors cannot create authoritative ground items");
+    descriptorDrop.sequence = CommandSequence { 2 };
+    std::get<ItemDropCommand>(descriptorDrop.payload).itemId = EntityId { 999999 };
+    auto unknownDrop = descriptorDropProcessor.process(descriptorDrop, session, executor);
+    expect(unknownDrop.result.status == CommandStatus::Rejected
+            && unknownDrop.result.rejection == CommandRejection::MissingEntity
+            && !unknownDrop.event.has_value() && executor.dropCalls == 1,
+        "a descriptor cannot substitute for an unknown authoritative item ID");
 
     GameCommand attack;
     attack.sequence.value = 8;
@@ -4681,89 +5670,12 @@ void testAuthoritativeCommandProcessing()
     expect(later.entityId.value > registeredDoor.entityId.value, "world entity IDs are not reused after a reset");
 }
 
-void testSnapshotNativeDescriptorValidation()
-{
-    WorldSnapshot empty = sampleSnapshot();
-    empty.actors.clear();
-    empty.critters.clear();
-    empty.doors.clear();
-    empty.scenery.clear();
-    empty.items.clear();
-    empty.timedEvents.clear();
-    auto rejectChecksumValidField = [](const WorldSnapshot& valid, std::size_t fieldOffset,
-                                       std::uint32_t value, SnapshotError expected,
-                                       const std::string& message) {
-        Packet packet;
-        expect(encodeSnapshot(valid, packet) == SnapshotError::None,
-            "native descriptor fixture starts with a valid checkpoint");
-        std::size_t offset = kSnapshotHeaderSize + 52 + fieldOffset;
-        for (int byte = 0; byte < 4; ++byte) {
-            packet[offset + byte] = static_cast<std::uint8_t>(value >> (24 - 8 * byte));
-        }
-        std::uint64_t digest = 14695981039346656037ULL;
-        for (std::size_t index = 20; index < packet.size(); ++index) {
-            digest ^= packet[index];
-            digest *= 1099511628211ULL;
-        }
-        for (int byte = 0; byte < 8; ++byte) {
-            packet[12 + byte] = static_cast<std::uint8_t>(digest >> (56 - 8 * byte));
-        }
-        expect(decodeSnapshot(packet).error == expected, message);
-    };
-    WorldSnapshot actor = empty;
-    actor.actors.push_back(sampleSnapshot().actors[0]);
-    actor.actors[0].whoHitMeId = {};
-    // Art encodes weapon, animation and facing in the higher bits. Death and
-    // armor art must still pass the critter category check.
-    actor.actors[0].fid = 0x61303123;
-    actor.actors[0].rotation = 5;
-    actor.actors[0].tile = HEX_GRID_SIZE - 1;
-    actor.actors[0].hitPoints = 0;
-    actor.actors[0].combatResults = 0x80;
-    Packet packet;
-    expect(encodeSnapshot(actor, packet) == SnapshotError::None && decodeSnapshot(packet),
-        "dead armored actor art with native facing bits and last legal tile round trips");
-    for (std::uint32_t fid : { 0x00000001u, 0x02000001u }) {
-        rejectChecksumValidField(actor, 32, fid, SnapshotError::InvalidActorState,
-            "checksum-valid actor cannot change native art category");
-    }
-    for (std::uint32_t tile : { static_cast<std::uint32_t>(HEX_GRID_SIZE), 0x7FFFFFFFu }) {
-        rejectChecksumValidField(actor, 8, tile, SnapshotError::InvalidActorState,
-            "checksum-valid actor cannot leave the native hex grid");
-    }
-    actor.actors[0].tile = HEX_GRID_SIZE;
-    expect(encodeSnapshot(actor, packet) == SnapshotError::InvalidActorState && packet.empty(),
-        "authority rejects an invalid actor tile without publishing a partial checkpoint");
-
-    WorldSnapshot critter = empty;
-    critter.critters.push_back(sampleSnapshot().critters[0]);
-    critter.critters[0].whoHitMeId = {};
-    critter.critters[0].fid = 0x61303123;
-    critter.critters[0].rotation = 5;
-    critter.critters[0].tile = HEX_GRID_SIZE - 1;
-    critter.critters[0].hitPoints = 0;
-    expect(encodeSnapshot(critter, packet) == SnapshotError::None && decodeSnapshot(packet),
-        "native corpse critter art retains facing bits and a legal edge tile");
-    rejectChecksumValidField(critter, 4, 0x02000001, SnapshotError::InvalidCritterState,
-        "checksum-valid critter cannot request a scenery prototype");
-    rejectChecksumValidField(critter, 36, 0x00000001, SnapshotError::InvalidCritterState,
-        "checksum-valid critter cannot become item art");
-    rejectChecksumValidField(critter, 8, HEX_GRID_SIZE, SnapshotError::InvalidCritterState,
-        "checksum-valid critter cannot leave the native hex grid");
-
-    WorldSnapshot scenery = empty;
-    scenery.scenery.push_back(sampleSnapshot().scenery[0]);
-    rejectChecksumValidField(scenery, 12, HEX_GRID_SIZE, SnapshotError::InvalidSceneryState,
-        "checksum-valid scenery cannot leave the native hex grid");
-    WorldSnapshot item = empty;
-    item.items.push_back(sampleSnapshot().items[1]);
-    rejectChecksumValidField(item, 8, HEX_GRID_SIZE, SnapshotError::InvalidItemState,
-        "checksum-valid ground item cannot leave the native hex grid");
-}
-
 void testSnapshotRoundTripAndRecovery()
 {
     WorldSnapshot authoritative = sampleSnapshot();
+    authoritative.actors[0].build.activeHand = 1;
+    authoritative.actors[1].build.activeHand = 0;
+    authoritative.critters[0].partyMember = true;
     std::vector<std::uint8_t> packet;
     expect(encodeSnapshot(authoritative, packet) == SnapshotError::None, "valid snapshot encodes");
     constexpr std::size_t characterBuildWireSize = (SAVEABLE_STAT_COUNT * 2
@@ -4771,14 +5683,59 @@ void testSnapshotRoundTripAndRecovery()
                                                         + PERK_COUNT
                                                         + NUM_TAGGED_SKILLS
                                                         + PC_TRAIT_MAX
-                                                        + 4)
+                                                        + 15)
         * sizeof(std::uint32_t);
-    expect(packet.size() == kSnapshotHeaderSize + 52 + 2 * (68 + characterBuildWireSize) + 68 + 12 + 48 + 2 * 56 + 6 * 4 + 2 * 36 + 31 * 29 + 15 * 7 + 6 * 4 + 20 + 14 * 4 + 32 + 8 + 4 + 4,
+    expect(packet.size() == kSnapshotHeaderSize + 52 + 2 * (76 + characterBuildWireSize) + 72 + 12 + 48 + 2 * 56 + 6 * 4 + 2 * 36 + 31 * 29 + 15 * 7 + 6 * 4 + 20 + 14 * 4 + 32 + 8 + 4 + 4 + 32,
         "snapshot packet declares a fixed-width payload");
     expect(packet[0] == 'F' && packet[1] == 'C' && packet[2] == 'M' && packet[3] == 'S', "snapshot magic uses network byte order");
 
     SnapshotDecodeResult decoded = decodeSnapshot(packet);
     expect(static_cast<bool>(decoded), "encoded snapshot decodes");
+    for (const auto& actor : authoritative.actors) {
+        auto found = std::find_if(decoded.snapshot.actors.begin(), decoded.snapshot.actors.end(),
+            [&](const auto& replica) { return replica.entityId == actor.entityId; });
+        expect(found != decoded.snapshot.actors.end() && found->build.activeHand == actor.build.activeHand,
+            "snapshots retain independent active hands by actor identity");
+    }
+    auto storySnapshot = authoritative;
+    storySnapshot.story = { 7, true, StoryPresentationKind::Slides, 0, 0, { 11, 13, 19, 28, 40 }, { kHostPlayerId } };
+    std::vector<std::uint8_t> storyPacket;
+    expect(encodeSnapshot(storySnapshot, storyPacket) == SnapshotError::None,
+        "selected settlement presentation encodes in a recovery checkpoint");
+    auto storyDecoded = decodeSnapshot(storyPacket);
+    expect(storyDecoded && storyDecoded.snapshot.story.revision == 7 && storyDecoded.snapshot.story.active
+        && storyDecoded.snapshot.story.slides == storySnapshot.story.slides
+        && storyDecoded.snapshot.story.completed == storySnapshot.story.completed,
+        "story choices and per-player completion survive snapshot recovery");
+    expect(computeSnapshotDigest(storySnapshot).digest.session != computeSnapshotDigest(authoritative).digest.session,
+        "story presentation is included in the session digest");
+    auto fourPlayerStory = storySnapshot;
+    for (std::uint32_t slot = 3; slot <= 4; ++slot) {
+        auto actor = authoritative.actors[0];
+        actor.entityId = EntityId { 1000 + slot };
+        actor.ownerId = PlayerId { slot };
+        actor.build.activeHand = slot % 2;
+        fourPlayerStory.actors.push_back(actor);
+    }
+    fourPlayerStory.story.completed = { PlayerId { 4 }, kGuestPlayerId, PlayerId { 3 }, kHostPlayerId };
+    expect(encodeSnapshot(fourPlayerStory, storyPacket) == SnapshotError::None,
+        "story completion and independent hands support a four-player roster");
+    auto fourPlayerDecoded = decodeSnapshot(storyPacket);
+    expect(fourPlayerDecoded && fourPlayerDecoded.snapshot.story.completed
+        == std::vector<PlayerId> { kHostPlayerId, kGuestPlayerId, PlayerId { 3 }, PlayerId { 4 } },
+        "four-player completion is canonical and survives recovery");
+    storySnapshot.story.completed.push_back(kHostPlayerId);
+    expect(encodeSnapshot(storySnapshot, storyPacket) != SnapshotError::None,
+        "story completion rejects duplicate player votes");
+    storySnapshot.story.completed = { PlayerId { 99 } };
+    expect(encodeSnapshot(storySnapshot, storyPacket) != SnapshotError::None,
+        "story completion rejects players outside the roster");
+    auto malformedHand = authoritative;
+    malformedHand.actors[1].build.activeHand = -1;
+    std::vector<std::uint8_t> malformedHandBytes;
+    expect(encodeSnapshot(malformedHand, malformedHandBytes) != SnapshotError::None,
+        "snapshots reject invalid active hands before transmission");
+    expect(decoded.snapshot.critters[0].partyMember, "snapshots retain actual native companion membership");
     expect(decoded.snapshot.lastIncludedEvent == EventSequence { 41 }, "snapshot keeps the last included event");
     expect(decoded.snapshot.phase == SessionPhase::Exploration
             && decoded.snapshot.phaseRevision == 7
@@ -4797,6 +5754,14 @@ void testSnapshotRoundTripAndRecovery()
             && decoded.snapshot.actors[1].frame == 2
             && decoded.snapshot.actors[1].whoHitMeId == EntityId { 12 },
         "snapshot keeps guest actor combat and presentation state");
+    expect(decoded.snapshot.actors[1].poison == 7 && decoded.snapshot.actors[1].radiation == 211
+            && decoded.snapshot.actors[0].poison == 3 && decoded.snapshot.actors[0].radiation == 11,
+        "snapshots preserve separate host and guest poison and radiation");
+    expect(decoded.snapshot.actors[1].build.healingSkillUses == authoritative.actors[0].build.healingSkillUses
+            && decoded.snapshot.actors[1].build.addictions == 2
+            && decoded.snapshot.actors[1].build.sneakWorking
+            && !decoded.snapshot.actors[0].build.sneakWorking,
+        "snapshots preserve separate player healing history and sneak outcomes");
     expect(decoded.snapshot.actors[0].build.experience == 125
             && decoded.snapshot.actors[1].build.experience == 2500
             && decoded.snapshot.actors[1].build.level == 2
@@ -4858,6 +5823,15 @@ void testSnapshotRoundTripAndRecovery()
     actorDrift.actors[1].tile++;
     SnapshotDigestResult actorDriftDigest = computeSnapshotDigest(actorDrift);
     expect(firstDivergentSection(authoritativeDigest.digest, actorDriftDigest.digest) == SnapshotSection::Actors, "position drift reports the actor section");
+
+    for (bool radiation : { false, true }) {
+        WorldSnapshot conditionDrift = decoded.snapshot;
+        if (radiation) conditionDrift.actors[1].radiation++;
+        else conditionDrift.actors[1].poison++;
+        SnapshotDigestResult conditionDigest = computeSnapshotDigest(conditionDrift);
+        expect(conditionDigest && firstDivergentSection(authoritativeDigest.digest, conditionDigest.digest) == SnapshotSection::Actors,
+            "poison or radiation drift changes the owning actor digest");
+    }
 
     WorldSnapshot buildDrift = decoded.snapshot;
     buildDrift.actors[1].build.experience++;
@@ -5055,9 +6029,17 @@ void testSnapshotRoundTripAndRecovery()
     expect(encodeSnapshot(invalidActor, packet) == SnapshotError::InvalidActorState, "snapshot rejects invalid actor coordinates before encoding");
     expect(packet.empty(), "failed snapshot encoding leaves no partial packet");
 
+    for (bool radiation : { false, true }) {
+        WorldSnapshot invalidCondition = authoritative;
+        if (radiation) invalidCondition.actors[0].radiation = -1;
+        else invalidCondition.actors[0].poison = -1;
+        expect(encodeSnapshot(invalidCondition, packet) == SnapshotError::InvalidActorState && packet.empty(),
+            "negative poison or radiation cannot publish a partial snapshot");
+    }
+
     WorldSnapshot invalidOwner = authoritative;
     invalidOwner.actors[0].ownerId.value = 99;
-    expect(validateSnapshot(invalidOwner) == SnapshotError::InvalidPlayerId, "two-player snapshot rejects an unknown actor owner");
+    expect(validateSnapshot(invalidOwner) == SnapshotError::InvalidPlayerId, "snapshot rejects a player ID outside its bounded roster capacity");
     invalidOwner = authoritative;
     invalidOwner.actors[0].ownerId = invalidOwner.actors[1].ownerId;
     expect(validateSnapshot(invalidOwner) == SnapshotError::InvalidPlayerId,
@@ -5071,6 +6053,51 @@ void testSnapshotRoundTripAndRecovery()
     invalidBuild.actors[0].build.taggedSkills = { SKILL_SPEECH, SKILL_SPEECH, -1, -1 };
     expect(validateSnapshot(invalidBuild) == SnapshotError::InvalidPlayerBuild,
         "snapshot rejects duplicate tagged skills in a player build");
+    invalidBuild = authoritative;
+    invalidBuild.actors[1].build.healingSkillUses[0][1] = -1;
+    expect(encodeSnapshot(invalidBuild, packet) == SnapshotError::InvalidPlayerBuild,
+        "snapshot rejects negative healing timestamps before replication");
+    invalidBuild = authoritative;
+    invalidBuild.actors[1].build.addictions = 1U << 7;
+    expect(encodeSnapshot(invalidBuild, packet) == SnapshotError::InvalidPlayerBuild,
+        "snapshot rejects unknown addiction bits before replication");
+    invalidBuild.actors[1].build.addictions = 1U << 6;
+    expect(encodeSnapshot(invalidBuild, packet) == SnapshotError::InvalidPlayerBuild,
+        "snapshot rejects an alcohol alias bit that no drug can clear");
+    expect(encodeSnapshot(authoritative, packet) == SnapshotError::None,
+        "valid snapshot restores packet after rejected player state");
+    std::vector<std::uint8_t> malformedSneak = packet;
+    constexpr std::size_t sneakOffset = kSnapshotHeaderSize + 52 + 68
+        + (SAVEABLE_STAT_COUNT * 2 + SKILL_COUNT + PERK_COUNT + NUM_TAGGED_SKILLS + PC_TRAIT_MAX + 6)
+            * sizeof(std::uint32_t);
+    malformedSneak[sneakOffset + 3] = 2;
+    // Recompute the packet checksum so decoding reaches boolean validation.
+    std::uint64_t malformedDigest = 14695981039346656037ULL;
+    for (std::size_t offset = 20; offset < malformedSneak.size(); ++offset) {
+        malformedDigest ^= malformedSneak[offset];
+        malformedDigest *= 1099511628211ULL;
+    }
+    for (int byte = 0; byte < 8; ++byte) {
+        malformedSneak[12 + byte] = static_cast<std::uint8_t>(malformedDigest >> (56 - 8 * byte));
+    }
+    expect(decodeSnapshot(malformedSneak).error == SnapshotError::InvalidPlayerBuild,
+        "snapshot rejects a checksum-valid sneak boolean outside zero and one");
+
+    constexpr std::size_t poisonOffset = kSnapshotHeaderSize + 52 + 68 + characterBuildWireSize;
+    for (std::size_t fieldOffset : { poisonOffset, poisonOffset + 4 }) {
+        std::vector<std::uint8_t> malformedCondition = packet;
+        std::fill(malformedCondition.begin() + fieldOffset, malformedCondition.begin() + fieldOffset + 4, 0xFF);
+        std::uint64_t digest = 14695981039346656037ULL;
+        for (std::size_t offset = 20; offset < malformedCondition.size(); ++offset) {
+            digest ^= malformedCondition[offset];
+            digest *= 1099511628211ULL;
+        }
+        for (int byte = 0; byte < 8; ++byte) {
+            malformedCondition[12 + byte] = static_cast<std::uint8_t>(digest >> (56 - 8 * byte));
+        }
+        expect(decodeSnapshot(malformedCondition).error == SnapshotError::InvalidActorState,
+            "checksum-valid packets cannot install negative poison or radiation");
+    }
 
     WorldSnapshot invalidGameTime = authoritative;
     invalidGameTime.gameTime = 0;
@@ -5089,6 +6116,26 @@ void testSnapshotRoundTripAndRecovery()
     invalidItem.items[0].holderId = invalidItem.items[0].entityId;
     expect(validateSnapshot(invalidItem) == SnapshotError::InvalidItemState,
         "snapshot rejects an item that contains itself");
+    invalidItem = authoritative;
+    invalidItem.items[0].holderId = EntityId { 999999 };
+    expect(validateSnapshot(invalidItem) == SnapshotError::InvalidItemState,
+        "snapshot rejects an inventory holder absent from the complete state");
+    invalidItem.items[0].holderId = authoritative.doors[0].entityId;
+    expect(validateSnapshot(invalidItem) == SnapshotError::None,
+        "snapshot preserves script inventories on known native non-item holders");
+    invalidItem = authoritative;
+    invalidItem.items[1].holderId = invalidItem.items[0].entityId;
+    invalidItem.items[1].tile = -1;
+    invalidItem.items[1].elevation = -1;
+    expect(validateSnapshot(invalidItem) == SnapshotError::None,
+        "snapshot accepts nested inventory with a forward or backward holder reference");
+    invalidItem.items[0].holderId = invalidItem.items[1].entityId;
+    expect(validateSnapshot(invalidItem) == SnapshotError::InvalidItemState,
+        "snapshot rejects mutual container ownership before native traversal");
+    auto missingTimerOwner = authoritative;
+    missingTimerOwner.timedEvents[0].ownerId = EntityId { 999999 };
+    expect(validateSnapshot(missingTimerOwner) == SnapshotError::InvalidTimedEventState,
+        "snapshot rejects a timer whose owner is absent from the state");
     invalidItem = authoritative;
     invalidItem.items[1].quantity = 2;
     expect(validateSnapshot(invalidItem) == SnapshotError::InvalidItemState,
@@ -5477,13 +6524,113 @@ void testDialogueAndActivityWireRecovery()
 }
 
 } // namespace
+void testCharacterAdvancementState()
+{
+    CharacterBuild host;
+    CharacterBuild guest;
+    host.level = 4;
+    guest.level = 4;
+    guest.traits = { TRAIT_GIFTED, TRAIT_SKILLED };
+    guest.perkRanks[PERK_EDUCATED] = 1;
+    grantCharacterLevels(host, 5);
+    grantCharacterLevels(guest, 6);
+    expect(host.unspentSkillPoints == 45 && host.pendingPerks == 1 && host.processedLevel == 4,
+        "host receives skill and perk grants for each gained level");
+    expect(guest.unspentSkillPoints == 42 && guest.pendingPerks == 1 && guest.processedLevel == 4,
+        "guest grants use its own Gifted Skilled and Educated build");
+    CharacterBuild granted = host;
+    grantCharacterLevels(host, 5);
+    expect(host == granted, "repeated grant checks do not award points or perks twice");
+    host.level = 9;
+    grantCharacterLevels(host, 5);
+    expect(host.unspentSkillPoints == 99 && host.pendingPerks == 3,
+        "skill grants cap at 99 while unchosen perks accumulate across levels");
+    auto fingerprint = characterAdvancementFingerprint(host);
+    host.healingSkillUses[0][0] = 1234;
+    host.sneakWorking = true;
+    expect(characterAdvancementFingerprint(host) == fingerprint,
+        "transient healing and Sneak do not invalidate an editor draft");
+    ++host.skillPoints[0];
+    expect(characterAdvancementFingerprint(host) != fingerprint,
+        "a changed authoritative skill invalidates an editor draft");
+    MultiplayerSaveSidecar saved;
+    saved.generation = 1;
+    saved.saveDatDigest = 123;
+    saved.players.resize(2);
+    saved.players[0].playerId = kHostPlayerId;
+    saved.players[0].actorId = EntityId { 1 };
+    saved.players[0].name = "Host";
+    saved.players[1].playerId = kGuestPlayerId;
+    saved.players[1].actorId = EntityId { 2 };
+    saved.players[1].name = "Guest";
+    saved.lootDistribution.roster = { kHostPlayerId, kGuestPlayerId };
+    saved.ownership = { { EntityId { 1 }, kHostPlayerId }, { EntityId { 2 }, kGuestPlayerId } };
+    host.activeHand = 1;
+    guest.activeHand = 0;
+    saved.players[0].build = host;
+    saved.players[1].build = guest;
+    std::vector<std::uint8_t> packet;
+    expect(encodeMultiplayerSave(saved, packet) == MultiplayerSaveError::None,
+        "independent advancement metadata saves");
+    auto decoded = decodeMultiplayerSave(packet);
+    expect(decoded && decoded.sidecar.players[0].build == host && decoded.sidecar.players[1].build == guest,
+        "processed levels and pending perks survive save load independently");
+    saved.players[0].build.activeHand = 2;
+    expect(validateMultiplayerSave(saved) == MultiplayerSaveError::InvalidBuild,
+        "sidecars reject an invalid hand selection");
+    saved.players[0].build.activeHand = host.activeHand;
+    saved.version = 7;
+    expect(encodeMultiplayerSave(saved, packet) == MultiplayerSaveError::None,
+        "previous sidecar version remains encodable");
+    decoded = decodeMultiplayerSave(packet);
+    expect(decoded && decoded.sidecar.players[0].build.activeHand == 0
+        && decoded.sidecar.players[1].build.activeHand == 0,
+        "older saves default each player's hand independently to the native left hand");
+    saved.version = 5;
+    expect(encodeMultiplayerSave(saved, packet) == MultiplayerSaveError::None,
+        "legacy saves remain encodable");
+    decoded = decodeMultiplayerSave(packet);
+    expect(decoded && decoded.sidecar.players[0].build.processedLevel == host.level
+        && decoded.sidecar.players[0].build.pendingPerks == 0,
+        "old saves conservatively avoid regranting previously spent levels");
+    CharacterAdvanceCommand advance;
+    advance.expectedBuild = fingerprint;
+    advance.skillIncrements[SKILL_SCIENCE] = 3;
+    advance.perk = PERK_EDUCATED;
+    GameCommand command;
+    command.playerId = kGuestPlayerId;
+    command.actorId = EntityId { 2 };
+    command.sequence = CommandSequence { 1 };
+    command.expectedPhase = SessionPhase::Exploration;
+    command.expectedPhaseRevision = 1;
+    command.payload = advance;
+    ProtocolEnvelope envelope;
+    envelope.sessionId = SessionId { 7 };
+    envelope.sequence = 1;
+    expect(encodeGameCommand(command, envelope) == GameplayWireError::None,
+        "advancement intent encodes");
+    auto wire = decodeGameCommand(envelope);
+    const auto* received = wire ? std::get_if<CharacterAdvanceCommand>(&wire.command.payload) : nullptr;
+    expect(received && received->expectedBuild == fingerprint && received->skillIncrements[SKILL_SCIENCE] == 3
+        && received->perk == PERK_EDUCATED && received->addedTrait == -1,
+        "advancement choices round trip without a client-supplied result build");
+    advance.skillIncrements[0] = -1;
+    command.payload = advance;
+    expect(encodeGameCommand(command, envelope) != GameplayWireError::None,
+        "negative investments cannot refund existing skill points");
+}
+
 } // namespace multiplayer
 } // namespace fallout
 
 int main()
 {
     fallout::multiplayer::testCoreTypes();
+    fallout::multiplayer::testCharacterAdvancementState();
+    fallout::multiplayer::testInventoryActionCommands();
     fallout::multiplayer::testEquipmentCommands();
+    fallout::multiplayer::testExplosiveTimerCommands();
+    fallout::multiplayer::testCombatStartCommands();
     fallout::multiplayer::testCombatTurnController();
     fallout::multiplayer::testDirectTradeController();
     fallout::multiplayer::testLootDistributionController();
@@ -5502,21 +6649,27 @@ int main()
     fallout::multiplayer::testProtocolDiagnostics();
     fallout::multiplayer::testContentManifest();
     fallout::multiplayer::testGameplayWireFormat();
+    fallout::multiplayer::testNpcBarterWire();
     fallout::multiplayer::testLoopbackTransport();
     fallout::multiplayer::testImpairedLoopbackTransport();
-    fallout::multiplayer::testTcpQueueBounds();
     fallout::multiplayer::testTcpTransportAndHandshake();
+    fallout::multiplayer::testTcpQueueBounds();
+    fallout::multiplayer::testSnapshotNativeDescriptorValidation();
+    fallout::multiplayer::testDenseSnapshotLimits();
     fallout::multiplayer::testNetworkLaunchAndBootstrap();
     fallout::multiplayer::testNetworkCharacterLobby();
     fallout::multiplayer::testSnapshotCapacityAbort();
-    fallout::multiplayer::testCheckpointAcknowledgementDisconnect();
     fallout::multiplayer::testNetworkCombatTurnTransport();
+    fallout::multiplayer::testCheckpointAcknowledgementDisconnect();
+    fallout::multiplayer::testAuthoritativeCheckpointCursor();
     fallout::multiplayer::testLocalSessionLifecycle();
     fallout::multiplayer::testCombatTurnCommandsAndReplication();
     fallout::multiplayer::testPendingCommandsAcrossTlsReconnect();
+    fallout::multiplayer::testActorActionGateAndReplay();
+    fallout::multiplayer::testCombatInteractionOwnershipAndReplay();
     fallout::multiplayer::testCombatActionCommandsAndReplication();
+    fallout::multiplayer::testCombatSneakCommands();
     fallout::multiplayer::testAuthoritativeCommandProcessing();
-    fallout::multiplayer::testSnapshotNativeDescriptorValidation();
     fallout::multiplayer::testSnapshotRoundTripAndRecovery();
     fallout::multiplayer::testNetworkSessionRecoveryPrimitives();
 

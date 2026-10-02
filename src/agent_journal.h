@@ -20,10 +20,14 @@ struct AgentJournalActorState {
     int screenY = -1;
     int hitPoints = 0;
     int actionPoints = 0;
+    int poison = 0;
+    int radiation = 0;
 };
 
 struct AgentJournalInventoryItemState {
     std::uint64_t entityId = 0;
+    int inventoryIndex = -1;
+    std::uint64_t holderId = 0;
     int pid = -1;
     std::string name;
     std::uint32_t quantity = 0;
@@ -101,6 +105,10 @@ struct AgentJournalWorldState {
         };
         std::uint64_t id = 0;
         std::uint64_t revision = 0;
+        bool npc = false;
+        std::uint32_t offeredValue = 0;
+        std::uint32_t askingValue = 0;
+        std::uint32_t status = 0;
         std::vector<Participant> participants;
     };
     std::optional<Trade> trade;
@@ -117,6 +125,7 @@ struct AgentJournalWorldState {
     AgentJournalActorState host;
     AgentJournalActorState guest;
     std::vector<AgentJournalInventoryItemState> localInventory;
+    std::vector<AgentJournalInventoryItemState> containedInventory;
     std::vector<AgentJournalCritterState> visibleCritters;
     std::vector<AgentJournalInteractableState> visibleInteractables;
 };

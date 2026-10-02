@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "game/map_defs.h"
@@ -18,10 +19,10 @@ constexpr std::size_t kCharacterBuildValueCount = SAVEABLE_STAT_COUNT * 2
     + PERK_COUNT
     + NUM_TAGGED_SKILLS
     + PC_TRAIT_MAX
-    + 4;
+    + 15;
 constexpr std::size_t kCharacterBuildSnapshotSize = kCharacterBuildValueCount * sizeof(std::uint32_t);
-constexpr std::size_t kActorSnapshotSize = 68 + kCharacterBuildSnapshotSize;
-constexpr std::size_t kCritterSnapshotSize = 68;
+constexpr std::size_t kActorSnapshotSize = 76 + kCharacterBuildSnapshotSize;
+constexpr std::size_t kCritterSnapshotSize = 72;
 constexpr std::size_t kDoorSnapshotSize = 12;
 constexpr std::size_t kScenerySnapshotSize = 48;
 constexpr std::size_t kItemSnapshotSize = 56;
@@ -108,6 +109,25 @@ void appendCombatTurnState(std::vector<std::uint8_t>& bytes, const CombatTurnSta
         appendUint32(bytes, entry.actorId.value);
         appendUint32(bytes, entry.ownerId.value);
     }
+}
+
+std::size_t storySnapshotSize(const WorldSnapshot& state)
+{
+    return 32 + 4 * (state.story.slides.size() + state.story.completed.size());
+}
+
+void appendStory(std::vector<std::uint8_t>& bytes, const WorldSnapshot& state)
+{
+    const auto& story = state.story;
+    appendUint64(bytes, story.revision);
+    appendUint32(bytes, story.active ? 1 : 0);
+    appendUint32(bytes, static_cast<std::uint32_t>(story.kind));
+    appendUint32(bytes, static_cast<std::uint32_t>(story.movie));
+    appendUint32(bytes, story.flags);
+    appendUint32(bytes, static_cast<std::uint32_t>(story.slides.size()));
+    appendUint32(bytes, static_cast<std::uint32_t>(story.completed.size()));
+    for (auto slide : story.slides) appendUint32(bytes, slide);
+    for (auto player : story.completed) appendUint32(bytes, player.value);
 }
 
 std::size_t dialogueSnapshotSize(const WorldSnapshot& snapshot)
@@ -300,6 +320,8 @@ bool isKnownPhase(SessionPhase phase)
 WorldSnapshot canonicalize(const WorldSnapshot& snapshot)
 {
     WorldSnapshot canonical = snapshot;
+    std::sort(canonical.story.completed.begin(), canonical.story.completed.end(),
+        [](PlayerId lhs, PlayerId rhs) { return lhs.value < rhs.value; });
     std::sort(canonical.actors.begin(), canonical.actors.end(), [](const ActorSnapshot& lhs, const ActorSnapshot& rhs) {
         return lhs.entityId.value < rhs.entityId.value;
     });
@@ -355,14 +377,31 @@ void appendActor(std::vector<std::uint8_t>& bytes, const ActorSnapshot& actor)
     for (std::int32_t value : actor.build.traits) {
         appendUint32(bytes, static_cast<std::uint32_t>(value));
     }
+    for (const auto& uses : actor.build.healingSkillUses) {
+        for (auto time : uses) appendUint32(bytes, static_cast<std::uint32_t>(time));
+    }
+    appendUint32(bytes, actor.build.sneakWorking ? 1 : 0);
+    appendUint32(bytes, actor.build.addictions);
     appendUint32(bytes, actor.build.prototypeFlags);
     appendUint32(bytes, static_cast<std::uint32_t>(actor.build.unspentSkillPoints));
     appendUint32(bytes, static_cast<std::uint32_t>(actor.build.level));
     appendUint32(bytes, static_cast<std::uint32_t>(actor.build.experience));
+    appendUint32(bytes, static_cast<std::uint32_t>(actor.build.processedLevel));
+    appendUint32(bytes, static_cast<std::uint32_t>(actor.build.pendingPerks));
+    appendUint32(bytes, static_cast<std::uint32_t>(actor.build.activeHand));
+    appendUint32(bytes, static_cast<std::uint32_t>(actor.poison));
+    appendUint32(bytes, static_cast<std::uint32_t>(actor.radiation));
 }
 
 bool validateCharacterBuild(const CharacterBuild& build)
 {
+    for (const auto& uses : build.healingSkillUses) {
+        if (std::any_of(uses.begin(), uses.end(), [](auto time) { return time < 0; })) return false;
+    }
+    if ((build.addictions & ~0x3FU) != 0) return false;
+    if (build.activeHand < 0 || build.activeHand > 1) return false;
+    if (build.processedLevel < 1 || build.processedLevel > build.level
+        || build.pendingPerks < 0 || build.pendingPerks > PC_LEVEL_MAX / 3) return false;
     if (build.unspentSkillPoints < 0
         || build.level < 1
         || build.level > PC_LEVEL_MAX
@@ -411,10 +450,21 @@ void readCharacterBuild(const std::vector<std::uint8_t>& bytes, std::size_t& off
     for (std::int32_t& value : build.traits) {
         value = static_cast<std::int32_t>(readUint32(bytes, offset));
     }
+    for (auto& uses : build.healingSkillUses) {
+        for (auto& time : uses) time = static_cast<std::int32_t>(readUint32(bytes, offset));
+    }
+    // Preserve malformed booleans as an invalid build rather than normalizing them.
+    auto sneakWorking = readUint32(bytes, offset);
+    build.sneakWorking = sneakWorking != 0;
+    build.addictions = readUint32(bytes, offset);
     build.prototypeFlags = readUint32(bytes, offset);
     build.unspentSkillPoints = static_cast<std::int32_t>(readUint32(bytes, offset));
     build.level = static_cast<std::int32_t>(readUint32(bytes, offset));
     build.experience = static_cast<std::int32_t>(readUint32(bytes, offset));
+    build.processedLevel = static_cast<std::int32_t>(readUint32(bytes, offset));
+    build.pendingPerks = static_cast<std::int32_t>(readUint32(bytes, offset));
+    build.activeHand = static_cast<std::int32_t>(readUint32(bytes, offset));
+    if (sneakWorking > 1) build.level = -1;
 }
 
 void appendDoor(std::vector<std::uint8_t>& bytes, const DoorSnapshot& door)
@@ -461,6 +511,7 @@ void appendCritter(std::vector<std::uint8_t>& bytes, const CritterSnapshot& crit
     appendUint32(bytes, static_cast<std::uint32_t>(critter.combatManeuver));
     appendUint32(bytes, static_cast<std::uint32_t>(critter.damageLastTurn));
     appendUint32(bytes, critter.whoHitMeId.value);
+    appendUint32(bytes, critter.partyMember ? 1 : 0);
 }
 
 void appendItem(std::vector<std::uint8_t>& bytes, const ItemSnapshot& item)
@@ -491,6 +542,9 @@ void appendVariables(std::vector<std::uint8_t>& bytes, const std::vector<std::in
 std::uint8_t expectedTimedEventPayloadCount(std::uint8_t eventType)
 {
     switch (eventType) {
+    case 13: // Player-owned explosion.
+    case 14: // Player-owned premature explosion.
+        return 1;
     case 0: // Drug.
         return 6;
     case 2: // Withdrawal.
@@ -683,8 +737,7 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
         if (!isValid(actor.entityId)) {
             return SnapshotError::InvalidEntityId;
         }
-        if (!isValid(actor.ownerId)
-            || (actor.ownerId != kHostPlayerId && actor.ownerId != kGuestPlayerId)) {
+        if (!isValid(actor.ownerId) || actor.ownerId.value > kMaxSnapshotActors) {
             return SnapshotError::InvalidPlayerId;
         }
         if (!validateCharacterBuild(actor.build)) {
@@ -701,6 +754,7 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
             || actor.rotation < 0 || actor.rotation > 5
             || actor.hitPoints < 0
             || actor.actionPoints < 0
+            || actor.poison < 0 || actor.radiation < 0
             || actor.fid < 0
             || FID_TYPE(actor.fid) != OBJ_TYPE_CRITTER
             || actor.frame < 0
@@ -822,16 +876,47 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
         }
     }
 
+    // Validate the complete ownership graph before the engine attaches items.
+    // A forward reference is legal, but dangling holders and container cycles
+    // would otherwise reach recursive native inventory/owner traversal.
+    std::unordered_set<std::uint32_t> inventoryRoots;
+    for (const ActorSnapshot& actor : snapshot.actors) inventoryRoots.insert(actor.entityId.value);
+    for (const CritterSnapshot& critter : snapshot.critters) inventoryRoots.insert(critter.entityId.value);
+    // Scripts can store inventory on native scenery and doors as well.
+    for (const DoorSnapshot& door : snapshot.doors) inventoryRoots.insert(door.entityId.value);
+    for (const ScenerySnapshot& scenery : snapshot.scenery) inventoryRoots.insert(scenery.entityId.value);
+    std::unordered_map<std::uint32_t, std::uint32_t> holders;
+    for (const ItemSnapshot& item : snapshot.items) holders.emplace(item.entityId.value, item.holderId.value);
+    std::unordered_map<std::uint32_t, unsigned char> ownershipState;
+    for (const ItemSnapshot& item : snapshot.items) {
+        std::vector<std::uint32_t> path;
+        std::uint32_t current = item.entityId.value;
+        while (current != 0 && inventoryRoots.count(current) == 0) {
+            auto holder = holders.find(current);
+            if (holder == holders.end() || ownershipState[current] == 1) return SnapshotError::InvalidItemState;
+            if (ownershipState[current] == 2) break;
+            ownershipState[current] = 1;
+            path.push_back(current);
+            current = holder->second;
+        }
+        for (std::uint32_t entry : path) ownershipState[entry] = 2;
+    }
+
     std::int32_t previousEventTime = 0;
     for (const TimedEventSnapshot& event : snapshot.timedEvents) {
         if (event.time <= 0
             || event.time < previousEventTime
-            || event.eventType >= 13
+            || event.eventType >= 15
+            || (isValid(event.ownerId) && entityIds.count(event.ownerId.value) == 0)
             || event.payloadCount != expectedTimedEventPayloadCount(event.eventType)
             || ((event.eventType == 4 || event.eventType == 12) && isValid(event.ownerId))
             || (event.eventType != 3 && event.eventType != 4 && event.eventType != 12 && !isValid(event.ownerId))) {
             return SnapshotError::InvalidTimedEventState;
         }
+        if ((event.eventType == 13 || event.eventType == 14)
+            && std::none_of(snapshot.actors.begin(), snapshot.actors.end(), [&](const auto& player) {
+                return event.payload[0] > 0 && player.ownerId.value == static_cast<std::uint32_t>(event.payload[0]);
+            })) return SnapshotError::InvalidTimedEventState;
         for (std::size_t index = event.payloadCount; index < event.payload.size(); index++) {
             if (event.payload[index] != 0) {
                 return SnapshotError::InvalidTimedEventState;
@@ -840,6 +925,29 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
         previousEventTime = event.time;
     }
 
+    const auto& story = snapshot.story;
+    if (static_cast<std::uint32_t>(story.kind) > 2 || story.movie < 0 || story.movie >= 14
+        || (story.flags & ~15u) != 0 || story.slides.size() > 10 || story.completed.size() > snapshot.actors.size()
+        || (story.active && story.revision == 0)
+        || (story.revision == 0 && (!story.slides.empty() || !story.completed.empty())))
+        return SnapshotError::InvalidDialogueState;
+    if (story.revision != 0 && ((story.kind == StoryPresentationKind::Finale && story.movie != 8 && story.movie != 9)
+        || (story.kind != StoryPresentationKind::Slides && !story.slides.empty())
+        || (story.kind == StoryPresentationKind::Slides && (story.movie != 0 || story.flags != 0))))
+        return SnapshotError::InvalidDialogueState;
+    for (auto slide : story.slides) {
+        constexpr int narrationIds[] = { 10, 11, 12, 13, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 27, 28, 29, 32, 34, 35, 36, 37, 40 };
+        if (std::find(std::begin(narrationIds), std::end(narrationIds), slide) == std::end(narrationIds))
+            return SnapshotError::InvalidDialogueState;
+    }
+    std::vector<PlayerId> completedPlayers;
+    for (auto player : story.completed) {
+        if (std::find(completedPlayers.begin(), completedPlayers.end(), player) != completedPlayers.end()
+            || std::none_of(snapshot.actors.begin(), snapshot.actors.end(),
+                [&](const auto& actor) { return actor.ownerId == player; }))
+            return SnapshotError::InvalidDialogueState;
+        completedPlayers.push_back(player);
+    }
     std::size_t payloadSize = kSnapshotPayloadHeaderSize
         + snapshot.actors.size() * kActorSnapshotSize
         + snapshot.critters.size() * kCritterSnapshotSize
@@ -857,7 +965,8 @@ SnapshotError validateSnapshot(const WorldSnapshot& snapshot)
         + snapshot.combat.initiative.size() * 8
         + dialogueSnapshotSize(snapshot)
         + sharedActivitySnapshotSize(snapshot)
-        + directTradeSnapshotSize(snapshot);
+        + directTradeSnapshotSize(snapshot)
+        + storySnapshotSize(snapshot);
     if (payloadSize > kMaxSnapshotPayloadSize) {
         return SnapshotError::PayloadTooLarge;
     }
@@ -892,7 +1001,8 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
         + canonical.combat.initiative.size() * 8
         + dialogueSnapshotSize(canonical)
         + sharedActivitySnapshotSize(canonical)
-        + directTradeSnapshotSize(canonical));
+        + directTradeSnapshotSize(canonical)
+        + storySnapshotSize(canonical));
 
     appendUint8(payload, static_cast<std::uint8_t>(canonical.phase));
     appendUint8(payload, 0);
@@ -937,6 +1047,7 @@ SnapshotError encodeSnapshot(const WorldSnapshot& snapshot, std::vector<std::uin
     appendDialogue(payload, canonical);
     appendSharedActivity(payload, canonical);
     appendDirectTrade(payload, canonical);
+    appendStory(payload, canonical);
 
     std::vector<std::uint8_t> protectedBytes;
     protectedBytes.reserve(sizeof(std::uint64_t) + payload.size());
@@ -1103,6 +1214,8 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
         actor.team = static_cast<std::int32_t>(readUint32(packet, offset));
         actor.whoHitMeId.value = readUint32(packet, offset);
         readCharacterBuild(packet, offset, actor.build);
+        actor.poison = static_cast<std::int32_t>(readUint32(packet, offset));
+        actor.radiation = static_cast<std::int32_t>(readUint32(packet, offset));
         result.snapshot.actors.push_back(actor);
     }
 
@@ -1126,6 +1239,12 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
         critter.combatManeuver = static_cast<std::int32_t>(readUint32(packet, offset));
         critter.damageLastTurn = static_cast<std::int32_t>(readUint32(packet, offset));
         critter.whoHitMeId.value = readUint32(packet, offset);
+        auto partyMember = readUint32(packet, offset);
+        if (partyMember > 1) {
+            result.error = SnapshotError::InvalidCritterState;
+            return result;
+        }
+        critter.partyMember = partyMember != 0;
         result.snapshot.critters.push_back(critter);
     }
 
@@ -1410,6 +1529,31 @@ SnapshotDecodeResult decodeSnapshot(const std::vector<std::uint8_t>& packet)
         }
         result.snapshot.directTrade = std::move(trade);
     }
+    if (packet.size() - offset < 32) {
+        result.error = SnapshotError::TruncatedPayload;
+        return result;
+    }
+    auto& story = result.snapshot.story;
+    story.revision = readUint64(packet, offset);
+    auto storyActive = readUint32(packet, offset);
+    story.active = storyActive != 0;
+    story.kind = static_cast<StoryPresentationKind>(readUint32(packet, offset));
+    story.movie = static_cast<std::int32_t>(readUint32(packet, offset));
+    story.flags = readUint32(packet, offset);
+    auto slides = readUint32(packet, offset);
+    auto completed = readUint32(packet, offset);
+    if (storyActive > 1 || slides > 10 || completed > kMaxSnapshotActors) {
+        result.error = SnapshotError::InvalidDialogueState;
+        return result;
+    }
+    if (packet.size() - offset < 4 * (slides + completed)) {
+        result.error = SnapshotError::TruncatedPayload;
+        return result;
+    }
+    for (std::uint32_t index = 0; index < slides; ++index)
+        story.slides.push_back(static_cast<std::int32_t>(readUint32(packet, offset)));
+    for (std::uint32_t index = 0; index < completed; ++index)
+        story.completed.push_back(PlayerId { readUint32(packet, offset) });
     if (offset != packet.size()) {
         result.error = SnapshotError::TrailingData;
         return result;
@@ -1448,6 +1592,7 @@ SnapshotDigestResult computeSnapshotDigest(const WorldSnapshot& snapshot)
     appendDialogue(sessionBytes, canonical);
     appendSharedActivity(sessionBytes, canonical);
     appendDirectTrade(sessionBytes, canonical);
+    appendStory(sessionBytes, canonical);
     result.digest.session = digestBytes(sessionBytes);
 
     std::vector<std::uint8_t> actorBytes;

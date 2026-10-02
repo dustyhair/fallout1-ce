@@ -25,10 +25,16 @@ struct CharacterBuild {
     std::array<std::int32_t, PERK_COUNT> perkRanks {};
     std::array<std::int32_t, NUM_TAGGED_SKILLS> taggedSkills { -1, -1, -1, -1 };
     std::array<std::int32_t, PC_TRAIT_MAX> traits { -1, -1 };
+    std::array<std::array<std::int32_t, 3>, 2> healingSkillUses {};
+    bool sneakWorking = false;
+    std::uint32_t addictions = 0;
     std::uint32_t prototypeFlags = 0;
     std::int32_t unspentSkillPoints = 0;
     std::int32_t level = 1;
     std::int32_t experience = 0;
+    std::int32_t processedLevel = 1;
+    std::int32_t pendingPerks = 0;
+    std::int32_t activeHand = 0;
 };
 
 inline bool operator==(const CharacterBuild& lhs, const CharacterBuild& rhs)
@@ -39,10 +45,16 @@ inline bool operator==(const CharacterBuild& lhs, const CharacterBuild& rhs)
         && lhs.perkRanks == rhs.perkRanks
         && lhs.taggedSkills == rhs.taggedSkills
         && lhs.traits == rhs.traits
+        && lhs.healingSkillUses == rhs.healingSkillUses
+        && lhs.sneakWorking == rhs.sneakWorking
+        && lhs.addictions == rhs.addictions
         && lhs.prototypeFlags == rhs.prototypeFlags
         && lhs.unspentSkillPoints == rhs.unspentSkillPoints
         && lhs.level == rhs.level
-        && lhs.experience == rhs.experience;
+        && lhs.experience == rhs.experience
+        && lhs.processedLevel == rhs.processedLevel
+        && lhs.pendingPerks == rhs.pendingPerks
+        && lhs.activeHand == rhs.activeHand;
 }
 
 inline bool operator!=(const CharacterBuild& lhs, const CharacterBuild& rhs)

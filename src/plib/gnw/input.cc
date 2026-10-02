@@ -190,6 +190,10 @@ void GNW_input_exit()
 }
 
 // 0x4B33C8
+static void (*inputObserver)() = nullptr;
+static bool inputObserverRunning = false;
+void set_input_observer(void (*observer)()) { inputObserver = observer; }
+
 int get_input()
 {
     multiplayer::ScopedBackgroundPlayerContext backgroundPlayerContext;
@@ -197,11 +201,18 @@ int get_input()
 
     GNW95_process_message();
 
-    if (!GNW95_isActive) {
+    // A multiplayer host and its modal presentations must keep running when
+    // the user switches windows. Ordinary solo sessions still pause on focus loss.
+    if (!GNW95_isActive && !background_processing_when_inactive) {
         GNW95_lost_focus();
     }
 
     process_bk();
+    if (inputObserver != nullptr && !inputObserverRunning) {
+        inputObserverRunning = true;
+        inputObserver();
+        inputObserverRunning = false;
+    }
 
     v3 = get_input_buffer();
     if (v3 == -1 && mouse_get_buttons() & 0x33) {
@@ -1139,12 +1150,14 @@ void GNW95_process_message()
                 break;
             case SDL_WINDOWEVENT_FOCUS_GAINED:
                 GNW95_isActive = true;
+                audioEngineSetFocused(true);
                 win_refresh_all(&scr_size);
                 audioEngineResume();
                 break;
             case SDL_WINDOWEVENT_FOCUS_LOST:
                 GNW95_isActive = false;
-                audioEnginePause();
+                audioEngineSetFocused(false);
+                if (!background_processing_when_inactive) audioEnginePause();
                 break;
             }
             break;
@@ -1244,6 +1257,11 @@ void GNW95_lost_focus()
 void set_background_processing_when_inactive(bool enabled)
 {
     background_processing_when_inactive = enabled;
+    audioEngineSetBackgroundPlayback(enabled);
+    if (!GNW95_isActive) {
+        if (enabled) audioEngineResume();
+        else audioEnginePause();
+    }
 }
 
 void set_input_process(InputProcess* process)

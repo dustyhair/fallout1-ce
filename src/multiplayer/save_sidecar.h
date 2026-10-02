@@ -15,7 +15,7 @@ namespace fallout {
 namespace multiplayer {
 
 constexpr std::uint16_t kMultiplayerSaveMinimumVersion = 1;
-constexpr std::uint16_t kMultiplayerSaveVersion = 4;
+constexpr std::uint16_t kMultiplayerSaveVersion = 8;
 constexpr std::size_t kMultiplayerSaveHeaderSize = 36;
 constexpr std::size_t kMultiplayerSaveLegacyPlayerCount = 2;
 constexpr std::size_t kMultiplayerSaveMaximumPlayers = kMaximumTransitionPlayers;

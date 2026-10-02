@@ -370,6 +370,10 @@ int gtime_q_process(Object* obj, void* data)
     }
 
     rc = critter_check_rads(obj_dude);
+    Object* peer = multiplayer::networkWorldPlayerActor(multiplayer::kGuestPlayerId);
+    if (peer != nullptr && peer != obj_dude && !multiplayer::networkRuntimeIsGuestReplica()) {
+        critter_check_rads(peer);
+    }
 
     queue_clear_type(EVENT_TYPE_GAME_TIME, NULL);
 
@@ -648,6 +652,8 @@ static void script_chk_critters()
 // 0x49207C
 static void script_chk_timed_events()
 {
+    if (multiplayer::networkWorldActive() && (multiplayer::networkWorldStory().active
+        || multiplayer::networkWorldPhase() == multiplayer::SessionPhase::Ending)) return;
     // 0x51C7E0
     static int last_time = 0;
 
@@ -799,9 +805,23 @@ int scripts_check_state()
     WorldMapContext ctx;
 
     if (multiplayer::networkRuntimeIsGuestReplica()) {
+        // Accepted loot is a local UI request. Transfers still go through the
+        // host, and no gameplay script request is executed on the replica.
+        if ((scriptState.requests & SCRIPT_REQUEST_LOOTING) != 0
+            && multiplayer::networkWorldIsLocalInventoryTransfer(scriptState.lootingBy, scriptState.lootingFrom)) {
+            scriptState.requests &= ~SCRIPT_REQUEST_LOOTING;
+            loot_container(scriptState.lootingBy, scriptState.lootingFrom);
+        }
+        if ((scriptState.requests & SCRIPT_REQUEST_STEALING) != 0
+            && multiplayer::networkWorldIsTheftTarget(scriptState.stealingBy, scriptState.stealingFrom)) {
+            scriptState.requests &= ~SCRIPT_REQUEST_STEALING;
+            inven_steal_container(scriptState.stealingBy, scriptState.stealingFrom);
+        }
         scriptState.requests = 0;
         return 0;
     }
+
+    multiplayer::networkWorldExecutePendingCombatStart();
 
     if (scriptState.requests == 0) {
         return 0;

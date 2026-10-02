@@ -765,7 +765,7 @@ void gdialog_multiplayer_guest_process()
 {
     if (!multiplayer::networkRuntimeIsGuestReplica()
         || multiplayer::networkWorldPhase() != multiplayer::SessionPhase::Dialogue
-        || gdialog_state != 0) return;
+        || gdialog_state == 1) return;
     const auto* presentation = multiplayer::networkWorldDialoguePresentation();
     if (presentation == nullptr) return;
     dialog_target = multiplayer::networkWorldFindObject(presentation->targetId);
@@ -1462,6 +1462,8 @@ static int gDialogProcess()
     gdReenterLevel += 1;
 
     gDialogProcessUpdate();
+    if (multiplayer::networkRuntimeSmokeTestEnabled() && multiplayer::networkWorldActive())
+        std::fprintf(stderr, "NATIVE_DIALOGUE_OPEN role=%s\n", multiplayer::networkRuntimeIsGuestReplica() ? "guest" : "host");
     std::string shownVotes = gdialogVoteSignature();
 
     int v18 = 0;
@@ -1480,11 +1482,17 @@ static int gDialogProcess()
         gdialogUpdateSpeechQueue();
 
         int keyCode = get_input();
+        if (game_user_wants_to_quit != 0) break;
 
         bool sharedDialogue = multiplayer::networkWorldActive()
             && multiplayer::networkWorldPhase() == multiplayer::SessionPhase::Dialogue;
         if (multiplayer::networkRuntimeIsGuestReplica() && !sharedDialogue) {
             break;
+        }
+        if (sharedDialogue) multiplayer::networkWorldProcessScriptedNpcBarter();
+        if (sharedDialogue && multiplayer::networkWorldNpcBarterState() != nullptr) {
+            inven_multiplayer_barter();
+            continue;
         }
         if (sharedDialogue) {
             const auto* presentation = multiplayer::networkWorldDialoguePresentation();
@@ -1562,7 +1570,7 @@ static int gDialogProcess()
 
             if (dialogue_switch_mode == 6) {
                 about_loop();
-            } else if (!sharedDialogue && keyCode == KEY_LOWERCASE_B) {
+            } else if (keyCode == KEY_LOWERCASE_B) {
                 talk_to_pressed_barter(-1, -1);
             } else if (!sharedDialogue && keyCode == KEY_LOWERCASE_A) {
                 talk_to_pressed_about(-1, -1);
@@ -2999,6 +3007,8 @@ static int text_to_rect_func(unsigned char* buffer, Rect* rect, char* string, in
 }
 
 // 0x4409DC
+int gdialogGetBarterModifier() { return gdBarterMod; }
+
 void gdialogSetBarterMod(int modifier)
 {
     gdBarterMod = modifier;
@@ -3007,6 +3017,10 @@ void gdialogSetBarterMod(int modifier)
 // 0x4409E4
 int gdActivateBarter(int modifier)
 {
+    if (multiplayer::networkWorldActive()) {
+        gdBarterMod = modifier;
+        return multiplayer::networkWorldRequestScriptedNpcBarter(dialog_target) ? 0 : -1;
+    }
     if (!dialog_state_fix) {
         return -1;
     }
@@ -3215,6 +3229,11 @@ static void dialogue_barter_cleanup_tables()
 // 0x440EC4
 static void talk_to_pressed_barter(int btn, int keyCode)
 {
+    if (multiplayer::networkWorldActive()) {
+        auto id = multiplayer::networkWorldFindEntity(dialog_target);
+        if (id.has_value()) multiplayer::networkRuntimeBeginNpcBarter(*id);
+        return;
+    }
     if (PID_TYPE(dialog_target->pid) != OBJ_TYPE_CRITTER) {
         return;
     }

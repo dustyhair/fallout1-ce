@@ -450,6 +450,11 @@ bool map_bk_processes_enabled()
     return map_bk_enabled;
 }
 
+bool map_disable_bk_processes_for_local_ui()
+{
+    return !multiplayer::networkWorldActive() && map_disable_bk_processes();
+}
+
 // 0x473D5C
 int map_set_elevation(int elevation)
 {

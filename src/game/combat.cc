@@ -50,6 +50,12 @@
 
 namespace fallout {
 
+static bool combat_is_player_actor(const Object* actor)
+{
+    return actor != nullptr && (actor == obj_dude
+        || multiplayer::playerStateForActor(actor) != nullptr);
+}
+
 #define CALLED_SHOT_WINDOW_X 108
 #define CALLED_SHOT_WINDOW_Y 20
 #define CALLED_SHOT_WINDOW_WIDTH 424
@@ -1746,7 +1752,8 @@ static void combat_begin(Object* a1)
 
     anim_stop();
     remove_bk_process(dude_fidget);
-    combat_elev = map_elevation;
+    combat_elev = multiplayer::networkWorldActive() && a1 != nullptr
+        && multiplayer::networkWorldCombatOwner(a1).has_value() ? a1->elevation : map_elevation;
 
     if (!isInCombat()) {
         combat_exps = 0;
@@ -1860,7 +1867,9 @@ static void combat_over()
     gmouse_3d_set_mode(GAME_MOUSE_MODE_MOVE);
     intface_update_ac(true);
 
-    if (critter_is_prone(obj_dude)) {
+    // Multiplayer knockout recovery stays in the host-owned native queue for
+    // every player. Solo retains its immediate protagonist wake-up.
+    if (!multiplayer::networkWorldActive() && critter_is_prone(obj_dude)) {
         if (!critter_is_dead(obj_dude)) {
             if (combat_ending_guy == NULL) {
                 queue_remove_this(obj_dude, EVENT_TYPE_KNOCKOUT);
@@ -2197,6 +2206,10 @@ static int combat_input()
             break;
         }
 
+        if (multiplayer::networkWorldActive() && multiplayer::networkWorldPartyDefeated()) {
+            break;
+        }
+
         if ((obj_dude->data.critter.combat.results & (DAM_KNOCKED_OUT | DAM_DEAD | DAM_LOSE_TURN)) != 0) {
             break;
         }
@@ -2234,6 +2247,7 @@ static int combat_input()
                 || input == KEY_LOWERCASE_I || input == KEY_UPPERCASE_I
                 || input == KEY_LOWERCASE_B || input == KEY_UPPERCASE_B
                 || input == KEY_LOWERCASE_N || input == KEY_UPPERCASE_N
+                || input == KEY_HOME
                 || input == KEY_LOWERCASE_M || input == KEY_UPPERCASE_M) {
                 game_handle_input(input, true);
             }
@@ -2303,13 +2317,16 @@ static int combat_turn(Object* a1, bool a2)
                 combat_free_move = 2 * perk_level(PERK_BONUS_MOVE);
             }
             multiplayer::networkRuntimeRequestCombatTurnCheckpoint();
+            multiplayer::networkWorldCombatRunInitialAttack(a1);
         }
         while (!unableToAct && multiplayer::networkWorldCombatTurnMatches(a1)
             && multiplayer::networkWorldCombatTurnRevision() == turnRevision
+            && !multiplayer::networkWorldPartyDefeated()
             && game_user_wants_to_quit == 0 && combat_end_due_to_load == 0
             && !multiplayer::networkRuntimeSimulationStopped()) {
             sharedFpsLimiter.mark();
-            get_input();
+            int input = get_input();
+            if (input == KEY_HOME) game_handle_input(input, true);
             renderPresent();
             sharedFpsLimiter.throttle();
         }
@@ -2320,7 +2337,8 @@ static int combat_turn(Object* a1, bool a2)
         a1->data.critter.combat.damageLastTurn = 0;
         a1->data.critter.combat.results &= ~DAM_LOSE_TURN;
         combat_free_move = 0;
-        return game_user_wants_to_quit != 0 || combat_end_due_to_load != 0 ? -1 : 0;
+        return game_user_wants_to_quit != 0 || combat_end_due_to_load != 0
+                || multiplayer::networkWorldPartyDefeated() ? -1 : 0;
     }
 
     combat_ctd_init(&main_ctd, a1, NULL, HIT_MODE_PUNCH, HIT_LOCATION_TORSO);
@@ -2370,7 +2388,8 @@ static int combat_turn(Object* a1, bool a2)
                 game_ui_enable();
                 gmouse_3d_refresh();
 
-                if (gcsd != NULL) {
+                bool initialAttackHandled = multiplayer::networkWorldCombatRunInitialAttack(a1);
+                if (gcsd != NULL && !initialAttackHandled) {
                     combat_attack_this(gcsd->defender);
                 }
 
@@ -2428,7 +2447,9 @@ static int combat_turn(Object* a1, bool a2)
 
     a1->data.critter.combat.damageLastTurn = 0;
 
-    if ((obj_dude->data.critter.combat.results & DAM_DEAD) != 0) {
+    if (multiplayer::networkWorldActive()
+            ? multiplayer::networkWorldPartyDefeated()
+            : (obj_dude->data.critter.combat.results & DAM_DEAD) != 0) {
         return -1;
     }
 
@@ -2441,6 +2462,22 @@ static int combat_turn(Object* a1, bool a2)
     return 0;
 }
 
+int combat_get_elevation()
+{
+    return isInCombat() ? combat_elev : map_elevation;
+}
+
+static Object* combat_player_on_floor()
+{
+    if (!multiplayer::networkWorldActive()) return obj_dude;
+    for (int index = 0; index < list_com; ++index) {
+        Object* actor = combat_list[index];
+        if (actor->elevation == combat_elev && critter_is_active(actor)
+            && multiplayer::networkWorldCombatOwner(actor).has_value()) return actor;
+    }
+    return nullptr;
+}
+
 // 0x420A54
 static bool combat_should_end()
 {
@@ -2448,9 +2485,12 @@ static bool combat_should_end()
         return true;
     }
 
+    Object* player = combat_player_on_floor();
+    if (player == nullptr) return true;
+
     int index;
     for (index = 0; index < list_com; index++) {
-        if (combat_list[index] == obj_dude) {
+        if (combat_list[index] == player) {
             break;
         }
     }
@@ -2459,7 +2499,7 @@ static bool combat_should_end()
         return true;
     }
 
-    int team = obj_dude->data.critter.combat.team;
+    int team = player->data.critter.combat.team;
 
     for (index = 0; index < list_com; index++) {
         Object* critter = combat_list[index];
@@ -2489,11 +2529,13 @@ void combat(STRUCT_664980* attack)
         return;
     }
     if (attack == NULL
+        || (multiplayer::networkWorldActive() && attack->attacker != nullptr
+            && multiplayer::networkWorldCombatOwner(attack->attacker).has_value())
         || (attack->attacker == NULL || attack->attacker->elevation == map_elevation)
         || (attack->defender == NULL || attack->defender->elevation == map_elevation)) {
         int v3 = combat_state & 0x01;
 
-        combat_begin(NULL);
+        combat_begin(multiplayer::networkWorldActive() && attack != nullptr ? attack->attacker : nullptr);
 
         int v6;
 
@@ -2962,30 +3004,30 @@ static int compute_attack(Attack* attack)
 
     if (weapon_subtype == ATTACK_TYPE_MELEE || weapon_subtype == ATTACK_TYPE_UNARMED) {
         if (roll == ROLL_SUCCESS) {
-            if (attack->attacker == obj_dude) {
+            if (combat_is_player_actor(attack->attacker)) {
                 if (perk_level(PERK_SLAYER)) {
                     roll = ROLL_CRITICAL_SUCCESS;
                 }
 
                 if (perk_level(PERK_SILENT_DEATH)
-                    && !is_hit_from_front(obj_dude, attack->defender)
+                    && !is_hit_from_front(attack->attacker, attack->defender)
                     && is_pc_flag(PC_FLAG_SNEAKING)
-                    && obj_dude != attack->defender->data.critter.combat.whoHitMe) {
+                    && attack->attacker != attack->defender->data.critter.combat.whoHitMe) {
                     damage_multiplier = 4;
                 }
             }
         }
     }
     if (roll == ROLL_SUCCESS) {
-        if ((weapon_subtype == ATTACK_TYPE_MELEE || weapon_subtype == ATTACK_TYPE_UNARMED) && attack->attacker == obj_dude) {
+        if ((weapon_subtype == ATTACK_TYPE_MELEE || weapon_subtype == ATTACK_TYPE_UNARMED) && combat_is_player_actor(attack->attacker)) {
             if (perk_level(PERK_SLAYER)) {
                 roll = ROLL_CRITICAL_SUCCESS;
             }
 
             if (perk_level(PERK_SILENT_DEATH)
-                && !is_hit_from_front(obj_dude, attack->defender)
+                && !is_hit_from_front(attack->attacker, attack->defender)
                 && is_pc_flag(PC_FLAG_SNEAKING)
-                && obj_dude != attack->defender->data.critter.combat.whoHitMe) {
+                && attack->attacker != attack->defender->data.critter.combat.whoHitMe) {
                 damage_multiplier = 4;
             }
         }
@@ -2994,9 +3036,9 @@ static int compute_attack(Attack* attack)
     if (weapon_subtype == ATTACK_TYPE_RANGED) {
         attack->ammoQuantity = roundsSpent;
 
-        if (roll == ROLL_SUCCESS && attack->attacker == obj_dude) {
+        if (roll == ROLL_SUCCESS && combat_is_player_actor(attack->attacker)) {
             if (perk_level(PERK_SNIPER) != 0) {
-                if (roll_random(1, 10) <= stat_level(obj_dude, STAT_LUCK)) {
+                if (roll_random(1, 10) <= stat_level(attack->attacker, STAT_LUCK)) {
                     roll = ROLL_CRITICAL_SUCCESS;
                 }
             }
@@ -3202,7 +3244,7 @@ static int attack_crit_success(Attack* attack)
     }
 
     CriticalHitDescription* criticalHitDescription;
-    if (defender == obj_dude) {
+    if (combat_is_player_actor(defender)) {
         criticalHitDescription = &(pc_crit_succ_eff[attack->defenderHitLocation][effect]);
     } else {
         int killType = critter_kill_count_type(defender);
@@ -3353,6 +3395,7 @@ int determine_to_hit_no_range(Object* a1, Object* a2, int hitLocation, int hitMo
 // 0x421E3C
 static int determine_to_hit_func(Object* attacker, Object* defender, int hitLocation, int hitMode, int check_range)
 {
+    multiplayer::ScopedActorPlayerContext playerContext(attacker);
     Object* weapon;
     bool is_ranged_weapon = false;
     int accuracy = 0;
@@ -3388,7 +3431,7 @@ static int determine_to_hit_func(Object* attacker, Object* defender, int hitLoca
                     range = -2 * perception;
                 }
 
-                if (attacker == obj_dude) {
+                if (combat_is_player_actor(attacker)) {
                     range -= 2 * perk_level(PERK_SHARPSHOOTER);
                 }
 
@@ -3405,7 +3448,7 @@ static int determine_to_hit_func(Object* attacker, Object* defender, int hitLoca
             accuracy -= 10 * modifier;
         }
 
-        if (attacker == obj_dude) {
+        if (combat_is_player_actor(attacker)) {
             if (trait_level(TRAIT_ONE_HANDER)) {
                 if (item_w_is_2handed(weapon)) {
                     accuracy -= 40;
@@ -3437,7 +3480,7 @@ static int determine_to_hit_func(Object* attacker, Object* defender, int hitLoca
         accuracy += 15;
     }
 
-    if (attacker == obj_dude) {
+    if (combat_is_player_actor(attacker)) {
         int lightIntensity = obj_get_visible_light(defender);
 
         if (lightIntensity <= 26214)
@@ -3529,7 +3572,7 @@ static void compute_damage(Attack* attack, int rounds, int damage_multiplier)
 
         damage_resistance = stat_level(critter, STAT_DAMAGE_RESISTANCE + damage_type);
 
-        if (attack->attacker == obj_dude) {
+        if (combat_is_player_actor(attack->attacker)) {
             if (trait_level(TRAIT_FINESSE)) {
                 damage_resistance += 30;
             }
@@ -3539,7 +3582,7 @@ static void compute_damage(Attack* attack, int rounds, int damage_multiplier)
         damage_resistance = 0;
     }
 
-    if (attack->attacker == obj_dude && item_w_subtype(attack->weapon, attack->hitMode) == ATTACK_TYPE_RANGED) {
+    if (combat_is_player_actor(attack->attacker) && item_w_subtype(attack->weapon, attack->hitMode) == ATTACK_TYPE_RANGED) {
         bonus_ranged_damage = 2 * perk_level(PERK_BONUS_RANGED_DAMAGE);
     } else {
         bonus_ranged_damage = 0;
@@ -4621,15 +4664,25 @@ void combat_attack_this(Object* a1)
         return;
     }
 
+    if (!isInCombat() && multiplayer::networkWorldActive()) {
+        int location = HIT_LOCATION_UNCALLED;
+        if (!aiming || combat_select_hit_location(a1, &location, hitMode) != -1) {
+            multiplayer::networkRuntimeHandleLocalCombatStart(a1, hitMode, location);
+        }
+        return;
+    }
+
+    Object* attackingPlayer = multiplayer::localPlayerActorOrStoryActor();
+    multiplayer::ScopedLocalPlayerContext playerContext;
     MessageListItem messageListItem;
     Object* item;
     char formattedText[80];
     const char* sfx;
 
-    int rc = combat_check_bad_shot(obj_dude, a1, hitMode, aiming);
+    int rc = combat_check_bad_shot(attackingPlayer, a1, hitMode, aiming);
     switch (rc) {
     case COMBAT_BAD_SHOT_NO_AMMO:
-        item = item_hit_with(obj_dude, hitMode);
+        item = item_hit_with(attackingPlayer, hitMode);
         messageListItem.num = 101; // Out of ammo.
         if (message_search(&combat_message_file, &messageListItem)) {
             display_print(messageListItem.text);
@@ -4645,10 +4698,10 @@ void combat_attack_this(Object* a1)
         }
         return;
     case COMBAT_BAD_SHOT_NOT_ENOUGH_AP:
-        item = item_hit_with(obj_dude, hitMode);
+        item = item_hit_with(attackingPlayer, hitMode);
         messageListItem.num = 100; // You need %d action points.
         if (message_search(&combat_message_file, &messageListItem)) {
-            int actionPointsRequired = item_w_mp_cost(obj_dude, hitMode, aiming);
+            int actionPointsRequired = item_w_mp_cost(attackingPlayer, hitMode, aiming);
             snprintf(formattedText, sizeof(formattedText), messageListItem.text, actionPointsRequired);
             display_print(formattedText);
         }

@@ -263,6 +263,8 @@ static const short holodisks[HOLODISK_COUNT] = {
 // 0x507224
 static bool bk_enable = false;
 static bool multiplayerBackgroundKept = false;
+static bool multiplayerMouseWasEnabled = false;
+static bool multiplayerScrollingWasEnabled = false;
 
 // NOTE: Quest location indexes match town, I'm not sure if that was intentional
 // or just a coincedence.
@@ -552,20 +554,42 @@ static unsigned char holo_flag;
 // 0x662CA6
 static unsigned char stat_flag;
 static bool pipboyOpen = false;
+static bool pipboyScreensaverActive = false;
 
 bool pipboy_is_open()
 {
     return pipboyOpen;
 }
 
+bool pipboy_screensaver_is_active()
+{
+    return pipboyScreensaverActive;
+}
+
 // 0x486A80
 int pipboy(int intent)
 {
+    bool cycleWasEnabled = cycle_is_enabled();
+    bool mouse3dWasOn = gmouse_3d_is_on();
+    int previousCursor = gmouse_get_cursor();
     intent = StartPipboy(intent);
     if (intent == -1) {
+        if (bk_enable) map_enable_bk_processes();
+        if (multiplayerBackgroundKept && multiplayerMouseWasEnabled) {
+            gmouse_enable();
+            if (!multiplayerScrollingWasEnabled) gmouse_disable_scrolling();
+        }
+        multiplayerBackgroundKept = false;
+        multiplayerMouseWasEnabled = false;
+        if (cycleWasEnabled) cycle_enable();
+        if (mouse3dWasOn) gmouse_3d_on();
+        gmouse_set_cursor(previousCursor);
+        text_font(savefont);
         return -1;
     }
     pipboyOpen = true;
+    if (multiplayer::networkRuntimeSmokeTestEnabled())
+        std::fprintf(stderr, "NATIVE_PIPBOY_OPEN role=%s\n", multiplayer::networkRuntimeIsGuestReplica() ? "guest" : "host");
     sharedActivityMode = false;
     sharedActivityPage = 0;
 
@@ -583,6 +607,7 @@ int pipboy(int intent)
         sharedFpsLimiter.mark();
 
         int keyCode = get_input();
+        if (game_user_wants_to_quit != 0) break;
         if (sharedActivityMode) {
             auto entries = multiplayer::networkWorldSharedActivity();
             std::uint64_t latestId = entries.empty() ? 0 : entries.back().id;
@@ -627,7 +652,8 @@ int pipboy(int intent)
             old_mouse_x = mouse_x;
             old_mouse_y = mouse_y;
         } else {
-            if (get_time() - wait_time > PIPBOY_IDLE_TIMEOUT) {
+            unsigned int idleTimeout = multiplayer::networkRuntimeSmokeTestPipboyScreensaver() ? 100 : PIPBOY_IDLE_TIMEOUT;
+            if (get_time() - wait_time > idleTimeout) {
                 ScreenSaver();
 
                 wait_time = get_time();
@@ -692,7 +718,9 @@ static int StartPipboy(int intent)
     // A player's local screen must not freeze other players' native actions.
     multiplayerBackgroundKept = multiplayer::networkWorldActive();
     bk_enable = multiplayerBackgroundKept ? false : map_disable_bk_processes();
-    if (multiplayerBackgroundKept) gmouse_disable(0);
+    multiplayerMouseWasEnabled = multiplayerBackgroundKept && gmouse_is_enabled();
+    multiplayerScrollingWasEnabled = gmouse_scrolling_is_enabled();
+    if (multiplayerMouseWasEnabled) gmouse_disable(0);
 
     cycle_disable();
     gmouse_3d_off();
@@ -802,7 +830,7 @@ static int StartPipboy(int intent)
     }
 
     if (intent == PIPBOY_OPEN_INTENT_REST) {
-        if (!critter_can_obj_dude_rest()) {
+        if (!critter_can_actor_rest(multiplayer::localPlayerActorOrStoryActor())) {
             trans_buf_to_buf(
                 pipbmp[PIPBOY_FRM_LOGO],
                 ginfo[PIPBOY_FRM_LOGO].width,
@@ -920,8 +948,12 @@ static void EndPipboy()
         map_enable_bk_processes();
     }
     if (multiplayerBackgroundKept) {
-        gmouse_enable();
+        if (multiplayerMouseWasEnabled) {
+            gmouse_enable();
+            if (!multiplayerScrollingWasEnabled) gmouse_disable_scrolling();
+        }
         multiplayerBackgroundKept = false;
+        multiplayerMouseWasEnabled = false;
     }
 
     cycle_enable();
@@ -1846,7 +1878,7 @@ static void PipArchives(int a1)
         }
 
         if (movie <= MOVIE_COUNT) {
-            gmovie_play(movie, GAME_MOVIE_FADE_IN | GAME_MOVIE_FADE_OUT | GAME_MOVIE_PAUSE_MUSIC);
+            gmovie_play_local(movie, GAME_MOVIE_FADE_IN | GAME_MOVIE_FADE_OUT | GAME_MOVIE_PAUSE_MUSIC);
         } else {
             debug_printf("\n ** Selected movie not found in list! **\n");
         }
@@ -1911,7 +1943,7 @@ static int ListArchive(int a1)
 static void PipAlarm(int a1)
 {
     if (a1 == 1024) {
-        if (critter_can_obj_dude_rest()) {
+        if (critter_can_actor_rest(multiplayer::localPlayerActorOrStoryActor())) {
             NixHotLines();
             DrawAlarmText(0);
             AddHotLines(5, PIPBOY_REST_DURATION_COUNT_WITHOUT_PARTY, false);
@@ -2542,6 +2574,9 @@ static int ScreenSaver()
         scrn_buf + PIPBOY_WINDOW_WIDTH * PIPBOY_WINDOW_CONTENT_VIEW_Y + PIPBOY_WINDOW_CONTENT_VIEW_X,
         PIPBOY_WINDOW_WIDTH);
 
+    pipboyScreensaverActive = true;
+    if (multiplayer::networkRuntimeSmokeTestEnabled())
+        std::fprintf(stderr, "NATIVE_PIPBOY_SCREENSAVER_OPEN role=%s\n", multiplayer::networkRuntimeIsGuestReplica() ? "guest" : "host");
     int v31 = 50;
     while (true) {
         sharedFpsLimiter.mark();
@@ -2549,7 +2584,8 @@ static int ScreenSaver()
         unsigned int time = get_time();
 
         mouseGetPositionInWindow(pip_win, &mouse_x, &mouse_y);
-        if (get_input() != -1 || old_mouse_x != mouse_x || old_mouse_y != mouse_y) {
+        if (get_input() != -1 || game_user_wants_to_quit != 0
+            || old_mouse_x != mouse_x || old_mouse_y != mouse_y) {
             break;
         }
 
@@ -2677,6 +2713,7 @@ static int ScreenSaver()
         PIPBOY_WINDOW_WIDTH);
 
     mem_free(buf);
+    pipboyScreensaverActive = false;
 
     win_draw_rect(pip_win, &pip_rect);
     gmouse_enable();

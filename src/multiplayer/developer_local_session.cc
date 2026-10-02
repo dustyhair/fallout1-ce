@@ -1,4 +1,5 @@
 #include "multiplayer/developer_local_session.h"
+#include "game/queue.h"
 
 #include <cstring>
 #include <optional>
@@ -107,6 +108,7 @@ bool applyPendingGuestObject(Object* actor)
     actor->data.critter.combat.whoHitMe = nullptr;
     attachInventory(actor, saved->data.inventory);
     saved->data.inventory = {};
+    queue_bind_loaded_owner(saved->id, actor);
 
     int savedFid = saved->fid;
     int savedTile = saved->tile;
@@ -166,7 +168,7 @@ public:
         return CommandExecutionStatus::Applied;
     }
 
-    DoorUseExecution useDoor(Object* actor, Object* target) override
+    DoorUseExecution useDoor(Object* actor, Object* target, std::uint64_t turnRevision = 0) override
     {
         DoorUseExecution execution;
         if (isInCombat()
@@ -183,7 +185,7 @@ public:
         return execution;
     }
 
-    CommandExecutionStatus pickup(Object* actor, Object* target) override
+    CommandExecutionStatus pickup(Object* actor, Object* target, std::uint64_t turnRevision = 0) override
     {
         if (isInCombat()
             || actor == target
@@ -197,7 +199,7 @@ public:
         return CommandExecutionStatus::Applied;
     }
 
-    CommandExecutionStatus loot(Object* actor, Object* target) override
+    CommandExecutionStatus loot(Object* actor, Object* target, std::uint64_t turnRevision = 0, bool targetChange = false) override
     {
         if (isInCombat()
             || actor == target

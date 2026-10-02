@@ -1,5 +1,31 @@
 # Script-facing player-role audit
 
+The tables below record the original audit. The current multiplayer contract is:
+
+- `obj_dude` remains the native story object. It is never swapped for an action.
+- `dude_obj` resolves the scoped acting player, with `obj_dude` as its fallback.
+  `source_obj` is the explicitly supplied interaction source. Shared map entry
+  uses the surviving story actor while remote actors are being recreated.
+- `using_skill(object, SKILL_SNEAK)` reads the supplied registered player's
+  flags in that player's scope. Other skill IDs and ordinary NPCs return zero.
+  The query restores the caller's scope and never changes Sneak state.
+- Steal's USE_SKILL_ON hook executes once on the host under the thief's scope.
+  The host alone rolls theft, executes caught PICKUP hooks, and grants personal
+  skill XP. Replicas open inventory only when the host explicitly authorizes it.
+- The live automap presents the local actor and same-floor roster markers.
+  Motion-sensor charges are host-owned; map, inventory, and HUD activation
+  never open another player's map inside host execution.
+- Perception already scopes the observed player's live Sneak result. Reaction
+  and dialogue options use the acting talker; shared NPC reaction locals remain
+  shared. Native delayed script events carry a script ID and fixed parameter,
+  not a persistent thief identity. They must not inherit an earlier interaction
+  after its scope ends. Content-specific delayed reactions still need campaign
+  testing before any broader timer-context policy is added.
+
+Sneak scheduling, healing histories, travel, and combat have received later
+fixes. Use the [October 1 completion review](completion-review-and-plan-2026-10-01.md)
+for implemented slices, evidence, and remaining campaign work.
+
 This audit covers exploration-time uses of Fallout's legacy player global and
 the script operations most likely to run while a player interacts with a map.
 It was made against the `multiplayer-plan` branch after the authoritative

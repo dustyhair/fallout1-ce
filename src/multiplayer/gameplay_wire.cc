@@ -37,6 +37,10 @@ enum class CommandType : std::uint8_t {
     DialogueVote = 23,
     DirectTrade = 24,
     Equipment = 25,
+    InventoryAction = 26,
+    NpcBarter = 27,
+    CharacterAdvance = 28,
+    StartCombat = 29,
 };
 
 enum class EventType : std::uint8_t {
@@ -68,6 +72,9 @@ enum class EventType : std::uint8_t {
     DirectTradeStateChanged = 26,
     CapsDistributed = 27,
     EquipmentChanged = 28,
+    PlayerFeedback = 29,
+    NpcBarter = 30,
+    CombatRequested = 31,
 };
 
 constexpr std::size_t kCommandHeaderSize = 28;
@@ -75,18 +82,18 @@ constexpr std::size_t kMoveCommandSize = kCommandHeaderSize + 12;
 constexpr std::size_t kTargetCommandSize = kCommandHeaderSize + 4;
 constexpr std::size_t kFacingCommandSize = kCommandHeaderSize + 8;
 constexpr std::size_t kItemDescriptorSize = 16;
-constexpr std::size_t kInventoryTransferCommandSize = kCommandHeaderSize + 20 + kItemDescriptorSize;
+constexpr std::size_t kInventoryTransferCommandSize = kCommandHeaderSize + 28 + kItemDescriptorSize;
 constexpr std::size_t kItemDropCommandSize = kCommandHeaderSize + 16 + kItemDescriptorSize;
 constexpr std::size_t kAttackCommandSize = kCommandHeaderSize + 20;
 constexpr std::size_t kEndTurnCommandSize = kCommandHeaderSize + 8;
 constexpr std::size_t kCombatMoveCommandSize = kCommandHeaderSize + 20;
-constexpr std::size_t kCombatItemCommandSize = kCommandHeaderSize + 16;
+constexpr std::size_t kCombatItemCommandSize = kCommandHeaderSize + 20;
 constexpr std::size_t kCombatReloadCommandSize = kCommandHeaderSize + 16;
 constexpr std::size_t kCombatFaceCommandSize = kCommandHeaderSize + 12;
 constexpr std::size_t kSharedModalCommandSize = kCommandHeaderSize + 4;
 constexpr std::size_t kDialogueVoteCommandSize = kCommandHeaderSize + 12;
 constexpr std::size_t kDirectTradeCommandBaseSize = kCommandHeaderSize + 36;
-constexpr std::size_t kSkillCommandSize = kCommandHeaderSize + 8;
+constexpr std::size_t kSkillCommandSize = kCommandHeaderSize + 16;
 constexpr std::size_t kItemUseCommandSize = kCommandHeaderSize + 8;
 constexpr std::size_t kElevatorCommandSize = kCommandHeaderSize + 8;
 constexpr std::size_t kCommandResultSize = 24;
@@ -110,7 +117,7 @@ constexpr std::size_t kDirectTradeParticipantSize = 24;
 constexpr std::size_t kDirectTradeItemSize = 8;
 constexpr std::size_t kCapsDistributedEventBaseSize = kEventHeaderSize + 16;
 constexpr std::size_t kCapShareSize = 12;
-constexpr std::size_t kSkillEventSize = kEventHeaderSize + 12;
+constexpr std::size_t kSkillEventSize = kEventHeaderSize + 16;
 constexpr std::size_t kItemUseEventSize = kEventHeaderSize + 12;
 constexpr std::size_t kElevatorEventSize = kEventHeaderSize + 40;
 constexpr std::size_t kExitGridEventBaseSize = kEventHeaderSize + 20;
@@ -204,6 +211,28 @@ ItemDescriptor readItemDescriptor(const std::vector<std::uint8_t>& bytes, std::s
         readInt32(bytes, offset + 8),
         readInt32(bytes, offset + 12),
     };
+}
+
+void appendBarterOffer(std::vector<std::uint8_t>& bytes, const DirectTradeOffer& offer)
+{
+    appendUInt32(bytes, offer.caps);
+    appendUInt16(bytes, static_cast<std::uint16_t>(offer.items.size()));
+    for (const auto& item : offer.items) {
+        appendUInt32(bytes, item.itemId.value);
+        appendUInt32(bytes, item.quantity);
+    }
+}
+
+bool readBarterOffer(const std::vector<std::uint8_t>& bytes, std::size_t& offset, DirectTradeOffer& offer)
+{
+    if (offset + 6 > bytes.size()) return false;
+    offer.caps = readUInt32(bytes, offset);
+    auto count = readUInt16(bytes, offset + 4);
+    offset += 6;
+    if (count > kMaximumDirectTradeItemsPerPlayer || offset + count * 8 > bytes.size()) return false;
+    for (unsigned index = 0; index < count; ++index, offset += 8)
+        offer.items.push_back({ EntityId { readUInt32(bytes, offset) }, readUInt32(bytes, offset + 4) });
+    return isValidBarterOffer(offer);
 }
 
 bool isValidTradeOffer(const DirectTradeOffer& offer)
@@ -343,6 +372,8 @@ GameplayWireError validateCommand(const GameCommand& command)
             : GameplayWireError::InvalidRotation;
     }
     if (const auto* transfer = std::get_if<InventoryTransferCommand>(&command.payload)) {
+        if (command.expectedPhase != (transfer->turnRevision == 0 ? SessionPhase::Exploration : SessionPhase::Combat))
+            return GameplayWireError::InvalidPhase;
         if (!isValid(transfer->sourceId)
             || !isValid(transfer->destinationId)
             || transfer->sourceId == transfer->destinationId) {
@@ -395,11 +426,28 @@ GameplayWireError validateCommand(const GameCommand& command)
     if (const auto* item = std::get_if<CombatItemCommand>(&command.payload)) {
         return item->turnRevision != 0 && isValid(item->itemId)
                 && item->itemId != item->targetId
+                && isValidExplosiveTimerChoice(item->timerSeconds)
+                && (item->timerSeconds == 0 || !isValid(item->targetId))
             ? GameplayWireError::None : GameplayWireError::InvalidCombatTurn;
     }
     if (const auto* reload = std::get_if<CombatReloadCommand>(&command.payload)) {
         return reload->turnRevision != 0 && isValid(reload->weaponId)
                 && (reload->hitMode == 6 || reload->hitMode == 7)
+            ? GameplayWireError::None : GameplayWireError::InvalidCombatTurn;
+    }
+    if (const auto* start = std::get_if<StartCombatCommand>(&command.payload)) {
+        return command.expectedPhase == SessionPhase::Exploration && isValid(*start)
+            ? GameplayWireError::None : GameplayWireError::InvalidCombatTurn;
+    }
+    if (const auto* advance = std::get_if<CharacterAdvanceCommand>(&command.payload)) {
+        return command.expectedPhase == SessionPhase::Exploration && isValid(*advance)
+            ? GameplayWireError::None : GameplayWireError::InvalidCombatTurn;
+    }
+    if (const auto* inventory = std::get_if<InventoryActionCommand>(&command.payload)) {
+        bool combat = command.expectedPhase == SessionPhase::Combat;
+        return isValid(*inventory)
+            && ((combat && inventory->turnRevision != 0)
+                || (command.expectedPhase == SessionPhase::Exploration && inventory->turnRevision == 0))
             ? GameplayWireError::None : GameplayWireError::InvalidCombatTurn;
     }
     if (const auto* equipment = std::get_if<EquipmentCommand>(&command.payload)) {
@@ -418,6 +466,10 @@ GameplayWireError validateCommand(const GameCommand& command)
             ? GameplayWireError::None : GameplayWireError::InvalidCombatTurn;
     }
     if (const auto* modal = std::get_if<SharedModalCommand>(&command.payload)) {
+        if (modal->kind == SharedModalKind::Theft) {
+            return !modal->open && command.expectedPhase == SessionPhase::Exploration
+                ? GameplayWireError::None : GameplayWireError::InvalidModal;
+        }
         return isValid(modal->kind)
             ? GameplayWireError::None
             : GameplayWireError::InvalidModal;
@@ -428,6 +480,10 @@ GameplayWireError validateCommand(const GameCommand& command)
     if (const auto* vote = std::get_if<DialogueVoteCommand>(&command.payload)) {
         return vote->revision != 0 && vote->option < kMaximumDialogueOptions
             ? GameplayWireError::None : GameplayWireError::InvalidModal;
+    }
+    if (const auto* barter = std::get_if<NpcBarterCommand>(&command.payload)) {
+        return command.expectedPhase == SessionPhase::Dialogue && isValid(*barter)
+            ? GameplayWireError::None : GameplayWireError::InvalidTrade;
     }
     if (const auto* trade = std::get_if<DirectTradeCommand>(&command.payload)) {
         if (trade->action < DirectTradeAction::Begin
@@ -458,7 +514,11 @@ GameplayWireError validateCommand(const GameCommand& command)
         if (!isValid(skill->targetId)) {
             return GameplayWireError::InvalidEntityId;
         }
+        bool combat = command.expectedPhase == SessionPhase::Combat;
         return isValid(skill->skill)
+                && (skill->skill != ExplorationSkill::Sneak || skill->targetId == command.actorId)
+                && (combat ? skill->skill == ExplorationSkill::Sneak && skill->turnRevision != 0
+                    : command.expectedPhase == SessionPhase::Exploration && skill->turnRevision == 0)
             ? GameplayWireError::None
             : GameplayWireError::InvalidSkill;
     }
@@ -496,10 +556,16 @@ GameplayWireError validateCommand(const GameCommand& command)
     EntityId targetId;
     if (const auto* interact = std::get_if<InteractCommand>(&command.payload)) {
         targetId = interact->targetId;
+        if (command.expectedPhase != (interact->turnRevision == 0 ? SessionPhase::Exploration : SessionPhase::Combat))
+            return GameplayWireError::InvalidPhase;
     } else if (const auto* pickup = std::get_if<PickupCommand>(&command.payload)) {
         targetId = pickup->targetId;
+        if (command.expectedPhase != (pickup->turnRevision == 0 ? SessionPhase::Exploration : SessionPhase::Combat))
+            return GameplayWireError::InvalidPhase;
     } else if (const auto* loot = std::get_if<LootCommand>(&command.payload)) {
         targetId = loot->targetId;
+        if (command.expectedPhase != (loot->turnRevision == 0 ? SessionPhase::Exploration : SessionPhase::Combat))
+            return GameplayWireError::InvalidPhase;
     }
     return isValid(targetId) ? GameplayWireError::None : GameplayWireError::InvalidEntityId;
 }
@@ -556,6 +622,9 @@ GameplayWireError validateEvent(const GameEvent& event)
             }
         }
         return GameplayWireError::None;
+    }
+    if (const auto* start = std::get_if<CombatRequestedEvent>(&event.payload)) {
+        return isValid(start->actorId) ? GameplayWireError::None : GameplayWireError::InvalidEntityId;
     }
     if (const auto* equipment = std::get_if<EquipmentChangedEvent>(&event.payload)) {
         return isValid(equipment->actorId)
@@ -702,6 +771,7 @@ GameplayWireError validateEvent(const GameEvent& event)
             : GameplayWireError::InvalidQuantity;
     }
     if (const auto* modal = std::get_if<SharedModalStateChangedEvent>(&event.payload)) {
+        if (modal->kind == SharedModalKind::Theft && modal->open) return GameplayWireError::InvalidModal;
         if (!isValid(modal->actorId)
             || !isValid(modal->kind)
             || modal->phaseRevision == 0) {
@@ -737,6 +807,12 @@ GameplayWireError validateEvent(const GameEvent& event)
         }
         return GameplayWireError::None;
     }
+    if (const auto* feedback = std::get_if<PlayerFeedbackEvent>(&event.payload)) {
+        return isValid(feedback->actorId) && !feedback->text.empty()
+                && feedback->text.size() <= 512
+                && feedback->text.find('\0') == std::string::npos
+            ? GameplayWireError::None : GameplayWireError::InvalidModal;
+    }
     if (const auto* activity = std::get_if<SharedActivityPublishedEvent>(&event.payload)) {
         const SharedActivityEntry& entry = activity->entry;
         return isValid(activity->actorId) && entry.id != 0
@@ -745,6 +821,14 @@ GameplayWireError validateEvent(const GameEvent& event)
                 && !entry.sourceName.empty() && entry.sourceName.size() <= 32
                 && !entry.text.empty() && entry.text.size() <= 160
             ? GameplayWireError::None : GameplayWireError::InvalidModal;
+    }
+    if (const auto* barter = std::get_if<NpcBarterStateChangedEvent>(&event.payload)) {
+        const auto& state = barter->state;
+        return isValid(state.buyerId) && isValid(state.sellerId) && state.buyerId != state.sellerId
+            && state.revision != 0 && barter->phaseRevision != 0
+            && state.status >= NpcBarterStatus::Negotiating && state.status <= NpcBarterStatus::Cancelled
+            && isValidBarterOffer(state.buyerOffer) && isValidBarterOffer(state.sellerOffer)
+            ? GameplayWireError::None : GameplayWireError::InvalidTrade;
     }
     if (const auto* trade = std::get_if<DirectTradeStateChangedEvent>(&event.payload)) {
         if (!isValid(trade->actorId) || !isKnownPhase(trade->phase)
@@ -774,6 +858,7 @@ GameplayWireError validateEvent(const GameEvent& event)
             return GameplayWireError::InvalidEntityId;
         }
         return isValid(skill->skill)
+                && (!skill->inventoryOpened || skill->skill == ExplorationSkill::Steal)
             ? GameplayWireError::None
             : GameplayWireError::InvalidSkill;
     }
@@ -987,12 +1072,17 @@ GameplayWireError encodeGameCommand(const GameCommand& command, ProtocolEnvelope
     } else if (const auto* interact = std::get_if<InteractCommand>(&command.payload)) {
         appendCommandHeader(command, CommandType::UseDoor, envelope.payload);
         appendUInt32(envelope.payload, interact->targetId.value);
+        appendUInt64(envelope.payload, interact->turnRevision);
     } else if (const auto* pickup = std::get_if<PickupCommand>(&command.payload)) {
         appendCommandHeader(command, CommandType::Pickup, envelope.payload);
         appendUInt32(envelope.payload, pickup->targetId.value);
+        appendUInt64(envelope.payload, pickup->turnRevision);
     } else if (const auto* loot = std::get_if<LootCommand>(&command.payload)) {
         appendCommandHeader(command, CommandType::Loot, envelope.payload);
         appendUInt32(envelope.payload, loot->targetId.value);
+        appendUInt64(envelope.payload, loot->turnRevision);
+        envelope.payload.push_back(loot->targetChange ? 1 : 0);
+        envelope.payload.insert(envelope.payload.end(), 3, 0);
     } else if (const auto* transfer = std::get_if<InventoryTransferCommand>(&command.payload)) {
         appendCommandHeader(command, CommandType::InventoryTransfer, envelope.payload);
         appendUInt32(envelope.payload, transfer->sourceId.value);
@@ -1001,6 +1091,7 @@ GameplayWireError encodeGameCommand(const GameCommand& command, ProtocolEnvelope
         appendUInt32(envelope.payload, transfer->quantity);
         appendUInt32(envelope.payload, transfer->sourceQuantity);
         appendItemDescriptor(envelope.payload, transfer->itemDescriptor);
+        appendUInt64(envelope.payload, transfer->turnRevision);
     } else if (const auto* drop = std::get_if<ItemDropCommand>(&command.payload)) {
         appendCommandHeader(command, CommandType::ItemDrop, envelope.payload);
         appendUInt32(envelope.payload, drop->sourceId.value);
@@ -1020,6 +1111,13 @@ GameplayWireError encodeGameCommand(const GameCommand& command, ProtocolEnvelope
         appendCommandHeader(command, CommandType::DialogueVote, envelope.payload);
         appendUInt64(envelope.payload, vote->revision);
         appendUInt32(envelope.payload, vote->option);
+    } else if (const auto* barter = std::get_if<NpcBarterCommand>(&command.payload)) {
+        appendCommandHeader(command, CommandType::NpcBarter, envelope.payload);
+        envelope.payload.push_back(static_cast<std::uint8_t>(barter->action));
+        appendUInt32(envelope.payload, barter->sellerId.value);
+        appendUInt64(envelope.payload, barter->revision);
+        appendBarterOffer(envelope.payload, barter->buyerOffer);
+        appendBarterOffer(envelope.payload, barter->sellerOffer);
     } else if (const auto* trade = std::get_if<DirectTradeCommand>(&command.payload)) {
         appendCommandHeader(command, CommandType::DirectTrade, envelope.payload);
         envelope.payload.push_back(static_cast<std::uint8_t>(trade->action));
@@ -1046,6 +1144,7 @@ GameplayWireError encodeGameCommand(const GameCommand& command, ProtocolEnvelope
         appendCommandHeader(command, CommandType::UseSkill, envelope.payload);
         appendUInt32(envelope.payload, skill->targetId.value);
         appendInt32(envelope.payload, static_cast<std::int32_t>(skill->skill));
+        appendUInt64(envelope.payload, skill->turnRevision);
     } else if (const auto* itemUse = std::get_if<UseItemOnCommand>(&command.payload)) {
         appendCommandHeader(command, CommandType::UseItemOn, envelope.payload);
         appendUInt32(envelope.payload, itemUse->itemId.value);
@@ -1077,11 +1176,33 @@ GameplayWireError encodeGameCommand(const GameCommand& command, ProtocolEnvelope
         appendUInt64(envelope.payload, item->turnRevision);
         appendUInt32(envelope.payload, item->itemId.value);
         appendUInt32(envelope.payload, item->targetId.value);
+        appendInt32(envelope.payload, item->timerSeconds);
     } else if (const auto* reload = std::get_if<CombatReloadCommand>(&command.payload)) {
         appendCommandHeader(command, CommandType::CombatReload, envelope.payload);
         appendUInt64(envelope.payload, reload->turnRevision);
         appendUInt32(envelope.payload, reload->weaponId.value);
         appendInt32(envelope.payload, reload->hitMode);
+    } else if (const auto* start = std::get_if<StartCombatCommand>(&command.payload)) {
+        appendCommandHeader(command, CommandType::StartCombat, envelope.payload);
+        appendUInt32(envelope.payload, start->targetId.value);
+        appendInt32(envelope.payload, start->hitMode);
+        appendInt32(envelope.payload, start->hitLocation);
+    } else if (const auto* advance = std::get_if<CharacterAdvanceCommand>(&command.payload)) {
+        appendCommandHeader(command, CommandType::CharacterAdvance, envelope.payload);
+        appendUInt64(envelope.payload, advance->expectedBuild);
+        for (int count : advance->skillIncrements) appendInt32(envelope.payload, count);
+        appendInt32(envelope.payload, advance->perk);
+        appendInt32(envelope.payload, advance->taggedSkill);
+        appendInt32(envelope.payload, advance->removedTrait);
+        appendInt32(envelope.payload, advance->addedTrait);
+    } else if (const auto* inventory = std::get_if<InventoryActionCommand>(&command.payload)) {
+        appendCommandHeader(command, CommandType::InventoryAction, envelope.payload);
+        appendUInt64(envelope.payload, inventory->turnRevision);
+        appendUInt32(envelope.payload, inventory->itemId.value);
+        appendInt32(envelope.payload, static_cast<std::int32_t>(inventory->action));
+        appendUInt32(envelope.payload, inventory->ammoId.value);
+        appendUInt32(envelope.payload, inventory->quantity);
+        appendInt32(envelope.payload, inventory->timerSeconds);
     } else if (const auto* equipment = std::get_if<EquipmentCommand>(&command.payload)) {
         appendCommandHeader(command, CommandType::Equipment, envelope.payload);
         appendUInt64(envelope.payload, equipment->turnRevision);
@@ -1162,17 +1283,20 @@ GameCommandDecodeResult decodeGameCommand(const ProtocolEnvelope& envelope)
     case CommandType::UseDoor:
     case CommandType::Pickup:
     case CommandType::Loot: {
-        if (envelope.payload.size() != kTargetCommandSize) {
+        if (envelope.payload.size() != kTargetCommandSize + 8 + (type == CommandType::Loot ? 4 : 0)) {
             result.error = GameplayWireError::InvalidLength;
             return result;
         }
         EntityId targetId { readUInt32(envelope.payload, 28) };
         if (type == CommandType::UseDoor) {
-            result.command.payload = InteractCommand { targetId };
+            result.command.payload = InteractCommand { targetId, readUInt64(envelope.payload, 32) };
         } else if (type == CommandType::Pickup) {
-            result.command.payload = PickupCommand { targetId };
+            result.command.payload = PickupCommand { targetId, readUInt64(envelope.payload, 32) };
         } else {
-            result.command.payload = LootCommand { targetId };
+            if (envelope.payload[40] > 1 || envelope.payload[41] != 0
+                || envelope.payload[42] != 0 || envelope.payload[43] != 0)
+                return { GameplayWireError::InvalidReservedField, {} };
+            result.command.payload = LootCommand { targetId, readUInt64(envelope.payload, 32), envelope.payload[40] != 0 };
         }
         break;
     }
@@ -1188,8 +1312,22 @@ GameCommandDecodeResult decodeGameCommand(const ProtocolEnvelope& envelope)
             readUInt32(envelope.payload, 40),
             readUInt32(envelope.payload, 44),
             readItemDescriptor(envelope.payload, 48),
+            readUInt64(envelope.payload, 64),
         };
         break;
+    case CommandType::NpcBarter: {
+        if (envelope.payload.size() < kCommandHeaderSize + 25) return { GameplayWireError::InvalidLength, {} };
+        NpcBarterCommand barter;
+        barter.action = static_cast<NpcBarterAction>(envelope.payload[kCommandHeaderSize]);
+        barter.sellerId = EntityId { readUInt32(envelope.payload, kCommandHeaderSize + 1) };
+        barter.revision = readUInt64(envelope.payload, kCommandHeaderSize + 5);
+        std::size_t offset = kCommandHeaderSize + 13;
+        if (!readBarterOffer(envelope.payload, offset, barter.buyerOffer)
+            || !readBarterOffer(envelope.payload, offset, barter.sellerOffer)
+            || offset != envelope.payload.size()) return { GameplayWireError::InvalidLength, {} };
+        result.command.payload = std::move(barter);
+        break;
+    }
     case CommandType::DirectTrade: {
         if (envelope.payload.size() < kDirectTradeCommandBaseSize
             || envelope.payload[29] != 0 || envelope.payload[30] != 0
@@ -1276,7 +1414,7 @@ GameCommandDecodeResult decodeGameCommand(const ProtocolEnvelope& envelope)
         }
         result.command.payload = CombatItemCommand {
             readUInt64(envelope.payload, 28), EntityId { readUInt32(envelope.payload, 36) },
-            EntityId { readUInt32(envelope.payload, 40) },
+            EntityId { readUInt32(envelope.payload, 40) }, readInt32(envelope.payload, 44),
         };
         break;
     case CommandType::CombatReload:
@@ -1287,6 +1425,43 @@ GameCommandDecodeResult decodeGameCommand(const ProtocolEnvelope& envelope)
         result.command.payload = CombatReloadCommand {
             readUInt64(envelope.payload, 28), EntityId { readUInt32(envelope.payload, 36) },
             readInt32(envelope.payload, 40),
+        };
+        break;
+    case CommandType::StartCombat:
+        if (envelope.payload.size() != kCommandHeaderSize + 12) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.command.payload = StartCombatCommand { EntityId { readUInt32(envelope.payload, 28) },
+            readInt32(envelope.payload, 32), readInt32(envelope.payload, 36) };
+        break;
+    case CommandType::CharacterAdvance: {
+        if (envelope.payload.size() != kCommandHeaderSize + 24 + SKILL_COUNT * 4) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        CharacterAdvanceCommand advance;
+        advance.expectedBuild = readUInt64(envelope.payload, 28);
+        for (int skill = 0; skill < SKILL_COUNT; ++skill) {
+            advance.skillIncrements[skill] = readInt32(envelope.payload, 36 + skill * 4);
+        }
+        std::size_t offset = 36 + SKILL_COUNT * 4;
+        advance.perk = readInt32(envelope.payload, offset);
+        advance.taggedSkill = readInt32(envelope.payload, offset + 4);
+        advance.removedTrait = readInt32(envelope.payload, offset + 8);
+        advance.addedTrait = readInt32(envelope.payload, offset + 12);
+        result.command.payload = advance;
+        break;
+    }
+    case CommandType::InventoryAction:
+        if (envelope.payload.size() != kCommandHeaderSize + 28) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.command.payload = InventoryActionCommand {
+            readUInt64(envelope.payload, 28), EntityId { readUInt32(envelope.payload, 36) },
+            static_cast<InventoryAction>(readInt32(envelope.payload, 40)),
+            EntityId { readUInt32(envelope.payload, 44) }, readUInt32(envelope.payload, 48), readInt32(envelope.payload, 52),
         };
         break;
     case CommandType::Equipment:
@@ -1366,6 +1541,7 @@ GameCommandDecodeResult decodeGameCommand(const ProtocolEnvelope& envelope)
         result.command.payload = UseSkillCommand {
             EntityId { readUInt32(envelope.payload, 28) },
             static_cast<ExplorationSkill>(readInt32(envelope.payload, 32)),
+            readUInt64(envelope.payload, 36),
         };
         break;
     case CommandType::UseItemOn:
@@ -1492,6 +1668,9 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
         envelope.payload.push_back(0);
         appendUInt16(envelope.payload, static_cast<std::uint16_t>(movement->path.size()));
         envelope.payload.insert(envelope.payload.end(), movement->path.begin(), movement->path.end());
+    } else if (const auto* start = std::get_if<CombatRequestedEvent>(&event.payload)) {
+        appendEventHeader(event, EventType::CombatRequested, envelope.payload);
+        appendUInt32(envelope.payload, start->actorId.value);
     } else if (const auto* equipment = std::get_if<EquipmentChangedEvent>(&event.payload)) {
         appendEventHeader(event, EventType::EquipmentChanged, envelope.payload);
         appendUInt32(envelope.payload, equipment->actorId.value);
@@ -1523,6 +1702,7 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
         appendEventHeader(event, EventType::LootStarted, envelope.payload);
         appendUInt32(envelope.payload, loot->actorId.value);
         appendUInt32(envelope.payload, loot->targetId.value);
+        appendUInt64(envelope.payload, loot->turnRevision);
     } else if (const auto* transfer = std::get_if<InventoryTransferredEvent>(&event.payload)) {
         appendEventHeader(event, EventType::InventoryTransferred, envelope.payload);
         appendUInt32(envelope.payload, transfer->actorId.value);
@@ -1546,6 +1726,18 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
             appendUInt32(envelope.payload, share.actorId.value);
             appendUInt32(envelope.payload, share.caps);
         }
+    } else if (const auto* barter = std::get_if<NpcBarterStateChangedEvent>(&event.payload)) {
+        appendEventHeader(event, EventType::NpcBarter, envelope.payload);
+        const auto& state = barter->state;
+        appendUInt32(envelope.payload, state.buyerId.value);
+        appendUInt32(envelope.payload, state.sellerId.value);
+        appendUInt64(envelope.payload, state.revision);
+        envelope.payload.push_back(static_cast<std::uint8_t>(state.status));
+        appendUInt32(envelope.payload, state.offeredValue);
+        appendUInt32(envelope.payload, state.askingValue);
+        appendUInt32(envelope.payload, barter->phaseRevision);
+        appendBarterOffer(envelope.payload, state.buyerOffer);
+        appendBarterOffer(envelope.payload, state.sellerOffer);
     } else if (const auto* trade = std::get_if<DirectTradeStateChangedEvent>(&event.payload)) {
         appendEventHeader(event, EventType::DirectTradeStateChanged,
             envelope.payload);
@@ -1616,6 +1808,11 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
             appendUInt16(envelope.payload, static_cast<std::uint16_t>(option.size()));
             envelope.payload.insert(envelope.payload.end(), option.begin(), option.end());
         }
+    } else if (const auto* feedback = std::get_if<PlayerFeedbackEvent>(&event.payload)) {
+        appendEventHeader(event, EventType::PlayerFeedback, envelope.payload);
+        appendUInt32(envelope.payload, feedback->actorId.value);
+        appendUInt16(envelope.payload, static_cast<std::uint16_t>(feedback->text.size()));
+        envelope.payload.insert(envelope.payload.end(), feedback->text.begin(), feedback->text.end());
     } else if (const auto* activity = std::get_if<SharedActivityPublishedEvent>(&event.payload)) {
         appendEventHeader(event, EventType::SharedActivityPublished, envelope.payload);
         appendUInt32(envelope.payload, activity->actorId.value);
@@ -1640,6 +1837,8 @@ GameplayWireError encodeGameEvent(const GameEvent& event, ProtocolEnvelope& enve
         appendUInt32(envelope.payload, skill->actorId.value);
         appendUInt32(envelope.payload, skill->targetId.value);
         appendInt32(envelope.payload, static_cast<std::int32_t>(skill->skill));
+        envelope.payload.push_back(skill->inventoryOpened ? 1 : 0);
+        envelope.payload.insert(envelope.payload.end(), 3, 0);
     } else if (const auto* itemUse = std::get_if<ItemUseStartedEvent>(&event.payload)) {
         appendEventHeader(event, EventType::ItemUseStarted, envelope.payload);
         appendUInt32(envelope.payload, itemUse->actorId.value);
@@ -1807,6 +2006,13 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
             };
         }
         break;
+    case EventType::CombatRequested:
+        if (envelope.payload.size() != kEventHeaderSize + 4) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        result.event.payload = CombatRequestedEvent { EntityId { readUInt32(envelope.payload, 20) } };
+        break;
     case EventType::EquipmentChanged:
         if (envelope.payload.size() != kEventHeaderSize + 4) {
             result.error = GameplayWireError::InvalidLength;
@@ -1844,7 +2050,7 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
     }
     case EventType::ItemPickupStarted:
     case EventType::LootStarted: {
-        if (envelope.payload.size() != kTargetEventSize) {
+        if (envelope.payload.size() != kTargetEventSize + (type == EventType::LootStarted ? 8 : 0)) {
             result.error = GameplayWireError::InvalidLength;
             return result;
         }
@@ -1853,7 +2059,7 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
         if (type == EventType::ItemPickupStarted) {
             result.event.payload = ItemPickupStartedEvent { actorId, targetId };
         } else {
-            result.event.payload = LootStartedEvent { actorId, targetId };
+            result.event.payload = LootStartedEvent { actorId, targetId, readUInt64(envelope.payload, 28) };
         }
         break;
     }
@@ -1918,6 +2124,25 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
             offset += kCapShareSize;
         }
         result.event.payload = std::move(distribution);
+        break;
+    }
+    case EventType::NpcBarter: {
+        if (envelope.payload.size() < kEventHeaderSize + 41) return { GameplayWireError::InvalidLength, {} };
+        NpcBarterStateChangedEvent barter;
+        auto& state = barter.state;
+        std::size_t offset = kEventHeaderSize;
+        state.buyerId = EntityId { readUInt32(envelope.payload, offset) };
+        state.sellerId = EntityId { readUInt32(envelope.payload, offset + 4) };
+        state.revision = readUInt64(envelope.payload, offset + 8);
+        state.status = static_cast<NpcBarterStatus>(envelope.payload[offset + 16]);
+        state.offeredValue = readUInt32(envelope.payload, offset + 17);
+        state.askingValue = readUInt32(envelope.payload, offset + 21);
+        barter.phaseRevision = readUInt32(envelope.payload, offset + 25);
+        offset += 29;
+        if (!readBarterOffer(envelope.payload, offset, state.buyerOffer)
+            || !readBarterOffer(envelope.payload, offset, state.sellerOffer)
+            || offset != envelope.payload.size()) return { GameplayWireError::InvalidLength, {} };
+        result.event.payload = std::move(barter);
         break;
     }
     case EventType::DirectTradeStateChanged: {
@@ -2119,10 +2344,16 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
             result.error = GameplayWireError::InvalidLength;
             return result;
         }
+        if (envelope.payload[32] > 1 || envelope.payload[33] != 0
+            || envelope.payload[34] != 0 || envelope.payload[35] != 0) {
+            result.error = GameplayWireError::InvalidSkill;
+            return result;
+        }
         result.event.payload = SkillUseStartedEvent {
             EntityId { readUInt32(envelope.payload, 20) },
             EntityId { readUInt32(envelope.payload, 24) },
             static_cast<ExplorationSkill>(readInt32(envelope.payload, 28)),
+            envelope.payload[32] != 0,
         };
         break;
     case EventType::ItemUseStarted:
@@ -2347,6 +2578,18 @@ GameEventDecodeResult decodeGameEvent(const ProtocolEnvelope& envelope)
             return result;
         }
         result.event.payload = std::move(presentation);
+        break;
+    }
+    case EventType::PlayerFeedback: {
+        if (envelope.payload.size() < 26
+            || envelope.payload.size() != 26 + readUInt16(envelope.payload, 24)) {
+            result.error = GameplayWireError::InvalidLength;
+            return result;
+        }
+        PlayerFeedbackEvent feedback;
+        feedback.actorId.value = readUInt32(envelope.payload, 20);
+        feedback.text.assign(envelope.payload.begin() + 26, envelope.payload.end());
+        result.event.payload = std::move(feedback);
         break;
     }
     case EventType::SharedActivityPublished: {

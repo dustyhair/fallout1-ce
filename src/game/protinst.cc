@@ -477,6 +477,8 @@ int obj_examine_func(Object* critter, Object* target, void (*fn)(char* string))
 // 0x48AA3C
 int obj_pickup(Object* critter, Object* item)
 {
+    multiplayer::ScopedPlayerFeedback feedback(critter);
+    multiplayer::ScopedActorPlayerContext playerContext(critter);
     multiplayer::ScopedLocalPlayerBinding localPlayerBinding(critter);
     std::optional<multiplayer::ScopedLocalPlayerContext> localPlayerContext;
     if (localPlayerBinding) {
@@ -697,6 +699,7 @@ static int obj_use_book(Object* critter, Object* book)
 {
     MessageListItem messageListItem;
     bool shouldPresent = multiplayer::isPresentedPlayerActor(critter);
+    bool shouldPrint = shouldPresent || multiplayer::networkWorldCapturingPlayerFeedback(critter);
 
     int messageId = -1;
     int skill;
@@ -736,7 +739,7 @@ static int obj_use_book(Object* critter, Object* book)
     if (isInCombat()) {
         // You cannot do that in combat.
         messageListItem.num = 902;
-        if (shouldPresent && message_search(&proto_main_msg_file, &messageListItem)) {
+        if (shouldPrint && message_search(&proto_main_msg_file, &messageListItem)) {
             display_print(messageListItem.text);
         }
 
@@ -769,12 +772,12 @@ static int obj_use_book(Object* critter, Object* book)
 
     // You read the book.
     messageListItem.num = 800;
-    if (shouldPresent && message_search(&proto_main_msg_file, &messageListItem)) {
+    if (shouldPrint && message_search(&proto_main_msg_file, &messageListItem)) {
         display_print(messageListItem.text);
     }
 
     messageListItem.num = messageId;
-    if (shouldPresent && message_search(&proto_main_msg_file, &messageListItem)) {
+    if (shouldPrint && message_search(&proto_main_msg_file, &messageListItem)) {
         display_print(messageListItem.text);
     }
 
@@ -787,7 +790,8 @@ static int obj_use_book(Object* critter, Object* book)
 static int obj_use_flare(Object* critter_obj, Object* flare)
 {
     MessageListItem messageListItem;
-    bool shouldPresent = multiplayer::isPresentedPlayerActor(critter_obj);
+    bool shouldPresent = multiplayer::isPresentedPlayerActor(critter_obj)
+        || multiplayer::networkWorldCapturingPlayerFeedback(critter_obj);
 
     if (flare->pid != PROTO_ID_FLARE) {
         return -1;
@@ -800,6 +804,13 @@ static int obj_use_flare(Object* critter_obj, Object* flare)
             display_print(messageListItem.text);
         }
     } else {
+        // The native inventory detaches one item before use. Target-use actions
+        // can still point at a stack representative, so isolate one flare
+        // before changing its PID and starting its burnout timer.
+        Object* holder = flare->owner;
+        int equippedFlags = flare->flags & OBJECT_EQUIPPED;
+        bool splitStack = holder != nullptr && item_count(holder, flare) > 1;
+        if (splitStack && item_remove_mult(holder, flare, 1) != 0) return -1;
         // You light the flare.
         messageListItem.num = 587;
         if (shouldPresent && message_search(&proto_main_msg_file, &messageListItem)) {
@@ -807,6 +818,11 @@ static int obj_use_flare(Object* critter_obj, Object* flare)
         }
 
         flare->pid = PROTO_ID_LIT_FLARE;
+
+        if (splitStack) {
+            flare->flags |= equippedFlags;
+            if (item_add_force(holder, flare, 1) != 0) return -1;
+        }
 
         obj_set_light(flare, 8, 0x10000, NULL);
         queue_add(72000, flare, NULL, EVENT_TYPE_FLARE);
@@ -835,69 +851,96 @@ int obj_use_radio(Object* critter, Object* item)
     return 0;
 }
 
-// 0x48B01C
-static int obj_use_explosive(Object* critter, Object* explosive)
+bool obj_is_explosive(const Object* item)
 {
-    MessageListItem messageListItem;
-    bool shouldPresent = multiplayer::isPresentedPlayerActor(critter);
+    return item != nullptr && (item->pid == PROTO_ID_DYNAMITE_I
+        || item->pid == PROTO_ID_PLASTIC_EXPLOSIVES_I
+        || item->pid == PROTO_ID_DYNAMITE_II
+        || item->pid == PROTO_ID_PLASTIC_EXPLOSIVES_II);
+}
 
-    int pid = explosive->pid;
-    if (pid != PROTO_ID_DYNAMITE_I
-        && pid != PROTO_ID_PLASTIC_EXPLOSIVES_I
-        && pid != PROTO_ID_DYNAMITE_II
-        && pid != PROTO_ID_PLASTIC_EXPLOSIVES_II) {
+int obj_arm_explosive(Object* critter, Object* explosive, int seconds)
+{
+    if (critter == nullptr || !obj_is_explosive(explosive)
+        || seconds < 10 || seconds > 180 || seconds % 10 != 0
+        || (explosive->flags & OBJECT_USED) != 0
+        || (explosive->pid != PROTO_ID_DYNAMITE_I && explosive->pid != PROTO_ID_PLASTIC_EXPLOSIVES_I)) return -1;
+    Object* holder = explosive->owner;
+    int equipped = explosive->flags & OBJECT_EQUIPPED;
+    bool split = holder != nullptr && item_count(holder, explosive) > 1;
+    if (split && item_remove_mult(holder, explosive, 1) != 0) return -1;
+    if (split && equipped != 0) {
+        // Native splitting leaves the hand flags on the remainder. Move those
+        // flags to the one armed item so the actor never equips two stacks.
+        for (int i = 0; i < holder->data.inventory.length; ++i)
+            holder->data.inventory.items[i].item->flags &= ~equipped;
+    }
+    int originalPid = explosive->pid;
+    explosive->pid = originalPid == PROTO_ID_DYNAMITE_I ? PROTO_ID_DYNAMITE_II : PROTO_ID_PLASTIC_EXPLOSIVES_II;
+    int delay = seconds * 10;
+    int roll = skill_result(critter, SKILL_TRAPS, 0, nullptr);
+    int eventType = EVENT_TYPE_EXPLOSION;
+    if (roll == ROLL_CRITICAL_FAILURE) {
+        delay = 0;
+        eventType = EVENT_TYPE_EXPLOSION_FAILURE;
+    } else if (roll == ROLL_FAILURE) {
+        delay /= 2;
+        eventType = EVENT_TYPE_EXPLOSION_FAILURE;
+    }
+    // Queue first: OBJECT_USED prevents an armed item merging with another
+    // stack and losing the object bound to its countdown.
+    auto playerId = multiplayer::networkWorldCombatOwner(critter);
+    int queued = multiplayer::networkWorldActive() && playerId.has_value()
+        ? queue_add_player_explosion(delay, explosive, static_cast<int>(playerId->value), eventType == EVENT_TYPE_EXPLOSION_FAILURE)
+        : queue_add(delay, explosive, nullptr, eventType);
+    if (queued != 0) {
+        explosive->pid = originalPid;
+        if (split) {
+            explosive->flags |= equipped;
+            item_add_force(holder, explosive, 1);
+        }
         return -1;
     }
-
-    if ((explosive->flags & OBJECT_USED) != 0) {
-        // The timer is already ticking.
-        messageListItem.num = 590;
-        if (shouldPresent && message_search(&proto_main_msg_file, &messageListItem)) {
-            display_print(messageListItem.text);
-        }
-    } else {
-        int seconds = inven_set_timer(explosive);
-        if (seconds != -1) {
-            // You set the timer.
-            messageListItem.num = 589;
-            if (shouldPresent && message_search(&proto_main_msg_file, &messageListItem)) {
-                display_print(messageListItem.text);
-            }
-
-            if (pid == PROTO_ID_DYNAMITE_I) {
-                explosive->pid = PROTO_ID_DYNAMITE_II;
-            } else if (pid == PROTO_ID_PLASTIC_EXPLOSIVES_I) {
-                explosive->pid = PROTO_ID_PLASTIC_EXPLOSIVES_II;
-            }
-
-            int delay = 10 * seconds;
-            int roll = skill_result(critter, SKILL_TRAPS, 0, NULL);
-
-            int eventType;
-            switch (roll) {
-            case ROLL_CRITICAL_FAILURE:
-                delay = 0;
-                eventType = EVENT_TYPE_EXPLOSION_FAILURE;
-                break;
-            case ROLL_FAILURE:
-                eventType = EVENT_TYPE_EXPLOSION_FAILURE;
-                delay /= 2;
-                break;
-            default:
-                eventType = EVENT_TYPE_EXPLOSION;
-                break;
-            }
-
-            queue_add(delay, explosive, NULL, eventType);
+    if (split) {
+        explosive->flags |= equipped;
+        if (item_add_force(holder, explosive, 1) != 0) {
+            queue_remove(explosive);
+            explosive->pid = originalPid;
+            explosive->flags &= ~OBJECT_USED;
+            item_add_force(holder, explosive, 1);
+            return -1;
         }
     }
-
+    MessageListItem messageListItem;
+    messageListItem.num = 589;
+    if ((multiplayer::isPresentedPlayerActor(critter) || multiplayer::networkWorldCapturingPlayerFeedback(critter))
+        && message_search(&proto_main_msg_file, &messageListItem)) display_print(messageListItem.text);
     return 0;
 }
 
-// 0x49BF38
+// 0x48B01C
+static int obj_use_explosive(Object* critter, Object* explosive)
+{
+    if (!obj_is_explosive(explosive)) return -1;
+    if ((explosive->flags & OBJECT_USED) != 0) {
+        MessageListItem messageListItem;
+        messageListItem.num = 590;
+        if ((multiplayer::isPresentedPlayerActor(critter) || multiplayer::networkWorldCapturingPlayerFeedback(critter))
+            && message_search(&proto_main_msg_file, &messageListItem)) display_print(messageListItem.text);
+        return 0;
+    }
+    // A network command must carry its player's choice. Never open a timer
+    // picker on the physical host while executing a guest command.
+    if (multiplayer::networkWorldActive()) return -1;
+    int seconds = inven_set_timer(explosive);
+    return seconds == -1 ? 0 : obj_arm_explosive(critter, explosive, seconds);
+}
+
+// 0x48B1DC
 int protinst_use_item(Object* critter, Object* item)
 {
+    multiplayer::ScopedPlayerFeedback feedback(critter);
+    multiplayer::ScopedActorPlayerContext playerContext(critter);
     int rc;
     MessageListItem messageListItem;
 
@@ -937,7 +980,8 @@ int protinst_use_item(Object* critter, Object* item)
     default:
         // That does nothing
         messageListItem.num = 582;
-        if (multiplayer::isPresentedPlayerActor(critter) && message_search(&proto_main_msg_file, &messageListItem)) {
+        if ((multiplayer::isPresentedPlayerActor(critter) || multiplayer::networkWorldCapturingPlayerFeedback(critter))
+            && message_search(&proto_main_msg_file, &messageListItem)) {
             display_print(messageListItem.text);
         }
 
@@ -971,7 +1015,7 @@ static int protinst_default_use_item(Object* a1, Object* a2, Object* item)
     switch (item_get_type(item)) {
     case ITEM_TYPE_DRUG:
         if (PID_TYPE(a2->pid) != OBJ_TYPE_CRITTER) {
-            if (multiplayer::isPresentedPlayerActor(a1)) {
+            if (multiplayer::isPresentedPlayerActor(a1) || multiplayer::networkWorldCapturingPlayerFeedback(a1)) {
                 // That does nothing
                 messageListItem.num = 582;
                 if (message_search(&proto_main_msg_file, &messageListItem)) {
@@ -995,7 +1039,7 @@ static int protinst_default_use_item(Object* a1, Object* a2, Object* item)
 
         rc = item_d_take_drug(a2, item);
 
-        if (multiplayer::isPresentedPlayerActor(a1) && a2 != a1) {
+        if ((multiplayer::isPresentedPlayerActor(a1) || multiplayer::networkWorldCapturingPlayerFeedback(a1)) && a2 != a1) {
             // TODO: Looks like there is bug in this branch, message 580 will never be shown,
             // as we can only be here when target is not dude.
 
@@ -1026,7 +1070,7 @@ static int protinst_default_use_item(Object* a1, Object* a2, Object* item)
 
     messageListItem.num = 582;
     if (message_search(&proto_main_msg_file, &messageListItem)) {
-        snprintf(formattedText, sizeof(formattedText), messageListItem.text);
+        snprintf(formattedText, sizeof(formattedText), "%s", messageListItem.text);
         display_print(formattedText);
     }
     return -1;
@@ -1035,6 +1079,8 @@ static int protinst_default_use_item(Object* a1, Object* a2, Object* item)
 // 0x48B394
 int protinst_use_item_on(Object* a1, Object* a2, Object* item)
 {
+    multiplayer::ScopedPlayerFeedback feedback(a1);
+    multiplayer::ScopedActorPlayerContext playerContext(a1);
     int messageId = -1;
     int criticalChanceModifier = 0;
     int skill = -1;
@@ -1107,7 +1153,7 @@ int protinst_use_item_on(Object* a1, Object* a2, Object* item)
         MessageListItem messageListItem;
         // You cannot do that in combat.
         messageListItem.num = 902;
-        if (multiplayer::isPresentedPlayerActor(a1)) {
+        if (multiplayer::isPresentedPlayerActor(a1) || multiplayer::networkWorldCapturingPlayerFeedback(a1)) {
             if (message_search(&proto_main_msg_file, &messageListItem)) {
                 display_print(messageListItem.text);
             }
@@ -1125,7 +1171,7 @@ int protinst_use_item_on(Object* a1, Object* a2, Object* item)
 
     MessageListItem messageListItem;
     messageListItem.num = messageId;
-    if (multiplayer::isPresentedPlayerActor(a1)) {
+    if (multiplayer::isPresentedPlayerActor(a1) || multiplayer::networkWorldCapturingPlayerFeedback(a1)) {
         if (message_search(&proto_main_msg_file, &messageListItem)) {
             display_print(messageListItem.text);
         }
@@ -1499,13 +1545,15 @@ int obj_use_container(Object* critter, Object* item)
 }
 
 // 0x48BD4C
-int obj_use_skill_on(Object* source, Object* target, int skill)
+int obj_use_skill_script(Object* source, Object* target, int skill)
 {
+    multiplayer::ScopedActorPlayerContext playerContext(source);
+    multiplayer::ScopedPlayerFeedback feedback(source);
     int sid = -1;
     bool scriptOverrides = false;
 
     if (obj_lock_is_jammed(target)) {
-        if (multiplayer::isPresentedPlayerActor(source)) {
+        if (source == obj_dude || multiplayer::isActingPlayerActor(source)) {
             MessageListItem messageListItem;
             messageListItem.num = 2001;
             if (message_search(&misc_message_file, &messageListItem)) {
@@ -1523,7 +1571,7 @@ int obj_use_skill_on(Object* source, Object* target, int skill)
     if (obj_sid(target, &sid) != -1) {
         scr_set_objs(sid, source, target);
         scr_set_action_num(sid, skill);
-        exec_script_proc(sid, SCRIPT_PROC_USE_SKILL_ON);
+        if (exec_script_proc(sid, SCRIPT_PROC_USE_SKILL_ON) == -1) return -1;
 
         Script* script;
         if (scr_ptr(sid, &script) == -1) {
@@ -1533,10 +1581,16 @@ int obj_use_skill_on(Object* source, Object* target, int skill)
         scriptOverrides = script->scriptOverrides;
     }
 
-    if (!scriptOverrides) {
-        skill_use(source, target, skill, 0);
-    }
+    return scriptOverrides ? 1 : 0;
+}
 
+int obj_use_skill_on(Object* source, Object* target, int skill)
+{
+    multiplayer::ScopedActorPlayerContext playerContext(source);
+    multiplayer::ScopedPlayerFeedback feedback(source);
+    int result = obj_use_skill_script(source, target, skill);
+    if (result == -1) return -1;
+    if (result == 0) skill_use(source, target, skill, 0);
     return 0;
 }
 

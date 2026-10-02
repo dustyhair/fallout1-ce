@@ -40,6 +40,7 @@
 #include "game/stat.h"
 #include "game/tile.h"
 #include "game/worldmap_walkmask.h"
+#include "multiplayer/local_player_context.h"
 #include "multiplayer/network_runtime.h"
 #include "multiplayer/network_world.h"
 #include "platform_compat.h"
@@ -1039,6 +1040,12 @@ bool worldmap_apply_travel_progress(const WorldMapTravelProgress& progress)
     return true;
 }
 
+static Object* worldmap_travel_actor()
+{
+    Object* controller = multiplayer::networkWorldWorldMapControllerActor();
+    return controller != nullptr ? controller : obj_dude;
+}
+
 bool worldmap_authoritative_travel_begin(int targetX, int targetY)
 {
     if (multiplayer::networkRuntimeMode() != multiplayer::NetworkLaunchMode::Host
@@ -1082,6 +1089,9 @@ WorldMapTravelStepResult worldmap_authoritative_travel_step()
         return result;
     }
 
+    Object* travelActor = worldmap_travel_actor();
+    multiplayer::ScopedActorPlayerContext playerContext(travelActor);
+
     auto finish = [&](WorldMapTravelStepStatus status) {
         result.status = status;
         result.x = world_xpos;
@@ -1092,6 +1102,10 @@ WorldMapTravelStepResult worldmap_authoritative_travel_step()
         }
         return result;
     };
+
+    if (multiplayer::networkWorldPartyDefeated()) {
+        return finish(WorldMapTravelStepStatus::QueueInterrupted);
+    }
 
     if (world_xpos == target_xpos && world_ypos == target_ypos) {
         return finish(WorldMapTravelStepStatus::Arrived);
@@ -1149,7 +1163,8 @@ WorldMapTravelStepResult worldmap_authoritative_travel_step()
             }
             int dueTime = queue_next_time();
             if (dueTime > game_time()) set_game_time(dueTime);
-            if (queue_process() != 0 || game_user_wants_to_quit != 0) {
+            if (queue_process() != 0 || game_user_wants_to_quit != 0
+                || multiplayer::networkWorldPartyDefeated()) {
                 return finish(WorldMapTravelStepStatus::QueueInterrupted);
             }
             if (game_time() > endTime) {
@@ -1176,7 +1191,7 @@ WorldMapTravelStepResult worldmap_authoritative_travel_step()
             && roll < encounterThresholds[WorldEcountChanceTable[world_ypos / 50][world_xpos / 50]]) {
             for (int attempt = 0; attempt < 128 && encounter_specials != 63; attempt++) {
                 int specialRoll = roll_random(1, 6) + roll_random(1, 6) + roll_random(1, 6)
-                    - 5 + stat_level(obj_dude, STAT_LUCK) + 2 * perk_level(PERK_EXPLORER);
+                    - 5 + stat_level(travelActor, STAT_LUCK) + 2 * perk_level(PERK_EXPLORER);
                 if (specialRoll < 18) break;
                 int selection = roll_random(1, 100);
                 for (int index = 0; index < 6; index++) {
@@ -1202,12 +1217,129 @@ WorldMapTravelStepResult worldmap_authoritative_travel_step()
                 : WorldMapTravelStepStatus::Moving);
 }
 
+WorldMapTravelStepResult worldmap_multiplayer_advance_travel()
+{
+    WorldMapTravelStepResult step = multiplayer::networkWorldAdvanceWorldMapTravel();
+    if (step.status == WorldMapTravelStepStatus::Blocked
+        || (step.status == WorldMapTravelStepStatus::Arrived && InCity(step.x, step.y) < 0)) {
+        multiplayer::networkWorldStopWorldMapRoute();
+    }
+    return step;
+}
+
+static void PrepareMultiplayerWorldMapPosition()
+{
+    // Match map_check_state before the single-player world map. Removing
+    // object_animate with a live sequence would freeze it and block snapshots.
+    anim_stop();
+    // Discovery belongs to the host; peers receive WorldGrid in snapshots.
+    if (multiplayer::networkRuntimeMode() == multiplayer::NetworkLaunchMode::Host) {
+        UpdVisualArea();
+    }
+}
+
+static void DrawMultiplayerWorldMap(int viewportX, int viewportY,
+    const WorldMapState& position, bool controller)
+{
+    using namespace multiplayer;
+    buf_to_buf(wmapbmp[WORLDMAP_FRM_WORLDMAP]
+            + WM_WORLDMAP_WIDTH * viewportY + viewportX,
+        450, 442, WM_WORLDMAP_WIDTH,
+        world_buf + WM_WINDOW_WIDTH * 21 + 22, WM_WINDOW_WIDTH);
+    block_map(viewportX, viewportY, world_buf);
+    trans_buf_to_buf(wmapbmp[WORLDMAP_FRM_BOX],
+        WM_WINDOW_WIDTH, WM_WINDOW_HEIGHT, WM_WINDOW_WIDTH,
+        world_buf, WM_WINDOW_WIDTH);
+    DrawTownLabels(wmapbmp[WORLDMAP_FRM_LABELS], world_buf);
+    bool moving = networkWorldSelectedWorldMapRoute().has_value();
+    int markerX = position.x - viewportX + (moving ? 20 : 10);
+    int markerY = position.y - viewportY + (moving ? 19 : 15);
+    int markerWidth = moving ? LOCATION_MARKER_WIDTH : HOTSPOT_WIDTH;
+    int markerHeight = moving ? LOCATION_MARKER_HEIGHT : HOTSPOT_HEIGHT;
+    if (markerX >= 22 && markerX + markerWidth <= 472
+        && markerY >= 21 && markerY + markerHeight <= 463) {
+        trans_buf_to_buf(wmapbmp[moving ? WORLDMAP_FRM_LOCATION_MARKER : WORLDMAP_FRM_HOTSPOT_NORMAL],
+            markerWidth, markerHeight, markerWidth,
+            world_buf + WM_WINDOW_WIDTH * markerY + markerX,
+            WM_WINDOW_WIDTH);
+    }
+    if (auto route = networkWorldSelectedWorldMapRoute()) {
+        markerX = route->first - viewportX + 17;
+        markerY = route->second - viewportY + 16;
+        if (markerX >= 22 && markerX < 461 && markerY >= 21 && markerY < 452) {
+            trans_buf_to_buf(wmapbmp[WORLDMAP_FRM_DESTINATION_MARKER_BRIGHT],
+                DESTINATION_MARKER_WIDTH, DESTINATION_MARKER_HEIGHT,
+                DESTINATION_MARKER_WIDTH,
+                world_buf + WM_WINDOW_WIDTH * markerY + markerX,
+                WM_WINDOW_WIDTH);
+        }
+    }
+    DrawMapTime(0);
+    const char* controls = controller ? "Click route  Esc land" : "Watching party route";
+    text_to_buf(world_buf + WM_WINDOW_WIDTH * 455 + 480,
+        controls, 155, WM_WINDOW_WIDTH, colorTable[992]);
+}
+
+bool worldmap_multiplayer_render_smoke_test()
+{
+    using namespace multiplayer;
+    if (networkRuntimeMode() != NetworkLaunchMode::Host) return true;
+    if (!networkWorldWorldMapTravelApproved()) return false;
+    WorldMapState saved;
+    worldmap_capture_state(saved);
+    if (InitWorldMapData() == -1) return false;
+    WorldMapState blank = saved;
+    blank.grid.fill(0);
+    bool passed = worldmap_apply_state(blank);
+    Object* actor = networkWorldPlayerActor(kHostPlayerId);
+    int savedFid = actor != nullptr ? actor->fid : 0;
+    int savedFrame = actor != nullptr ? actor->frame : 0;
+    int savedX = actor != nullptr ? actor->x : 0;
+    int savedY = actor != nullptr ? actor->y : 0;
+    WorldSnapshot snapshot;
+    bool animationRegistered = actor != nullptr && register_begin(ANIMATION_REQUEST_RESERVED) == 0
+        && register_object_animate(actor, ANIM_WALK, 0) == 0
+        && register_end() == 0 && anim_busy(actor) == -1;
+    bool busyCaptureRejected = animationRegistered
+        && !networkWorldCaptureAuthoritativeState({}, snapshot);
+    PrepareMultiplayerWorldMapPosition();
+    bool idleCaptureAccepted = actor != nullptr && anim_busy(actor) == 0
+        && networkWorldCaptureAuthoritativeState({}, snapshot);
+    if (actor != nullptr) {
+        obj_change_fid(actor, savedFid, nullptr);
+        obj_set_frame(actor, savedFrame, nullptr);
+        obj_offset(actor, savedX - actor->x, savedY - actor->y, nullptr);
+    }
+    passed = passed && busyCaptureRejected && idleCaptureAccepted;
+    WorldMapState revealed;
+    worldmap_capture_state(revealed);
+    int viewportX = std::clamp(revealed.x - 247, 0, VIEWPORT_MAX_X);
+    int viewportY = std::clamp(revealed.y - 242, 0, VIEWPORT_MAX_Y);
+    DrawMultiplayerWorldMap(viewportX, viewportY, revealed, true);
+    int visiblePixels = 0;
+    for (int y = 21; y < 463; y++) {
+        for (int x = 22; x < 472; x++) {
+            if (world_buf[y * WM_WINDOW_WIDTH + x] != colorTable[0]) visiblePixels++;
+        }
+    }
+    passed = passed && WorldGrid[revealed.y / 50][revealed.x / 50] == 2
+        && visiblePixels >= 1000;
+    UnInitWorldMapData();
+    KillWorldWin();
+    passed = worldmap_apply_state(saved) && passed;
+    std::fprintf(stderr, "WORLD_MAP_RENDER_SMOKE_%s initial_fog_revealed=1 visible_pixels=%d busy_capture_blocked=%d idle_capture_ready=%d\n",
+        passed ? "PASS" : "FAIL", visiblePixels, busyCaptureRejected, idleCaptureAccepted);
+    return passed;
+}
+
 void worldmap_multiplayer_open()
 {
     using namespace multiplayer;
     if (!networkWorldWorldMapTravelApproved() || InitWorldMapData() == -1) {
         return;
     }
+
+    PrepareMultiplayerWorldMapPosition();
 
     bool mapBackgroundWasEnabled = map_disable_bk_processes();
     cycle_disable();
@@ -1232,14 +1364,11 @@ void worldmap_multiplayer_open()
         worldmap_capture_state(position);
         if (networkRuntimeMode() == NetworkLaunchMode::Host
             && networkWorldSelectedWorldMapRoute().has_value()) {
-            WorldMapTravelStepResult step = networkWorldAdvanceWorldMapTravel();
+            WorldMapTravelStepResult step = worldmap_multiplayer_advance_travel();
             if (step.status == WorldMapTravelStepStatus::Arrived) {
                 if (InCity(step.x, step.y) >= 0) {
                     arrivalKind = WorldMapArrivalKind::City;
                     break;
-                }
-                if (networkWorldLocalWorldMapController()) {
-                    networkRuntimeSubmitLocalWorldMapRoute(-1, -1, true);
                 }
             } else if (step.status == WorldMapTravelStepStatus::Encounter) {
                 arrivalKind = WorldMapArrivalKind::Encounter;
@@ -1260,10 +1389,6 @@ void worldmap_multiplayer_open()
             } else if (step.status == WorldMapTravelStepStatus::QueueInterrupted) {
                 arrivalKind = WorldMapArrivalKind::Interrupted;
                 break;
-            } else if (step.status == WorldMapTravelStepStatus::Blocked) {
-                if (networkWorldLocalWorldMapController()) {
-                    networkRuntimeSubmitLocalWorldMapRoute(-1, -1, true);
-                }
             }
             worldmap_capture_state(position);
         }
@@ -1308,39 +1433,7 @@ void worldmap_multiplayer_open()
             viewportY = std::clamp(position.y - 242, 0, VIEWPORT_MAX_Y);
         }
 
-        buf_to_buf(wmapbmp[WORLDMAP_FRM_WORLDMAP]
-                + WM_WORLDMAP_WIDTH * viewportY + viewportX,
-            450, 442, WM_WORLDMAP_WIDTH,
-            world_buf + WM_WINDOW_WIDTH * 21 + 22, WM_WINDOW_WIDTH);
-        block_map(viewportX, viewportY, world_buf);
-        trans_buf_to_buf(wmapbmp[WORLDMAP_FRM_BOX],
-            WM_WINDOW_WIDTH, WM_WINDOW_HEIGHT, WM_WINDOW_WIDTH,
-            world_buf, WM_WINDOW_WIDTH);
-        DrawTownLabels(wmapbmp[WORLDMAP_FRM_LABELS], world_buf);
-        int markerX = position.x - viewportX + 20;
-        int markerY = position.y - viewportY + 19;
-        if (markerX >= 22 && markerX < 467 && markerY >= 21 && markerY < 458) {
-            trans_buf_to_buf(wmapbmp[WORLDMAP_FRM_LOCATION_MARKER],
-                LOCATION_MARKER_WIDTH, LOCATION_MARKER_HEIGHT,
-                LOCATION_MARKER_WIDTH,
-                world_buf + WM_WINDOW_WIDTH * markerY + markerX,
-                WM_WINDOW_WIDTH);
-        }
-        if (auto route = networkWorldSelectedWorldMapRoute()) {
-            markerX = route->first - viewportX + 17;
-            markerY = route->second - viewportY + 16;
-            if (markerX >= 22 && markerX < 461 && markerY >= 21 && markerY < 452) {
-                trans_buf_to_buf(wmapbmp[WORLDMAP_FRM_DESTINATION_MARKER_BRIGHT],
-                    DESTINATION_MARKER_WIDTH, DESTINATION_MARKER_HEIGHT,
-                    DESTINATION_MARKER_WIDTH,
-                    world_buf + WM_WINDOW_WIDTH * markerY + markerX,
-                    WM_WINDOW_WIDTH);
-            }
-        }
-        DrawMapTime(0);
-        const char* controls = controller ? "Click route  Esc land" : "Watching party route";
-        text_to_buf(world_buf + WM_WINDOW_WIDTH * 455 + 480,
-            controls, 155, WM_WINDOW_WIDTH, colorTable[992]);
+        DrawMultiplayerWorldMap(viewportX, viewportY, position, controller);
         win_draw(world_win);
         renderPresent();
         sharedFpsLimiter.throttle();
@@ -2745,6 +2838,7 @@ int world_map(WorldMapContext ctx)
 // 0x4AC860
 static void UpdVisualArea()
 {
+    multiplayer::ScopedActorPlayerContext playerContext(worldmap_travel_actor());
     // 0x4A9FE0
     static const struct {
         int column_offset;
@@ -3313,6 +3407,11 @@ static int InCity(unsigned int x, unsigned int y)
     }
 
     return -1;
+}
+
+bool worldmap_multiplayer_position_is_city()
+{
+    return InCity(world_xpos, world_ypos) >= 0;
 }
 
 bool worldmap_multiplayer_choose_destination(bool encounter,
@@ -4226,7 +4325,9 @@ static void CalcTimeAdder()
 {
     float outdoorsman;
 
-    outdoorsman = (float)skill_level(obj_dude, SKILL_OUTDOORSMAN);
+    Object* travelActor = worldmap_travel_actor();
+    multiplayer::ScopedActorPlayerContext playerContext(travelActor);
+    outdoorsman = (float)skill_level(travelActor, SKILL_OUTDOORSMAN);
     if (outdoorsman > 100.0f) {
         outdoorsman = 100.0f;
     }

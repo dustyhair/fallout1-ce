@@ -46,6 +46,7 @@
 #include "plib/gnw/gnw.h"
 #include "plib/gnw/grbuf.h"
 #include "plib/gnw/input.h"
+#include "plib/gnw/intrface.h"
 #include "plib/gnw/svga.h"
 #include "plib/gnw/text.h"
 
@@ -277,7 +278,8 @@ static int stack_offset[10];
 static Object* stack[10];
 
 // 0x59CE1C
-static int mt_wid;
+static int mt_wid = -1;
+static bool networkBarterWindowActive = false;
 
 // 0x59CE24
 static int barter_mod;
@@ -404,15 +406,51 @@ static bool networkInventory = false;
 static std::uint64_t networkInventoryTurn = 0;
 static std::vector<InventoryItem> networkInventoryItems;
 static Inventory networkInventoryView {};
+static std::uint32_t networkLootPhaseRevision = 0;
+static bool networkTheft = false;
+static std::vector<InventoryItem> networkTheftItems;
+static Inventory networkTheftView {};
+
+static bool network_loot_current()
+{
+    using namespace multiplayer;
+    if (!networkInventory) return true;
+    // Check navigation pointers before reading inventory after a checkpoint.
+    if (!networkWorldActive() || stack[0] != localPlayerActor()) return false;
+    for (int index = 0; index <= curr_stack; ++index) {
+        if (!networkWorldFindEntity(stack[index]).has_value()
+            || (index > 0 && stack[index]->owner != stack[index - 1])) return false;
+    }
+    if (activeInventoryWindowType != INVENTORY_WINDOW_TYPE_LOOT) return true;
+    if (!networkWorldActive()
+        || (networkInventoryTurn == 0 ? networkWorldPhase() != SessionPhase::Exploration
+            : networkWorldPhase() != SessionPhase::Combat
+                || networkWorldCombatTurnRevision() != networkInventoryTurn
+                || networkWorldActiveCombatOwner() != networkWorldCombatOwner(stack[0]))
+        || networkWorldPhaseRevision() != networkLootPhaseRevision
+        || stack[0] != localPlayerActor()) return false;
+    for (int index = 0; index <= target_curr_stack; ++index) {
+        if (!networkWorldFindEntity(target_stack[index]).has_value()
+            || (index > 0 && target_stack[index]->owner != target_stack[index - 1])) return false;
+    }
+    return target_stack[0]->owner == nullptr
+        && (target_stack[0]->flags & OBJECT_HIDDEN) == 0
+        && (FID_TYPE(target_stack[0]->fid) == OBJ_TYPE_CRITTER
+            ? (!critter_is_active(target_stack[0]) || networkWorldIsTheftTarget(stack[0], target_stack[0]))
+            : !obj_is_locked(target_stack[0]))
+        && stack[0]->elevation == target_stack[0]->elevation
+        && stack[0]->tile >= 0 && target_stack[0]->tile >= 0
+        && obj_dist(stack[0], target_stack[0]) <= 1;
+}
 
 static multiplayer::EquipmentCommand inventory_equipment()
 {
     using namespace multiplayer;
     EquipmentCommand command;
     command.turnRevision = networkInventoryTurn;
-    command.leftHand = networkWorldFindEntity(inven_left_hand(inven_dude)).value_or(EntityId {});
-    command.rightHand = networkWorldFindEntity(inven_right_hand(inven_dude)).value_or(EntityId {});
-    command.armor = networkWorldFindEntity(inven_worn(inven_dude)).value_or(EntityId {});
+    command.leftHand = networkWorldFindEntity(inven_left_hand(inventory_player())).value_or(EntityId {});
+    command.rightHand = networkWorldFindEntity(inven_right_hand(inventory_player())).value_or(EntityId {});
+    command.armor = networkWorldFindEntity(inven_worn(inventory_player())).value_or(EntityId {});
     command.activeHand = intface_is_item_right_hand() ? 1 : 0;
     return command;
 }
@@ -421,15 +459,17 @@ static bool network_inventory_current()
 {
     using namespace multiplayer;
     return networkWorldActive()
+        && network_loot_current()
         && (networkInventoryTurn == 0
             ? networkWorldPhase() == SessionPhase::Exploration
             : networkWorldPhase() == SessionPhase::Combat
                 && networkWorldCombatTurnRevision() == networkInventoryTurn
-                && networkWorldActiveCombatOwner() == networkWorldCombatOwner(inven_dude));
+                && networkWorldActiveCombatOwner() == networkWorldCombatOwner(inventory_player()));
 }
 
 static void network_inventory_refresh()
 {
+    if (!network_loot_current()) return;
     i_lhand = inven_left_hand(inven_dude);
     i_rhand = inven_right_hand(inven_dude);
     i_worn = inven_worn(inven_dude);
@@ -444,7 +484,7 @@ static void network_inventory_refresh()
     networkInventoryView.length = static_cast<int>(networkInventoryItems.size());
     networkInventoryView.items = networkInventoryItems.data();
     pud = &networkInventoryView;
-    stack_offset[0] = std::clamp(stack_offset[0], 0, std::max(0, pud->length - inven_cur_disp));
+    stack_offset[curr_stack] = std::clamp(stack_offset[curr_stack], 0, std::max(0, pud->length - inven_cur_disp));
     adjust_fid();
 }
 
@@ -516,7 +556,7 @@ void handle_inventory()
         if (networkInventory) {
             if (!network_inventory_current()) break;
             network_inventory_refresh();
-            display_inventory(stack_offset[0], -1, INVENTORY_WINDOW_TYPE_NORMAL);
+            display_inventory(stack_offset[curr_stack], -1, INVENTORY_WINDOW_TYPE_NORMAL);
             if (immode == INVENTORY_WINDOW_CURSOR_HAND) display_stats();
         }
 
@@ -1623,6 +1663,17 @@ void display_inventory(int first_item_index, int selected_index, int inventoryWi
 // 0x463C00
 void display_target_inventory(int first_item_index, int selected_index, Inventory* inventory, int inventoryWindowType)
 {
+    if (networkTheft && inventoryWindowType == INVENTORY_WINDOW_TYPE_LOOT) {
+        networkTheftItems.clear();
+        const Inventory& source = target_stack[target_curr_stack]->data.inventory;
+        for (int index = 0; index < source.length; ++index) {
+            const auto& entry = source.items[index];
+            if ((entry.item->flags & (OBJECT_EQUIPPED | OBJECT_USED)) == 0) networkTheftItems.push_back(entry);
+        }
+        networkTheftView.length = static_cast<int>(networkTheftItems.size());
+        networkTheftView.items = networkTheftItems.data();
+        inventory = target_pud = &networkTheftView;
+    }
     unsigned char* windowBuffer = win_get_buf(i_wid);
 
     int pitch;
@@ -2148,11 +2199,17 @@ void inven_pickup(int keyCode, int first_item_index)
 
         renderPresent();
         sharedFpsLimiter.throttle();
-    } while ((mouse_get_buttons() & MOUSE_EVENT_LEFT_BUTTON_REPEAT) != 0);
+    } while (game_user_wants_to_quit == 0
+        && (mouse_get_buttons() & MOUSE_EVENT_LEFT_BUTTON_REPEAT) != 0);
 
     if (itemInventoryFrm != NULL) {
         art_ptr_unlock(itemInventoryFrmHandle);
         gsound_play_sfx_file("iputdown");
+    }
+
+    if (game_user_wants_to_quit != 0) {
+        inven_set_mouse(INVENTORY_WINDOW_CURSOR_ARROW);
+        return;
     }
 
     if (networkInventory) {
@@ -2168,7 +2225,33 @@ void inven_pickup(int keyCode, int first_item_index)
             if (mouseHitTestInWindow(i_wid, INVENTORY_RIGHT_HAND_SLOT_X, INVENTORY_RIGHT_HAND_SLOT_Y, INVENTORY_RIGHT_HAND_SLOT_MAX_X, INVENTORY_RIGHT_HAND_SLOT_MAX_Y)) destination = 1;
             if (mouseHitTestInWindow(i_wid, INVENTORY_ARMOR_SLOT_X, INVENTORY_ARMOR_SLOT_Y, INVENTORY_ARMOR_SLOT_MAX_X, INVENTORY_ARMOR_SLOT_MAX_Y)
                 && item_get_type(a1a) == ITEM_TYPE_ARMOR) destination = 2;
-            if (destination != -2 && destination != source) {
+            Object* reloadTarget = destination >= 0
+                ? multiplayer::networkWorldFindObject(*slots[destination]) : nullptr;
+            if (destination == -1) {
+                int x, y;
+                mouseGetPositionInWindow(i_wid, &x, &y);
+                int index = (y - INVENTORY_SCROLLER_Y) / INVENTORY_SLOT_HEIGHT + first_item_index;
+                if (index >= 0 && index < pud->length) reloadTarget = pud->items[index].item;
+            }
+            bool reload = item_get_type(a1a) == ITEM_TYPE_AMMO && reloadTarget != nullptr
+                && item_get_type(reloadTarget) == ITEM_TYPE_WEAPON && item_w_can_reload(reloadTarget, a1a);
+            if (reload) {
+                auto weaponId = multiplayer::networkWorldFindEntity(reloadTarget);
+                int quantity = count > 1 ? do_move_timer(INVENTORY_WINDOW_TYPE_MOVE_ITEMS, a1a, count) : 1;
+                a1a = multiplayer::networkWorldFindObject(draggedId);
+                reloadTarget = weaponId.has_value() ? multiplayer::networkWorldFindObject(*weaponId) : nullptr;
+                if (quantity > 0 && a1a != nullptr && reloadTarget != nullptr && network_inventory_current()) {
+                    multiplayer::networkRuntimeHandleInventoryAction(reloadTarget,
+                        multiplayer::InventoryAction::Reload, a1a, quantity);
+                }
+            } else if (destination == -1 && reloadTarget != nullptr && reloadTarget != a1a
+                && item_get_type(reloadTarget) == ITEM_TYPE_CONTAINER) {
+                drop_into_container(reloadTarget, a1a, v3, v29, count);
+            } else if (destination == -2 && curr_stack > 0
+                && mouseHitTestInWindow(i_wid, INVENTORY_PC_BODY_VIEW_X, INVENTORY_PC_BODY_VIEW_Y,
+                    INVENTORY_PC_BODY_VIEW_X + INVENTORY_BODY_VIEW_WIDTH, INVENTORY_PC_BODY_VIEW_Y + INVENTORY_BODY_VIEW_HEIGHT)) {
+                drop_into_container(stack[curr_stack - 1], a1a, v3, v29, count);
+            } else if (curr_stack == 0 && destination != -2 && destination != source) {
                 auto displaced = destination >= 0 ? *slots[destination] : multiplayer::EntityId {};
                 Object* displacedItem = multiplayer::networkWorldFindObject(displaced);
                 if (source >= 0) {
@@ -3429,6 +3512,12 @@ void inven_action_cursor(int keyCode, int inventoryWindowType)
     }
 
     auto selectedId = networkInventory ? multiplayer::networkWorldFindEntity(item) : std::nullopt;
+    auto selectedItemAvailable = [&]() {
+        return item != nullptr && network_inventory_current()
+            && (item->owner == inven_dude
+                || (inventoryWindowType == INVENTORY_WINDOW_TYPE_LOOT
+                    && multiplayer::networkWorldIsLocalInventoryTransfer(inven_dude, item->owner)));
+    };
     int itemType = item_get_type(item);
 
     int mouseState;
@@ -3436,10 +3525,14 @@ void inven_action_cursor(int keyCode, int inventoryWindowType)
         sharedFpsLimiter.mark();
 
         get_input();
+        if (game_user_wants_to_quit != 0) {
+            inven_set_mouse(INVENTORY_WINDOW_CURSOR_ARROW);
+            return;
+        }
         if (networkInventory) {
             network_inventory_refresh();
             item = selectedId.has_value() ? multiplayer::networkWorldFindObject(*selectedId) : nullptr;
-            if (item == nullptr || item->owner != inven_dude || !network_inventory_current()) {
+            if (!selectedItemAvailable()) {
                 inven_set_mouse(INVENTORY_WINDOW_CURSOR_ARROW);
                 return;
             }
@@ -3562,7 +3655,8 @@ void inven_action_cursor(int keyCode, int inventoryWindowType)
 
     int menuItemIndex = 0;
     int previousMouseY = y;
-    while ((mouse_get_buttons() & MOUSE_EVENT_LEFT_BUTTON_UP) == 0) {
+    while (game_user_wants_to_quit == 0
+        && (mouse_get_buttons() & MOUSE_EVENT_LEFT_BUTTON_UP) == 0) {
         sharedFpsLimiter.mark();
 
         get_input();
@@ -3617,10 +3711,15 @@ void inven_action_cursor(int keyCode, int inventoryWindowType)
 
     mouse_set_position(x, y);
 
+    if (game_user_wants_to_quit != 0) {
+        inven_set_mouse(INVENTORY_WINDOW_CURSOR_ARROW);
+        return;
+    }
+
     if (networkInventory) {
         network_inventory_refresh();
         item = selectedId.has_value() ? multiplayer::networkWorldFindObject(*selectedId) : nullptr;
-        if (item == nullptr || item->owner != inven_dude || !network_inventory_current()) {
+        if (!selectedItemAvailable()) {
             inven_set_mouse(INVENTORY_WINDOW_CURSOR_ARROW);
             return;
         }
@@ -3629,17 +3728,44 @@ void inven_action_cursor(int keyCode, int inventoryWindowType)
 
     int actionMenuItem = actionMenuItems[menuItemIndex];
     if (networkInventory && actionMenuItem != GAME_MOUSE_ACTION_MENU_ITEM_LOOK) {
+        if (item->owner != inven_dude) {
+            inven_set_mouse(INVENTORY_WINDOW_CURSOR_ARROW);
+            return;
+        }
         if (actionMenuItem == GAME_MOUSE_ACTION_MENU_ITEM_DROP) {
-            obj_drop(inven_dude, item);
+            int quantity = v56 > 1 ? do_move_timer(INVENTORY_WINDOW_TYPE_MOVE_ITEMS, item, v56) : 1;
+            item = selectedId.has_value() ? multiplayer::networkWorldFindObject(*selectedId) : nullptr;
+            if (quantity > 0 && item != nullptr && item->owner == inven_dude && network_inventory_current()) {
+                if (multiplayer::networkWorldPhase() == multiplayer::SessionPhase::Combat) {
+                    multiplayer::networkRuntimeHandleInventoryAction(item,
+                        multiplayer::InventoryAction::Drop, nullptr, quantity);
+                } else if (item->pid == PROTO_ID_MONEY) {
+                    multiplayer::networkRuntimeHandleLocalMoneyDrop(inven_dude, item, quantity);
+                } else {
+                    // Ground objects represent one item each. The guest's
+                    // pending-drop queue waits for each host split identity.
+                    int pid = item->pid;
+                    for (int dropped = 0; dropped < quantity; ++dropped) {
+                        network_inventory_refresh();
+                        if (inven_from_button(keyCode, &item, nullptr, nullptr) == 0
+                            || item->pid != pid || item->owner != inven_dude
+                            || !network_inventory_current() || obj_drop(inven_dude, item) != 0) break;
+                    }
+                }
+            }
+        } else if (actionMenuItem == GAME_MOUSE_ACTION_MENU_ITEM_USE && itemType == ITEM_TYPE_CONTAINER) {
+            container_enter(keyCode, inventoryWindowType);
         } else if (actionMenuItem == GAME_MOUSE_ACTION_MENU_ITEM_USE && itemType != ITEM_TYPE_CONTAINER) {
-            multiplayer::networkRuntimeHandleLocalItemUse(inven_dude, item, inven_dude);
+            multiplayer::networkRuntimeHandleInventoryAction(item, multiplayer::InventoryAction::Use);
+        } else if (actionMenuItem == GAME_MOUSE_ACTION_MENU_ITEM_UNLOAD) {
+            multiplayer::networkRuntimeHandleInventoryAction(item, multiplayer::InventoryAction::Unload);
         } else if (actionMenuItem != GAME_MOUSE_ACTION_MENU_ITEM_CANCEL) {
             char message[] = "This inventory action is not available in multiplayer yet.";
             display_print(message);
         }
         network_inventory_refresh();
         display_stats();
-        display_inventory(stack_offset[0], -1, inventoryWindowType);
+        display_inventory(stack_offset[curr_stack], -1, inventoryWindowType);
         inven_set_mouse(INVENTORY_WINDOW_CURSOR_ARROW);
         return;
     }
@@ -3823,7 +3949,9 @@ static int loot_container_for_current_player(Object* a1, Object* a2)
         return 0;
     }
 
-    if (FID_TYPE(a2->fid) == OBJ_TYPE_ITEM) {
+    bool authorizedNetworkLoot = multiplayer::networkWorldIsLocalInventoryTransfer(a1, a2);
+    networkTheft = authorizedNetworkLoot && multiplayer::networkWorldIsTheftTarget(a1, a2);
+    if (FID_TYPE(a2->fid) == OBJ_TYPE_ITEM && !authorizedNetworkLoot) {
         if (item_get_type(a2) == ITEM_TYPE_CONTAINER) {
             if (a2->frame == 0) {
                 CacheEntry* handle;
@@ -3840,7 +3968,7 @@ static int loot_container_for_current_player(Object* a1, Object* a2)
     }
 
     int sid = -1;
-    if (!gIsSteal) {
+    if (!gIsSteal && !authorizedNetworkLoot) {
         if (obj_sid(a2, &sid) != -1) {
             scr_set_objs(sid, a1, NULL);
             exec_script_proc(sid, SCRIPT_PROC_PICKUP);
@@ -3864,7 +3992,7 @@ static int loot_container_for_current_player(Object* a1, Object* a2)
     target_stack[0] = a2;
 
     Object* a1a = NULL;
-    if (obj_new(&a1a, 0, 467) == -1) {
+    if (!authorizedNetworkLoot && obj_new(&a1a, 0, 467) == -1) {
         return 0;
     }
 
@@ -3872,7 +4000,7 @@ static int loot_container_for_current_player(Object* a1, Object* a2)
     Object* item2 = NULL;
     Object* armor = NULL;
 
-    if (gIsSteal) {
+    if (gIsSteal && !authorizedNetworkLoot) {
         item1 = inven_left_hand(a2);
         if (item1 != NULL) {
             item_remove_mult(a2, item1, 1);
@@ -3889,6 +4017,12 @@ static int loot_container_for_current_player(Object* a1, Object* a2)
         }
     }
 
+    // Keep equipped objects in the authoritative inventory while checkpoints
+    // arrive. Native removal leaves cached hand pointers detached and stale.
+    networkInventory = authorizedNetworkLoot;
+    networkInventoryTurn = authorizedNetworkLoot && multiplayer::networkWorldPhase() == multiplayer::SessionPhase::Combat
+        ? multiplayer::networkWorldCombatTurnRevision() : 0;
+    networkLootPhaseRevision = multiplayer::networkWorldPhaseRevision();
     bool isoWasEnabled = setup_inventory(INVENTORY_WINDOW_TYPE_LOOT);
 
     Object** critters = NULL;
@@ -4008,6 +4142,8 @@ static int loot_container_for_current_player(Object* a1, Object* a2)
         }
 
         int keyCode = get_input();
+
+        if (authorizedNetworkLoot && !network_loot_current()) break;
 
         if (keyCode == KEY_CTRL_Q || keyCode == KEY_CTRL_X || keyCode == KEY_F10) {
             game_quit_with_confirm();
@@ -4204,7 +4340,7 @@ static int loot_container_for_current_player(Object* a1, Object* a2)
         }
     }
 
-    if (gIsSteal) {
+    if (gIsSteal && !authorizedNetworkLoot) {
         if (item1 != NULL) {
             item1->flags |= OBJECT_IN_LEFT_HAND;
             item_add_force(a2, item1, 1);
@@ -4221,10 +4357,12 @@ static int loot_container_for_current_player(Object* a1, Object* a2)
         }
     }
 
-    item_move_all(a1a, a2);
-    obj_erase_object(a1a, NULL);
+    if (a1a != nullptr) {
+        item_move_all(a1a, a2);
+        obj_erase_object(a1a, NULL);
+    }
 
-    if (gIsSteal) {
+    if (gIsSteal && !authorizedNetworkLoot) {
         if (!isCaughtStealing) {
             if (stealingXp > 0) {
                 if (!isPartyMember(a2)) {
@@ -4245,12 +4383,24 @@ static int loot_container_for_current_player(Object* a1, Object* a2)
         }
     }
 
+    if (networkInventory && !networkTheft && network_inventory_current()) {
+        multiplayer::EquipmentCommand close = inventory_equipment();
+        close.action = multiplayer::EquipmentAction::CloseInventory;
+        multiplayer::networkRuntimeSubmitEquipment(close);
+    }
     exit_inventory(isoWasEnabled);
 
     // NOTE: Uninline.
     inven_exit();
 
-    if (gIsSteal) {
+    networkInventory = false;
+    networkInventoryItems.clear();
+    networkInventoryView = {};
+    networkTheft = false;
+    networkTheftItems.clear();
+    networkTheftView = {};
+
+    if (gIsSteal && !authorizedNetworkLoot) {
         if (isCaughtStealing) {
             if (gStealCount > 0) {
                 if (obj_sid(a2, &sid) != -1) {
@@ -4285,9 +4435,11 @@ int loot_container(Object* a1, Object* a2)
 
 void inven_refresh_loot_window()
 {
-    if (!lootWindowActive || target_pud == nullptr) {
+    if (!lootWindowActive || target_pud == nullptr || !network_loot_current()) {
         return;
     }
+
+    if (networkInventory) network_inventory_refresh();
 
     target_stack_offset[target_curr_stack] = std::min(
         target_stack_offset[target_curr_stack],
@@ -4313,14 +4465,51 @@ void inven_refresh_inventory_window()
     win_draw(i_wid);
 }
 
+bool inven_network_inventory_window_is_active()
+{
+    return networkInventory && activeInventoryWindowType != -1;
+}
+
+bool inven_network_barter_window_is_active()
+{
+    return networkBarterWindowActive;
+}
+
+bool inven_quantity_window_is_active()
+{
+    return mt_wid != -1;
+}
+
 bool inven_loot_window_is_active()
 {
     return lootWindowActive;
 }
 
 // 0x467658
+void inven_steal_award_xp(Object* actor, Object* target, int experience)
+{
+    if (experience <= 0 || isPartyMember(target)) return;
+    experience = std::max(0, std::min(300 - skill_level(actor, SKILL_STEAL), experience));
+    if (experience == 0) return;
+    MessageListItem message;
+    message.num = 29;
+    bool temporaryMessages = !inven_is_initialized;
+    bool messagesReady = !temporaryMessages || inventry_msg_load() == 0;
+    if (messagesReady && message_search(&inventry_message_file, &message)) {
+        char text[200];
+        snprintf(text, sizeof(text), message.text, experience);
+        display_print(text);
+    }
+    if (temporaryMessages) inventry_msg_unload();
+    stat_pc_add_experience(experience);
+}
+
 int inven_steal_container(Object* a1, Object* a2)
 {
+    bool network = multiplayer::networkWorldActive();
+    if (network && !multiplayer::networkWorldIsTheftTarget(a1, a2)) {
+        return -1;
+    }
     if (a1 == a2) {
         return -1;
     }
@@ -4330,6 +4519,10 @@ int inven_steal_container(Object* a1, Object* a2)
     gStealSize = 0;
 
     int rc = loot_container(a1, a2);
+
+    if (network && multiplayer::networkWorldHasTheftAccess(a1)) {
+        multiplayer::networkRuntimeRequestSharedModal(multiplayer::SharedModalKind::Theft, false);
+    }
 
     gIsSteal = 0;
     gStealCount = 0;
@@ -4408,11 +4601,17 @@ int move_inventory(Object* a1, int a2, Object* a3, bool a4)
 
         renderPresent();
         sharedFpsLimiter.throttle();
-    } while ((mouse_get_buttons() & MOUSE_EVENT_LEFT_BUTTON_REPEAT) != 0);
+    } while (game_user_wants_to_quit == 0
+        && (mouse_get_buttons() & MOUSE_EVENT_LEFT_BUTTON_REPEAT) != 0);
 
     if (inventoryFrm != NULL) {
         art_ptr_unlock(inventoryFrmHandle);
         gsound_play_sfx_file("iputdown");
+    }
+
+    if (game_user_wants_to_quit != 0) {
+        inven_set_mouse(INVENTORY_WINDOW_CURSOR_ARROW);
+        return 0;
     }
 
     int rc = 0;
@@ -4428,7 +4627,7 @@ int move_inventory(Object* a1, int a2, Object* a3, bool a4)
             }
 
             if (quantityToMove != -1) {
-                if (gIsSteal) {
+                if (gIsSteal && !networkInventory) {
                     if (skill_check_stealing(inven_dude, a3, a1, true) == 0) {
                         rc = 1;
                     }
@@ -4437,7 +4636,7 @@ int move_inventory(Object* a1, int a2, Object* a3, bool a4)
                 if (rc != 1) {
                     if (item_move(inven_dude, a3, a1, quantityToMove) != -1) {
                         rc = 2;
-                    } else {
+                    } else if (!networkTheft || multiplayer::networkWorldHasTheftAccess(inven_dude)) {
                         // There is no space left for that item.
                         messageListItem.num = 26;
                         if (message_search(&inventry_message_file, &messageListItem)) {
@@ -4457,7 +4656,7 @@ int move_inventory(Object* a1, int a2, Object* a3, bool a4)
             }
 
             if (quantityToMove != -1) {
-                if (gIsSteal) {
+                if (gIsSteal && !networkInventory) {
                     if (skill_check_stealing(inven_dude, a3, a1, false) == 0) {
                         rc = 1;
                     }
@@ -4472,7 +4671,7 @@ int move_inventory(Object* a1, int a2, Object* a3, bool a4)
                         a3->flags &= ~OBJECT_EQUIPPED;
 
                         rc = 2;
-                    } else {
+                    } else if (!networkTheft || multiplayer::networkWorldHasTheftAccess(inven_dude)) {
                         // You cannot pick that up. You are at your maximum weight capacity.
                         messageListItem.num = 25;
                         if (message_search(&inventry_message_file, &messageListItem)) {
@@ -4581,11 +4780,17 @@ static void barter_move_inventory(Object* a1, int quantity, int a3, int a4, Obje
 
         renderPresent();
         sharedFpsLimiter.throttle();
-    } while ((mouse_get_buttons() & MOUSE_EVENT_LEFT_BUTTON_REPEAT) != 0);
+    } while (game_user_wants_to_quit == 0
+        && (mouse_get_buttons() & MOUSE_EVENT_LEFT_BUTTON_REPEAT) != 0);
 
     if (inventoryFrm != NULL) {
         art_ptr_unlock(inventoryFrmHandle);
         gsound_play_sfx_file("iputdown");
+    }
+
+    if (game_user_wants_to_quit != 0) {
+        inven_set_mouse(INVENTORY_WINDOW_CURSOR_ARROW);
+        return;
     }
 
     MessageListItem messageListItem;
@@ -4674,11 +4879,17 @@ static void barter_move_from_table_inventory(Object* a1, int quantity, int a3, O
 
         renderPresent();
         sharedFpsLimiter.throttle();
-    } while ((mouse_get_buttons() & MOUSE_EVENT_LEFT_BUTTON_REPEAT) != 0);
+    } while (game_user_wants_to_quit == 0
+        && (mouse_get_buttons() & MOUSE_EVENT_LEFT_BUTTON_REPEAT) != 0);
 
     if (inventoryFrm != NULL) {
         art_ptr_unlock(inventoryFrmHandle);
         gsound_play_sfx_file("iputdown");
+    }
+
+    if (game_user_wants_to_quit != 0) {
+        inven_set_mouse(INVENTORY_WINDOW_CURSOR_ARROW);
+        return;
     }
 
     MessageListItem messageListItem;
@@ -4817,6 +5028,155 @@ static void display_table_inventories(int win, Object* a2, Object* a3, int a4)
 }
 
 // 0x4684E4
+// Offers are views of real inventories; editing them never detaches an item.
+void inven_multiplayer_barter()
+{
+    using namespace multiplayer;
+    if (networkWorldNpcBarterState() == nullptr) return;
+    int oldFont = text_curr();
+    text_font(101);
+    int window = win_add((screenGetWidth() - 600) / 2, (screenGetHeight() - 380) / 2,
+        600, 380, colorTable[5281], WINDOW_MODAL | WINDOW_MOVE_ON_TOP);
+    if (window == -1) {
+        const auto* state = networkWorldNpcBarterState();
+        if (state != nullptr && networkWorldFindObject(state->buyerId) == networkWorldPlayerActor(networkRuntimePresentedPlayerId()))
+            networkRuntimeSubmitNpcBarter(NpcBarterCommand { NpcBarterAction::Cancel, state->sellerId, state->revision });
+        text_font(oldFont);
+        return;
+    }
+    networkBarterWindowActive = true;
+    if (networkRuntimeSmokeTestEnabled())
+        std::fprintf(stderr, "NATIVE_BARTER_OPEN role=%s\n", networkRuntimeIsGuestReplica() ? "guest" : "host");
+    struct Row { EntityId id; std::string name; unsigned available; unsigned offered; };
+    std::array<int, 2> offsets {};
+    std::vector<int> buttons;
+    const auto* initial = networkWorldNpcBarterState();
+    bool initialControls = initial != nullptr && networkWorldFindObject(initial->buyerId)
+        == networkWorldPlayerActor(networkRuntimePresentedPlayerId());
+    for (int side = 0; side < 2; ++side) {
+        int x = 15 + side * 295;
+        if (initialControls) for (int line = 0; line < 10; ++line)
+            buttons.push_back(win_register_button(window, x, 80 + line * 20, 275, 19,
+                -1, -1, -1, 1000 + side * 100 + line, nullptr, nullptr, nullptr, 0));
+        buttons.push_back(win_register_text_button(window, x, 286, -1, -1, -1, 1200 + side * 2, "Up", 0));
+        buttons.push_back(win_register_text_button(window, x + 70, 286, -1, -1, -1, 1201 + side * 2, "Down", 0));
+    }
+    if (initialControls) {
+        buttons.push_back(win_register_text_button(window, 260, 352, -1, -1, -1, KEY_LOWERCASE_M, "Make offer", 0));
+        buttons.push_back(win_register_text_button(window, 470, 352, -1, -1, -1, KEY_ESCAPE, "Cancel", 0));
+    }
+    std::uint64_t pendingRevision = 0;
+    unsigned pendingSince = 0;
+    while (networkWorldPhase() == SessionPhase::Dialogue && networkRuntimeConnected() && game_user_wants_to_quit == 0) {
+        sharedFpsLimiter.mark();
+        const auto* current = networkWorldNpcBarterState();
+        if (current == nullptr) break;
+        NpcBarterState state = *current;
+        Object* buyer = networkWorldFindObject(state.buyerId);
+        Object* seller = networkWorldFindObject(state.sellerId);
+        if (buyer == nullptr || seller == nullptr) break;
+        bool controls = buyer == networkWorldPlayerActor(networkRuntimePresentedPlayerId());
+        if (pendingRevision != state.revision || elapsed_tocks(get_time(), pendingSince) > 3000) pendingRevision = 0;
+        win_fill(window, 0, 0, 600, 380, colorTable[5281]);
+        win_box(window, 0, 0, 599, 379, colorTable[32767]);
+        std::string title = std::string("Barter: ") + object_name(buyer) + " / " + object_name(seller);
+        win_print(window, title.c_str(), 570, 15, 12, colorTable[32767]);
+        win_print(window, controls ? "Select an item or caps to set the offer. Zero removes it."
+            : "Watching the other player's negotiation.", 570, 15, 32, colorTable[32767]);
+        std::array<std::vector<Row>, 2> rows;
+        std::array<Object*, 2> owners { buyer, seller };
+        std::array<DirectTradeOffer, 2> offers { state.buyerOffer, state.sellerOffer };
+        for (int side = 0; side < 2; ++side) {
+            int x = 15 + side * 295;
+            win_print(window, side == 0 ? "Items offered     Stock / Offer" : "Items requested   Stock / Offer", 280, x, 58, colorTable[32767]);
+            rows[side].push_back({ {}, "Caps", static_cast<unsigned>(std::max(0, item_caps_total(owners[side]))), offers[side].caps });
+            auto& inventory = owners[side]->data.inventory;
+            for (int index = 0; index < inventory.length; ++index) {
+                const auto& entry = inventory.items[index];
+                if (!networkWorldNpcBarterItemAvailable(owners[side], entry.item, side == 1)) continue;
+                auto id = networkWorldFindEntity(entry.item);
+                if (!id.has_value()) continue;
+                unsigned offered = 0;
+                for (const auto& offer : offers[side].items) if (offer.itemId == *id) offered = offer.quantity;
+                rows[side].push_back({ *id, object_name(entry.item), static_cast<unsigned>(entry.quantity), offered });
+            }
+            std::sort(rows[side].begin() + 1, rows[side].end(), [](const Row& a, const Row& b) { return a.id.value < b.id.value; });
+            offsets[side] = std::clamp(offsets[side], 0, std::max(0, static_cast<int>(rows[side].size()) - 10));
+            for (int line = 0; line < 10 && line + offsets[side] < static_cast<int>(rows[side].size()); ++line) {
+                const Row& row = rows[side][line + offsets[side]];
+                char text[150];
+                snprintf(text, sizeof(text), "%.24s  %u / %u", row.name.c_str(), row.available, row.offered);
+                win_print(window, text, 280, x, 82 + line * 20, colorTable[32767]);
+
+            }
+
+        }
+        char price[160];
+        snprintf(price, sizeof(price), "Offer value: %u caps     Asking value: %u caps", state.offeredValue, state.askingValue);
+        win_print(window, price, 570, 15, 316, colorTable[32767]);
+        if (state.status == NpcBarterStatus::Rejected)
+            win_print(window, "The offer was rejected. Adjust it and try again.", 570, 15, 334, colorTable[32767]);
+        else if (pendingRevision != 0) win_print(window, "Waiting for the offer to update...", 570, 15, 334, colorTable[32767]);
+
+        win_draw(window);
+        int key = get_input();
+        if (game_user_wants_to_quit != 0) break;
+        if (key >= 1200 && key <= 1203) {
+            int side = (key - 1200) / 2;
+            offsets[side] += (key % 2 == 0 ? -1 : 1);
+        } else if (controls && pendingRevision == 0) {
+            NpcBarterCommand command { NpcBarterAction::Offer, state.sellerId, state.revision,
+                state.buyerOffer, state.sellerOffer };
+            bool submit = false;
+            if (key == KEY_ESCAPE || key == KEY_LOWERCASE_T || game_user_wants_to_quit != 0) {
+                command.action = NpcBarterAction::Cancel;
+                command.buyerOffer = {}; command.sellerOffer = {}; submit = true;
+            } else if (key == KEY_LOWERCASE_M) {
+                command.action = NpcBarterAction::Accept;
+                command.buyerOffer = {}; command.sellerOffer = {}; submit = true;
+            } else if (key >= 1000 && key < 1110 && key % 100 < 10) {
+                int side = (key - 1000) / 100;
+                int index = key % 100 + offsets[side];
+                if (index < static_cast<int>(rows[side].size())) {
+                    const Row row = rows[side][index];
+                    char input[24] = {};
+                    char prompt[120];
+                    snprintf(prompt, sizeof(prompt), "%.60s: quantity, 0 to remove (max %u)", row.name.c_str(), row.available);
+                    if (networkRuntimeSmokeTestEnabled()) std::fprintf(stderr, "NATIVE_BARTER_QUANTITY_OPEN role=%s\n", networkRuntimeIsGuestReplica() ? "guest" : "host");
+                    if (win_get_str(input, 20, prompt, 80, 80, [] {
+                            return game_user_wants_to_quit != 0 || networkWorldPhase() != SessionPhase::Dialogue
+                                || networkWorldNpcBarterState() == nullptr;
+                        }) == 0) {
+                        char* end = nullptr;
+                        unsigned long amount = strtoul(input, &end, 10);
+                        if (*input != '\0' && end != input && *end == '\0' && amount <= row.available) {
+                            auto& offer = side == 0 ? command.buyerOffer : command.sellerOffer;
+                            if (!isValid(row.id)) offer.caps = static_cast<unsigned>(amount);
+                            else {
+                                offer.items.erase(std::remove_if(offer.items.begin(), offer.items.end(),
+                                    [&](const auto& item) { return item.itemId == row.id; }), offer.items.end());
+                                if (amount != 0) offer.items.push_back({ row.id, static_cast<unsigned>(amount) });
+                                std::sort(offer.items.begin(), offer.items.end(), [](const auto& a, const auto& b) { return a.itemId.value < b.itemId.value; });
+                            }
+                            submit = true;
+                        }
+                    }
+                }
+            }
+            if (submit && networkWorldNpcBarterState() != nullptr
+                && networkWorldNpcBarterState()->revision == state.revision && networkRuntimeSubmitNpcBarter(command)) {
+                pendingRevision = state.revision; pendingSince = get_time();
+            }
+        }
+        renderPresent();
+        sharedFpsLimiter.throttle();
+    }
+    for (int button : buttons) win_delete_button(button);
+    win_delete(window);
+    networkBarterWindowActive = false;
+    text_font(oldFont);
+}
+
 void barter_inventory(int win, Object* a2, Object* a3, Object* a4, int a5)
 {
     multiplayer::ScopedLocalPlayerContext localPlayerContext;
@@ -5148,6 +5508,7 @@ void barter_inventory(int win, Object* a2, Object* a3, Object* a4, int a5)
 // 0x468E58
 void container_enter(int keyCode, int inventoryWindowType)
 {
+    if (networkInventory && !network_inventory_current()) return;
     if (keyCode >= 2000) {
         int index = target_stack_offset[target_curr_stack] + keyCode - 2000;
         if (index < target_pud->length && target_curr_stack < 9) {
@@ -5178,6 +5539,7 @@ void container_enter(int keyCode, int inventoryWindowType)
 
                 inven_dude = stack[curr_stack];
                 pud = &(item->data.inventory);
+                if (networkInventory) network_inventory_refresh();
 
                 adjust_fid();
                 display_body(-1, inventoryWindowType);
@@ -5190,11 +5552,13 @@ void container_enter(int keyCode, int inventoryWindowType)
 // 0x468FC0
 void container_exit(int keyCode, int inventoryWindowType)
 {
+    if (networkInventory && !network_inventory_current()) return;
     if (keyCode == 2500) {
         if (curr_stack > 0) {
             curr_stack -= 1;
             inven_dude = stack[curr_stack];
             pud = &inven_dude->data.inventory;
+            if (networkInventory) network_inventory_refresh();
             adjust_fid();
             display_body(-1, inventoryWindowType);
             display_inventory(stack_offset[curr_stack], -1, inventoryWindowType);
@@ -5214,6 +5578,16 @@ void container_exit(int keyCode, int inventoryWindowType)
 // 0x469090
 int drop_into_container(Object* a1, Object* a2, int a3, Object** a4, int quantity)
 {
+    if (networkInventory) {
+        auto destinationId = multiplayer::networkWorldFindEntity(a1);
+        auto itemId = multiplayer::networkWorldFindEntity(a2);
+        int count = quantity > 1 ? do_move_timer(INVENTORY_WINDOW_TYPE_MOVE_ITEMS, a2, quantity) : 1;
+        a1 = destinationId ? multiplayer::networkWorldFindObject(*destinationId) : nullptr;
+        a2 = itemId ? multiplayer::networkWorldFindObject(*itemId) : nullptr;
+        if (count <= 0 || !network_inventory_current() || a1 == nullptr || a2 == nullptr
+            || a2->owner != inven_dude) return -1;
+        return item_move(inven_dude, a1, a2, count);
+    }
     int quantityToMove;
     if (quantity > 1) {
         quantityToMove = do_move_timer(INVENTORY_WINDOW_TYPE_MOVE_ITEMS, a2, quantity);
@@ -5367,6 +5741,11 @@ void draw_amount(int value, int inventoryWindowType)
 static int do_move_timer(int inventoryWindowType, Object* item, int max)
 {
     setup_move_timer_win(inventoryWindowType, item);
+    if (multiplayer::networkRuntimeSmokeTestEnabled()) {
+        std::fprintf(stderr, "NATIVE_QUANTITY_PROMPT_OPEN role=%s type=%s\n",
+            multiplayer::networkRuntimeIsGuestReplica() ? "guest" : "host",
+            inventoryWindowType == INVENTORY_WINDOW_TYPE_SET_TIMER ? "timer" : "quantity");
+    }
 
     int value;
     int min;
@@ -5388,7 +5767,7 @@ static int do_move_timer(int inventoryWindowType, Object* item, int max)
         sharedFpsLimiter.mark();
 
         int keyCode = get_input();
-        if (keyCode == KEY_ESCAPE) {
+        if (keyCode == KEY_ESCAPE || game_user_wants_to_quit != 0) {
             exit_move_timer_win(inventoryWindowType);
             return -1;
         }
@@ -5632,6 +6011,7 @@ static int exit_move_timer_win(int inventoryWindowType)
     }
 
     win_delete(mt_wid);
+    mt_wid = -1;
 
     return 0;
 }

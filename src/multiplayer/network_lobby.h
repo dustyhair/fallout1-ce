@@ -24,6 +24,11 @@ namespace multiplayer {
 constexpr std::uint16_t kNetworkLobbyVersion = 4;
 constexpr std::size_t kMaxLobbyChatMessageLength = 64;
 
+struct StoryPresentationCompletion {
+    PlayerId playerId;
+    std::uint64_t revision = 0;
+};
+
 struct LobbyChatMessage {
     PlayerId playerId;
     std::string text;
@@ -65,10 +70,11 @@ public:
         const std::vector<std::uint8_t>& path = {},
         std::uint32_t phaseRevision = 1);
     bool sendLocalFacing(int rotation, std::uint32_t phaseRevision = 1);
-    bool sendLocalDoorUse(EntityId targetId, std::uint32_t phaseRevision = 1);
-    bool sendLocalPickup(EntityId targetId, std::uint32_t phaseRevision = 1);
-    bool sendLocalLoot(EntityId targetId, std::uint32_t phaseRevision = 1);
-    bool sendLocalSkillUse(EntityId targetId, ExplorationSkill skill, std::uint32_t phaseRevision = 1);
+    bool sendLocalDoorUse(EntityId targetId, std::uint32_t phaseRevision = 1, std::uint64_t turnRevision = 0);
+    bool sendLocalPickup(EntityId targetId, std::uint32_t phaseRevision = 1, std::uint64_t turnRevision = 0);
+    bool sendLocalLoot(EntityId targetId, std::uint32_t phaseRevision = 1, std::uint64_t turnRevision = 0, bool targetChange = false);
+    bool sendLocalSkillUse(EntityId targetId, ExplorationSkill skill, std::uint32_t phaseRevision = 1,
+        std::uint64_t turnRevision = 0);
     bool sendLocalItemUse(EntityId itemId, EntityId targetId, std::uint32_t phaseRevision = 1);
     bool sendLocalElevator(std::int32_t elevatorType, std::int32_t destinationLevel, std::uint32_t phaseRevision = 1);
     bool sendLocalExitGrid(EntityId exitId, std::uint32_t phaseRevision = 1);
@@ -79,9 +85,12 @@ public:
     bool sendLocalCombatMove(std::int32_t tile, std::int32_t elevation,
         bool running, std::uint64_t turnRevision, std::uint32_t phaseRevision);
     bool sendLocalCombatItem(EntityId itemId, EntityId targetId, std::uint64_t turnRevision,
-        std::uint32_t phaseRevision);
+        std::uint32_t phaseRevision, std::int32_t timerSeconds = 0);
     bool sendLocalCombatReload(EntityId weaponId, std::int32_t hitMode,
         std::uint64_t turnRevision, std::uint32_t phaseRevision);
+    bool sendLocalInventoryAction(const InventoryActionCommand& command, std::uint32_t phaseRevision);
+    bool sendLocalStartCombat(const StartCombatCommand& command, std::uint32_t phaseRevision);
+    bool sendLocalCharacterAdvance(const CharacterAdvanceCommand& command, std::uint32_t phaseRevision);
     bool sendLocalEquipment(const EquipmentCommand& equipment, std::uint32_t phaseRevision);
     bool sendLocalCombatFace(std::int32_t rotation, std::uint64_t turnRevision,
         std::uint32_t phaseRevision);
@@ -89,6 +98,7 @@ public:
     bool sendLocalSharedModal(SharedModalKind kind, bool open, SessionPhase currentPhase, std::uint32_t phaseRevision = 1);
     bool sendLocalTalk(EntityId targetId, std::uint32_t phaseRevision);
     bool sendLocalDialogueVote(std::uint64_t revision, std::uint8_t option, std::uint32_t phaseRevision);
+    bool sendLocalNpcBarter(const NpcBarterCommand& command, std::uint32_t phaseRevision);
     bool sendLocalDirectTrade(const DirectTradeCommand& trade,
         std::uint32_t phaseRevision);
     bool sendLocalWorldMapRoute(const WorldMapRouteCommand& route, std::uint32_t phaseRevision = 1);
@@ -99,7 +109,8 @@ public:
         std::uint32_t sourceQuantity,
         std::uint32_t phaseRevision = 1,
         EntityId remainderItemId = {},
-        ItemDescriptor itemDescriptor = {});
+        ItemDescriptor itemDescriptor = {},
+        std::uint64_t turnRevision = 0);
     bool sendLocalItemDrop(EntityId sourceId,
         EntityId itemId,
         std::uint32_t quantity,
@@ -125,6 +136,8 @@ public:
     std::optional<WorldSnapshot> takePeerSnapshot();
     bool sendAuthoritativeState(const WorldSnapshot& snapshot);
     std::optional<WorldSnapshot> takeAuthoritativeState();
+    bool confirmStoryPresentationCompleted(std::uint64_t revision);
+    std::optional<StoryPresentationCompletion> takeStoryPresentationCompleted();
     bool confirmSessionEndingApplied(std::uint32_t phaseRevision);
     std::uint32_t acknowledgedEndingPhaseRevision() const;
     EventSequence latestAuthoritativeEvent() const;
@@ -145,9 +158,9 @@ public:
     const CharacterCreationSheet* localSheet() const;
     const CharacterCreationSheet* peerSheet() const;
     bool startRequested() const;
+    CommandSequence nextLocalCommandSequence() const;
     std::uint64_t nextSendSequence() const;
     std::uint64_t nextReceiveSequence() const;
-    CommandSequence nextLocalCommandSequence() const;
     const ProtocolDiagnostics& diagnostics() const;
     std::unique_ptr<Transport> takeTransport();
 
@@ -186,7 +199,10 @@ private:
     std::uint64_t _nextEventSequence = 1;
     std::uint64_t _nextExpectedEventSequence = 1;
     EventSequence _lastAppliedEventSequence;
+    EventSequence _lastDeliveredEventSequence;
+    EventSequence _latestReceivedCheckpoint;
     std::uint32_t _acknowledgedEndingPhaseRevision = 0;
+    std::deque<StoryPresentationCompletion> _storyCompletions;
     std::unordered_map<PlayerId, EventSequence, PlayerIdHash> _acknowledgedEvents;
     // Retain unconfirmed intents across stream replacement. Replaying their
     // original IDs/revisions lets authority consume every command sequence.

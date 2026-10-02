@@ -24,8 +24,14 @@ typedef enum EventType {
     EVENT_TYPE_SNEAK = 10,
     EVENT_TYPE_EXPLOSION_FAILURE = 11,
     EVENT_TYPE_MAP_UPDATE_EVENT = 12,
+    EVENT_TYPE_PLAYER_EXPLOSION = 13,
+    EVENT_TYPE_PLAYER_EXPLOSION_FAILURE = 14,
     EVENT_TYPE_COUNT,
 } EventType;
+
+struct PlayerExplosionEvent {
+    int playerId; // Stable roster identity, not an actor pointer.
+};
 
 typedef struct DrugEffectEvent {
     int drugPid;
@@ -97,12 +103,29 @@ private:
     bool _prepared = false;
 };
 
+// Preserve persistent player timers while multiplayer replaces the peer actor.
+// Event data stays intact; native Sneak/device/explosive exit effects still run.
+class DetachedActorQueueEvents {
+public:
+    explicit DetachedActorQueueEvents(Object* actor);
+    ~DetachedActorQueueEvents();
+    DetachedActorQueueEvents(const DetachedActorQueueEvents&) = delete;
+    DetachedActorQueueEvents& operator=(const DetachedActorQueueEvents&) = delete;
+    void restore(Object* replacement);
+
+private:
+    Object* _actor;
+    void* _events = nullptr;
+};
+
 void queue_init();
 int queue_reset();
 int queue_exit();
 int queue_load(DB_FILE* stream);
 int queue_save(DB_FILE* stream);
+void queue_bind_loaded_owner(int savedActorId, Object* actor);
 int queue_add(int delay, Object* owner, void* data, int eventType);
+int queue_add_player_explosion(int delay, Object* owner, int playerId, bool premature);
 int queue_remove(Object* owner);
 int queue_remove_this(Object* owner, int eventType);
 bool queue_find(Object* owner, int eventType);

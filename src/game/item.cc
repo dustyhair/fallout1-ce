@@ -26,6 +26,7 @@
 #include "game/tile.h"
 #include "game/trait.h"
 #include "multiplayer/acting_player_context.h"
+#include "multiplayer/local_player_context.h"
 #include "multiplayer/network_runtime.h"
 #include "multiplayer/network_world.h"
 #include "platform_compat.h"
@@ -485,7 +486,13 @@ void item_move_all(Object* a1, Object* a2)
             break;
         }
         if (disposition == multiplayer::NetworkInventoryTransferDisposition::DeferToHost) {
-            index++;
+            // Host commands execute immediately and can remove this entry.
+            // Guest commands leave it in place until the checkpoint arrives.
+            if (index < inventory->length
+                && inventory->items[index].item == item
+                && inventory->items[index].quantity == quantity) {
+                index++;
+            }
             continue;
         }
         if (item_move_func(a1, a2, item, quantity, true) != 0) {
@@ -1398,6 +1405,7 @@ int item_w_reload(Object* weapon, Object* ammo)
 // 0x46B104
 int item_w_range(Object* critter, int hit_mode)
 {
+    multiplayer::ScopedActorPlayerContext playerContext(critter);
     Object* weapon;
     Proto* proto;
     int range;
@@ -1438,6 +1446,7 @@ int item_w_range(Object* critter, int hit_mode)
 // 0x46B1E8
 int item_w_mp_cost(Object* critter, int hit_mode, bool aiming)
 {
+    multiplayer::ScopedActorPlayerContext playerContext(critter);
     Object* weapon;
     int action_points;
     int weapon_subtype;
@@ -1601,6 +1610,7 @@ char item_w_sound_id(Object* weapon)
 // 0x46B450
 int item_w_called_shot(Object* critter, int hit_mode)
 {
+    multiplayer::ScopedActorPlayerContext playerContext(critter);
     int anim;
     Object* weapon;
     int damage_type;
@@ -1879,6 +1889,23 @@ bool item_m_uses_charges(Object* miscItem)
     return proto->item.data.misc.charges != 0;
 }
 
+int item_m_use_motion_sensor(Object* item)
+{
+    if (item == nullptr || item->pid != PROTO_ID_MOTION_SENSOR || item_m_curr_charges(item) <= 0) return -1;
+    Object* holder = item->owner;
+    int equipped = item->flags & OBJECT_EQUIPPED;
+    bool split = holder != nullptr && item_count(holder, item) > 1;
+    if (split && item_remove_mult(holder, item, 1) != 0) return -1;
+    if (split && equipped != 0) {
+        for (int index = 0; index < holder->data.inventory.length; ++index)
+            holder->data.inventory.items[index].item->flags &= ~equipped;
+        item->flags |= equipped;
+    }
+    int result = item_m_dec_charges(item);
+    if (split) item_add_force(holder, item, 1);
+    return result;
+}
+
 // 0x46B84C
 int item_m_use_charged_item(Object* critter, Object* miscItem)
 {
@@ -1896,8 +1923,14 @@ int item_m_use_charged_item(Object* critter, Object* miscItem)
             item_m_turn_on(miscItem);
         }
     } else if (pid == PROTO_ID_MOTION_SENSOR) {
+        if (multiplayer::networkWorldActive()) {
+            // Host execution only consumes the resource. The acting client
+            // opens its own map after the result and checkpoint arrive.
+            if (multiplayer::networkRuntimeIsGuestReplica()) return -1;
+            return item_m_use_motion_sensor(miscItem);
+        }
         // NOTE: Uninline.
-        if (item_m_dec_charges(miscItem) == 0) {
+        if (item_m_use_motion_sensor(miscItem) == 0) {
             automap(true, true);
         } else {
             MessageListItem messageListItem;
@@ -2192,7 +2225,7 @@ static int insert_drug_effect(Object* critter, Object* item, int a3, int* stats,
     }
 
     int delay = 600 * a3;
-    if (critter == obj_dude) {
+    if (item_is_player_actor(critter)) {
         if (trait_level(TRAIT_CHEM_RESISTANT)) {
             delay /= 2;
         }
@@ -2209,6 +2242,7 @@ static int insert_drug_effect(Object* critter, Object* item, int a3, int* stats,
 // 0x46BEEC
 static void perform_drug_effect(Object* critter, int* stats, int* mods, bool isImmediate)
 {
+    multiplayer::ScopedActorPlayerContext playerContext(critter);
     int v10;
     int v11;
     int v12;
@@ -2312,6 +2346,7 @@ static void perform_drug_effect(Object* critter, int* stats, int* mods, bool isI
 // 0x46C09C
 int item_d_take_drug(Object* critter, Object* item)
 {
+    multiplayer::ScopedActorPlayerContext playerContext(critter);
     Proto* proto;
     int addiction_chance;
 
@@ -2334,9 +2369,9 @@ int item_d_take_drug(Object* critter, Object* item)
     insert_drug_effect(critter, item, proto->item.data.drug.duration1, proto->item.data.drug.stat, proto->item.data.drug.amount1);
     insert_drug_effect(critter, item, proto->item.data.drug.duration2, proto->item.data.drug.stat, proto->item.data.drug.amount2);
 
-    if (!item_d_check_addict(item->pid)) {
+    if (!item_is_player_actor(critter) || !item_d_check_addict(item->pid)) {
         addiction_chance = proto->item.data.drug.addictionChance;
-        if (critter == obj_dude) {
+        if (item_is_player_actor(critter)) {
             if (trait_level(TRAIT_CHEM_RELIANT)) {
                 addiction_chance *= 2;
             }
@@ -2353,7 +2388,7 @@ int item_d_take_drug(Object* critter, Object* item)
         if (roll_random(1, 100) <= addiction_chance) {
             insert_withdrawal(critter, 1, proto->item.data.drug.withdrawalOnset, proto->item.data.drug.withdrawalEffect, item->pid);
 
-            if (critter == obj_dude) {
+            if (item_is_player_actor(critter)) {
                 // NOTE: Uninline.
                 item_d_set_addict(item->pid);
             }
@@ -2453,6 +2488,7 @@ static int insert_withdrawal(Object* obj, int a2, int duration, int perk, int pi
 // 0x46C3B4
 int item_wd_clear(Object* obj, void* data)
 {
+    multiplayer::ScopedActorPlayerContext context(obj);
     WithdrawalEvent* withdrawalEvent = (WithdrawalEvent*)data;
 
     if (isPartyMember(obj)) {
@@ -2469,6 +2505,7 @@ int item_wd_clear(Object* obj, void* data)
 // 0x46C40C
 static int item_wd_clear_all(Object* obj, void* data)
 {
+    multiplayer::ScopedActorPlayerContext context(obj);
     WithdrawalEvent* withdrawalEvent = (WithdrawalEvent*)data;
 
     if (obj != wd_obj) {
@@ -2493,6 +2530,7 @@ static int item_wd_clear_all(Object* obj, void* data)
 // 0x46C4A0
 int item_wd_process(Object* obj, void* data)
 {
+    multiplayer::ScopedActorPlayerContext context(obj);
     WithdrawalEvent* withdrawalEvent = (WithdrawalEvent*)data;
 
     if (withdrawalEvent->field_0) {
@@ -2500,13 +2538,13 @@ int item_wd_process(Object* obj, void* data)
     } else {
         perform_withdrawal_end(obj, withdrawalEvent->perk);
 
-        if (obj == obj_dude) {
+        if (item_is_player_actor(obj)) {
             // NOTE: Uninline.
             item_d_unset_addict(withdrawalEvent->pid);
         }
     }
 
-    if (obj == obj_dude) {
+    if (item_is_player_actor(obj)) {
         return 1;
     }
 
@@ -2549,6 +2587,7 @@ int item_wd_save(DB_FILE* stream, void* data)
 // 0x46C60C
 static void perform_withdrawal_start(Object* obj, int perk, int pid)
 {
+    multiplayer::ScopedActorPlayerContext context(obj);
     int duration;
 
     perk_add_effect(obj, perk);
@@ -2558,7 +2597,7 @@ static void perform_withdrawal_start(Object* obj, int perk, int pid)
     }
 
     duration = 10080;
-    if (obj == obj_dude) {
+    if (item_is_player_actor(obj)) {
         if (trait_level(TRAIT_CHEM_RELIANT)) {
             duration /= 2;
         }
@@ -2574,6 +2613,7 @@ static void perform_withdrawal_start(Object* obj, int perk, int pid)
 // 0x46C678
 static void perform_withdrawal_end(Object* obj, int perk)
 {
+    multiplayer::ScopedActorPlayerContext context(obj);
     MessageListItem messageListItem;
 
     perk_remove_effect(obj, perk);
@@ -2600,56 +2640,46 @@ static int pid_to_gvar(int pid)
     return -1;
 }
 
-// 0x46C6E8
+static std::uint32_t addiction_mask(int pid)
+{
+    int gvar = pid_to_gvar(pid);
+    if (gvar == -1) return 0;
+    for (int index = 0; index < ADDICTION_COUNT; ++index) {
+        if (drug_gvar[index] == gvar) return 1U << index;
+    }
+    return 0;
+}
+
 void item_d_set_addict(int pid)
 {
-    int gvar;
-
-    // NOTE: Uninline.
-    gvar = pid_to_gvar(pid);
-    if (gvar != -1) {
-        game_global_vars[gvar] = 1;
+    if (auto* build = multiplayer::actingCharacterBuild()) {
+        build->addictions |= addiction_mask(pid);
+    } else {
+        int gvar = pid_to_gvar(pid);
+        if (gvar != -1) game_global_vars[gvar] = 1;
     }
-
     pc_flag_on(PC_FLAG_ADDICTED);
 }
 
-// 0x46C73C
 void item_d_unset_addict(int pid)
 {
-    int gvar;
-
-    // NOTE: Uninline.
-    gvar = pid_to_gvar(pid);
-    if (gvar != -1) {
-        game_global_vars[gvar] = 0;
+    if (auto* build = multiplayer::actingCharacterBuild()) {
+        build->addictions &= ~addiction_mask(pid);
+    } else {
+        int gvar = pid_to_gvar(pid);
+        if (gvar != -1) game_global_vars[gvar] = 0;
     }
-
-    if (!item_d_check_addict(-1)) {
-        pc_flag_off(PC_FLAG_ADDICTED);
-    }
+    if (!item_d_check_addict(-1)) pc_flag_off(PC_FLAG_ADDICTED);
 }
 
-// Returns `true` if dude has addiction to item with given pid or any addition
-// if [pid] is -1.
-//
-// 0x46C79C
 bool item_d_check_addict(int pid)
 {
-    int index;
-
-    for (index = 0; index < ADDICTION_COUNT; index++) {
-        if (drug_pid[index] == pid) {
-            return game_global_vars[drug_pid[index]] != 0;
-        }
-
-        if (pid == -1) {
-            if (game_global_vars[drug_pid[index]] != 0) {
-                return true;
-            }
-        }
+    if (auto* build = multiplayer::actingCharacterBuild()) {
+        return pid == -1 ? build->addictions != 0 : (build->addictions & addiction_mask(pid)) != 0;
     }
-
+    for (int index = 0; index < ADDICTION_COUNT; ++index) {
+        if ((pid == -1 || drug_pid[index] == pid) && game_global_vars[drug_gvar[index]] != 0) return true;
+    }
     return false;
 }
 
@@ -2715,7 +2745,7 @@ int item_caps_adjust(Object* obj, int amount)
                 if (amount <= 0 || capsInContainer <= 0) {
                     if (amount < 0) {
                         if (capsInContainer < -amount) {
-                            if (item_caps_adjust(item, capsInContainer) == 0) {
+                            if (item_caps_adjust(item, -capsInContainer) == 0) {
                                 amount += capsInContainer;
                             }
                         } else {
@@ -2736,12 +2766,13 @@ int item_caps_adjust(Object* obj, int amount)
     }
 
     Object* item;
-    if (obj_pid_new(&item, PROTO_ID_MONEY) == 0) {
-        obj_disconnect(item, NULL);
-        if (item_add_force(obj, item, amount) != 0) {
-            obj_erase_object(item, NULL);
-            return -1;
-        }
+    if (obj_pid_new(&item, PROTO_ID_MONEY) != 0) {
+        return -1;
+    }
+    obj_disconnect(item, NULL);
+    if (item_add_force(obj, item, amount) != 0) {
+        obj_erase_object(item, NULL);
+        return -1;
     }
 
     return 0;

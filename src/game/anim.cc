@@ -1,4 +1,5 @@
 #include "game/anim.h"
+#include "multiplayer/local_player_context.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -633,6 +634,7 @@ int register_object_move_to_object(Object* owner, Object* destination, int actio
 // 0x413B48
 int register_object_run_to_object(Object* owner, Object* destination, int actionPoints, int delay)
 {
+    multiplayer::ScopedActorPlayerContext context(owner);
     if (check_registry(owner) == -1 || actionPoints == 0) {
         anim_cleanup();
         return -1;
@@ -648,7 +650,7 @@ int register_object_run_to_object(Object* owner, Object* destination, int action
     animationDescription->destination = destination;
 
     if ((FID_TYPE(owner->fid) == OBJ_TYPE_CRITTER && (owner->data.critter.combat.results & DAM_CRIP_LEG_ANY) != 0)
-        || (owner == obj_dude && is_pc_flag(PC_FLAG_SNEAKING) && !perk_level(PERK_SILENT_RUNNING))
+        || ((owner == obj_dude || multiplayer::isActingPlayerActor(owner)) && is_pc_flag(PC_FLAG_SNEAKING) && !perk_level(PERK_SILENT_RUNNING))
         || (!art_exists(art_id(FID_TYPE(owner->fid), owner->fid & 0xFFF, ANIM_RUNNING, 0, owner->rotation + 1)))) {
         animationDescription->anim = ANIM_WALK;
     } else {
@@ -707,6 +709,7 @@ int register_object_move_to_tile(Object* owner, int tile, int elevation, int act
 // 0x413DE8
 int register_object_run_to_tile(Object* owner, int tile, int elevation, int actionPoints, int delay)
 {
+    multiplayer::ScopedActorPlayerContext context(owner);
     if (check_registry(owner) == -1 || actionPoints == 0) {
         anim_cleanup();
         return -1;
@@ -723,7 +726,7 @@ int register_object_run_to_tile(Object* owner, int tile, int elevation, int acti
     animationDescription->elevation = elevation;
 
     if ((FID_TYPE(owner->fid) == OBJ_TYPE_CRITTER && (owner->data.critter.combat.results & DAM_CRIP_LEG_ANY) != 0)
-        || (owner == obj_dude && is_pc_flag(PC_FLAG_SNEAKING) && !perk_level(PERK_SILENT_RUNNING))
+        || ((owner == obj_dude || multiplayer::isActingPlayerActor(owner)) && is_pc_flag(PC_FLAG_SNEAKING) && !perk_level(PERK_SILENT_RUNNING))
         || (!art_exists(art_id(FID_TYPE(owner->fid), owner->fid & 0xFFF, ANIM_RUNNING, 0, owner->rotation + 1)))) {
         animationDescription->anim = ANIM_WALK;
     } else {
@@ -769,7 +772,8 @@ int register_object_move_along_path(
     animationDescription->owner = owner;
     animationDescription->tile = destinationTile;
     animationDescription->elevation = elevation;
-    animationDescription->anim = running ? ANIM_RUNNING : ANIM_WALK;
+    animationDescription->anim = running && (owner->data.critter.combat.results & DAM_CRIP_LEG_ANY) == 0
+        ? ANIM_RUNNING : ANIM_WALK;
     if (!art_exists(art_id(FID_TYPE(owner->fid), owner->fid & 0xFFF, animationDescription->anim, 0, owner->rotation + 1))) {
         animationDescription->anim = ANIM_WALK;
     }

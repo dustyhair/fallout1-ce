@@ -5,6 +5,59 @@ the current uncommitted parity fixes. This plan targets a complete two-player
 game first. New work must remain compatible with the planned four-player
 branch, without claiming that the current transport supports four players.
 
+## Stopping checkpoint, 2 October 2026
+
+Stop after the successful ordinary Killian confession hand-in. Matched source
+101 on HAL and codex-testbox completed the same dialogue that previously hung.
+Both players received native 500 XP, Natalia received five Stimpaks, and her
+recorder was removed. Actual adjacent transfer split the Stimpaks 2/3. SLOT09
+"Killian reward peaceful stop" preserves healthy, holstered players in Junktown
+with no dialogue or rest pending. External backup is
+`SLOT09-Killian-reward-peaceful-stop101-20261002`. Both visible sessions are muted.
+Detailed acceptance is in [the visible campaign record](visible-campaign-2026-10-01.md).
+
+This checkpoint saves the remaining multiplayer parity implementation, native
+fixtures, test drivers and review evidence previously held in the working tree.
+It is a development checkpoint. Goals 1 through 4 have accepted scoped results;
+Goal 5, complete campaign and release acceptance, remains open. Current network
+transport remains two-player. Roster-based state and tests retain four-player
+compatibility for future work.
+
+Checkpoint source 102 builds with multiplayer enabled and disabled. CTest
+passes 3/3 and 2/2; Python tool tests pass 17/17. Actual native editor cancel,
+skill spending, perk selection and save pass for both players. Movement, native
+disk recovery and authenticated reconnect finish with clean host/guest exits.
+Evidence is `/var/tmp/fallout-stop-checkpoint-ctest102-20261002.log`,
+`/var/tmp/fallout-stop-off-ctest102-20261002.log`,
+`/var/tmp/fallout-stop-tools-tests102b-20261002.log`,
+`/var/tmp/fallout-stop-native-character102-20261002.log` and
+`/var/tmp/fallout-stop-focused102-20261002/summary.tsv`.
+The visible saved run uses pinned source 101. Source 102 adds mouse scrolling
+state preservation tested natively; it has not been deployed to those desktops.
+
+Resume in this order:
+
+1. Close character-editor lifetime gaps. Cancel safely if a map transition,
+   actor replacement or phase change invalidates an open draft, including nested
+   perk dialogs. Background rules now use registered state while the editor
+   displays its draft, but lifetime transitions remain untested.
+2. Finish local-menu policy. Explicit Pause, save/load, help and other nested
+   windows need consistent multiplayer behavior. Preserve deliberate shared
+   dialogue/travel pauses. Skilldex, options and character windows now keep map
+   processing active; Pip-Boy startup failures restore their prior UI state.
+3. Continue ordinary story acceptance from the saved Killian reward. Test Lars,
+   Dogmeat recruitment, other companion loyalty and water-chip progression.
+   Prove HP-changing healing refresh on an already-open Pip-Boy alarm page.
+4. Complete remaining transfer/drop allocation failures and cross-map rollback.
+   Keep unchanged-state rejection tests and clean native process exits as gates.
+5. Run a final full compatibility campaign on the final source, then long-session,
+   disrupted-network and platform/crash checks. File/directory fsync and power-loss
+   durability remain open. The last completed full campaign is source 98; later
+   HUD and editor/menu changes have their own focused checks below.
+
+Future dialogue policy selection and the three death/downing/corpse-respawn
+policies remain in this plan. They are not implemented by this checkpoint.
+
 ## Assessment
 
 The foundation supports synchronized exploration, host combat rules, shared
@@ -1071,5 +1124,10 @@ Visible build 81 ordinary Junktown testing completes Kenji's assassination encou
 - [ ] Complete remaining transfer/drop allocation failures and cross-map rollback. The build 97 ground-node hypothesis did not reproduce a failure: matching chooses a staged ground body, which is already positioned before reconciliation. No speculative ground-node change was made.
 - [x] Build 97's full 50-scenario compatibility campaign and core finish 0/0 throughout. All 28 emitted final digests match; 22 scenarios emit no digest. Evidence: `/var/tmp/fallout-five-goals-regression97-full/summary.tsv` and `digests.tsv`.
 - [x] Commit `1746c45` preserves native map background processing behind multiplayer Pip-Boy and inventory windows. Both actual native opening/closing paths previously disabled background processing on both peers and exit explicitly 1/1 in the negative fixture. Build 98's permanent controls keep processing enabled during both windows, restore cleanly and finish 0/0. Solo mode retains native background pause. CTest passes 3/3. Evidence: `/var/tmp/fallout-local-ui-background-20261002/negative97.log`, `/var/tmp/fallout-native-local-ui98-20261002.log`.
-- [ ] Visible acceptance of the local UI fix: keep HAL Pip-Boy/inventory open while Natalia walks on codex-testbox, confirm actions/captures advance, then continue Killian's ordinary quest. Prepare matched build 98 after a safe save. Full build 98 compatibility campaign is running.
+- [x] Visible build 98 Pip-Boy acceptance passes in both directions: host keeps the alarm open while Natalia moves 27286 to 26882; guest keeps it open while Max moves 28868 to 28468. Both journals advance and capture the resulting positions. Visible inventory-held walking remains separate from this Pip-Boy acceptance.
+- [x] Full build 98 compatibility campaign completes all 50 scenarios plus the core gate, with every host/guest exit 0/0. All 28 emitted digests match; 22 scenarios emit none. Evidence: `/var/tmp/fallout-five-goals-regression98-full/{summary,digests}.tsv`.
+- [x] Commit `cb679b2` fixes the actual Killian hand-in hang. Shared dialogue disables native map animation processing, so synchronous HUD weapon animation cannot finish there. Item refresh now redraws without waiting for animation while multiplayer map processing is paused. The permanent paused-HUD test leaves existing animation state unchanged and exits 0/0. Matched source 101 then completes the original confession dialogue and reward. Evidence: `/var/tmp/fallout-native-paused-hud100c-20261002.log` and the visible campaign record.
+- [x] Commit `d902723` restores registered character state for native background callbacks and input polling while a character editor holds an uncommitted draft. Four-player tests cover nested drafts, registered-state updates, restoration and isolation. Source 101 passes CTest 3/3 and actual native editor cancel, skill spending, perk selection and save on both players. Evidence: `/var/tmp/fallout-five-goals-ctest101c-20261002.log`, `/var/tmp/fallout-native-local-character101-20261002.log`.
+- [x] Source 102 extends local background processing to Skilldex, options and the character editor while retaining solo pause behavior. Permanent native controls verify all five menu paths, disabled/nested mouse preservation, prior scrolling restoration and real missing-message Pip-Boy startup recovery. Skilldex renders all eight values using a selected registered actor distinct from obj_dude on both processes. Both peers exit 0/0. Evidence: `/var/tmp/fallout-stop-native-local-ui102b-20261002.log`.
+- [ ] Final full regression after the HUD, background draft-context and remaining menu corrections. Source 98 is the last completed full matrix; focused source 102 checks do not replace this gate.
 
