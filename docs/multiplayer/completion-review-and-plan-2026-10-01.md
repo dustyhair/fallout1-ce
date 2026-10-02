@@ -66,7 +66,7 @@ The next five goals (current work):
 - [x] 2. Shared story movies and actual ending presentation. Both clients render the destruction movies, identical host-selected settlement slides, departure and credits. Independent skipping, reconnect after playback, missing movie assets and unfocused guest playback pass. This validates presentation, not completion of the underlying quests.
 - [x] 3. Real recruited Ian lifecycle: recruitment, dismissal, gear, native retaliation, battle, death, travel and fresh-session recovery pass. Other companions and quest-specific loyalty remain content acceptance in goal 5.
 - [x] 4. Independent active hand. Save format 8 retains each actor's hand, versions 1–7 default to left, snapshot/wire formats reject invalid values, rejected requests leave the HUD unchanged. The 50-scenario interim run includes native disk/reconnect recovery with host left and guest right.
-- [ ] 5. Complete content acceptance and final release gates on the final code. Builds 45, 51, 62, 64, 66 and 72 each passed all 50 scenarios. Build 79's complete run is underway; ordinary full-story acceptance remains open.
+- [ ] 5. Complete content acceptance and final release gates on the final code. Builds 45, 51, 62, 64, 66 and 72 each passed all 50 scenarios. Build 79 passed all 50 scenarios and the core gate with clean exits; candidate 81 adds focused fixes and its full run is underway. Ordinary full-story acceptance remains open.
 
 Goal 5 acceptance slices:
 
@@ -995,3 +995,33 @@ and 2/2. Exact-slot cleanup and stopped-combat native ASAN probes pass. A visibl
 Pip-Boy alarm refresh correction awaits matched deployment and real healing
 acceptance. The build-78 campaign used only the default 18 scenarios, all passed;
 it is not counted as a full run. The complete 50-scenario build-79 run is underway.
+
+Build 79 completed all 50 compatibility scenarios and the core gate, with clean
+zero exits throughout and all 28 emitted final digests matching. The remaining
+22 scenarios do not emit a digest. Evidence is
+`/var/tmp/fallout-five-goals-regression79-full/{summary,digests}.tsv`.
+
+Commits `6d9e7f2` and `4c9d651` protect retrying failed native saves and multiplayer
+metadata publication. A later save must successfully restore pending native
+backups before replacing them. Metadata backups use MULTI.OLD, outside the native
+map-backup wildcard; legacy MULTI.BAK is recovered before native backup cleanup.
+The permanent native rename-failure probe verifies original metadata survives
+failed publication, failed restore and repeated retry, then publishes exact bytes
+when I/O recovers. A destination directory preserves the backup, and a legacy
+backup is retained until recovery succeeds. All nine assertions pass on combined
+81 and on the isolated committed production build. Isolated build/CTest pass 3/3.
+
+Commit `54b8a26` validates required native prototypes before map, local-variable
+or entity mutation. Checksummed native checkpoints containing missing creature,
+scenery or item prototypes are rejected with unchanged digest/registry and zero
+native execution. Combined 81's movement and disk/authenticated recovery pass
+with both processes exiting zero. This closes the missing-prototype rejection
+case, not allocation or placement rollback across the entire application path.
+
+Matched muted HAL/testbox role 94 now runs pinned source 81, 306 source/config
+hashes equal across platforms, restored to ordinary Junktown. Both native builds
+retain saved level-three HP 55/41, Ian 50, zero poison and weapon/consumable/cap
+resources. The full candidate-81 regression and actual HP-changing alarm redraw
+acceptance remain pending. Source bundle is
+`/var/tmp/fallout-visible-pinned81-src`; HAL binary SHA256 is
+`b6b3c9ba2a7e56861375997b10f8f567911ebcdef4e743b6ac57dec8a0d4ae7d`.
