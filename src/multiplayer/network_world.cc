@@ -804,6 +804,54 @@ bool validateSnapshotActorArt(const WorldSnapshot& snapshot)
     return true;
 }
 
+Object* matchSnapshotCritter(const CritterSnapshot& state,
+    const std::vector<Object*>& candidates, const std::unordered_set<Object*>& used)
+{
+    for (Object* candidate : candidates) {
+        if (candidate != nullptr && used.count(candidate) == 0
+            && candidate->pid == state.pid && candidate->tile == state.tile
+            && candidate->elevation == state.elevation) return candidate;
+    }
+    Object* solePidMatch = nullptr;
+    for (Object* candidate : candidates) {
+        if (candidate != nullptr && used.count(candidate) == 0 && candidate->pid == state.pid) {
+            if (solePidMatch != nullptr) return nullptr;
+            solePidMatch = candidate;
+        }
+    }
+    return solePidMatch;
+}
+
+bool validateSnapshotCritterFrames(const WorldSnapshot& snapshot)
+{
+    bool stableIdentity = snapshot.critters.size() == worldCritters.size()
+        && validateCritterState(snapshot);
+    std::vector<Object*> candidates;
+    candidates.reserve(worldCritters.size());
+    for (const auto& entry : worldCritters) candidates.push_back(entry.second);
+    std::unordered_set<Object*> used;
+    for (const CritterSnapshot& state : snapshot.critters) {
+        Object* matched = stableIdentity ? session.entities().findObject(state.entityId)
+            : matchSnapshotCritter(state, candidates, used);
+        if (matched != nullptr) used.insert(matched);
+        // Reconstructed native objects start at frame zero. Presentation only
+        // loads the selected FID's artwork when obj_set_frame will be called.
+        int nativeFrame = matched != nullptr ? matched->frame : 0;
+        if (nativeFrame == state.frame) continue;
+        CacheEntry* handle = nullptr;
+        Art* frames = art_ptr_lock(state.fid, &handle);
+        bool available = frames != nullptr && state.frame < art_frame_max_frame(frames);
+        if (frames != nullptr) art_ptr_unlock(handle);
+        if (!available) {
+            std::fprintf(stderr,
+                "Multiplayer snapshot critter frame preflight failed: entity=%u fid=%d frame=%d native_frame=%d matched=%d.\n",
+                state.entityId.value, state.fid, state.frame, nativeFrame, matched != nullptr ? 1 : 0);
+            return false;
+        }
+    }
+    return true;
+}
+
 bool applyActorAndCritterState(const WorldSnapshot& snapshot, bool preserveMovement)
 {
     for (const ActorSnapshot& actorState : snapshot.actors) {
@@ -4487,6 +4535,73 @@ bool networkWorldRunEngineAuthoritySmokeTest(EngineExecutionProbeCounts& counts)
             animation, poseMatched ? 1 : 0, poseRestoreMatched ? 1 : 0);
         if (!poseMatched || !poseRestoreMatched) return false;
     }
+    WorldSnapshot unavailableNpcFrame = rejectionBaseline;
+    ++unavailableNpcFrame.actors.front().hitPoints;
+    unavailableNpcFrame.critters.back().frame = 0x7FFFFFFF;
+    if (!rejectsWithoutMutation(unavailableNpcFrame, "stable_npc_frame_out_of_bounds")) return false;
+    std::uint32_t unusedCritterId = 1;
+    while (session.entities().contains(EntityId { unusedCritterId })) ++unusedCritterId;
+    WorldSnapshot rebasedNpcFrame = unavailableNpcFrame;
+    if (rebasedNpcFrame.critters.size() < 2) return false;
+    std::swap(rebasedNpcFrame.critters.front().entityId, rebasedNpcFrame.critters.back().entityId);
+    // Native encounter populations can consist entirely of the same PID.
+    // An extra descriptor forces reconciliation regardless of that layout.
+    CritterSnapshot extraRebasedCritter = rejectionBaseline.critters.front();
+    extraRebasedCritter.entityId = EntityId { unusedCritterId };
+    extraRebasedCritter.frame = 0;
+    rebasedNpcFrame.critters.push_back(extraRebasedCritter);
+    if (!rejectsWithoutMutation(rebasedNpcFrame, "reconciled_npc_frame_out_of_bounds")) return false;
+    WorldSnapshot newNpcFrame = rejectionBaseline;
+    CritterSnapshot newCritter = newNpcFrame.critters.front();
+    newCritter.entityId = EntityId { unusedCritterId };
+    newCritter.tile = tile_num_in_direction(newCritter.tile, 0, 1);
+    if (!hexGridTileIsValid(newCritter.tile)) return false;
+    newCritter.frame = 0x7FFFFFFF;
+    newCritter.whoHitMeId = {};
+    newNpcFrame.critters.push_back(newCritter);
+    ++newNpcFrame.actors.front().hitPoints;
+    if (!rejectsWithoutMutation(newNpcFrame, "new_npc_frame_out_of_bounds")) return false;
+    auto critterControl = [&](const WorldSnapshot& control, const char* reason) {
+        std::vector<std::uint8_t> packet;
+        if (encodeSnapshot(control, packet) != SnapshotError::None) return false;
+        auto decoded = decodeSnapshot(packet);
+        if (!decoded) return false;
+        engineExecutionProbeBegin();
+        bool applied = networkWorldApplySnapshot(decoded.snapshot);
+        WorldSnapshot captured;
+        bool capturePassed = networkWorldCaptureSnapshot({}, captured);
+        auto expected = computeSnapshotDigest(control);
+        auto actual = computeSnapshotDigest(captured);
+        bool matched = applied && capturePassed && expected && actual
+            && expected.digest.overall == actual.digest.overall;
+        bool restored = networkWorldApplySnapshot(rejectionBaseline);
+        WorldSnapshot restoredCapture;
+        bool restoreCaptured = networkWorldCaptureSnapshot({}, restoredCapture);
+        auto restoredDigest = computeSnapshotDigest(restoredCapture);
+        EngineExecutionProbeCounts controlCounts = engineExecutionProbeEnd();
+        bool preserved = restored && restoreCaptured && restoredDigest
+            && rejectionDigest.digest.overall == restoredDigest.digest.overall
+            && controlCounts.scriptProcedures == 0 && controlCounts.combatAttacks == 0
+            && controlCounts.randomDraws == 0;
+        std::fprintf(stderr, "NATIVE_SNAPSHOT_NPC_FRAME_CONTROL reason=%s applied=%d restored=%d.\n",
+            reason, matched ? 1 : 0, preserved ? 1 : 0);
+        return matched && preserved;
+    };
+    Object* hiddenCritter = session.entities().findObject(rejectionBaseline.critters.back().entityId);
+    if (hiddenCritter == nullptr) return false;
+    int hiddenFid = art_id(OBJ_TYPE_CRITTER, hiddenCritter->fid & 0xFFF, ANIM_TAKE_OUT, 0, 0);
+    if (art_exists(hiddenFid)) return false;
+    obj_change_fid(hiddenCritter, hiddenFid, nullptr);
+    hiddenCritter->flags |= OBJECT_HIDDEN;
+    WorldSnapshot hiddenPresentation;
+    if (!networkWorldCaptureSnapshot({}, hiddenPresentation)
+        || !critterControl(hiddenPresentation, "unchanged_hidden_missing_art")) return false;
+    WorldSnapshot frameZero = rejectionBaseline;
+    newCritter.frame = 0;
+    newCritter.fid = art_id(OBJ_TYPE_CRITTER, newCritter.fid & 0xFFF, ANIM_TAKE_OUT, 0, 0);
+    newCritter.objectFlags |= OBJECT_HIDDEN;
+    frameZero.critters.push_back(newCritter);
+    if (!critterControl(frameZero, "new_hidden_frame_zero")) return false;
     std::fprintf(stderr, "NATIVE_SNAPSHOT_REJECTION_PREFLIGHT_PASS\n");
 
     engineExecutionProbeBegin();
@@ -7678,6 +7793,10 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
             snapshot.doors.size(), worldDoors.size(), snapshot.scenery.size(), worldScenery.size());
         return false;
     }
+    if (session.isActive() && snapshotError == SnapshotError::None
+        && !validateSnapshotCritterFrames(snapshot)) {
+        return false;
+    }
     if (session.isActive()
         && snapshotError == SnapshotError::None
         && networkWorldReplicaSessionActive()
@@ -7836,32 +7955,7 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
         worldCritters.clear();
         std::unordered_set<Object*> reboundCritters;
         for (const CritterSnapshot& critterState : snapshot.critters) {
-            Object* matched = nullptr;
-            for (Object* candidate : localCritters) {
-                if (candidate != nullptr
-                    && reboundCritters.find(candidate) == reboundCritters.end()
-                    && candidate->pid == critterState.pid
-                    && candidate->tile == critterState.tile
-                    && candidate->elevation == critterState.elevation) {
-                    matched = candidate;
-                    break;
-                }
-            }
-            if (matched == nullptr) {
-                Object* solePidMatch = nullptr;
-                for (Object* candidate : localCritters) {
-                    if (candidate != nullptr
-                        && reboundCritters.find(candidate) == reboundCritters.end()
-                        && candidate->pid == critterState.pid) {
-                        if (solePidMatch != nullptr) {
-                            solePidMatch = nullptr;
-                            break;
-                        }
-                        solePidMatch = candidate;
-                    }
-                }
-                matched = solePidMatch;
-            }
+            Object* matched = matchSnapshotCritter(critterState, localCritters, reboundCritters);
             bool created = false;
             if (matched == nullptr) {
                 if (obj_pid_new(&matched, critterState.pid) == -1
