@@ -1294,6 +1294,19 @@ bool stageSnapshotBodies(const WorldSnapshot& snapshot, SnapshotReconciliationPl
     return true;
 }
 
+bool validateItemTimerOwnerFlags(const WorldSnapshot& snapshot)
+{
+    for (const TimedEventSnapshot& event : snapshot.timedEvents) {
+        auto owner = std::find_if(snapshot.items.begin(), snapshot.items.end(), [&](const auto& item) {
+            return item.entityId == event.ownerId;
+        });
+        // Native queues mark every owner USED. In particular, this keeps an
+        // item timer owner from being replaced by a native inventory merge.
+        if (owner != snapshot.items.end() && (owner->objectFlags & OBJECT_USED) == 0) return false;
+    }
+    return true;
+}
+
 bool prepareTimedEvents(const WorldSnapshot& snapshot, const SnapshotReconciliationPlan& reconciliation,
     std::vector<Object*>& owners, PreparedQueueEvents& prepared)
 {
@@ -8127,6 +8140,11 @@ bool networkWorldCaptureSnapshot(EventSequence lastIncludedEvent, WorldSnapshot&
 bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovement)
 {
     SnapshotError snapshotError = validateSnapshot(snapshot);
+    if (session.isActive() && snapshotError == SnapshotError::None
+        && !validateItemTimerOwnerFlags(snapshot)) {
+        std::fprintf(stderr, "Multiplayer snapshot item timer owner lacks native USED flag.\n");
+        return false;
+    }
     // Identity and phase checks must precede map replacement or object
     // reconciliation. A rejected checkpoint must not delete native items.
     if (session.isActive() && snapshotError == SnapshotError::None

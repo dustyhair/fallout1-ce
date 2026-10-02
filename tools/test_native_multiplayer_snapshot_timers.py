@@ -81,10 +81,13 @@ def installed_file(data, name):
     raise RuntimeError(f'installed game is missing {name}: {data}')
 
 
-def run_fixture(binary, data, port, root, expect_negative, fault_mode):
+def run_fixture(binary, data, port, root, expect_negative, fault_mode, expect_owner_negative=False):
     processes = []
     env = dict(os.environ, SDL_AUDIODRIVER='dummy', SDL_RENDER_DRIVER='software',
                NATIVE_SNAPSHOT_TIMER_FAULT=fault_mode)
+    env.pop('NATIVE_SNAPSHOT_TIMER_ALLOCATION_NEGATIVE', None)
+    if expect_negative:
+        env['NATIVE_SNAPSHOT_TIMER_ALLOCATION_NEGATIVE'] = '1'
 
     def read_log(directory):
         return (directory / 'game.log').read_text(errors='replace')
@@ -132,14 +135,36 @@ def run_fixture(binary, data, port, root, expect_negative, fault_mode):
                       if line.startswith('NATIVE_SNAPSHOT_TIMERS_FAILURE_CONTROL ')), '')
         placement = next((line for line in guest.splitlines()
                           if line.startswith('NATIVE_SNAPSHOT_TIMERS_PLACEMENT_CONTROL ')), '')
+        item_positive = next((line for line in guest.splitlines()
+                              if line.startswith('NATIVE_SNAPSHOT_TIMERS_ITEM_OWNER_POSITIVE ')), '')
+        item_negative = next((line for line in guest.splitlines()
+                              if line.startswith('NATIVE_SNAPSHOT_TIMERS_ITEM_OWNER_REJECTION ')), '')
+        if item_positive:
+            print(item_positive, flush=True)
+        if item_negative:
+            print(item_negative, flush=True)
         owner = next((line for line in guest.splitlines()
                       if line.startswith('NATIVE_SNAPSHOT_TIMERS_OWNER_REBIND_CONTROL ')), '')
         if owner:
             print(owner, flush=True)
-        print(fault or 'NATIVE_SNAPSHOT_TIMERS_FAILURE_CONTROL_MISSING', flush=True)
+        if fault or not expect_owner_negative:
+            print(fault or 'NATIVE_SNAPSHOT_TIMERS_FAILURE_CONTROL_MISSING', flush=True)
         if placement:
             print(placement, flush=True)
         print(f'NATIVE_SNAPSHOT_TIMERS_EXITS host={exits["host"]} guest={exits["guest"]}', flush=True)
+        if not re.search(r'queued_used=1 checksummed=1 applied=1 matched=1 restored=1', item_positive):
+            raise RuntimeError('native queued item with USED did not match and restore')
+        if expect_owner_negative:
+            if exits != {'host': 1, 'guest': 1} or not re.search(
+                    r'missing_used=1 matching_duplicate=1 checksummed=1 rejected=1 preserved=0 captured=1', item_negative):
+                raise RuntimeError('old item timer owner guard negative was not reproduced')
+            if not re.search(r'mappings=0 bodies=(\d+)/\1 scripts=(\d+)/\2 queue=1 old_owner_present=0 duplicate_present=1 scripts_run=0 attacks=0 rng=0', item_negative):
+                raise RuntimeError('old item owner replacement evidence is missing')
+            print('NATIVE_MULTIPLAYER_SNAPSHOT_TIMERS_OWNER_NEGATIVE_CONFIRMED', flush=True)
+            return
+        if not expect_negative and not re.search(
+                r'missing_used=1 matching_duplicate=1 checksummed=1 rejected=1 preserved=1 captured=1', item_negative):
+            raise RuntimeError('item timer owner rejection did not preserve native state')
         request_counts = re.search(r'node=(\d+) nested_item=1 expected_requests=(\d+) requests=(\d+) faults=1', fault)
         if request_counts is None or int(request_counts[1]) != (fault_mode == 'node') or request_counts[2] != request_counts[3]:
             raise RuntimeError('native payload/node allocation request was not reached')
@@ -191,17 +216,23 @@ def main():
                         help='native source matching the built game; defaults to this checkout')
     parser.add_argument('--expect-negative', action='store_true',
                         help='require old-code corruption and explicit host/guest exits 1/1')
+    parser.add_argument('--expect-owner-negative', action='store_true',
+                        help='require old-code item timer owner replacement and explicit exits 1/1')
     parser.add_argument('--fault', choices=('payload', 'node', 'both'), default='both')
     parser.add_argument('--port', type=int, default=0)
     args = parser.parse_args()
     if args.port != 0 and not 1024 <= args.port <= 65535:
         parser.error('port must be 0 for automatic selection or between 1024 and 65535')
+    if args.expect_negative and args.expect_owner_negative:
+        parser.error('select one negative control')
     checkout = pathlib.Path(__file__).resolve().parents[1]
     source = (args.source_root or checkout).resolve()
     root = pathlib.Path(tempfile.mkdtemp(prefix='fallout-native-snapshot-timers-', dir='/var/tmp'))
     print(f'NATIVE_SNAPSHOT_TIMERS_ARTIFACTS {root}', flush=True)
     binary = compile_fixture(args.build_directory.resolve(), source, checkout / 'tests', root)
     modes = ('payload', 'node') if args.fault == 'both' else (args.fault,)
+    if args.expect_owner_negative:
+        modes = (modes[0],)
     for offset, mode in enumerate(modes):
         port = args.port + offset if args.port else 0
         if port > 65535:
@@ -213,7 +244,7 @@ def main():
         run_root = root / mode
         run_root.mkdir()
         print(f'NATIVE_SNAPSHOT_TIMERS_RUN fault={mode} port={port}', flush=True)
-        run_fixture(binary, args.data_root.resolve(), port, run_root, args.expect_negative, mode)
+        run_fixture(binary, args.data_root.resolve(), port, run_root, args.expect_negative, mode, args.expect_owner_negative)
 
 
 

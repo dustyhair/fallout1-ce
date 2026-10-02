@@ -39,6 +39,159 @@ bool sameQueue(const std::vector<QueueEventState>& left, const std::vector<Queue
     return true;
 }
 
+struct RegistryMapping {
+    EntityId id;
+    Object* object;
+    std::optional<PlayerId> owner;
+};
+
+std::vector<RegistryMapping> captureRegistryMappings(const WorldSnapshot& snapshot)
+{
+    std::vector<RegistryMapping> mappings;
+    auto record = [&mappings](const auto& entries) {
+        for (const auto& entry : entries) {
+            mappings.push_back({ entry.first, entry.second, session.entities().ownerOf(entry.first) });
+        }
+    };
+    record(worldExitGrids);
+    record(worldDoors);
+    record(worldScenery);
+    record(worldCritters);
+    record(worldItems);
+    for (const auto& actor : snapshot.actors) {
+        mappings.push_back({ actor.entityId, session.entities().findObject(actor.entityId),
+            session.entities().ownerOf(actor.entityId) });
+    }
+    return mappings;
+}
+
+bool registryMappingsUnchanged(const std::vector<RegistryMapping>& mappings, std::size_t size)
+{
+    if (session.entities().size() != size) return false;
+    for (const auto& mapping : mappings) {
+        if (session.entities().findObject(mapping.id) != mapping.object
+            || session.entities().findEntity(mapping.object) != mapping.id
+            || session.entities().ownerOf(mapping.id) != mapping.owner) return false;
+    }
+    return true;
+}
+
+bool runItemTimerOwnerControls()
+{
+    WorldSnapshot baseline;
+    std::vector<QueueEventState> nativeQueue;
+    if (!networkWorldCaptureSnapshot({}, baseline) || baseline.actors.empty()
+        || !queue_capture_state(nativeQueue)) return false;
+    auto baselineDigest = computeSnapshotDigest(baseline);
+    auto chosen = std::find_if(baseline.items.begin(), baseline.items.end(), [](const auto& item) {
+        Proto* prototype = nullptr;
+        return isValid(item.holderId) && (item.objectFlags & (OBJECT_USED | OBJECT_EQUIPPED)) == 0
+            && proto_ptr(item.itemDescriptor.pid, &prototype) == 0
+            && prototype->item.type != ITEM_TYPE_CONTAINER;
+    });
+    if (!baselineDigest || chosen == baseline.items.end()) return false;
+    int bodiesBefore = nativeSnapshotTimersBodyCount();
+    int scriptsBefore = nativeSnapshotTimersScriptCount();
+    std::size_t registryBefore = session.entities().size();
+    auto mappings = captureRegistryMappings(baseline);
+    TimedEventSnapshot event;
+    event.time = std::max(1, baseline.gameTime);
+    for (const auto& timer : baseline.timedEvents) event.time = std::max(event.time, timer.time);
+    ++event.time;
+    event.eventType = EVENT_TYPE_FLARE;
+    event.ownerId = chosen->entityId;
+    WorldSnapshot positive = baseline;
+    auto owner = std::find_if(positive.items.begin(), positive.items.end(), [&](const auto& item) {
+        return item.entityId == chosen->entityId;
+    });
+    owner->objectFlags |= OBJECT_USED;
+    positive.timedEvents.push_back(event);
+    std::vector<std::uint8_t> packet;
+    if (encodeSnapshot(positive, packet) != SnapshotError::None) return false;
+    auto positiveDecoded = decodeSnapshot(packet);
+    if (!positiveDecoded) return false;
+    engineExecutionProbeBegin();
+    bool applied = networkWorldApplySnapshot(positiveDecoded.snapshot);
+    WorldSnapshot afterPositive;
+    bool positiveCaptured = networkWorldCaptureSnapshot({}, afterPositive);
+    auto expectedDigest = computeSnapshotDigest(positiveDecoded.snapshot);
+    auto positiveDigest = computeSnapshotDigest(afterPositive);
+    std::vector<QueueEventState> queued;
+    bool nativeOwner = queue_capture_state(queued)
+        && std::any_of(queued.begin(), queued.end(), [&](const auto& timer) {
+            return timer.eventType == event.eventType && timer.time == event.time
+                && timer.owner == session.entities().findObject(chosen->entityId)
+                && timer.owner != nullptr && (timer.owner->flags & OBJECT_USED) != 0;
+        });
+    bool matched = applied && positiveCaptured && expectedDigest && positiveDigest && nativeOwner
+        && expectedDigest.digest.overall == positiveDigest.digest.overall;
+    bool restored = networkWorldApplySnapshot(baseline);
+    WorldSnapshot restoredSnapshot;
+    bool restoredCaptured = networkWorldCaptureSnapshot({}, restoredSnapshot);
+    auto restoredDigest = computeSnapshotDigest(restoredSnapshot);
+    std::vector<QueueEventState> restoredQueue;
+    auto positiveEffects = engineExecutionProbeEnd();
+    bool positiveMappings = registryMappingsUnchanged(mappings, registryBefore);
+    bool baselineRestored = restored && restoredCaptured && restoredDigest
+        && restoredDigest.digest.overall == baselineDigest.digest.overall
+        && queue_capture_state(restoredQueue) && sameQueue(nativeQueue, restoredQueue)
+        && bodiesBefore == nativeSnapshotTimersBodyCount() && scriptsBefore == nativeSnapshotTimersScriptCount()
+        && positiveMappings && positiveEffects.scriptProcedures == 0
+        && positiveEffects.combatAttacks == 0 && positiveEffects.randomDraws == 0;
+    std::fprintf(stderr,
+        "NATIVE_SNAPSHOT_TIMERS_ITEM_OWNER_POSITIVE queued_used=1 checksummed=1 applied=%d matched=%d restored=%d registry=%zu/%zu mappings=%d bodies=%d/%d scripts=%d/%d queue=%d scripts_run=%u attacks=%u rng=%u\n",
+        applied, matched, baselineRestored, registryBefore, session.entities().size(), positiveMappings,
+        bodiesBefore, nativeSnapshotTimersBodyCount(), scriptsBefore, nativeSnapshotTimersScriptCount(),
+        sameQueue(nativeQueue, restoredQueue), positiveEffects.scriptProcedures,
+        positiveEffects.combatAttacks, positiveEffects.randomDraws);
+    if (!matched || !baselineRestored) return false;
+    // Old allocator controls isolate allocation failure from this later guard.
+    if (std::getenv("NATIVE_SNAPSHOT_TIMER_ALLOCATION_NEGATIVE") != nullptr) return true;
+
+    WorldSnapshot negative = baseline;
+    std::uint32_t nextId = 1;
+    auto include = [&](const auto& entries) {
+        for (const auto& entry : entries) nextId = std::max(nextId, entry.entityId.value + 1);
+    };
+    include(negative.actors);
+    include(negative.doors);
+    include(negative.scenery);
+    include(negative.critters);
+    include(negative.items);
+    while (session.entities().contains(EntityId { nextId })) ++nextId;
+    ItemSnapshot duplicate = *chosen;
+    duplicate.entityId = EntityId { nextId };
+    duplicate.quantity = 1;
+    negative.items.push_back(duplicate);
+    negative.timedEvents.push_back(event);
+    ++negative.actors.front().hitPoints;
+    negative.mapLocalVariables.push_back(98765);
+    if (encodeSnapshot(negative, packet) != SnapshotError::None) return false;
+    auto negativeDecoded = decodeSnapshot(packet);
+    if (!negativeDecoded) return false;
+    engineExecutionProbeBegin();
+    bool rejected = !networkWorldApplySnapshot(negativeDecoded.snapshot);
+    WorldSnapshot afterNegative;
+    bool captured = networkWorldCaptureSnapshot({}, afterNegative);
+    auto afterDigest = computeSnapshotDigest(afterNegative);
+    std::vector<QueueEventState> afterQueue;
+    bool queueUnchanged = queue_capture_state(afterQueue) && sameQueue(nativeQueue, afterQueue);
+    auto effects = engineExecutionProbeEnd();
+    bool mappingUnchanged = registryMappingsUnchanged(mappings, registryBefore);
+    bool preserved = rejected && captured && afterDigest
+        && afterDigest.digest.overall == baselineDigest.digest.overall && mappingUnchanged
+        && bodiesBefore == nativeSnapshotTimersBodyCount() && scriptsBefore == nativeSnapshotTimersScriptCount()
+        && queueUnchanged && effects.scriptProcedures == 0 && effects.combatAttacks == 0 && effects.randomDraws == 0;
+    std::fprintf(stderr,
+        "NATIVE_SNAPSHOT_TIMERS_ITEM_OWNER_REJECTION missing_used=1 matching_duplicate=1 checksummed=1 rejected=%d preserved=%d captured=%d registry=%zu/%zu mappings=%d bodies=%d/%d scripts=%d/%d queue=%d old_owner_present=%d duplicate_present=%d scripts_run=%u attacks=%u rng=%u\n",
+        rejected, preserved, captured, registryBefore, session.entities().size(), mappingUnchanged,
+        bodiesBefore, nativeSnapshotTimersBodyCount(), scriptsBefore, nativeSnapshotTimersScriptCount(),
+        queueUnchanged, session.entities().findObject(chosen->entityId) != nullptr,
+        session.entities().findObject(duplicate.entityId) != nullptr,
+        effects.scriptProcedures, effects.combatAttacks, effects.randomDraws);
+    return preserved;
+}
+
 #ifdef NATIVE_SNAPSHOT_TIMERS_PREPARED_OWNER_CONTROL
 bool runPreparedQueueOwnerControl()
 {
@@ -89,6 +242,7 @@ bool runNativeSnapshotTimersControl()
 #ifdef NATIVE_SNAPSHOT_TIMERS_PREPARED_OWNER_CONTROL
     if (!runPreparedQueueOwnerControl()) return false;
 #endif
+    if (!runItemTimerOwnerControls()) return false;
     WorldSnapshot baseline;
     if (!networkWorldCaptureSnapshot({}, baseline)
         || baseline.scenery.empty() || baseline.critters.empty() || baseline.actors.empty()) return false;
@@ -187,26 +341,7 @@ bool runNativeSnapshotTimersControl()
     int originalSid = stagedPrototype->sid;
     stagedPrototype->sid = (scriptType << 24) | scriptFixture->scr_script_idx;
 
-    struct RegistryMapping {
-        EntityId id;
-        Object* object;
-        std::optional<PlayerId> owner;
-    };
-    std::vector<RegistryMapping> mappings;
-    auto recordMappings = [&mappings](const auto& entries) {
-        for (const auto& entry : entries) {
-            mappings.push_back({ entry.first, entry.second, session.entities().ownerOf(entry.first) });
-        }
-    };
-    recordMappings(worldExitGrids);
-    recordMappings(worldDoors);
-    recordMappings(worldScenery);
-    recordMappings(worldCritters);
-    recordMappings(worldItems);
-    for (const auto& actor : baseline.actors) {
-        mappings.push_back({ actor.entityId, session.entities().findObject(actor.entityId),
-            session.entities().ownerOf(actor.entityId) });
-    }
+    auto mappings = captureRegistryMappings(baseline);
     int bodiesBefore = nativeSnapshotTimersBodyCount();
     int scriptsBefore = nativeSnapshotTimersScriptCount();
     std::size_t registryBefore = session.entities().size();
@@ -224,13 +359,7 @@ bool runNativeSnapshotTimersControl()
     EngineExecutionProbeCounts effects = engineExecutionProbeEnd();
     std::vector<QueueEventState> queueAfter;
     bool queueUnchanged = queue_capture_state(queueAfter) && sameQueue(queueBefore, queueAfter);
-    bool registryUnchanged = registryBefore == session.entities().size();
-    for (const auto& mapping : mappings) {
-        registryUnchanged = registryUnchanged
-            && session.entities().findObject(mapping.id) == mapping.object
-            && session.entities().findEntity(mapping.object) == mapping.id
-            && session.entities().ownerOf(mapping.id) == mapping.owner;
-    }
+    bool registryUnchanged = registryMappingsUnchanged(mappings, registryBefore);
     bool preserved = rejected && captured && afterDigest
         && afterDigest.digest.overall == baselineDigest.digest.overall && registryUnchanged
         && bodiesBefore == nativeSnapshotTimersBodyCount() && scriptsBefore == nativeSnapshotTimersScriptCount()
