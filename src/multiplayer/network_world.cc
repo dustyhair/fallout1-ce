@@ -822,18 +822,35 @@ Object* matchSnapshotCritter(const CritterSnapshot& state,
     return solePidMatch;
 }
 
-bool validateSnapshotCritterFrames(const WorldSnapshot& snapshot)
+struct SnapshotReconciliationPlan {
+    std::unordered_map<EntityId, Object*, EntityIdHash> objects;
+    std::vector<const ItemSnapshot*> orderedItems;
+    std::vector<Object*> created;
+    bool reconstructScenery = false;
+    bool reconstructCritters = false;
+
+    SnapshotReconciliationPlan() = default;
+    SnapshotReconciliationPlan(const SnapshotReconciliationPlan&) = delete;
+    SnapshotReconciliationPlan& operator=(const SnapshotReconciliationPlan&) = delete;
+    ~SnapshotReconciliationPlan();
+
+    Object* find(EntityId id) const
+    {
+        auto entry = objects.find(id);
+        return entry != objects.end() ? entry->second : nullptr;
+    }
+
+    void commit()
+    {
+        // Native lifetime callbacks own every body after reconciliation starts.
+        created.clear();
+    }
+};
+
+bool validateSnapshotCritterFrames(const WorldSnapshot& snapshot, const SnapshotReconciliationPlan& plan)
 {
-    bool stableIdentity = snapshot.critters.size() == worldCritters.size()
-        && validateCritterState(snapshot);
-    std::vector<Object*> candidates;
-    candidates.reserve(worldCritters.size());
-    for (const auto& entry : worldCritters) candidates.push_back(entry.second);
-    std::unordered_set<Object*> used;
     for (const CritterSnapshot& state : snapshot.critters) {
-        Object* matched = stableIdentity ? session.entities().findObject(state.entityId)
-            : matchSnapshotCritter(state, candidates, used);
-        if (matched != nullptr) used.insert(matched);
+        Object* matched = plan.find(state.entityId);
         // Reconstructed native objects start at frame zero. Presentation only
         // loads the selected FID's artwork when obj_set_frame will be called.
         int nativeFrame = matched != nullptr ? matched->frame : 0;
@@ -1104,58 +1121,26 @@ bool validateRequiredObjectFrame(std::int32_t fid, std::int32_t frame,
     return available;
 }
 
-bool validateSnapshotObjectFrames(const WorldSnapshot& snapshot)
+bool validateSnapshotObjectFrames(const WorldSnapshot& snapshot, const SnapshotReconciliationPlan& plan)
 {
-    // Predict the native bodies selected by reconciliation without changing
-    // IDs, holders or resources. A null body means a new frame-zero object.
-    std::unordered_map<EntityId, Object*, EntityIdHash> nativeObjects;
-    for (const ActorSnapshot& state : snapshot.actors) {
-        nativeObjects.emplace(state.entityId, session.entities().findObject(state.entityId));
-    }
-    for (std::size_t index = 0; index < snapshot.doors.size(); ++index) {
-        Object* door = worldDoors[index].second;
-        const DoorSnapshot& state = snapshot.doors[index];
-        // The native door setter always loads its existing art, even when
-        // the requested frame is unchanged. IDs are rebased by this index.
+    // Validate the exact bodies selected for reconciliation. Null means a new
+    // frame-zero object, which will be allocated only after art preflight.
+    for (const DoorSnapshot& state : snapshot.doors) {
+        Object* door = plan.find(state.entityId);
         if (door == nullptr || !obj_is_a_portal(door) || state.open != (state.frame != 0)
             || !validateRequiredObjectFrame(door->fid, state.frame, state.entityId, "doors")) return false;
-        nativeObjects.emplace(state.entityId, door);
     }
-    bool reconstructScenery = networkWorldReplicaSessionActive() && snapshotSceneryLayoutMismatch(snapshot);
-    std::unordered_set<Object*> usedScenery;
-    for (std::size_t index = 0; index < snapshot.scenery.size(); ++index) {
-        const ScenerySnapshot& state = snapshot.scenery[index];
-        Object* matched = reconstructScenery ? matchSnapshotScenery(state, worldScenery, usedScenery)
-            : worldScenery[index].second;
-        if (matched != nullptr) usedScenery.insert(matched);
+    for (const ScenerySnapshot& state : snapshot.scenery) {
+        Object* matched = plan.find(state.entityId);
         int nativeFrame = matched != nullptr ? matched->frame : 0;
         if (nativeFrame != state.frame
             && !validateRequiredObjectFrame(state.fid, state.frame, state.entityId, "scenery")) return false;
-        nativeObjects.emplace(state.entityId, matched);
     }
-    bool stableCritters = snapshot.critters.size() == worldCritters.size() && validateCritterState(snapshot);
-    std::vector<Object*> critterCandidates;
-    for (const auto& entry : worldCritters) critterCandidates.push_back(entry.second);
-    std::unordered_set<Object*> usedCritters;
-    for (const CritterSnapshot& state : snapshot.critters) {
-        Object* matched = stableCritters ? session.entities().findObject(state.entityId)
-            : matchSnapshotCritter(state, critterCandidates, usedCritters);
-        if (matched != nullptr) usedCritters.insert(matched);
-        nativeObjects.emplace(state.entityId, matched);
-    }
-    std::vector<Object*> itemCandidates;
-    for (const auto& entry : worldItems) if (entry.second != nullptr) itemCandidates.push_back(entry.second);
-    std::unordered_set<Object*> usedItems;
-    for (const ItemSnapshot* state : orderSnapshotItems(snapshot)) {
-        bool hasHolder = isValid(state->holderId);
-        auto holder = nativeObjects.find(state->holderId);
-        Object* holderBody = holder != nativeObjects.end() ? holder->second : nullptr;
-        Object* matched = matchSnapshotItem(*state, holderBody, hasHolder, itemCandidates, usedItems);
-        if (matched != nullptr) usedItems.insert(matched);
+    for (const ItemSnapshot* state : plan.orderedItems) {
+        Object* matched = plan.find(state->entityId);
         int nativeFrame = matched != nullptr ? matched->frame : 0;
         if (nativeFrame != state->frame
             && !validateRequiredObjectFrame(state->fid, state->frame, state->entityId, "items")) return false;
-        nativeObjects.emplace(state->entityId, matched);
     }
     return true;
 }
@@ -1185,6 +1170,110 @@ Object* createItem(const ItemDescriptor& descriptor)
         return nullptr;
     }
     return item;
+}
+
+SnapshotReconciliationPlan::~SnapshotReconciliationPlan()
+{
+    for (Object* object : created) {
+        // Staged bodies keep their native list node and never own inventory.
+        // Remove scripts directly so cleanup cannot execute a DESTROY proc.
+        if (object->sid != -1) {
+            scr_remove(object->sid);
+            object->sid = -1;
+        }
+        object->flags &= ~OBJECT_NO_REMOVE;
+        obj_erase_object(object, nullptr);
+    }
+}
+
+void selectSnapshotBodies(const WorldSnapshot& snapshot, SnapshotReconciliationPlan& plan)
+{
+    plan.reconstructScenery = networkWorldReplicaSessionActive() && snapshotSceneryLayoutMismatch(snapshot);
+    plan.reconstructCritters = snapshot.critters.size() != worldCritters.size() || !validateCritterState(snapshot);
+    plan.orderedItems = orderSnapshotItems(snapshot);
+    plan.objects.reserve(snapshot.actors.size() + snapshot.doors.size()
+        + snapshot.scenery.size() + snapshot.critters.size() + snapshot.items.size());
+    plan.created.reserve(snapshot.scenery.size() + snapshot.critters.size() + snapshot.items.size());
+    for (const ActorSnapshot& state : snapshot.actors) {
+        plan.objects.emplace(state.entityId, session.entities().findObject(state.entityId));
+    }
+    for (std::size_t index = 0; index < snapshot.doors.size(); ++index) {
+        plan.objects.emplace(snapshot.doors[index].entityId, worldDoors[index].second);
+    }
+    std::unordered_set<Object*> usedScenery;
+    for (std::size_t index = 0; index < snapshot.scenery.size(); ++index) {
+        const ScenerySnapshot& state = snapshot.scenery[index];
+        Object* matched = plan.reconstructScenery ? matchSnapshotScenery(state, worldScenery, usedScenery)
+            : worldScenery[index].second;
+        if (matched != nullptr) usedScenery.insert(matched);
+        plan.objects.emplace(state.entityId, matched);
+    }
+    std::vector<Object*> critterCandidates;
+    for (const auto& entry : worldCritters) critterCandidates.push_back(entry.second);
+    std::unordered_set<Object*> usedCritters;
+    for (const CritterSnapshot& state : snapshot.critters) {
+        Object* matched = plan.reconstructCritters ? matchSnapshotCritter(state, critterCandidates, usedCritters)
+            : session.entities().findObject(state.entityId);
+        if (matched != nullptr) usedCritters.insert(matched);
+        plan.objects.emplace(state.entityId, matched);
+    }
+    std::vector<Object*> itemCandidates;
+    for (const auto& entry : worldItems) if (entry.second != nullptr) itemCandidates.push_back(entry.second);
+    std::unordered_set<Object*> usedItems;
+    for (const ItemSnapshot* state : plan.orderedItems) {
+        Object* matched = matchSnapshotItem(*state, plan.find(state->holderId),
+            isValid(state->holderId), itemCandidates, usedItems);
+        if (matched != nullptr) usedItems.insert(matched);
+        plan.objects.emplace(state->entityId, matched);
+    }
+}
+
+bool stageSnapshotBodies(const WorldSnapshot& snapshot, SnapshotReconciliationPlan& plan)
+{
+    auto create = [&plan](EntityId id, int pid, int type) {
+        if (plan.find(id) != nullptr) return true;
+        Object* object = nullptr;
+        // Discarded creations consume monotonic native IDs, but never entity IDs.
+        if (obj_pid_new(&object, pid) == -1 || object == nullptr) return false;
+        plan.created.push_back(object);
+        object->flags &= ~OBJECT_NO_REMOVE;
+        if (type != OBJ_TYPE_ITEM) object->flags |= OBJECT_NO_SAVE;
+        Proto* prototype = nullptr;
+        if (FID_TYPE(object->fid) != type || proto_ptr(pid, &prototype) == -1 || prototype == nullptr
+            || (prototype->sid != -1 && object->sid == -1)) return false;
+        plan.objects.at(id) = object;
+        return true;
+    };
+    for (const ScenerySnapshot& state : snapshot.scenery) {
+        if (!create(state.entityId, state.pid, OBJ_TYPE_SCENERY)) return false;
+    }
+    for (const CritterSnapshot& state : snapshot.critters) {
+        if (!create(state.entityId, state.pid, OBJ_TYPE_CRITTER)) return false;
+    }
+    for (const ItemSnapshot* state : plan.orderedItems) {
+        bool missing = plan.find(state->entityId) == nullptr;
+        if (!create(state->entityId, state->itemDescriptor.pid, OBJ_TYPE_ITEM)
+            || (missing && !applyItemDescriptor(plan.find(state->entityId), state->itemDescriptor))) return false;
+    }
+    // Move only newly created bodies. obj_move_to_tile reuses their creation
+    // node and reports failure; obj_attempt_placement discards that result.
+    std::unordered_set<Object*> staged(plan.created.begin(), plan.created.end());
+    for (const ScenerySnapshot& state : snapshot.scenery) {
+        Object* object = plan.find(state.entityId);
+        if (staged.count(object) != 0
+            && obj_move_to_tile(object, state.tile, state.elevation, nullptr) == -1) return false;
+    }
+    for (const CritterSnapshot& state : snapshot.critters) {
+        Object* object = plan.find(state.entityId);
+        if (staged.count(object) != 0
+            && obj_move_to_tile(object, state.tile, state.elevation, nullptr) == -1) return false;
+    }
+    for (const ItemSnapshot* state : plan.orderedItems) {
+        Object* object = plan.find(state->entityId);
+        if (!isValid(state->holderId) && staged.count(object) != 0
+            && obj_move_to_tile(object, state->tile, state->elevation, nullptr) == -1) return false;
+    }
+    return true;
 }
 
 EntityRegistrationResult registerItem(Object* item)
@@ -8008,9 +8097,8 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
             snapshot.gameGlobalVariables.size(), num_game_global_vars);
         return false;
     }
-    // Prototype creation can fail after registry reconciliation has started.
-    // Reject unavailable native resources before replacing maps, variables or
-    // any object identity. Allocation/placement failures remain separate.
+    // Reject unavailable prototypes before map replacement. Missing native
+    // bodies and their exact placement are staged below before reconciliation.
     if (session.isActive() && snapshotError == SnapshotError::None
         && !validateSnapshotPrototypes(snapshot)) {
         return false;
@@ -8042,12 +8130,21 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
             snapshot.doors.size(), worldDoors.size(), snapshot.scenery.size(), worldScenery.size());
         return false;
     }
+    SnapshotReconciliationPlan reconciliation;
+    if (session.isActive() && snapshotError == SnapshotError::None) {
+        selectSnapshotBodies(snapshot, reconciliation);
+    }
     if (session.isActive() && snapshotError == SnapshotError::None
-        && !validateSnapshotCritterFrames(snapshot)) {
+        && !validateSnapshotCritterFrames(snapshot, reconciliation)) {
         return false;
     }
     if (session.isActive() && snapshotError == SnapshotError::None
-        && !validateSnapshotObjectFrames(snapshot)) {
+        && !validateSnapshotObjectFrames(snapshot, reconciliation)) {
+        return false;
+    }
+    if (session.isActive() && snapshotError == SnapshotError::None
+        && !stageSnapshotBodies(snapshot, reconciliation)) {
+        std::fprintf(stderr, "Multiplayer snapshot native creation or placement failed before reconciliation.\n");
         return false;
     }
     if (session.isActive()
@@ -8077,7 +8174,8 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
         return false;
     }
 
-    bool sceneryLayoutMismatch = snapshotSceneryLayoutMismatch(snapshot);
+    reconciliation.commit();
+    bool sceneryLayoutMismatch = reconciliation.reconstructScenery;
     if (networkWorldReplicaSessionActive() && sceneryLayoutMismatch) {
         // Saved terrain and map-enter scripts can have a different scenery
         // population from the installed MAP. Replicas reconstruct descriptors
@@ -8085,29 +8183,13 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
         auto localScenery = worldScenery;
         std::vector<std::pair<EntityId, Object*>> reconstructed;
         std::unordered_set<Object*> retained;
-        std::vector<Object*> created;
-        auto discardCreated = [&created]() {
-            for (Object* object : created) {
-                auto id = session.entities().findEntity(object);
-                if (id.has_value()) session.entities().unregisterEntity(*id);
-                obj_erase_object(object, nullptr);
-            }
-            return false;
-        };
         reconstructed.reserve(snapshot.scenery.size());
         for (const ScenerySnapshot& state : snapshot.scenery) {
-            Object* matched = matchSnapshotScenery(state, localScenery, retained);
-            if (matched == nullptr) {
-                if (obj_pid_new(&matched, state.pid) == -1 || matched == nullptr) return discardCreated();
-                created.push_back(matched);
-                matched->flags |= OBJECT_NO_SAVE;
-                if (obj_move_to_tile(matched, state.tile, state.elevation, nullptr) == -1
-                    || !session.registerWorldObject(matched)) {
-                    return discardCreated();
-                }
-            }
+            Object* matched = reconciliation.find(state.entityId);
+            if (!session.entities().findEntity(matched).has_value()
+                && !session.registerWorldObject(matched)) return false;
             auto entityId = session.entities().findEntity(matched);
-            if (!entityId.has_value()) return discardCreated();
+            if (!entityId.has_value()) return false;
             retained.insert(matched);
             reconstructed.emplace_back(*entityId, matched);
         }
@@ -8241,7 +8323,7 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
     // Encounter and map-enter scripts can create or remove critters only on
     // the authority. Reconcile them before inventory holders and timed-event
     // owners are resolved; replicas never execute the spawning scripts.
-    if (snapshot.critters.size() != worldCritters.size() || !validateCritterState(snapshot)) {
+    if (reconciliation.reconstructCritters) {
         std::vector<Object*> localCritters;
         localCritters.reserve(worldCritters.size());
         for (const auto& entry : worldCritters) {
@@ -8251,26 +8333,8 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
         worldCritters.clear();
         std::unordered_set<Object*> reboundCritters;
         for (const CritterSnapshot& critterState : snapshot.critters) {
-            Object* matched = matchSnapshotCritter(critterState, localCritters, reboundCritters);
-            bool created = false;
-            if (matched == nullptr) {
-                if (obj_pid_new(&matched, critterState.pid) == -1
-                    || matched == nullptr
-                    || FID_TYPE(matched->fid) != OBJ_TYPE_CRITTER) {
-                    std::fprintf(stderr, "Multiplayer snapshot could not create critter pid=%d.\n",
-                        critterState.pid);
-                    return false;
-                }
-                matched->flags |= OBJECT_NO_SAVE;
-                created = true;
-            }
-            if (created && obj_attempt_placement(matched, critterState.tile,
-                    critterState.elevation, 2) == -1) {
-                obj_erase_object(matched, nullptr);
-                return false;
-            }
+            Object* matched = reconciliation.find(critterState.entityId);
             if (session.entities().restoreObject(critterState.entityId, matched) != EntityRegistryError::None) {
-                if (created) obj_erase_object(matched, nullptr);
                 std::fprintf(stderr,
                     "Multiplayer snapshot could not rebind critter pid=%d tile=%d elevation=%d.\n",
                     critterState.pid, critterState.tile, critterState.elevation);
@@ -8289,7 +8353,7 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
             return false;
         }
     }
-    std::vector<const ItemSnapshot*> orderedItems = orderSnapshotItems(snapshot);
+    const auto& orderedItems = reconciliation.orderedItems;
     std::unordered_set<Object*> reboundItems;
     for (const ItemSnapshot* orderedItem : orderedItems) {
         const ItemSnapshot& itemState = *orderedItem;
@@ -8302,19 +8366,11 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
             return false;
         }
 
-        Object* matched = matchSnapshotItem(itemState, desiredHolder, isValid(itemState.holderId), localItems, reboundItems);
-        bool created = false;
-        if (matched == nullptr) {
-            matched = createItem(itemState.itemDescriptor);
-            created = true;
-        }
+        Object* matched = reconciliation.find(itemState.entityId);
         if (matched == nullptr
             || session.entities().restoreObject(itemState.entityId, matched) != EntityRegistryError::None) {
-            std::fprintf(stderr, "Multiplayer snapshot item rebind failed: item=%u pid=%d created=%d.\n",
-                itemState.entityId.value, itemState.itemDescriptor.pid, created ? 1 : 0);
-            if (created && matched != nullptr) {
-                obj_erase_object(matched, nullptr);
-            }
+            std::fprintf(stderr, "Multiplayer snapshot item rebind failed: item=%u pid=%d.\n",
+                itemState.entityId.value, itemState.itemDescriptor.pid);
             return false;
         }
         reboundItems.insert(matched);
@@ -8501,10 +8557,7 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
                 return false;
             }
         } else if (item->tile < 0) {
-            // obj_pid_new owns a floating-list node. Detach it before
-            // obj_connect creates the ground node for this object.
-            obj_disconnect(item, nullptr);
-            if (obj_connect(item, itemState.tile, itemState.elevation, nullptr) == -1) {
+            if (obj_move_to_tile(item, itemState.tile, itemState.elevation, nullptr) == -1) {
                 return false;
             }
         } else if (item->tile != itemState.tile || item->elevation != itemState.elevation) {
