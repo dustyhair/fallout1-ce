@@ -2120,36 +2120,11 @@ int scr_remove_local_vars(Script* script)
     return 0;
 }
 
-// 0x494384
-int scr_remove(int sid)
+// Remove the exact slot already found by the caller. Native party recovery
+// can leave duplicate SIDs, including an unprotected slot after a protected one.
+// Resolving that slot again by SID would select the protected entry forever.
+static int scr_remove_at(ScriptList* scriptList, ScriptListExtent* scriptListExtent, int index)
 {
-    if (sid == -1) {
-        return -1;
-    }
-
-    ScriptList* scriptList = &(scriptlists[SID_TYPE(sid)]);
-
-    ScriptListExtent* scriptListExtent = scriptList->head;
-    int index;
-    while (scriptListExtent != NULL) {
-        for (index = 0; index < scriptListExtent->length; index++) {
-            Script* script = &(scriptListExtent->scripts[index]);
-            if (script->scr_id == sid) {
-                break;
-            }
-        }
-
-        if (index < scriptListExtent->length) {
-            break;
-        }
-
-        scriptListExtent = scriptListExtent->next;
-    }
-
-    if (scriptListExtent == NULL) {
-        return -1;
-    }
-
     Script* script = &(scriptListExtent->scripts[index]);
     if ((script->scr_flags & SCRIPT_FLAG_0x02) != 0) {
         if (script->program != NULL) {
@@ -2217,6 +2192,39 @@ int scr_remove(int sid)
     return 0;
 }
 
+// 0x494384
+int scr_remove(int sid)
+{
+    if (sid == -1) {
+        return -1;
+    }
+
+    ScriptList* scriptList = &(scriptlists[SID_TYPE(sid)]);
+
+    ScriptListExtent* scriptListExtent = scriptList->head;
+    int index;
+    while (scriptListExtent != NULL) {
+        for (index = 0; index < scriptListExtent->length; index++) {
+            Script* script = &(scriptListExtent->scripts[index]);
+            if (script->scr_id == sid) {
+                break;
+            }
+        }
+
+        if (index < scriptListExtent->length) {
+            break;
+        }
+
+        scriptListExtent = scriptListExtent->next;
+    }
+
+    if (scriptListExtent == NULL) {
+        return -1;
+    }
+
+    return scr_remove_at(scriptList, scriptListExtent, index);
+}
+
 // 0x4945AC
 int scr_remove_all()
 {
@@ -2236,10 +2244,11 @@ int scr_remove_all()
                     index++;
                 } else {
                     if (index == 0 && scriptListExtent->length == 1) {
+                        ScriptListExtent* removingExtent = scriptListExtent;
                         scriptListExtent = scriptListExtent->next;
-                        scr_remove(script->scr_id);
+                        scr_remove_at(scriptList, removingExtent, index);
                     } else {
-                        scr_remove(script->scr_id);
+                        scr_remove_at(scriptList, scriptListExtent, index);
                     }
                 }
             }
