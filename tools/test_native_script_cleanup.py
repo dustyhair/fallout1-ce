@@ -11,6 +11,8 @@ import tempfile
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('build_directory', type=pathlib.Path)
+    parser.add_argument('--stopped-combat', action='store_true',
+                        help='check pending combat script requests obey the runtime stop')
     args = parser.parse_args()
     build = args.build_directory.resolve()
     source = pathlib.Path(__file__).resolve().parents[1]
@@ -38,7 +40,9 @@ def main():
         binary = root / 'probe'
         compile_args = shlex.split(compile_line)
         compile_args[1:1] = ['-I', str(source / 'src')]
-        compile_args[compile_args.index('-c') + 1] = str(source / 'tests/native_script_cleanup_test.cc')
+        test_name = ('native_stopped_script_entry_test.cc' if args.stopped_combat
+                     else 'native_script_cleanup_test.cc')
+        compile_args[compile_args.index('-c') + 1] = str(source / 'tests' / test_name)
         compile_args[compile_args.index('-o') + 1] = str(obj)
         compile_args[compile_args.index('-MF') + 1] = str(root / 'probe.d')
         compile_args += ['-fsanitize=address', '-g', '-O1']
@@ -49,7 +53,10 @@ def main():
         subprocess.run(link, cwd=build, check=True, timeout=60)
         subprocess.run([str(binary)], check=True, timeout=5,
                        env=dict(os.environ, ASAN_OPTIONS='detect_leaks=0'))
-    print('NATIVE_SCRIPT_CLEANUP_PASS sanitizer_scope=native_scripts duplicate_sid=removed protected_scripts=retained')
+    if args.stopped_combat:
+        print('NATIVE_STOPPED_SCRIPT_ENTRY_PASS pending_elevator=blocked ordinary_request=preserved')
+    else:
+        print('NATIVE_SCRIPT_CLEANUP_PASS sanitizer_scope=native_scripts duplicate_sid=removed protected_scripts=retained')
 
 
 if __name__ == '__main__':

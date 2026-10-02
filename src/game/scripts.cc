@@ -936,7 +936,7 @@ bool scripts_take_worldmap_request()
 // 0x4925C0
 int scripts_check_state_in_combat()
 {
-    if (multiplayer::networkRuntimeIsGuestReplica()) {
+    if (multiplayer::networkRuntimeIsGuestReplica() || multiplayer::networkRuntimeSimulationStopped()) {
         scriptState.requests = 0;
         return 0;
     }
