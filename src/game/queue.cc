@@ -600,14 +600,16 @@ bool queue_replace_state(const std::vector<QueueEventState>& state)
         node->owner = event.owner;
         node->data = data;
         node->next = NULL;
-        if (node->owner != NULL) {
-            node->owner->flags |= OBJECT_USED;
-        }
         *next = node;
         next = &(node->next);
         previousTime = event.time;
     }
 
+    // Validation and allocation can still fail while constructing later nodes.
+    // Change owner bookkeeping only after the complete replacement is ready.
+    for (QueueListNode* node = replacement; node != nullptr; node = node->next) {
+        if (node->owner != nullptr) node->owner->flags |= OBJECT_USED;
+    }
     queue_clear();
     queue = replacement;
     return true;

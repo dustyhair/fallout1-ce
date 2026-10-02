@@ -295,6 +295,29 @@ bool queueEventStatesEqual(const std::vector<QueueEventState>& lhs, const std::v
     return true;
 }
 
+bool smokeTestRejectedQueueReplacement()
+{
+    if (obj_dude == nullptr) return false;
+    std::vector<QueueEventState> before;
+    if (!queue_capture_state(before)) return false;
+    int savedFlags = obj_dude->flags;
+    obj_dude->flags &= ~OBJECT_USED;
+    QueueEventState valid;
+    valid.time = game_time() + 1000;
+    valid.eventType = EVENT_TYPE_SNEAK;
+    valid.owner = obj_dude;
+    QueueEventState invalid = valid;
+    invalid.eventType = EVENT_TYPE_COUNT;
+    bool rejected = !queue_replace_state({ valid, invalid });
+    std::vector<QueueEventState> after;
+    bool preserved = rejected && (obj_dude->flags & OBJECT_USED) == 0
+        && queue_capture_state(after) && queueEventStatesEqual(before, after);
+    obj_dude->flags = savedFlags;
+    std::fprintf(stderr, "NATIVE_QUEUE_REPLACEMENT_ATOMIC_%s owner_flags=1 queue=1\n",
+        preserved ? "PASS" : "FAIL");
+    return preserved;
+}
+
 bool smokeTestTimedQueueRoundTrip()
 {
     std::vector<QueueEventState> original;
@@ -314,7 +337,8 @@ bool smokeTestTimedQueueRoundTrip()
 
     std::vector<QueueEventState> expected;
     std::vector<QueueEventState> actual;
-    bool passed = queue_capture_state(expected)
+    bool passed = smokeTestRejectedQueueReplacement()
+        && queue_capture_state(expected)
         && queue_replace_state(expected)
         && queue_capture_state(actual)
         && queueEventStatesEqual(expected, actual);
