@@ -8501,6 +8501,9 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
                 return false;
             }
         } else if (item->tile < 0) {
+            // obj_pid_new owns a floating-list node. Detach it before
+            // obj_connect creates the ground node for this object.
+            obj_disconnect(item, nullptr);
             if (obj_connect(item, itemState.tile, itemState.elevation, nullptr) == -1) {
                 return false;
             }
