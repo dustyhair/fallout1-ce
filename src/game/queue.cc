@@ -1,5 +1,7 @@
 #include "game/queue.h"
 
+#include <cstdint>
+
 #include "game/actions.h"
 #include "game/critter.h"
 #include "game/display.h"
@@ -23,9 +25,13 @@ typedef struct QueueListNode {
     int time;
     int type;
     Object* owner;
+    // In-memory traversal identity; not serialized in saves or snapshots.
+    std::uint64_t generation;
     void* data;
     struct QueueListNode* next;
 } QueueListNode;
+
+static std::uint64_t nextQueueNodeGeneration = 1;
 
 static int queue_destroy(Object* obj, void* data);
 static int queue_explode(Object* obj, void* data);
@@ -291,6 +297,7 @@ int queue_add(int delay, Object* obj, void* data, int eventType)
     if (newQueueListNode == NULL) {
         return -1;
     }
+    newQueueListNode->generation = nextQueueNodeGeneration++;
 
     int v1 = game_time();
     int v2 = v1 + delay;
@@ -450,30 +457,34 @@ void queue_clear()
 // 0x490AA4
 void queue_clear_type(int eventType, QueueEventHandler* fn)
 {
-    QueueListNode** ptr = &queue;
-    QueueListNode* curr = *ptr;
+    // Callbacks can destroy an owner, remove other events or reset the queue.
+    // Hold identities rather than links into nodes that callbacks may free.
+    std::vector<std::uint64_t> pending;
+    for (QueueListNode* node = queue; node != nullptr; node = node->next) {
+        if (node->type == eventType) pending.push_back(node->generation);
+    }
+    for (std::uint64_t generation : pending) {
+        QueueListNode** link = &queue;
+        while (*link != nullptr && (*link)->generation != generation) link = &(*link)->next;
+        if (*link == nullptr) continue;
+        QueueListNode* node = *link;
+        *link = node->next;
+        node->next = nullptr;
 
-    while (curr != NULL) {
-        if (eventType == curr->type) {
-            QueueListNode* tmp = curr;
-
-            *ptr = curr->next;
-            curr = *ptr;
-
-            if (fn != NULL && fn(tmp->owner, tmp->data) != 1) {
-                *ptr = tmp;
-                ptr = &(tmp->next);
-            } else {
-                EventTypeDescription* eventTypeDescription = &(q_func[tmp->type]);
-                if (eventTypeDescription->freeProc != NULL) {
-                    eventTypeDescription->freeProc(tmp->data);
-                }
-
-                mem_free(tmp);
+        if (fn != nullptr && fn(node->owner, node->data) != 1) {
+            // Preserve the original order of equal-time events. Events newly
+            // scheduled by a callback remain for a subsequent queue pass.
+            QueueListNode** insertion = &queue;
+            while (*insertion != nullptr && ((*insertion)->time < node->time
+                || ((*insertion)->time == node->time && (*insertion)->generation < generation))) {
+                insertion = &(*insertion)->next;
             }
+            node->next = *insertion;
+            *insertion = node;
         } else {
-            ptr = &(curr->next);
-            curr = *ptr;
+            EventTypeDescription* description = &q_func[node->type];
+            if (description->freeProc != nullptr) description->freeProc(node->data);
+            mem_free(node);
         }
     }
 }
@@ -595,6 +606,7 @@ bool queue_replace_state(const std::vector<QueueEventState>& state)
             queue_free_list(replacement);
             return false;
         }
+        node->generation = nextQueueNodeGeneration++;
         node->time = event.time;
         node->type = event.eventType;
         node->owner = event.owner;
