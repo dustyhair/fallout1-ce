@@ -1172,7 +1172,8 @@ int exec_script_proc(int sid, int action)
         executeProcedure(program, proc);
     }
 
-    script->source = NULL;
+    // The procedure can destroy its owner and remove or compact this script.
+    if (scr_ptr(sid, &script) != -1) script->source = NULL;
 
     return 0;
 }
