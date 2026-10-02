@@ -1,4 +1,5 @@
 #include "game/party.h"
+#include "multiplayer/network_world.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -322,7 +323,11 @@ int partyMemberRecoverLoad()
 
             memcpy(script, partyMember->script, sizeof(*script));
 
-            partyMember->object->sid = ((partyMember->object->pid & 0xFFFFFF) + 18000) | (SCRIPT_TYPE_CRITTER << 24);
+            // Human actors share the player prototype. Keep their newly
+            // allocated script identity instead of the NPC prototype scheme.
+            bool playerActor = multiplayer::networkWorldCombatOwner(partyMember->object).has_value();
+            partyMember->object->sid = playerActor ? sid
+                : ((partyMember->object->pid & 0xFFFFFF) + 18000) | (SCRIPT_TYPE_CRITTER << 24);
             script->scr_id = partyMember->object->sid;
 
             script->program = NULL;
