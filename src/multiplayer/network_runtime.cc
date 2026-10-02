@@ -1177,7 +1177,8 @@ bool submitHostCommand(GameCommandPayload payload)
     bool needsCombatCheckpoint = isCheckpointedCombatAction(command.payload);
     AuthoritativeCommandResult outcome = networkWorldProcessCommand(command);
     bool accepted = outcome.result.status == CommandStatus::Accepted;
-    if (accepted && std::holds_alternative<EquipmentCommand>(command.payload)) intface_redraw();
+    if (accepted && (std::holds_alternative<EquipmentCommand>(command.payload)
+            || std::holds_alternative<RestCommand>(command.payload))) intface_redraw();
     bool needsStateCheckpoint = needsCombatCheckpoint
         || (accepted && needsInventoryCheckpoint(outcome));
     if (!accepted) {
@@ -1381,7 +1382,8 @@ void networkRuntimeBackgroundProcess()
                 }
                 AuthoritativeCommandResult outcome = networkWorldProcessCommand(*command);
                 if (outcome.result.status == CommandStatus::Accepted
-                    && std::holds_alternative<EquipmentCommand>(command->payload)) intface_redraw();
+                    && (std::holds_alternative<EquipmentCommand>(command->payload)
+                        || std::holds_alternative<RestCommand>(command->payload))) intface_redraw();
                 if (isDialogueSmokeScenario()
                     && std::holds_alternative<DialogueVoteCommand>(command->payload)) {
                     const auto& ballots = networkWorldDialogueBallots();
