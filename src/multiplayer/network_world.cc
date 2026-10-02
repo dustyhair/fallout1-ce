@@ -682,28 +682,6 @@ bool captureTimedEvents(WorldSnapshot& snapshot)
     return true;
 }
 
-bool applyTimedEvents(const WorldSnapshot& snapshot)
-{
-    std::vector<QueueEventState> queueEvents;
-    queueEvents.reserve(snapshot.timedEvents.size());
-    for (const TimedEventSnapshot& event : snapshot.timedEvents) {
-        QueueEventState queueEvent;
-        queueEvent.time = event.time;
-        queueEvent.eventType = event.eventType;
-        queueEvent.payloadCount = event.payloadCount;
-        for (std::size_t index = 0; index < event.payload.size(); index++) {
-            queueEvent.payload[index] = event.payload[index];
-        }
-        if (isValid(event.ownerId)) {
-            queueEvent.owner = session.entities().findObject(event.ownerId);
-            if (queueEvent.owner == nullptr) {
-                return false;
-            }
-        }
-        queueEvents.push_back(queueEvent);
-    }
-    return queue_replace_state(queueEvents);
-}
 
 bool validateActorState(const WorldSnapshot& snapshot)
 {
@@ -1314,6 +1292,28 @@ bool stageSnapshotBodies(const WorldSnapshot& snapshot, SnapshotReconciliationPl
             && obj_move_to_tile(object, state->tile, state->elevation, nullptr) == -1) return false;
     }
     return true;
+}
+
+bool prepareTimedEvents(const WorldSnapshot& snapshot, const SnapshotReconciliationPlan& reconciliation,
+    std::vector<Object*>& owners, PreparedQueueEvents& prepared)
+{
+    std::vector<QueueEventState> events;
+    events.reserve(snapshot.timedEvents.size());
+    owners.reserve(snapshot.timedEvents.size());
+    for (const TimedEventSnapshot& event : snapshot.timedEvents) {
+        QueueEventState native;
+        native.time = event.time;
+        native.eventType = event.eventType;
+        native.payloadCount = event.payloadCount;
+        native.payload = event.payload;
+        if (isValid(event.ownerId)) {
+            native.owner = reconciliation.find(event.ownerId);
+            if (native.owner == nullptr) return false;
+        }
+        owners.push_back(native.owner);
+        events.push_back(native);
+    }
+    return prepared.prepare(events);
 }
 
 EntityRegistrationResult registerItem(Object* item)
@@ -8200,6 +8200,13 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
         std::fprintf(stderr, "Multiplayer snapshot native creation or placement failed before reconciliation.\n");
         return false;
     }
+    PreparedQueueEvents preparedTimers;
+    std::vector<Object*> preparedTimerOwners;
+    if (session.isActive() && snapshotError == SnapshotError::None
+        && !prepareTimedEvents(snapshot, reconciliation, preparedTimerOwners, preparedTimers)) {
+        std::fprintf(stderr, "Multiplayer snapshot timed-event preparation failed before reconciliation.\n");
+        return false;
+    }
     if (session.isActive()
         && snapshotError == SnapshotError::None
         && networkWorldReplicaSessionActive()
@@ -8631,7 +8638,14 @@ bool networkWorldApplySnapshot(const WorldSnapshot& snapshot, bool preserveMovem
         std::fprintf(stderr, "Multiplayer snapshot failed world-map travel application.\n");
         return false;
     }
-    if (!applyTimedEvents(snapshot)) {
+    // Native inventory stacking can replace an item body during application.
+    // Resolve owners by their final authoritative IDs before setting USED flags.
+    for (std::size_t index = 0; index < snapshot.timedEvents.size(); ++index) {
+        EntityId id = snapshot.timedEvents[index].ownerId;
+        preparedTimerOwners[index] = isValid(id) ? session.entities().findObject(id) : nullptr;
+        if (isValid(id) && preparedTimerOwners[index] == nullptr) return false;
+    }
+    if (!preparedTimers.rebindOwners(preparedTimerOwners) || !preparedTimers.commit()) {
         std::fprintf(stderr, "Multiplayer snapshot failed timed-event application.\n");
         return false;
     }

@@ -563,7 +563,12 @@ bool queue_capture_state(std::vector<QueueEventState>& state)
     return true;
 }
 
-bool queue_replace_state(const std::vector<QueueEventState>& state)
+PreparedQueueEvents::~PreparedQueueEvents()
+{
+    queue_free_list(static_cast<QueueListNode*>(_events));
+}
+
+bool PreparedQueueEvents::prepare(const std::vector<QueueEventState>& state)
 {
     QueueListNode* replacement = NULL;
     QueueListNode** next = &replacement;
@@ -617,14 +622,52 @@ bool queue_replace_state(const std::vector<QueueEventState>& state)
         previousTime = event.time;
     }
 
-    // Validation and allocation can still fail while constructing later nodes.
-    // Change owner bookkeeping only after the complete replacement is ready.
-    for (QueueListNode* node = replacement; node != nullptr; node = node->next) {
+    queue_free_list(static_cast<QueueListNode*>(_events));
+    _events = replacement;
+    _eventCount = state.size();
+    _prepared = true;
+    return true;
+}
+
+bool PreparedQueueEvents::rebindOwners(const std::vector<Object*>& owners)
+{
+    if (!_prepared || owners.size() != _eventCount) return false;
+    std::size_t index = 0;
+    for (auto* node = static_cast<QueueListNode*>(_events); node != nullptr; node = node->next, ++index) {
+        bool ownerRequired = node->type != EVENT_TYPE_SCRIPT
+            && node->type != EVENT_TYPE_GAME_TIME && node->type != EVENT_TYPE_MAP_UPDATE_EVENT;
+        if ((ownerRequired && owners[index] == nullptr)
+            || ((node->type == EVENT_TYPE_GAME_TIME || node->type == EVENT_TYPE_MAP_UPDATE_EVENT)
+                && owners[index] != nullptr)) return false;
+    }
+    index = 0;
+    for (auto* node = static_cast<QueueListNode*>(_events); node != nullptr; node = node->next, ++index) {
+        node->owner = owners[index];
+    }
+    return true;
+}
+
+bool PreparedQueueEvents::commit()
+{
+    if (!_prepared) return false;
+    auto* replacement = static_cast<QueueListNode*>(_events);
+    // Only commit changes owner bookkeeping. Allocation and validation have
+    // completed, and snapshot owners may have been rebound without allocation.
+    for (auto* node = replacement; node != nullptr; node = node->next) {
         if (node->owner != nullptr) node->owner->flags |= OBJECT_USED;
     }
     queue_clear();
     queue = replacement;
+    _events = nullptr;
+    _eventCount = 0;
+    _prepared = false;
     return true;
+}
+
+bool queue_replace_state(const std::vector<QueueEventState>& state)
+{
+    PreparedQueueEvents replacement;
+    return replacement.prepare(state) && replacement.commit();
 }
 
 // 0x490B30

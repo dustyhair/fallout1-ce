@@ -79,6 +79,24 @@ struct QueueEventState {
 
 extern EventTypeDescription q_func[EVENT_TYPE_COUNT];
 
+// Allocate and validate a complete event list before changing native state.
+// Staged event cleanup frees data and nodes without running event handlers.
+class PreparedQueueEvents {
+public:
+    PreparedQueueEvents() = default;
+    ~PreparedQueueEvents();
+    PreparedQueueEvents(const PreparedQueueEvents&) = delete;
+    PreparedQueueEvents& operator=(const PreparedQueueEvents&) = delete;
+    bool prepare(const std::vector<QueueEventState>& state);
+    bool rebindOwners(const std::vector<Object*>& owners);
+    bool commit();
+
+private:
+    void* _events = nullptr;
+    std::size_t _eventCount = 0;
+    bool _prepared = false;
+};
+
 void queue_init();
 int queue_reset();
 int queue_exit();
