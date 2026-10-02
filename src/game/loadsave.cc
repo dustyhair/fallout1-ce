@@ -1548,7 +1548,11 @@ static int SaveSlot()
     compat_mkdir(gmpath);
 
     if (SaveBackup() == -1) {
-        debug_printf("\nLOADSAVE: Warning, can't backup save file!\n");
+        debug_printf("\nLOADSAVE: ** Error backing up save files; original slot retained! **\n");
+        SaveDirectoryPath(gmpath, true, true);
+        MapDirErase(gmpath, "BAK");
+        gsound_background_unpause();
+        return -1;
     }
 
     SaveDirectoryPath(gmpath, true, true);
@@ -2680,70 +2684,42 @@ int MapDirEraseFile(const char* a1, const char* a2)
 static int SaveBackup()
 {
     debug_printf("\nLOADSAVE: Backing up save slot files..\n");
+    automap_db_flag = 0;
 
-    SaveDirectoryPath(gmpath, false, true);
+    // Database paths are relative to the configured patches directory. Copy
+    // backups without moving the live slot, so a failed later copy leaves the
+    // original SAVE.DAT, maps and multiplayer sidecar usable together.
+    SaveDirectoryPath(gmpath, true, true);
+    if (MapDirErase(gmpath, "BAK") == -1) return -1;
     strcpy(str0, gmpath);
-
     strcat(str0, "SAVE.DAT");
-
     strmfe(str1, str0, "BAK");
 
-    DB_FILE* stream1 = db_fopen(str0, "rb");
-    if (stream1 != NULL) {
-        db_fclose(stream1);
-        if (compat_rename(str0, str1) != 0) {
-            return -1;
-        }
+    DB_FILE* stream = db_fopen(str0, "rb");
+    if (stream != nullptr) {
+        db_fclose(stream);
+        if (copy_file(str0, str1) == -1) return -1;
     }
 
-    SaveDirectoryPath(gmpath, true, true);
     snprintf(str0, sizeof(str0), "%s*.%s", gmpath, "SAV");
-
     char** fileList;
     int fileListLength = db_get_file_list(str0, &fileList, NULL, 0);
-    if (fileListLength == -1) {
-        return -1;
-    }
-
+    if (fileListLength == -1) return -1;
     map_backup_count = fileListLength;
 
-    SaveDirectoryPath(gmpath, false, true);
     for (int index = fileListLength - 1; index >= 0; index--) {
         strcpy(str0, gmpath);
         strcat(str0, fileList[index]);
-
         strmfe(str1, str0, "BAK");
-        if (compat_rename(str0, str1) != 0) {
+        if (copy_file(str0, str1) == -1) {
             db_free_file_list(&fileList, NULL);
             return -1;
         }
     }
-
     db_free_file_list(&fileList, NULL);
-
+    // AUTOMAP.SAV is included in the map list. Restoring it twice would consume
+    // its backup on the first rename and fail the second restore.
     debug_printf("\nLOADSAVE: %d map files backed up.\n", fileListLength);
-
-    SaveDirectoryPath(gmpath, true, true);
-
-    char* v1 = strmfe(str2, "AUTOMAP.DB", "SAV");
-    snprintf(str0, sizeof(str0), "%s\\%s", gmpath, v1);
-
-    char* v2 = strmfe(str2, "AUTOMAP.DB", "BAK");
-    snprintf(str1, sizeof(str1), "%s\\%s", gmpath, v2);
-
-    automap_db_flag = 0;
-
-    DB_FILE* stream2 = db_fopen(str0, "rb");
-    if (stream2 != NULL) {
-        db_fclose(stream2);
-
-        if (copy_file(str0, str1) == -1) {
-            return -1;
-        }
-
-        automap_db_flag = 1;
-    }
-
     return 0;
 }
 
