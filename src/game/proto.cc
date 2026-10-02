@@ -19,6 +19,7 @@
 #include "game/stat.h"
 #include "game/trait.h"
 #include "int/dialog.h"
+#include "multiplayer/acting_player_context.h"
 #include "platform_compat.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/memory.h"
@@ -351,7 +352,7 @@ static char* proto_get_msg_info(int pid, int message)
 char* proto_name(int pid)
 {
     if (pid == 0x1000000) {
-        return critter_name(obj_dude);
+        return critter_name(multiplayer::actingPlayerActorOr(obj_dude));
     }
 
     return proto_get_msg_info(pid, PROTOTYPE_MESSAGE_NAME);
