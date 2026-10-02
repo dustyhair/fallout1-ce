@@ -2621,8 +2621,8 @@ out:
         db_fclose(stream1);
     }
 
-    if (stream2 != NULL) {
-        db_fclose(stream2);
+    if (stream2 != NULL && db_fclose(stream2) != 0) {
+        result = -1;
     }
 
     if (buf != NULL) {
