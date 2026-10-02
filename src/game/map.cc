@@ -502,6 +502,9 @@ int map_set_global_var(int var, ProgramValue& value)
 // 0x473E18
 int map_get_global_var(int var, ProgramValue& value)
 {
+    // Native map storage reconstructs a pointer; it carries no VM origin.
+    value.pointerOrigin = PointerOrigin::None;
+    value.pointerOriginGeneration = 0;
     if (var < 0 || var >= num_map_global_vars) {
         debug_printf("ERROR: attempt to reference map var out of range: %d", var);
         return -1;
@@ -540,6 +543,9 @@ int map_set_local_var(int var, ProgramValue& value)
 // 0x473E78
 int map_get_local_var(int var, ProgramValue& value)
 {
+    // Native map storage reconstructs a pointer; it carries no VM origin.
+    value.pointerOrigin = PointerOrigin::None;
+    value.pointerOriginGeneration = 0;
     if (var < 0 || var >= num_map_local_vars) {
         debug_printf("ERROR: attempt to reference local var out of range: %d", var);
         return -1;

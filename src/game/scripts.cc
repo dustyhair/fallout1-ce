@@ -24,6 +24,7 @@
 #include "game/worldmap.h"
 #include "int/dialog.h"
 #include "int/export.h"
+#include "int/support/intextra.h"
 #include "int/window.h"
 #include "multiplayer/network_runtime.h"
 #include "multiplayer/network_world.h"
@@ -1184,9 +1185,19 @@ int exec_script_proc(int sid, int action)
 
     script->scr_flags |= SCRIPT_FLAG_0x04;
 
-    engineExecutionProbeRecordScriptProcedure();
     if (programLoaded) {
         scr_build_lookup_table(script);
+    }
+    if (action == SCRIPT_PROC_TALK && multiplayer::networkWorldActive()
+        && SID_TYPE(sid) == SCRIPT_TYPE_CRITTER
+        && script->procs[SCRIPT_PROC_CRITTER] > SCRIPT_PROC_NO_PROC
+        && script->owner != nullptr && PID_TYPE(script->owner->pid) == OBJ_TYPE_CRITTER
+        && !multiplayer::networkWorldCombatOwner(script->owner).has_value()) {
+        intExtraRememberDialogueActor(program, multiplayer::actingPlayerActor());
+    }
+
+    engineExecutionProbeRecordScriptProcedure();
+    if (programLoaded) {
         runProgram(program);
         interpretSetCPUBurstSize(5000);
         updatePrograms();
@@ -1196,7 +1207,14 @@ int exec_script_proc(int sid, int action)
     }
 
     // The procedure can destroy its owner and remove or compact this script.
-    if (scr_ptr(sid, &script) != -1) script->source = NULL;
+    if (scr_ptr(sid, &script) != -1) {
+        script->source = NULL;
+        if (action == SCRIPT_PROC_CRITTER) {
+            // No deferred attack occurred: expire the dialogue context after
+            // the first ambient update, without changing its actor binding.
+            intExtraClearDialogueActor(script->program);
+        }
+    }
 
     return 0;
 }

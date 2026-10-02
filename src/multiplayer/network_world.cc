@@ -43,6 +43,7 @@
 #include "game/stat.h"
 #include "game/tile.h"
 #include "game/worldmap.h"
+#include "int/support/intextra.h"
 #include "multiplayer/acting_player_context.h"
 #include "multiplayer/combat_turn_controller.h"
 #include "multiplayer/dialogue_vote_controller.h"
@@ -2722,6 +2723,13 @@ public:
             || actor->elevation != target->elevation || obj_dist(actor, target) >= 9
             || activeSharedModal.has_value() || pendingTalk.has_value()
             || session.phase() != SessionPhase::Exploration) {
+            return CommandExecutionStatus::InvalidAction;
+        }
+        // Order another conversation after this NPC's native reaction. This
+        // leaves the existing phase and shared modal untouched on rejection.
+        Script* script = nullptr;
+        if (scr_ptr(target->sid, &script) == 0 && script->program != nullptr
+            && intExtraHasDialogueActor(script->program)) {
             return CommandExecutionStatus::InvalidAction;
         }
         std::optional<EntityId> actorId = session.entities().findEntity(actor);
@@ -8966,6 +8974,7 @@ void networkWorldLeave()
     combatTurns.stop();
     openInventories.clear();
     session.stop();
+    intExtraResetDialogueActors();
     worldDoors.clear();
     worldScenery.clear();
     worldExitGrids.clear();

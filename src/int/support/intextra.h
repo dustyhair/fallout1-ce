@@ -20,6 +20,10 @@ void intExtraClose();
 void initIntExtra();
 void updateIntExtra();
 void intExtraRemoveProgramReferences(Program* program);
+void intExtraRememberDialogueActor(Program* program, Object* actor);
+void intExtraClearDialogueActor(Program* program);
+bool intExtraHasDialogueActor(Program* program);
+void intExtraResetDialogueActors();
 
 } // namespace fallout
 

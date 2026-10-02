@@ -3,6 +3,7 @@
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
+#include <unordered_map>
 
 #include "game/actions.h"
 #include "game/anim.h"
@@ -38,6 +39,7 @@
 #include "game/worldmap.h"
 #include "int/dialog.h"
 #include "multiplayer/acting_player_context.h"
+#include "multiplayer/local_player_context.h"
 #include "multiplayer/network_world.h"
 #include "multiplayer/presentation_bridge.h"
 #include "plib/color/color.h"
@@ -49,6 +51,49 @@
 #include "tts.h"
 
 namespace fallout {
+
+namespace {
+
+// Dialogue can set a transient VM hostility flag that is consumed later.
+// Keep its player identity for the same lifetime as that live program.
+struct DeferredDialogueActor {
+    multiplayer::PlayerId playerId;
+    uint32_t generation;
+};
+std::unordered_map<Program*, DeferredDialogueActor> deferredDialogueActors;
+// Do not reuse generations when sessions end but native programs remain live.
+// Saturation disables new provenance rather than making old VM values current.
+uint32_t nextDialogueActorGeneration = 1;
+
+} // namespace
+
+void intExtraResetDialogueActors()
+{
+    deferredDialogueActors.clear();
+}
+
+void intExtraClearDialogueActor(Program* program)
+{
+    deferredDialogueActors.erase(program);
+}
+
+void intExtraRememberDialogueActor(Program* program, Object* actor)
+{
+    // Keep the first dialogue until its native ambient reaction runs.
+    if (multiplayer::networkWorldActive()) {
+        if (auto* player = multiplayer::playerStateForActor(actor)) {
+            if (!intExtraHasDialogueActor(program) && nextDialogueActorGeneration != 0) {
+                uint32_t generation = nextDialogueActorGeneration++;
+                deferredDialogueActors.emplace(program, DeferredDialogueActor { player->id, generation });
+            }
+        }
+    }
+}
+
+bool intExtraHasDialogueActor(Program* program)
+{
+    return deferredDialogueActors.find(program) != deferredDialogueActors.end();
+}
 
 typedef enum Metarule {
     METARULE_SIGNAL_END_GAME = 13,
@@ -840,7 +885,15 @@ static void op_target_obj(Program* program)
 // 0x44C948
 static void op_dude_obj(Program* program)
 {
-    programStackPushPointer(program, multiplayer::actingPlayerActorOr(obj_dude));
+    ProgramValue value;
+    value.opcode = VALUE_TYPE_PTR;
+    value.pointerValue = multiplayer::actingPlayerActorOr(obj_dude);
+    auto actor = deferredDialogueActors.find(program);
+    if (actor != deferredDialogueActors.end()) {
+        value.pointerOrigin = PointerOrigin::DudeObject;
+        value.pointerOriginGeneration = actor->second.generation;
+    }
+    programStackPushValue(program, value);
 }
 
 // NOTE: The implementation is the same as in [op_target_obj].
@@ -1481,7 +1534,35 @@ static void op_attack(Program* program)
         data[arg] = programStackPopInteger(program);
     }
 
-    Object* target = static_cast<Object*>(programStackPopPointer(program));
+    ProgramValue targetValue = programStackPopValue(program);
+    Object* target = nullptr;
+    if (targetValue.opcode != VALUE_TYPE_INT || targetValue.integerValue != 0) {
+        if (targetValue.opcode != VALUE_TYPE_PTR) {
+            interpretError("pointer expected, got %x", targetValue.opcode);
+        }
+        target = static_cast<Object*>(targetValue.pointerValue);
+    }
+
+    if (multiplayer::networkWorldActive()
+        && targetValue.opcode == VALUE_TYPE_PTR
+        && targetValue.pointerOrigin == PointerOrigin::DudeObject) {
+        Script* script = nullptr;
+        auto actor = deferredDialogueActors.find(program);
+        if (actor != deferredDialogueActors.end()
+            && targetValue.pointerOriginGeneration == actor->second.generation
+            && scr_ptr(scr_find_sid_from_program(program), &script) == 0
+            && (script->action == SCRIPT_PROC_CRITTER || script->action == SCRIPT_PROC_TIMED)
+            && script->owner != nullptr && PID_TYPE(script->owner->pid) == OBJ_TYPE_CRITTER
+            && !multiplayer::networkWorldCombatOwner(script->owner).has_value()) {
+            // Only an implicit player attack consumes dialogue provenance.
+            // Explicit pointer targets and every movement lookup stay intact.
+            if (Object* origin = multiplayer::networkWorldPlayerActor(actor->second.playerId)) {
+                target = origin;
+            }
+            deferredDialogueActors.erase(actor);
+        }
+    }
+
     if (target == NULL) {
         dbg_error(program, "attack", SCRIPT_ERROR_OBJECT_IS_NULL);
         return;
@@ -4339,6 +4420,7 @@ void updateIntExtra()
 // 0x4531E0
 void intExtraRemoveProgramReferences(Program* program)
 {
+    intExtraClearDialogueActor(program);
 }
 
 } // namespace fallout

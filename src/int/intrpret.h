@@ -2,6 +2,7 @@
 #define FALLOUT_INT_INTRPRET_H_
 
 #include <setjmp.h>
+#include <stdint.h>
 
 #include <vector>
 
@@ -135,8 +136,13 @@ typedef struct Procedure {
     int field_14;
 } Procedure;
 
+// Runtime provenance; this tag does not change the stored pointer.
+enum class PointerOrigin : unsigned char { None, DudeObject };
+
 typedef struct ProgramValue {
     opcode_t opcode;
+    PointerOrigin pointerOrigin = PointerOrigin::None;
+    uint32_t pointerOriginGeneration = 0;
     union {
         int integerValue;
         float floatValue;
